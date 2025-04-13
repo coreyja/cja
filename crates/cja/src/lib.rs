@@ -12,3 +12,5 @@ pub use color_eyre;
 pub use color_eyre::Result;
 
 pub use maud;
+
+pub mod db;
