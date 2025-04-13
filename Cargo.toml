@@ -62,3 +62,6 @@ rss = { version = "2.0", features = ["validation"] }
 markdown = "1.0.0-alpha"
 include_dir = { version = "0.7.3", features = ["metadata", "glob"] }
 path-absolutize = "3.0"
+
+axum = "0.7.4"
+async-trait = "0.1.77"
