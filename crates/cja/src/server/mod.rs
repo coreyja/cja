@@ -6,7 +6,15 @@ use tokio::net::TcpListener;
 use tower_cookies::CookieManagerLayer;
 use tower_service::Service;
 
-pub mod cookies;
+pub mod cookies {
+    mod cookie_key;
+    pub use cookie_key::CookieKey;
+
+    mod cookie_jar;
+    pub use cookie_jar::CookieJar;
+
+    pub use tower_cookies::Cookie;
+}
 pub mod session;
 
 pub mod trace;
