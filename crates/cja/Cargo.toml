@@ -27,6 +27,7 @@ listenfd = "1.0.2"
 
 tracing-common = { path = "../tracing-common" }
 color-eyre = "0.6.3"
+maud = { version = "0.26.0", features = ["axum"] }
 
 [lints]
 workspace = true

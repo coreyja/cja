@@ -17,6 +17,9 @@ pub mod cookies {
 
     pub use tower_cookies::cookie::SameSite;
 }
+
+pub mod page;
+
 pub mod session;
 
 pub mod trace;
