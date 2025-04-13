@@ -1,5 +1,4 @@
 pub use sqlx;
-pub use tower_cookies;
 pub use uuid;
 
 pub mod cron;
