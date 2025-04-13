@@ -14,6 +14,8 @@ pub mod cookies {
     pub use cookie_jar::CookieJar;
 
     pub use tower_cookies::Cookie;
+
+    pub use tower_cookies::cookie::SameSite;
 }
 pub mod session;
 
