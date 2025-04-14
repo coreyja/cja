@@ -1,4 +1,5 @@
 use axum::{extract::FromRequestParts, response::Redirect};
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
@@ -10,6 +11,18 @@ pub struct CJASession {
     pub session_id: uuid::Uuid,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl CJASession {
+    fn save_cookie<A: AppState>(&self, jar: &CookieJar<A>) {
+        let cookie = tower_cookies::Cookie::build(("session_id", self.session_id.to_string()))
+            .path("/")
+            .http_only(true)
+            .secure(true)
+            .expires(None);
+
+        jar.add(cookie.into());
+    }
 }
 
 // #[async_trait::async_trait]
@@ -113,27 +126,47 @@ pub trait AppSession: Sized {
     }
 }
 
-struct Session<A: AppSession>(A);
+pub struct Session<A: AppSession>(pub A);
 
 #[async_trait::async_trait]
 impl<A: AppState + Send + Sync, S: AppSession + Send + Sync> FromRequestParts<A> for Session<S> {
-    type Rejection = Redirect;
+    type Rejection = StatusCode;
 
     async fn from_request_parts(
         parts: &mut http::request::Parts,
         state: &A,
     ) -> Result<Self, Self::Rejection> {
-        let cookies = CookieJar::from_request_parts(parts, state)
-            .await
-            .map_err(|_| Redirect::temporary("/login"))?;
-
-        let Some(session_cookie) = cookies.get("session_id") else {
-            return Ok(S::create(state.db())
+        async fn create_session<A: AppState, S: AppSession>(
+            state: &A,
+            cookies: &CookieJar<A>,
+        ) -> Result<Session<S>, StatusCode> {
+            let session = S::create(state.db())
                 .await
                 .map(Session)
-                .map_err(|_| Redirect::temporary("/login")))?;
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            session.0.inner().save_cookie(cookies);
+
+            Ok(session)
+        }
+
+        let cookies = CookieJar::from_request_parts(parts, state)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let Some(session_cookie) = cookies.get("session_id") else {
+            return create_session(state, &cookies).await;
         };
 
-        todo!()
+        let session_id = session_cookie.value().to_string();
+        let Ok(session_id) = uuid::Uuid::parse_str(&session_id) else {
+            return create_session(state, &cookies).await;
+        };
+
+        let Ok(session) = S::from_db(state.db(), session_id).await.map(Session) else {
+            return create_session(state, &cookies).await;
+        };
+
+        Ok(session)
     }
 }

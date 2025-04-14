@@ -65,3 +65,4 @@ path-absolutize = "3.0"
 
 axum = "0.7.4"
 async-trait = "0.1.77"
+maud = { version = "0.26.0", features = ["axum"] }

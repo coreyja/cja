@@ -7,10 +7,11 @@ use cja::{
     server::{
         cookies::CookieKey,
         run_server,
-        session::{AppSession, CJASession},
+        session::{AppSession, CJASession, Session},
     },
     setup::{setup_sentry, setup_tracing},
 };
+use maud::html;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::info;
 
@@ -162,8 +163,22 @@ impl AppSession for SiteSession {
     }
 }
 
-async fn root() -> impl IntoResponse {
-    "Hello, World!"
+async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
+    html! {
+        html {
+            head {
+                title { "CJA Site" }
+            }
+            body {
+                h1 { "Hello, World!" }
+
+                h4 { "Session" }
+                p { "Session ID: " (session.session_id()) }
+                p { "Created At: " (session.created_at()) }
+                p { "Updated At: " (session.updated_at()) }
+            }
+        }
+    }
 }
 
 /// Spawn all application background tasks
