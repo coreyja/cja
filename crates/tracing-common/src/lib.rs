@@ -5,7 +5,7 @@ use opentelemetry_otlp::WithExportConfig;
 use sentry::ClientInitGuard;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{
-    layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter, Registry,
+    layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter, Layer as _, Registry,
 };
 use tracing_tree::HierarchicalLayer;
 
@@ -67,7 +67,14 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<()> {
         None
     };
 
-    let hierarchical = {
+    let stdout_layer = if std::env::var("JSON_LOGS").is_ok() {
+        println!("Logging to STDOUT as JSON");
+
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .boxed()
+    } else {
         let hierarchical = HierarchicalLayer::default()
             .with_writer(std::io::stdout)
             .with_indent_lines(true)
@@ -78,16 +85,15 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<()> {
             .with_verbose_entry(true)
             .with_targets(true);
 
-        println!("Let's also log to stdout.");
+        println!("Logging to STDOUT as hierarchical");
 
-        hierarchical
+        hierarchical.boxed()
     };
 
     Registry::default()
-        .with(hierarchical)
+        .with(stdout_layer)
         .with(opentelemetry_layer)
         .with(env_filter)
-        .with(sentry_tracing::layer())
         .try_init()?;
 
     Ok(())
