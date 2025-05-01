@@ -21,7 +21,7 @@ items-after-statements = "allow"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-sqlx = { version = "0.7", default-features = false, features = [
+sqlx = { version = "0.8", default-features = false, features = [
   "postgres",
   "runtime-tokio-rustls",
   "chrono",
