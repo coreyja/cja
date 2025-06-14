@@ -97,7 +97,7 @@ fn test_project_with_all_features() {
         .child("src")
         .child("main.rs")
         .assert(predicate::path::exists())
-        .assert(predicate::str::contains("JobRegistry"));
+        .assert(predicate::str::contains("impl_job_registry!"));
     
     // Check that main.rs contains cron registry
     temp.child(project_name)
@@ -109,7 +109,7 @@ fn test_project_with_all_features() {
     temp.child(project_name)
         .child("src")
         .child("main.rs")
-        .assert(predicate::str::contains("impl Session"));
+        .assert(predicate::str::contains("impl AppSession"));
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn test_project_without_jobs() {
         .child("src")
         .child("main.rs")
         .assert(predicate::path::exists())
-        .assert(predicate::str::contains("JobRegistry").not());
+        .assert(predicate::str::contains("impl_job_registry!").not());
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn test_project_without_sessions() {
         .child("src")
         .child("main.rs")
         .assert(predicate::path::exists())
-        .assert(predicate::str::contains("impl Session").not());
+        .assert(predicate::str::contains("impl AppSession").not());
 }
 
 #[test]

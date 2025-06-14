@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(mv:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(rg:*)",
+      "Bash(rm:*)",
+      "Bash(grep:*)",
+      "Bash(jj new:*)"
     ],
     "deny": []
   }
