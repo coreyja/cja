@@ -40,7 +40,7 @@ fn test_new_command_without_args() {
 #[test]
 fn test_new_command_with_project_name() {
     let mut cmd = Command::cargo_bin("cja-cli").unwrap();
-    cmd.args(&["new", "test-project"])
+    cmd.args(&["new", "test-project-1"])
         .assert()
         .success();
 }
@@ -48,7 +48,7 @@ fn test_new_command_with_project_name() {
 #[test]
 fn test_new_command_with_no_cron_flag() {
     let mut cmd = Command::cargo_bin("cja-cli").unwrap();
-    cmd.args(&["new", "test-project", "--no-cron"])
+    cmd.args(&["new", "test-project-2", "--no-cron"])
         .assert()
         .success();
 }
@@ -56,7 +56,7 @@ fn test_new_command_with_no_cron_flag() {
 #[test]
 fn test_new_command_with_no_jobs_flag() {
     let mut cmd = Command::cargo_bin("cja-cli").unwrap();
-    cmd.args(&["new", "test-project", "--no-jobs"])
+    cmd.args(&["new", "test-project-3", "--no-jobs"])
         .assert()
         .success();
 }
@@ -64,7 +64,7 @@ fn test_new_command_with_no_jobs_flag() {
 #[test]
 fn test_new_command_with_no_sessions_flag() {
     let mut cmd = Command::cargo_bin("cja-cli").unwrap();
-    cmd.args(&["new", "test-project", "--no-sessions"])
+    cmd.args(&["new", "test-project-4", "--no-sessions"])
         .assert()
         .success();
 }
@@ -72,7 +72,7 @@ fn test_new_command_with_no_sessions_flag() {
 #[test]
 fn test_new_command_with_all_flags() {
     let mut cmd = Command::cargo_bin("cja-cli").unwrap();
-    cmd.args(&["new", "test-project", "--no-cron", "--no-jobs", "--no-sessions"])
+    cmd.args(&["new", "test-project-5", "--no-cron", "--no-jobs", "--no-sessions"])
         .assert()
         .success();
 }
@@ -80,7 +80,7 @@ fn test_new_command_with_all_flags() {
 #[test]
 fn test_new_command_with_both_no_jobs_and_no_cron_shows_warning() {
     let mut cmd = Command::cargo_bin("cja-cli").unwrap();
-    cmd.args(&["new", "test-project", "--no-jobs", "--no-cron"])
+    cmd.args(&["new", "test-project-6", "--no-jobs", "--no-cron"])
         .assert()
         .success()
         .stderr(str::contains("--no-jobs implies --no-cron"));
