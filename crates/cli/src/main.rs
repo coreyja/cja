@@ -1,8 +1,112 @@
+//! # CJA CLI
+//!
+//! A command-line interface for scaffolding new [CJA](https://github.com/your-org/cja) projects.
+//! 
+//! CJA CLI generates fully functional web applications built on the CJA framework,
+//! with configurable features including background jobs, cron scheduling, and session management.
+//!
+//! ## Features
+//!
+//! - **Full-Stack Project Generation**: Creates complete CJA applications with HTTP server, database integration, and optional background processing
+//! - **Feature Flags**: Opt-out of specific features (`--no-jobs`, `--no-cron`, `--no-sessions`) for minimal deployments
+//! - **Smart Defaults**: All features enabled by default, with intelligent dependency handling
+//! - **Database Migrations**: Automatically includes relevant SQL migrations based on enabled features
+//! - **Production Ready**: Generated projects include proper error handling, logging, and configuration
+//!
+//! ## Quick Start
+//!
+//! ```bash
+//! # Create a full-featured CJA project
+//! cja new my-web-app
+//!
+//! # Create a minimal HTTP server (no background processing)
+//! cja new my-api --no-jobs --no-cron --no-sessions
+//!
+//! # Create a project with jobs but no cron scheduling
+//! cja new my-worker --no-cron
+//! ```
+//!
+//! ## Generated Project Structure
+//!
+//! ```text
+//! my-project/
+//! ├── Cargo.toml          # Project dependencies and metadata
+//! ├── src/
+//! │   └── main.rs         # Application entry point with conditional features
+//! └── migrations/         # Database migrations (feature-dependent)
+//!     ├── *_AddJobsTable.sql      # Jobs support (if enabled)
+//!     ├── *_AddCrons.up.sql       # Cron scheduling (if enabled)
+//!     └── *_AddSessions.up.sql    # Session management (if enabled)
+//! ```
+//!
+//! ## Feature Dependencies
+//!
+//! - **Cron requires Jobs**: The `--no-jobs` flag automatically disables cron scheduling
+//! - **Independent Sessions**: Session support is independent of jobs and cron
+//! - **HTTP Server**: Always included (core CJA functionality)
+//!
+//! ## Examples
+//!
+//! ### Create a Full-Featured Application
+//! ```bash
+//! cja new ecommerce-site
+//! cd ecommerce-site
+//! cargo run
+//! ```
+//!
+//! The generated application includes:
+//! - HTTP server with Axum
+//! - PostgreSQL database with migrations
+//! - Background job processing
+//! - Cron scheduling system
+//! - Session management
+//! - HTML templating with Maud
+//! - Structured logging and error handling
+//!
+//! ### Create a Microservice
+//! ```bash
+//! cja new user-service --no-sessions --no-cron --no-jobs
+//! ```
+//!
+//! Creates a lightweight HTTP API server without background processing.
+//!
+//! ### Create a Background Worker
+//! ```bash
+//! cja new data-processor --no-sessions
+//! ```
+//!
+//! Creates an application optimized for background job processing with cron scheduling.
+
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
 use std::fs;
 use std::path::Path;
 
+/// Main entry point for the CJA CLI application.
+///
+/// Sets up command-line argument parsing and routes to the appropriate subcommand handler.
+/// Currently supports the `new` subcommand for project generation.
+///
+/// # Returns
+///
+/// - `Ok(())` on successful command execution
+/// - `Err(anyhow::Error)` if command parsing fails or project creation encounters an error
+///
+/// # Examples
+///
+/// The CLI supports several usage patterns:
+///
+/// ```bash
+/// # Basic project creation
+/// cja new my-project
+///
+/// # Project with feature flags
+/// cja new my-project --no-sessions --no-cron
+///
+/// # Help and version information
+/// cja --help
+/// cja --version
+/// ```
 fn main() -> Result<()> {
     let matches = Command::new("cja")
         .version(env!("CARGO_PKG_VERSION"))
@@ -59,6 +163,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Creates a new CJA project with the specified configuration.
+///
+/// This function orchestrates the complete project creation process, including:
+/// - Directory structure creation
+/// - Template file generation
+/// - Database migration copying
+/// - Feature-based conditional logic
+///
+/// # Arguments
+///
+/// * `project_name` - The name of the project to create (used as directory name and in Cargo.toml)
+/// * `no_cron` - If true, excludes cron scheduling functionality and migrations
+/// * `no_jobs` - If true, excludes background job processing functionality and migrations
+/// * `no_sessions` - If true, excludes session management functionality and migrations
+///
+/// # Returns
+///
+/// - `Ok(())` on successful project creation
+/// - `Err(anyhow::Error)` if any step fails (directory creation, file writing, etc.)
+///
+/// # Errors
+///
+/// This function will return an error in the following cases:
+/// - A directory with the same name already exists
+/// - Insufficient permissions to create directories or files
+/// - Template generation fails
+/// - Migration file copying fails
+///
+/// # Feature Dependencies
+///
+/// - If `no_jobs` is true, cron functionality is automatically disabled since cron depends on jobs
+/// - A warning is displayed if both `no_jobs` and `no_cron` are explicitly specified
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use anyhow::Result;
+///
+/// // Create a full-featured project
+/// create_project("my-app", false, false, false)?;
+///
+/// // Create a minimal API server
+/// create_project("my-api", true, true, true)?;
+///
+/// // Create a project with jobs but no cron
+/// create_project("my-worker", true, false, false)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions: bool) -> Result<()> {
     let project_path = Path::new(project_name);
     
@@ -105,6 +257,44 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
     Ok(())
 }
 
+/// Generates the `Cargo.toml` content for a new CJA project.
+///
+/// Creates a complete `Cargo.toml` file with all necessary dependencies for a CJA application.
+/// The generated configuration includes:
+/// - Project metadata (name, version, edition)
+/// - Core CJA framework dependency
+/// - HTTP server dependencies (Axum, Tokio)
+/// - Database dependencies (SQLx with PostgreSQL support)
+/// - Utility dependencies (serde, tracing, error handling)
+/// - HTML templating (Maud)
+///
+/// # Arguments
+///
+/// * `project_name` - The name to use in the `[package]` section
+///
+/// # Returns
+///
+/// A complete `Cargo.toml` file content as a `String`
+///
+/// # Generated Dependencies
+///
+/// The function includes these key dependencies:
+/// - `cja = "0.0.0"` - Core CJA framework
+/// - `axum = "0.7"` - HTTP server framework
+/// - `tokio` - Async runtime with full features
+/// - `sqlx` - Database toolkit with PostgreSQL support
+/// - `serde` - Serialization framework
+/// - `tracing` - Structured logging
+/// - `color-eyre` - Enhanced error reporting
+/// - `maud` - Type-safe HTML templating
+///
+/// # Examples
+///
+/// ```rust
+/// let toml_content = generate_cargo_toml("my-awesome-app");
+/// assert!(toml_content.contains("name = \"my-awesome-app\""));
+/// assert!(toml_content.contains("cja = { version = \"0.0.0\" }"));
+/// ```
 fn generate_cargo_toml(project_name: &str) -> String {
     format!(r#"[package]
 name = "{}"
@@ -129,6 +319,99 @@ async-trait = "0.1"
 "#, project_name)
 }
 
+/// Generates the `main.rs` content for a new CJA project with conditional features.
+///
+/// This is the most complex template generation function, creating a complete Rust application
+/// entry point that conditionally includes modules and functionality based on feature flags.
+///
+/// # Arguments
+///
+/// * `no_cron` - If true, excludes cron scheduling module and worker spawning
+/// * `no_jobs` - If true, excludes background job module and worker spawning  
+/// * `no_sessions` - If true, excludes session management and uses simple route handlers
+///
+/// # Returns
+///
+/// A complete `main.rs` file content as a `String` with conditional compilation
+///
+/// # Generated Structure
+///
+/// The function generates these components:
+///
+/// ## Always Included
+/// - Standard imports and `AppState` struct
+/// - Database connection pooling with advisory locking
+/// - Tokio runtime setup and application lifecycle
+/// - HTTP server with basic routing
+/// - Environment-based feature toggling
+///
+/// ## Conditionally Included
+///
+/// ### Sessions Module (`!no_sessions`)
+/// - `SiteSession` struct implementing `AppSession` trait
+/// - Database operations for session creation and retrieval
+/// - Session-aware route handlers with HTML templating
+/// - Session information display in web interface
+///
+/// ### Jobs Module (`!no_jobs`)
+/// - Example `NoopJob` implementation
+/// - Job registry macro invocation
+/// - Job worker spawning logic
+/// - Integration with CJA jobs system
+///
+/// ### Cron Module (`!no_cron`)
+/// - Cron registry setup and configuration
+/// - Cron worker spawning
+/// - Integration with jobs system (if available)
+/// - Scheduled task execution
+///
+/// # Feature Interactions
+///
+/// - **Sessions**: Independent of other features
+/// - **Jobs + Cron**: Cron integrates with jobs when both are enabled
+/// - **Cron Only**: Cron can run without specific job types when jobs are disabled
+///
+/// # Generated Code Examples
+///
+/// With all features enabled:
+/// ```rust,ignore
+/// // Includes session imports
+/// use cja::server::session::{AppSession, CJASession, Session};
+///
+/// // Session-aware route handler
+/// async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
+///     // HTML with session display
+/// }
+///
+/// // Background modules
+/// mod jobs { /* Job implementations */ }
+/// mod cron { /* Cron scheduling */ }
+/// ```
+///
+/// With minimal features:
+/// ```rust,ignore
+/// // Simple route handler
+/// async fn root() -> impl IntoResponse {
+///     // Basic HTML response
+/// }
+/// // No background modules
+/// ```
+///
+/// # Examples
+///
+/// ```rust
+/// // Generate full-featured application
+/// let full_app = generate_main_rs(false, false, false);
+/// assert!(full_app.contains("impl AppSession"));
+/// assert!(full_app.contains("impl_job_registry!"));
+/// assert!(full_app.contains("CronRegistry"));
+///
+/// // Generate minimal application
+/// let minimal_app = generate_main_rs(true, true, true);
+/// assert!(!minimal_app.contains("Session"));
+/// assert!(!minimal_app.contains("jobs::"));
+/// assert!(!minimal_app.contains("cron::"));
+/// ```
 fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
     let mut content = String::new();
     
@@ -468,6 +751,45 @@ mod cron {
     content
 }
 
+/// Copies the jobs table migration file to the new project.
+///
+/// Creates the SQL migration file for the background jobs system. This migration
+/// establishes the core `Jobs` table used by the CJA jobs system for persistent
+/// job queuing and execution tracking.
+///
+/// # Arguments
+///
+/// * `project_path` - Path to the project directory where migrations should be created
+///
+/// # Returns
+///
+/// - `Ok(())` on successful migration file creation
+/// - `Err(anyhow::Error)` if file writing fails
+///
+/// # Generated Migration
+///
+/// Creates `migrations/20231210151519_AddJobsTable.sql` with:
+/// - `Jobs` table with UUID primary key
+/// - Job metadata fields (name, payload, priority)
+/// - Scheduling fields (run_at, created_at)
+/// - Locking mechanism fields (locked_at, locked_by)
+/// - Context field for job execution context
+///
+/// # Database Schema
+///
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS Jobs (
+///     job_id UUID PRIMARY KEY NOT NULL,
+///     name TEXT NOT NULL,
+///     payload JSONB NOT NULL,
+///     priority INT NOT NULL,
+///     run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+///     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+///     locked_at TIMESTAMPTZ,
+///     locked_by TEXT,
+///     context TEXT NOT NULL
+/// );
+/// ```
 fn copy_jobs_migration(project_path: &Path) -> Result<()> {
     let jobs_migration = r#"-- Add migration script here
 CREATE TABLE
@@ -492,6 +814,45 @@ CREATE TABLE
     Ok(())
 }
 
+/// Copies the cron scheduling migration files to the new project.
+///
+/// Creates both up and down SQL migration files for the cron scheduling system.
+/// These migrations establish the `Crons` table used to track cron job execution
+/// and prevent duplicate runs.
+///
+/// # Arguments
+///
+/// * `project_path` - Path to the project directory where migrations should be created
+///
+/// # Returns
+///
+/// - `Ok(())` on successful migration file creation
+/// - `Err(anyhow::Error)` if file writing fails
+///
+/// # Generated Migrations
+///
+/// Creates two migration files:
+/// - `migrations/20240228040146_AddCrons.up.sql` - Creates the cron table
+/// - `migrations/20240228040146_AddCrons.down.sql` - Removes the cron table
+///
+/// # Database Schema (Up Migration)
+///
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS Crons (
+///     cron_id UUID PRIMARY KEY,
+///     name TEXT NOT NULL,
+///     last_run_at TIMESTAMP WITH TIME ZONE NOT NULL,
+///     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+///     updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+/// );
+/// CREATE UNIQUE INDEX idx_crons_name ON Crons (name);
+/// ```
+///
+/// # Rollback (Down Migration)
+///
+/// ```sql
+/// DROP TABLE Crons;
+/// ```
 fn copy_cron_migrations(project_path: &Path) -> Result<()> {
     let cron_up_migration = r#"-- Add migration script here
 CREATE TABLE
@@ -529,6 +890,64 @@ DROP TABLE Crons;
     Ok(())
 }
 
+/// Copies the session management migration files to the new project.
+///
+/// Creates both up and down SQL migration files for the session management system.
+/// These migrations establish the `Sessions` table with automatic timestamp updates
+/// and include PostgreSQL-specific trigger functions.
+///
+/// # Arguments
+///
+/// * `project_path` - Path to the project directory where migrations should be created
+///
+/// # Returns
+///
+/// - `Ok(())` on successful migration file creation
+/// - `Err(anyhow::Error)` if file writing fails
+///
+/// # Generated Migrations
+///
+/// Creates two migration files:
+/// - `migrations/20250413182934_AddSessions.up.sql` - Creates sessions table and triggers
+/// - `migrations/20250413182934_AddSessions.down.sql` - Removes sessions table and functions
+///
+/// # Database Schema (Up Migration)
+///
+/// ```sql
+/// CREATE TABLE IF NOT EXISTS Sessions (
+///     session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+///     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+///     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+/// );
+///
+/// -- Automatic timestamp update function
+/// CREATE OR REPLACE FUNCTION update_updated_at_column()
+/// RETURNS TRIGGER AS $$
+/// BEGIN
+///    NEW.updated_at = NOW();
+///    RETURN NEW;
+/// END;
+/// $$ language 'plpgsql';
+///
+/// -- Trigger for automatic updates
+/// CREATE TRIGGER update_sessions_updated_at
+///   BEFORE UPDATE ON sessions
+///   FOR EACH ROW
+///   EXECUTE FUNCTION update_updated_at_column();
+/// ```
+///
+/// # Rollback (Down Migration)
+///
+/// ```sql
+/// DROP TABLE IF EXISTS Sessions;
+/// DROP FUNCTION IF EXISTS update_updated_at_column();
+/// ```
+///
+/// # PostgreSQL Features
+///
+/// - Uses `gen_random_uuid()` for automatic UUID generation
+/// - Includes PL/pgSQL trigger function for timestamp updates
+/// - Provides proper cleanup in down migration
 fn copy_session_migrations(project_path: &Path) -> Result<()> {
     let session_up_migration = r#"-- Add migration script here
 CREATE TABLE
