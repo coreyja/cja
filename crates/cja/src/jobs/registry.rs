@@ -77,7 +77,7 @@ pub trait JobRegistry<AppState: app_state::AppState> {
 #[macro_export]
 macro_rules! impl_job_registry {
     ($state:ty, $($job_type:ty),*) => {
-        pub(crate) struct Jobs;
+        pub struct Jobs;
 
         #[async_trait::async_trait]
         impl $crate::jobs::registry::JobRegistry<$state> for Jobs {
