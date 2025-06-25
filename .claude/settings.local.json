@@ -4,6 +4,7 @@
       "Bash(cargo build:*)",
       "Bash(cargo check:*)",
       "Bash(cargo clippy:*)",
+      "Bash(cargo run:*)",
       "Bash(cargo test:*)",
       "Bash(gh pr comment:*)",
       "Bash(gh pr view:*)",
@@ -12,7 +13,8 @@
       "Bash(mkdir:*)",
       "Bash(mv:*)",
       "Bash(rg:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "WebFetch(domain:docs.rs)"
     ],
     "deny": []
   }

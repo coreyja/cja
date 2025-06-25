@@ -109,8 +109,15 @@ use std::process::Command as ProcessCommand;
 /// cja --version
 /// ```
 fn main() -> Result<()> {
+    const VERSION: &str = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("VERGEN_GIT_SHA"),
+        ")"
+    );
+    
     let matches = Command::new("cja")
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(VERSION)
         .about("CJA CLI for project scaffolding")
         .subcommand_required(true)
         .arg_required_else_help(true)
