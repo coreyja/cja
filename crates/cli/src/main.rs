@@ -56,7 +56,7 @@
 //!
 //! The generated application includes:
 //! - HTTP server with Axum
-//! - PostgreSQL database with migrations
+//! - `PostgreSQL` database with migrations
 //! - Background job processing
 //! - Cron scheduling system
 //! - Session management
@@ -81,6 +81,7 @@ use anyhow::{Context, Result};
 use clap::{Arg, Command};
 use std::fs;
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 /// Main entry point for the CJA CLI application.
 ///
@@ -139,6 +140,66 @@ fn main() -> Result<()> {
                         .long("no-sessions")
                         .help("Create project without sessions support")
                         .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("github")
+                        .long("github")
+                        .help("Use GitHub version instead of crates.io (defaults to https://github.com/coreyja/cja)")
+                        .value_name("REPO")
+                        .num_args(0..=1)
+                        .default_missing_value("https://github.com/coreyja/cja"),
+                )
+                .arg(
+                    Arg::new("branch")
+                        .long("branch")
+                        .help("GitHub branch to use (defaults to main)")
+                        .value_name("BRANCH")
+                        .default_value("main")
+                        .requires("github"),
+                ),
+        )
+        .subcommand(
+            Command::new("init")
+                .about("Initialize CJA in an existing Rust project")
+                .arg(
+                    Arg::new("bin-name")
+                        .long("bin-name")
+                        .help("Name of the binary to create (defaults to project name)")
+                        .value_name("NAME"),
+                )
+                .arg(
+                    Arg::new("no-cron")
+                        .long("no-cron")
+                        .help("Create project without cron support")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-jobs")
+                        .long("no-jobs")
+                        .help("Create project without jobs support")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-sessions")
+                        .long("no-sessions")
+                        .help("Create project without sessions support")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("github")
+                        .long("github")
+                        .help("Use GitHub version instead of crates.io (defaults to https://github.com/coreyja/cja)")
+                        .value_name("REPO")
+                        .num_args(0..=1)
+                        .default_missing_value("https://github.com/coreyja/cja"),
+                )
+                .arg(
+                    Arg::new("branch")
+                        .long("branch")
+                        .help("GitHub branch to use (defaults to main)")
+                        .value_name("BRANCH")
+                        .default_value("main")
+                        .requires("github"),
                 ),
         )
         .get_matches();
@@ -149,13 +210,30 @@ fn main() -> Result<()> {
             let no_cron = sub_matches.get_flag("no-cron");
             let no_jobs = sub_matches.get_flag("no-jobs");
             let no_sessions = sub_matches.get_flag("no-sessions");
+            let github_repo = sub_matches.get_one::<String>("github");
+            let branch = sub_matches.get_one::<String>("branch").map(String::as_str).unwrap_or("main");
             
             // Warn if both --no-jobs and --no-cron are specified
             if no_jobs && no_cron {
                 eprintln!("Warning: --no-jobs implies --no-cron since cron requires the jobs system");
             }
             
-            create_project(project_name, no_cron, no_jobs, no_sessions)?;
+            create_project(project_name, no_cron, no_jobs, no_sessions, github_repo, branch)?;
+        }
+        Some(("init", sub_matches)) => {
+            let bin_name = sub_matches.get_one::<String>("bin-name");
+            let no_cron = sub_matches.get_flag("no-cron");
+            let no_jobs = sub_matches.get_flag("no-jobs");
+            let no_sessions = sub_matches.get_flag("no-sessions");
+            let github_repo = sub_matches.get_one::<String>("github");
+            let branch = sub_matches.get_one::<String>("branch").map(String::as_str).unwrap_or("main");
+            
+            // Warn if both --no-jobs and --no-cron are specified
+            if no_jobs && no_cron {
+                eprintln!("Warning: --no-jobs implies --no-cron since cron requires the jobs system");
+            }
+            
+            init_project(bin_name, no_cron, no_jobs, no_sessions, github_repo, branch)?;
         }
         _ => unreachable!("Subcommand required"),
     }
@@ -177,6 +255,8 @@ fn main() -> Result<()> {
 /// * `no_cron` - If true, excludes cron scheduling functionality and migrations
 /// * `no_jobs` - If true, excludes background job processing functionality and migrations
 /// * `no_sessions` - If true, excludes session management functionality and migrations
+/// * `github_repo` - Optional GitHub repository URL to use instead of crates.io
+/// * `branch` - GitHub branch to use (defaults to "main")
 ///
 /// # Returns
 ///
@@ -201,17 +281,17 @@ fn main() -> Result<()> {
 /// ```rust,no_run
 /// use anyhow::Result;
 ///
-/// // Create a full-featured project
-/// create_project("my-app", false, false, false)?;
+/// // Create a full-featured project from crates.io
+/// create_project("my-app", false, false, false, None, "main")?;
 ///
-/// // Create a minimal API server
-/// create_project("my-api", true, true, true)?;
+/// // Create a minimal API server from GitHub
+/// create_project("my-api", true, true, true, Some(&"https://github.com/coreyja/cja".to_string()), "main")?;
 ///
-/// // Create a project with jobs but no cron
-/// create_project("my-worker", true, false, false)?;
+/// // Create a project with jobs but no cron from a custom branch
+/// create_project("my-worker", true, false, false, Some(&"https://github.com/coreyja/cja".to_string()), "develop")?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions: bool) -> Result<()> {
+fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions: bool, github_repo: Option<&String>, branch: &str) -> Result<()> {
     let project_path = Path::new(project_name);
     
     // Check if directory already exists
@@ -220,8 +300,8 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
     }
     
     // Create project directory structure
-    fs::create_dir(&project_path)
-        .with_context(|| format!("Failed to create project directory '{}'", project_name))?;
+    fs::create_dir(project_path)
+        .with_context(|| format!("Failed to create project directory '{project_name}'"))?;
     
     fs::create_dir(project_path.join("src"))
         .context("Failed to create src directory")?;
@@ -230,7 +310,7 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
         .context("Failed to create migrations directory")?;
     
     // Create Cargo.toml
-    let cargo_toml_content = generate_cargo_toml(project_name);
+    let cargo_toml_content = generate_cargo_toml(project_name, github_repo, branch, no_cron, no_jobs, no_sessions);
     fs::write(project_path.join("Cargo.toml"), cargo_toml_content)
         .context("Failed to write Cargo.toml")?;
     
@@ -241,18 +321,205 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
     
     // Copy migration files based on feature flags
     if !no_jobs {
-        copy_jobs_migration(&project_path)?;
+        copy_jobs_migration(project_path)?;
     }
     
     if !no_cron {
-        copy_cron_migrations(&project_path)?;
+        copy_cron_migrations(project_path)?;
     }
     
     if !no_sessions {
-        copy_session_migrations(&project_path)?;
+        copy_session_migrations(project_path)?;
     }
     
-    println!("Created new CJA project '{}'", project_name);
+    println!("Created new CJA project '{project_name}'");
+    
+    Ok(())
+}
+
+/// Initializes CJA in an existing Rust project.
+///
+/// This function adds CJA to an existing Cargo project, creating the necessary
+/// files and structure while preserving the existing project configuration.
+///
+/// # Arguments
+///
+/// * `bin_name` - Optional binary name (defaults to project name from Cargo.toml)
+/// * `no_cron` - If true, excludes cron scheduling functionality
+/// * `no_jobs` - If true, excludes background job processing functionality  
+/// * `no_sessions` - If true, excludes session management functionality
+/// * `github_repo` - Optional GitHub repository URL to use instead of crates.io
+/// * `branch` - GitHub branch to use (defaults to "main")
+///
+/// # Returns
+///
+/// - `Ok(())` on successful initialization
+/// - `Err(anyhow::Error)` if initialization fails
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - Not in a Cargo project directory
+/// - Unable to read or parse Cargo.toml
+/// - Unable to create necessary directories or files
+/// - cargo add command fails
+fn init_project(bin_name: Option<&String>, no_cron: bool, no_jobs: bool, no_sessions: bool, github_repo: Option<&String>, branch: &str) -> Result<()> {
+    // Check if we're in a Cargo project
+    let cargo_toml_path = Path::new("Cargo.toml");
+    if !cargo_toml_path.exists() {
+        anyhow::bail!("No Cargo.toml found. Please run this command in a Rust project directory.");
+    }
+    
+    // Read and parse Cargo.toml to get project name
+    let cargo_toml_content = fs::read_to_string(cargo_toml_path)
+        .context("Failed to read Cargo.toml")?;
+    
+    let toml_value: toml::Value = cargo_toml_content.parse()
+        .context("Failed to parse Cargo.toml")?;
+    
+    let package_name = toml_value
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Could not find package name in Cargo.toml"))?;
+    
+    let bin_name = bin_name.map_or(package_name, std::string::String::as_str);
+    
+    // Create src/bin directory if it doesn't exist
+    let bin_dir = Path::new("src").join("bin");
+    if !bin_dir.exists() {
+        fs::create_dir_all(&bin_dir)
+            .context("Failed to create src/bin directory")?;
+    }
+    
+    // Check if the binary already exists
+    let bin_file_path = bin_dir.join(format!("{bin_name}.rs"));
+    if bin_file_path.exists() {
+        anyhow::bail!("Binary file '{}' already exists", bin_file_path.display());
+    }
+    
+    // Create migrations directory if it doesn't exist
+    let migrations_dir = Path::new("migrations");
+    if !migrations_dir.exists() {
+        fs::create_dir(migrations_dir)
+            .context("Failed to create migrations directory")?;
+    }
+    
+    // Add CJA dependency using cargo add
+    println!("Adding CJA dependency...");
+    let mut cargo_add_cmd = ProcessCommand::new("cargo");
+    cargo_add_cmd.arg("add");
+    
+    // Use GitHub dependency if specified
+    if let Some(repo) = github_repo {
+        cargo_add_cmd.arg("--git").arg(repo);
+        cargo_add_cmd.arg("--branch").arg(branch);
+        println!("Using GitHub repository: {} (branch: {})", repo, branch);
+    } else {
+        cargo_add_cmd.arg("cja");
+    }
+    
+    // Add features based on flags
+    let mut features = vec![];
+    if !no_jobs {
+        features.push("jobs");
+    }
+    if !no_cron && !no_jobs {  // Cron requires jobs
+        features.push("cron");
+    }
+    if !no_sessions {
+        features.push("sessions");
+    }
+    
+    if !features.is_empty() {
+        cargo_add_cmd.arg("-F").arg(features.join(","));
+    }
+    
+    let output = cargo_add_cmd.output()
+        .context("Failed to execute cargo add command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("cargo add failed: {}", stderr);
+    }
+    
+    // Add other required dependencies
+    println!("Adding additional dependencies...");
+    let deps = vec![
+        ("axum", Some("0.7"), vec![]),
+        ("tokio", Some("1"), vec!["full"]),
+        ("sqlx", Some("0.8"), vec!["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"]),
+        ("serde", Some("1.0"), vec!["derive"]),
+        ("serde_json", Some("1.0"), vec![]),
+        ("tracing", Some("0.1"), vec![]),
+        ("tracing-subscriber", Some("0.3"), vec!["env-filter"]),
+        ("color-eyre", Some("0.6"), vec![]),
+        ("uuid", Some("1.5"), vec!["v4", "serde"]),
+        ("chrono", Some("0.4"), vec!["serde"]),
+        ("maud", Some("0.26"), vec!["axum"]),
+        ("futures", Some("0.3"), vec![]),
+        ("async-trait", Some("0.1"), vec![]),
+    ];
+    
+    for (dep, version, features) in deps {
+        let mut cmd = ProcessCommand::new("cargo");
+        cmd.arg("add").arg(dep);
+        
+        if let Some(v) = version {
+            cmd.arg("--vers").arg(v);
+        }
+        
+        if !features.is_empty() {
+            cmd.arg("-F").arg(features.join(","));
+        }
+        
+        let output = cmd.output()
+            .with_context(|| format!("Failed to add dependency: {dep}"))?;
+        
+        if !output.status.success() {
+            eprintln!("Warning: Failed to add {}: {}", dep, String::from_utf8_lossy(&output.stderr));
+        }
+    }
+    
+    // Create the binary file
+    let main_content = generate_main_rs(no_cron, no_jobs, no_sessions);
+    fs::write(&bin_file_path, main_content)
+        .with_context(|| format!("Failed to write {}", bin_file_path.display()))?;
+    
+    // Add [[bin]] entry to Cargo.toml
+    let mut cargo_toml_content = fs::read_to_string(cargo_toml_path)
+        .context("Failed to read Cargo.toml")?;
+    
+    // Check if [[bin]] section already exists for this binary
+    if !cargo_toml_content.contains(&format!("name = \"{bin_name}\"")) {
+        cargo_toml_content.push_str(&format!(r#"
+
+[[bin]]
+name = "{bin_name}"
+path = "src/bin/{bin_name}.rs"
+"#));
+        
+        fs::write(cargo_toml_path, cargo_toml_content)
+            .context("Failed to update Cargo.toml")?;
+    }
+    
+    // Copy migration files based on feature flags
+    if !no_jobs {
+        copy_jobs_migration(Path::new("."))?;
+    }
+    
+    if !no_cron && !no_jobs {
+        copy_cron_migrations(Path::new("."))?;
+    }
+    
+    if !no_sessions {
+        copy_session_migrations(Path::new("."))?;
+    }
+    
+    println!("Successfully initialized CJA in your project!");
+    println!("Binary created at: {}", bin_file_path.display());
+    println!("\nTo run your CJA application:");
+    println!("  cargo run --bin {bin_name}");
     
     Ok(())
 }
@@ -264,13 +531,18 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
 /// - Project metadata (name, version, edition)
 /// - Core CJA framework dependency
 /// - HTTP server dependencies (Axum, Tokio)
-/// - Database dependencies (SQLx with PostgreSQL support)
+/// - Database dependencies (`SQLx` with `PostgreSQL` support)
 /// - Utility dependencies (serde, tracing, error handling)
 /// - HTML templating (Maud)
 ///
 /// # Arguments
 ///
 /// * `project_name` - The name to use in the `[package]` section
+/// * `github_repo` - Optional GitHub repository URL to use instead of crates.io
+/// * `branch` - GitHub branch to use (defaults to "main")
+/// * `no_cron` - If true, excludes cron feature
+/// * `no_jobs` - If true, excludes jobs feature
+/// * `no_sessions` - If true, excludes sessions feature
 ///
 /// # Returns
 ///
@@ -282,7 +554,7 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
 /// - `cja = "0.0.0"` - Core CJA framework
 /// - `axum = "0.7"` - HTTP server framework
 /// - `tokio` - Async runtime with full features
-/// - `sqlx` - Database toolkit with PostgreSQL support
+/// - `sqlx` - Database toolkit with `PostgreSQL` support
 /// - `serde` - Serialization framework
 /// - `tracing` - Structured logging
 /// - `color-eyre` - Enhanced error reporting
@@ -295,14 +567,37 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
 /// assert!(toml_content.contains("name = \"my-awesome-app\""));
 /// assert!(toml_content.contains("cja = { version = \"0.0.0\" }"));
 /// ```
-fn generate_cargo_toml(project_name: &str) -> String {
+fn generate_cargo_toml(project_name: &str, github_repo: Option<&String>, branch: &str, no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
+    // Build CJA dependency line
+    let cja_dep = if let Some(repo) = github_repo {
+        // Build features array
+        let mut features = vec![];
+        if !no_jobs {
+            features.push("jobs");
+        }
+        if !no_cron && !no_jobs {
+            features.push("cron");
+        }
+        if !no_sessions {
+            features.push("sessions");
+        }
+        
+        if features.is_empty() {
+            format!(r#"cja = {{ git = "{}", branch = "{}" }}"#, repo, branch)
+        } else {
+            format!(r#"cja = {{ git = "{}", branch = "{}", features = {:?} }}"#, repo, branch, features)
+        }
+    } else {
+        r#"cja = { version = "0.0.0" }"#.to_string()
+    };
+    
     format!(r#"[package]
-name = "{}"
+name = "{project_name}"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cja = {{ version = "0.0.0" }}
+{cja_dep}
 axum = "0.7"
 tokio = {{ version = "1", features = ["full"] }}
 sqlx = {{ version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"] }}
@@ -316,7 +611,7 @@ chrono = {{ version = "0.4", features = ["serde"] }}
 maud = {{ version = "0.26", features = ["axum"] }}
 futures = "0.3"
 async-trait = "0.1"
-"#, project_name)
+"#)
 }
 
 /// Generates the `main.rs` content for a new CJA project with conditional features.
@@ -416,7 +711,7 @@ fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
     let mut content = String::new();
     
     // Base imports
-    content.push_str(r#"use axum::response::IntoResponse;
+    content.push_str(r"use axum::response::IntoResponse;
 use cja::{
     color_eyre::{
         self,
@@ -425,7 +720,7 @@ use cja::{
     server::{
         cookies::CookieKey,
         run_server,
-"#);
+");
 
     // Session imports only if sessions are enabled
     if !no_sessions {
@@ -540,93 +835,93 @@ fn routes(app_state: AppState) -> axum::Router {
 "#);
 
     // Sessions implementation only if sessions are enabled
-    if !no_sessions {
-        content.push_str(r#"
-struct SiteSession {
-    inner: CJASession,
-}
+    if no_sessions {
+            // Simple root handler without sessions
+            content.push_str(r#"
+    async fn root() -> impl IntoResponse {
+        html! {
+            html {
+                head {
+                    title { "CJA Site" }
+                }
+                body {
+                    h1 { "Hello, World!" }
+                }
+            }
+        }
+    }
+    "#);
+        } else {
+            content.push_str(r#"
+    struct SiteSession {
+        inner: CJASession,
+    }
 
-#[async_trait::async_trait]
-impl AppSession for SiteSession {
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
-        let row = sqlx::query!(
-            "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
-            session_id
-        )
-        .fetch_one(pool)
-        .await?;
+    #[async_trait::async_trait]
+    impl AppSession for SiteSession {
+        async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
+            let row = sqlx::query!(
+                "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
+                session_id
+            )
+            .fetch_one(pool)
+            .await?;
 
-        let session = SiteSession {
-            inner: CJASession {
+            let session = SiteSession {
+                inner: CJASession {
+                    session_id: row.session_id,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                },
+            };
+
+            Ok(session)
+        }
+
+        async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
+            let row = sqlx::query!(
+                "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",
+            )
+            .fetch_one(pool)
+            .await?;
+
+            let inner = CJASession {
                 session_id: row.session_id,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
-            },
-        };
+            };
 
-        Ok(session)
+            Ok(Self { inner })
+        }
+
+        fn from_inner(inner: CJASession) -> Self {
+            Self { inner }
+        }
+
+        fn inner(&self) -> &CJASession {
+            &self.inner
+        }
     }
 
-    async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
-        let row = sqlx::query!(
-            "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",
-        )
-        .fetch_one(pool)
-        .await?;
+    async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
+        html! {
+            html {
+                head {
+                    title { "CJA Site" }
+                }
+                body {
+                    h1 { "Hello, World!" }
 
-        let inner = CJASession {
-            session_id: row.session_id,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        };
-
-        Ok(Self { inner })
-    }
-
-    fn from_inner(inner: CJASession) -> Self {
-        Self { inner }
-    }
-
-    fn inner(&self) -> &CJASession {
-        &self.inner
-    }
-}
-
-async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
-    html! {
-        html {
-            head {
-                title { "CJA Site" }
-            }
-            body {
-                h1 { "Hello, World!" }
-
-                h4 { "Session" }
-                p { "Session ID: " (session.session_id()) }
-                p { "Created At: " (session.created_at()) }
-                p { "Updated At: " (session.updated_at()) }
+                    h4 { "Session" }
+                    p { "Session ID: " (session.session_id()) }
+                    p { "Created At: " (session.created_at()) }
+                    p { "Updated At: " (session.updated_at()) }
+                }
             }
         }
     }
-}
-"#);
-    } else {
-        // Simple root handler without sessions
-        content.push_str(r#"
-async fn root() -> impl IntoResponse {
-    html! {
-        html {
-            head {
-                title { "CJA Site" }
-            }
-            body {
-                h1 { "Hello, World!" }
-            }
+    "#);
         }
-    }
-}
-"#);
-    }
 
     // Spawn application tasks function
     content.push_str(r#"
@@ -714,19 +1009,19 @@ mod jobs {
 
     // Add cron module if cron is enabled
     if !no_cron {
-        content.push_str(r#"
+        content.push_str(r"
 mod cron {
     use std::time::Duration;
 
     use cja::cron::{CronRegistry, Worker};
-"#);
+");
         
         // Only import NoopJob if jobs are also enabled
         if !no_jobs {
             content.push_str("\n    use crate::jobs::NoopJob;\n");
         }
         
-        content.push_str(r#"
+        content.push_str(r"
     use super::AppState;
 
     pub(crate) async fn run_cron(app_state: AppState) -> cja::Result<()> {
@@ -735,17 +1030,17 @@ mod cron {
 
     fn cron_registry() -> cja::cron::CronRegistry<AppState> {
         let mut registry = CronRegistry::new();
-"#);
+");
         
         // Only register NoopJob if jobs are enabled
         if !no_jobs {
             content.push_str("        registry.register_job(NoopJob, Duration::from_secs(60));\n");
         }
         
-        content.push_str(r#"        registry
+        content.push_str(r"        registry
     }
 }
-"#);
+");
     }
 
     content
@@ -771,8 +1066,8 @@ mod cron {
 /// Creates `migrations/20231210151519_AddJobsTable.sql` with:
 /// - `Jobs` table with UUID primary key
 /// - Job metadata fields (name, payload, priority)
-/// - Scheduling fields (run_at, created_at)
-/// - Locking mechanism fields (locked_at, locked_by)
+/// - Scheduling fields (`run_at`, `created_at`)
+/// - Locking mechanism fields (`locked_at`, `locked_by`)
 /// - Context field for job execution context
 ///
 /// # Database Schema
@@ -791,7 +1086,7 @@ mod cron {
 /// );
 /// ```
 fn copy_jobs_migration(project_path: &Path) -> Result<()> {
-    let jobs_migration = r#"-- Add migration script here
+    let jobs_migration = r"-- Add migration script here
 CREATE TABLE
   IF NOT EXISTS Jobs (
     job_id UUID PRIMARY KEY NOT NULL,
@@ -804,7 +1099,7 @@ CREATE TABLE
     locked_by TEXT,
     context TEXT NOT NULL
   );
-"#;
+";
     
     fs::write(
         project_path.join("migrations").join("20231210151519_AddJobsTable.sql"),
@@ -854,7 +1149,7 @@ CREATE TABLE
 /// DROP TABLE Crons;
 /// ```
 fn copy_cron_migrations(project_path: &Path) -> Result<()> {
-    let cron_up_migration = r#"-- Add migration script here
+    let cron_up_migration = r"-- Add migration script here
 CREATE TABLE
   IF NOT EXISTS Crons (
     cron_id UUID PRIMARY KEY,
@@ -871,11 +1166,11 @@ CREATE TABLE
   );
 
 CREATE UNIQUE INDEX idx_crons_name ON Crons (name);
-"#;
+";
 
-    let cron_down_migration = r#"-- Add migration script here
+    let cron_down_migration = r"-- Add migration script here
 DROP TABLE Crons;
-"#;
+";
     
     fs::write(
         project_path.join("migrations").join("20240228040146_AddCrons.up.sql"),
@@ -943,13 +1238,13 @@ DROP TABLE Crons;
 /// DROP FUNCTION IF EXISTS update_updated_at_column();
 /// ```
 ///
-/// # PostgreSQL Features
+/// # `PostgreSQL` Features
 ///
 /// - Uses `gen_random_uuid()` for automatic UUID generation
 /// - Includes PL/pgSQL trigger function for timestamp updates
 /// - Provides proper cleanup in down migration
 fn copy_session_migrations(project_path: &Path) -> Result<()> {
-    let session_up_migration = r#"-- Add migration script here
+    let session_up_migration = r"-- Add migration script here
 CREATE TABLE
   IF NOT EXISTS Sessions (
     session_id UUID PRIMARY KEY DEFAULT gen_random_uuid (),
@@ -975,13 +1270,13 @@ CREATE TRIGGER update_sessions_updated_at
   BEFORE UPDATE ON sessions
   FOR EACH ROW
   EXECUTE FUNCTION update_updated_at_column();
-"#;
+";
 
-    let session_down_migration = r#"-- Add migration script here
+    let session_down_migration = r"-- Add migration script here
 DROP TABLE IF EXISTS Sessions;
 
 DROP FUNCTION IF EXISTS update_updated_at_column ();
-"#;
+";
     
     fs::write(
         project_path.join("migrations").join("20250413182934_AddSessions.up.sql"),

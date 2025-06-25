@@ -1,4 +1,4 @@
 target/
 .env
 .envrc
-.claude/settings.local.json
+crates/cli/test-project-*
