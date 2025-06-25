@@ -6,7 +6,9 @@
       "Bash(rg:*)",
       "Bash(rm:*)",
       "Bash(grep:*)",
-      "Bash(jj new:*)"
+      "Bash(jj new:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo clippy:*)"
     ],
     "deny": []
   }
