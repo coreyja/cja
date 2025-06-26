@@ -1,5 +1,5 @@
 use crate::app_state::AppState as AS;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tracing::instrument;
 
