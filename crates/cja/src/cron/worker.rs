@@ -1,6 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, Utc};
+use sqlx::Row;
 
 use crate::app_state::AppState as AS;
 
@@ -21,16 +22,20 @@ impl<AppState: AS> Worker<AppState> {
 
         tracing::debug!("Starting cron loop");
         loop {
-            let last_runs = sqlx::query!(
+            let last_runs = sqlx::query(
                 "SELECT name, max(last_run_at) as last_run_at FROM Crons GROUP BY name"
             )
             .fetch_all(self.state.db())
             .await
             .map_err(TickError::SqlxError)?;
 
-            let last_run_map: HashMap<&str, DateTime<Utc>> = last_runs
+            let last_run_map: HashMap<String, DateTime<Utc>> = last_runs
                 .iter()
-                .map(|row| (row.name.as_str(), row.last_run_at.unwrap_or_default()))
+                .map(|row| {
+                    let name: String = row.get("name");
+                    let last_run_at: Option<DateTime<Utc>> = row.get("last_run_at");
+                    (name, last_run_at.unwrap_or_default())
+                })
                 .collect();
             self.tick(&worker_id, &last_run_map).await?;
 
@@ -42,7 +47,7 @@ impl<AppState: AS> Worker<AppState> {
     async fn tick(
         &self,
         worker_id: &uuid::Uuid,
-        last_enqueue_map: &HashMap<&str, chrono::DateTime<Utc>>,
+        last_enqueue_map: &HashMap<String, chrono::DateTime<Utc>>,
     ) -> Result<(), TickError> {
         for job in self.registry.jobs.values() {
             job.tick(self.state.clone(), last_enqueue_map).await?;

@@ -88,7 +88,8 @@ pub enum EnqueueError {
 ///     async fn run(&self, app_state: AS) -> color_eyre::Result<()> {
 ///         // Access the database through app_state
 ///         // In a real app, you'd query your users table here
-///         // let _user = sqlx::query!("SELECT * FROM users WHERE id = $1", self.user_id)
+///         // let _user = sqlx::query("SELECT * FROM users WHERE id = $1")
+///         //     .bind(self.user_id)
 ///         //     .fetch_one(app_state.db())
 ///         //     .await?;
 ///         
@@ -97,7 +98,7 @@ pub enum EnqueueError {
 ///                  self.amount_cents, self.user_id);
 ///         
 ///         // Update payment status in database
-///         // sqlx::query!("INSERT INTO payments ...")
+///         // sqlx::query("INSERT INTO payments ...")
 ///         
 ///         Ok(())
 ///     }

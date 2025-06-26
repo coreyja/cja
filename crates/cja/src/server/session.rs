@@ -152,11 +152,10 @@ impl CJASession {
 ///     async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
 ///         // Query your session data including any custom fields
 ///         // In a real app, you'd have extended the sessions table with these columns
-///         let row = sqlx::query_as!(
-///             CJASession,
-///             "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
-///             session_id
+///         let row = sqlx::query_as::<_, CJASession>(
+///             "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1"
 ///         )
+///         .bind(session_id)
 ///         .fetch_one(pool)
 ///         .await?;
 ///         
@@ -170,8 +169,7 @@ impl CJASession {
 ///     }
 ///     
 ///     async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
-///         let row = sqlx::query_as!(
-///             CJASession,
+///         let row = sqlx::query_as::<_, CJASession>(
 ///             "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at"
 ///         )
 ///         .fetch_one(pool)
