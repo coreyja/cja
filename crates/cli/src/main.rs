@@ -424,6 +424,7 @@ fn init_project(bin_name: Option<&String>, no_cron: bool, no_jobs: bool, no_sess
     
     // Use GitHub dependency if specified
     if let Some(repo) = github_repo {
+        cargo_add_cmd.arg("cja");  // Specify the package name from the workspace
         cargo_add_cmd.arg("--git").arg(repo);
         cargo_add_cmd.arg("--branch").arg(branch);
         println!("Using GitHub repository: {} (branch: {})", repo, branch);
