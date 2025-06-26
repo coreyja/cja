@@ -326,6 +326,11 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
     fs::write(project_path.join("src").join("main.rs"), main_rs_content)
         .context("Failed to write main.rs")?;
     
+    // Create build.rs
+    let build_rs_content = generate_build_rs();
+    fs::write(project_path.join("build.rs"), build_rs_content)
+        .context("Failed to write build.rs")?;
+    
     // Copy migration files based on feature flags
     if !no_jobs {
         copy_jobs_migration(project_path)?;
@@ -488,10 +493,34 @@ fn init_project(bin_name: Option<&String>, no_cron: bool, no_jobs: bool, no_sess
         }
     }
     
+    // Add vergen as a build dependency
+    println!("Adding vergen build dependency...");
+    let mut vergen_cmd = ProcessCommand::new("cargo");
+    vergen_cmd.arg("add")
+        .arg("--build")
+        .arg("vergen")
+        .arg("--vers").arg("8")
+        .arg("-F").arg("build,git,gitcl");
+    
+    let output = vergen_cmd.output()
+        .context("Failed to add vergen build dependency")?;
+    
+    if !output.status.success() {
+        eprintln!("Warning: Failed to add vergen: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    
     // Create the binary file
     let main_content = generate_main_rs(no_cron, no_jobs, no_sessions);
     fs::write(&bin_file_path, main_content)
         .with_context(|| format!("Failed to write {}", bin_file_path.display()))?;
+    
+    // Create build.rs if it doesn't exist
+    let build_rs_path = Path::new("build.rs");
+    if !build_rs_path.exists() {
+        let build_rs_content = generate_build_rs();
+        fs::write(build_rs_path, build_rs_content)
+            .context("Failed to write build.rs")?;
+    }
     
     // Add [[bin]] entry to Cargo.toml
     let mut cargo_toml_content = fs::read_to_string(cargo_toml_path)
@@ -618,7 +647,40 @@ chrono = {{ version = "0.4", features = ["serde"] }}
 maud = {{ version = "0.26", features = ["axum"] }}
 futures = "0.3"
 async-trait = "0.1"
+
+[build-dependencies]
+vergen = {{ version = "8", features = ["build", "git", "gitcl"] }}
 "#)
+}
+
+/// Generates the `build.rs` content for a new CJA project.
+///
+/// Creates a build script that uses vergen to embed git and build information
+/// into the compiled binary. This allows the application to report its version
+/// including the git commit hash, similar to how the CJA CLI itself works.
+///
+/// # Returns
+///
+/// The content of the build.rs file as a String.
+///
+/// # Generated Code
+///
+/// The build script:
+/// - Uses vergen's EmitBuilder to capture build and git metadata
+/// - Emits environment variables like VERGEN_GIT_SHA that can be used at runtime
+/// - Follows the same pattern as the CJA CLI's own build.rs
+fn generate_build_rs() -> String {
+    r#"use vergen::EmitBuilder;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    EmitBuilder::builder()
+        .all_build()
+        .all_git()
+        .emit()?;
+    
+    Ok(())
+}
+"#.to_string()
 }
 
 /// Generates the `main.rs` content for a new CJA project with conditional features.
@@ -759,7 +821,12 @@ impl AppState {
 
 impl cja::app_state::AppState for AppState {
     fn version(&self) -> &'static str {
-        "unknown"
+        concat!(
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("VERGEN_GIT_SHA"),
+            ")"
+        )
     }
 
     fn db(&self) -> &sqlx::PgPool {
