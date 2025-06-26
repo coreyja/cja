@@ -1,4 +1,4 @@
-use axum::{extract::Request, response::Response, serve::IncomingStream};
+use axum::{extract::Request, response::Response};
 use color_eyre::eyre::WrapErr;
 use listenfd::ListenFd;
 use std::{convert::Infallible, error::Error, net::SocketAddr};
