@@ -128,7 +128,6 @@ pub trait AppSession: Sized {
 
 pub struct Session<A: AppSession>(pub A);
 
-#[async_trait::async_trait]
 impl<A: AppState + Send + Sync, S: AppSession + Send + Sync> FromRequestParts<A> for Session<S> {
     type Rejection = StatusCode;
 

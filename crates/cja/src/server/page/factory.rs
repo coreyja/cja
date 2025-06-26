@@ -1,4 +1,4 @@
-use axum::{async_trait, extract::FromRequestParts, http::request::Parts, response::Response};
+use axum::{extract::FromRequestParts, http::request::Parts, response::Response};
 use maud::Render;
 
 use crate::app_state::AppState;
@@ -17,7 +17,6 @@ impl<A: AppState> Factory<A> {
     }
 }
 
-#[async_trait]
 impl<A: AppState> FromRequestParts<A> for Factory<A> {
     type Rejection = Response;
 

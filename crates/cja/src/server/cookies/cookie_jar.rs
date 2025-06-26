@@ -13,7 +13,6 @@ pub struct CookieJar<AS> {
     state: AS,
 }
 
-#[async_trait::async_trait]
 impl<A> FromRequestParts<A> for CookieJar<A>
 where
     A: Send + Sync,
