@@ -31,13 +31,13 @@ pub struct CronFnClosure<
 
 #[async_trait::async_trait]
 impl<
-        AppState: AS,
-        FnError: Error + Send + Sync + 'static,
-        F: Fn(AppState, String) -> Pin<Box<dyn Future<Output = Result<(), FnError>> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    > CronFn<AppState> for CronFnClosure<AppState, FnError, F>
+    AppState: AS,
+    FnError: Error + Send + Sync + 'static,
+    F: Fn(AppState, String) -> Pin<Box<dyn Future<Output = Result<(), FnError>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+> CronFn<AppState> for CronFnClosure<AppState, FnError, F>
 {
     async fn run(&self, app_state: AppState, context: String) -> Result<(), String> {
         (self.func)(app_state, context)
@@ -133,9 +133,9 @@ impl<AppState: AS> CronRegistry<AppState> {
         name: &'static str,
         interval: Duration,
         job: impl Fn(AppState, String) -> Pin<Box<dyn Future<Output = Result<(), FnError>> + Send>>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) {
         let cron_job = CronJob {
             name,

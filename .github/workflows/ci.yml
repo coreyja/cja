@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  format:
+    uses: ./.github/workflows/format-rust.yml
+
+  check-stable:
+    uses: ./.github/workflows/check-rust.yml
+    with:
+      rust-version: stable
+
+  check-nightly:
+    uses: ./.github/workflows/check-rust.yml
+    with:
+      rust-version: nightly
+
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-binstall
+        run: curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+
+      - name: Install cargo-deny
+        run: cargo binstall --no-confirm cargo-deny
+
+      - name: Run cargo deny
+        run: cargo deny check bans
