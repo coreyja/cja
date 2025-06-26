@@ -1,7 +1,7 @@
 //! # CJA CLI
 //!
 //! A command-line interface for scaffolding new [CJA](https://github.com/your-org/cja) projects.
-//! 
+//!
 //! CJA CLI generates fully functional web applications built on the CJA framework,
 //! with configurable features including background jobs, cron scheduling, and session management.
 //!
@@ -109,13 +109,8 @@ use std::process::Command as ProcessCommand;
 /// cja --version
 /// ```
 fn main() -> Result<()> {
-    const VERSION: &str = concat!(
-        env!("CARGO_PKG_VERSION"),
-        " (",
-        env!("VERGEN_GIT_SHA"),
-        ")"
-    );
-    
+    const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")");
+
     let matches = Command::new("cja")
         .version(VERSION)
         .about("CJA CLI for project scaffolding")
@@ -218,14 +213,26 @@ fn main() -> Result<()> {
             let no_jobs = sub_matches.get_flag("no-jobs");
             let no_sessions = sub_matches.get_flag("no-sessions");
             let github_repo = sub_matches.get_one::<String>("github");
-            let branch = sub_matches.get_one::<String>("branch").map(String::as_str).unwrap_or("main");
-            
+            let branch = sub_matches
+                .get_one::<String>("branch")
+                .map(String::as_str)
+                .unwrap_or("main");
+
             // Warn if both --no-jobs and --no-cron are specified
             if no_jobs && no_cron {
-                eprintln!("Warning: --no-jobs implies --no-cron since cron requires the jobs system");
+                eprintln!(
+                    "Warning: --no-jobs implies --no-cron since cron requires the jobs system"
+                );
             }
-            
-            create_project(project_name, no_cron, no_jobs, no_sessions, github_repo, branch)?;
+
+            create_project(
+                project_name,
+                no_cron,
+                no_jobs,
+                no_sessions,
+                github_repo,
+                branch,
+            )?;
         }
         Some(("init", sub_matches)) => {
             let bin_name = sub_matches.get_one::<String>("bin-name");
@@ -233,18 +240,23 @@ fn main() -> Result<()> {
             let no_jobs = sub_matches.get_flag("no-jobs");
             let no_sessions = sub_matches.get_flag("no-sessions");
             let github_repo = sub_matches.get_one::<String>("github");
-            let branch = sub_matches.get_one::<String>("branch").map(String::as_str).unwrap_or("main");
-            
+            let branch = sub_matches
+                .get_one::<String>("branch")
+                .map(String::as_str)
+                .unwrap_or("main");
+
             // Warn if both --no-jobs and --no-cron are specified
             if no_jobs && no_cron {
-                eprintln!("Warning: --no-jobs implies --no-cron since cron requires the jobs system");
+                eprintln!(
+                    "Warning: --no-jobs implies --no-cron since cron requires the jobs system"
+                );
             }
-            
+
             init_project(bin_name, no_cron, no_jobs, no_sessions, github_repo, branch)?;
         }
         _ => unreachable!("Subcommand required"),
     }
-    
+
     Ok(())
 }
 
@@ -298,54 +310,67 @@ fn main() -> Result<()> {
 /// create_project("my-worker", true, false, false, Some(&"https://github.com/coreyja/cja".to_string()), "develop")?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions: bool, github_repo: Option<&String>, branch: &str) -> Result<()> {
+fn create_project(
+    project_name: &str,
+    no_cron: bool,
+    no_jobs: bool,
+    no_sessions: bool,
+    github_repo: Option<&String>,
+    branch: &str,
+) -> Result<()> {
     let project_path = Path::new(project_name);
-    
+
     // Check if directory already exists
     if project_path.exists() {
         anyhow::bail!("Directory '{}' already exists", project_name);
     }
-    
+
     // Create project directory structure
     fs::create_dir(project_path)
         .with_context(|| format!("Failed to create project directory '{project_name}'"))?;
-    
-    fs::create_dir(project_path.join("src"))
-        .context("Failed to create src directory")?;
-    
+
+    fs::create_dir(project_path.join("src")).context("Failed to create src directory")?;
+
     fs::create_dir(project_path.join("migrations"))
         .context("Failed to create migrations directory")?;
-    
+
     // Create Cargo.toml
-    let cargo_toml_content = generate_cargo_toml(project_name, github_repo, branch, no_cron, no_jobs, no_sessions);
+    let cargo_toml_content = generate_cargo_toml(
+        project_name,
+        github_repo,
+        branch,
+        no_cron,
+        no_jobs,
+        no_sessions,
+    );
     fs::write(project_path.join("Cargo.toml"), cargo_toml_content)
         .context("Failed to write Cargo.toml")?;
-    
+
     // Create main.rs
     let main_rs_content = generate_main_rs(no_cron, no_jobs, no_sessions);
     fs::write(project_path.join("src").join("main.rs"), main_rs_content)
         .context("Failed to write main.rs")?;
-    
+
     // Create build.rs
     let build_rs_content = generate_build_rs();
     fs::write(project_path.join("build.rs"), build_rs_content)
         .context("Failed to write build.rs")?;
-    
+
     // Copy migration files based on feature flags
     if !no_jobs {
         copy_jobs_migration(project_path)?;
     }
-    
+
     if !no_cron {
         copy_cron_migrations(project_path)?;
     }
-    
+
     if !no_sessions {
         copy_session_migrations(project_path)?;
     }
-    
+
     println!("Created new CJA project '{project_name}'");
-    
+
     Ok(())
 }
 
@@ -375,93 +400,88 @@ fn create_project(project_name: &str, no_cron: bool, no_jobs: bool, no_sessions:
 /// - Unable to read or parse Cargo.toml
 /// - Unable to create necessary directories or files
 /// - cargo add command fails
-fn init_project(bin_name: Option<&String>, no_cron: bool, no_jobs: bool, no_sessions: bool, github_repo: Option<&String>, branch: &str) -> Result<()> {
+fn init_project(
+    bin_name: Option<&String>,
+    no_cron: bool,
+    no_jobs: bool,
+    no_sessions: bool,
+    github_repo: Option<&String>,
+    branch: &str,
+) -> Result<()> {
     // Check if we're in a Cargo project
     let cargo_toml_path = Path::new("Cargo.toml");
     if !cargo_toml_path.exists() {
         anyhow::bail!("No Cargo.toml found. Please run this command in a Rust project directory.");
     }
-    
+
     // Read and parse Cargo.toml to get project name
-    let cargo_toml_content = fs::read_to_string(cargo_toml_path)
-        .context("Failed to read Cargo.toml")?;
-    
-    let toml_value: toml::Value = cargo_toml_content.parse()
+    let cargo_toml_content =
+        fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
+
+    let toml_value: toml::Value = cargo_toml_content
+        .parse()
         .context("Failed to parse Cargo.toml")?;
-    
+
     let package_name = toml_value
         .get("package")
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Could not find package name in Cargo.toml"))?;
-    
+
     let bin_name = bin_name.map_or(package_name, std::string::String::as_str);
-    
+
     // Create src/bin directory if it doesn't exist
     let bin_dir = Path::new("src").join("bin");
     if !bin_dir.exists() {
-        fs::create_dir_all(&bin_dir)
-            .context("Failed to create src/bin directory")?;
+        fs::create_dir_all(&bin_dir).context("Failed to create src/bin directory")?;
     }
-    
+
     // Check if the binary already exists
     let bin_file_path = bin_dir.join(format!("{bin_name}.rs"));
     if bin_file_path.exists() {
         anyhow::bail!("Binary file '{}' already exists", bin_file_path.display());
     }
-    
+
     // Create migrations directory if it doesn't exist
     let migrations_dir = Path::new("migrations");
     if !migrations_dir.exists() {
-        fs::create_dir(migrations_dir)
-            .context("Failed to create migrations directory")?;
+        fs::create_dir(migrations_dir).context("Failed to create migrations directory")?;
     }
-    
+
     // Add CJA dependency using cargo add
     println!("Adding CJA dependency...");
     let mut cargo_add_cmd = ProcessCommand::new("cargo");
     cargo_add_cmd.arg("add");
-    
+
     // Use GitHub dependency if specified
     if let Some(repo) = github_repo {
-        cargo_add_cmd.arg("cja");  // Specify the package name from the workspace
+        cargo_add_cmd.arg("cja"); // Specify the package name from the workspace
         cargo_add_cmd.arg("--git").arg(repo);
         cargo_add_cmd.arg("--branch").arg(branch);
         println!("Using GitHub repository: {} (branch: {})", repo, branch);
     } else {
         cargo_add_cmd.arg("cja");
     }
-    
-    // Add features based on flags
-    let mut features = vec![];
-    if !no_jobs {
-        features.push("jobs");
-    }
-    if !no_cron && !no_jobs {  // Cron requires jobs
-        features.push("cron");
-    }
-    if !no_sessions {
-        features.push("sessions");
-    }
-    
-    if !features.is_empty() {
-        cargo_add_cmd.arg("-F").arg(features.join(","));
-    }
-    
-    let output = cargo_add_cmd.output()
+
+    let output = cargo_add_cmd
+        .output()
         .context("Failed to execute cargo add command")?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("cargo add failed: {}", stderr);
     }
-    
+
     // Add other required dependencies
     println!("Adding additional dependencies...");
     let deps = vec![
         ("axum", Some("0.7"), vec![]),
         ("tokio", Some("1"), vec!["full"]),
-        ("sqlx", Some("0.8"), vec!["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"]),
+        (
+            "sqlx",
+            Some("0.8"),
+            vec!["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"],
+        ),
         ("serde", Some("1.0"), vec!["derive"]),
         ("serde_json", Some("1.0"), vec![]),
         ("tracing", Some("0.1"), vec![]),
@@ -473,91 +493,104 @@ fn init_project(bin_name: Option<&String>, no_cron: bool, no_jobs: bool, no_sess
         ("futures", Some("0.3"), vec![]),
         ("async-trait", Some("0.1"), vec![]),
     ];
-    
+
     for (dep, version, features) in deps {
         let mut cmd = ProcessCommand::new("cargo");
-        cmd.arg("add").arg(dep);
+        cmd.arg("add");
         
+        // Use name@version syntax
         if let Some(v) = version {
-            cmd.arg("--vers").arg(v);
+            cmd.arg(format!("{dep}@{v}"));
+        } else {
+            cmd.arg(dep);
         }
-        
+
         if !features.is_empty() {
             cmd.arg("-F").arg(features.join(","));
         }
-        
-        let output = cmd.output()
+
+        let output = cmd
+            .output()
             .with_context(|| format!("Failed to add dependency: {dep}"))?;
-        
+
         if !output.status.success() {
-            eprintln!("Warning: Failed to add {}: {}", dep, String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "Warning: Failed to add {}: {}",
+                dep,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
-    
+
     // Add vergen as a build dependency
     println!("Adding vergen build dependency...");
     let mut vergen_cmd = ProcessCommand::new("cargo");
-    vergen_cmd.arg("add")
+    vergen_cmd
+        .arg("add")
         .arg("--build")
-        .arg("vergen")
-        .arg("--vers").arg("8")
-        .arg("-F").arg("build,git,gitcl");
-    
-    let output = vergen_cmd.output()
+        .arg("vergen@8")
+        .arg("-F")
+        .arg("build,git,gitcl");
+
+    let output = vergen_cmd
+        .output()
         .context("Failed to add vergen build dependency")?;
-    
+
     if !output.status.success() {
-        eprintln!("Warning: Failed to add vergen: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "Warning: Failed to add vergen: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    
+
     // Create the binary file
     let main_content = generate_main_rs(no_cron, no_jobs, no_sessions);
     fs::write(&bin_file_path, main_content)
         .with_context(|| format!("Failed to write {}", bin_file_path.display()))?;
-    
+
     // Create build.rs if it doesn't exist
     let build_rs_path = Path::new("build.rs");
     if !build_rs_path.exists() {
         let build_rs_content = generate_build_rs();
-        fs::write(build_rs_path, build_rs_content)
-            .context("Failed to write build.rs")?;
+        fs::write(build_rs_path, build_rs_content).context("Failed to write build.rs")?;
     }
-    
+
     // Add [[bin]] entry to Cargo.toml
-    let mut cargo_toml_content = fs::read_to_string(cargo_toml_path)
-        .context("Failed to read Cargo.toml")?;
-    
+    let mut cargo_toml_content =
+        fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
+
     // Check if [[bin]] section already exists for this binary
     if !cargo_toml_content.contains(&format!("name = \"{bin_name}\"")) {
-        cargo_toml_content.push_str(&format!(r#"
+        cargo_toml_content.push_str(&format!(
+            r#"
 
 [[bin]]
 name = "{bin_name}"
 path = "src/bin/{bin_name}.rs"
-"#));
-        
-        fs::write(cargo_toml_path, cargo_toml_content)
-            .context("Failed to update Cargo.toml")?;
+"#
+        ));
+
+        fs::write(cargo_toml_path, cargo_toml_content).context("Failed to update Cargo.toml")?;
     }
-    
+
     // Copy migration files based on feature flags
     if !no_jobs {
         copy_jobs_migration(Path::new("."))?;
     }
-    
+
     if !no_cron && !no_jobs {
         copy_cron_migrations(Path::new("."))?;
     }
-    
+
     if !no_sessions {
         copy_session_migrations(Path::new("."))?;
     }
-    
+
     println!("Successfully initialized CJA in your project!");
     println!("Binary created at: {}", bin_file_path.display());
     println!("\nTo run your CJA application:");
     println!("  cargo run --bin {bin_name}");
-    
+
     Ok(())
 }
 
@@ -604,31 +637,23 @@ path = "src/bin/{bin_name}.rs"
 /// assert!(toml_content.contains("name = \"my-awesome-app\""));
 /// assert!(toml_content.contains("cja = { version = \"0.0.0\" }"));
 /// ```
-fn generate_cargo_toml(project_name: &str, github_repo: Option<&String>, branch: &str, no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
+fn generate_cargo_toml(
+    project_name: &str,
+    github_repo: Option<&String>,
+    branch: &str,
+    _no_cron: bool,
+    _no_jobs: bool,
+    _no_sessions: bool,
+) -> String {
     // Build CJA dependency line
     let cja_dep = if let Some(repo) = github_repo {
-        // Build features array
-        let mut features = vec![];
-        if !no_jobs {
-            features.push("jobs");
-        }
-        if !no_cron && !no_jobs {
-            features.push("cron");
-        }
-        if !no_sessions {
-            features.push("sessions");
-        }
-        
-        if features.is_empty() {
-            format!(r#"cja = {{ git = "{}", branch = "{}" }}"#, repo, branch)
-        } else {
-            format!(r#"cja = {{ git = "{}", branch = "{}", features = {:?} }}"#, repo, branch, features)
-        }
+        format!(r#"cja = {{ git = "{}", branch = "{}" }}"#, repo, branch)
     } else {
         r#"cja = { version = "0.0.0" }"#.to_string()
     };
-    
-    format!(r#"[package]
+
+    format!(
+        r#"[package]
 name = "{project_name}"
 version = "0.1.0"
 edition = "2021"
@@ -651,7 +676,8 @@ async-trait = "0.1"
 
 [build-dependencies]
 vergen = {{ version = "8", features = ["build", "git", "gitcl"] }}
-"#)
+"#
+    )
 }
 
 /// Generates the `build.rs` content for a new CJA project.
@@ -681,7 +707,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     Ok(())
 }
-"#.to_string()
+"#
+    .to_string()
 }
 
 /// Generates the `main.rs` content for a new CJA project with conditional features.
@@ -779,9 +806,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// ```
 fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
     let mut content = String::new();
-    
+
     // Base imports
-    content.push_str(r"use axum::response::IntoResponse;
+    content.push_str(
+        r"use axum::response::IntoResponse;
 use cja::{
     color_eyre::{
         self,
@@ -790,14 +818,16 @@ use cja::{
     server::{
         cookies::CookieKey,
         run_server,
-");
+",
+    );
 
     // Session imports only if sessions are enabled
     if !no_sessions {
         content.push_str("        session::{AppSession, CJASession, Session},\n");
     }
-    
-    content.push_str(r#"    },
+
+    content.push_str(
+        r#"    },
     setup::{setup_sentry, setup_tracing},
 };
 use maud::html;
@@ -907,12 +937,14 @@ fn routes(app_state: AppState) -> axum::Router {
         .route("/", axum::routing::get(root))
         .with_state(app_state)
 }
-"#);
+"#,
+    );
 
     // Sessions implementation only if sessions are enabled
     if no_sessions {
-            // Simple root handler without sessions
-            content.push_str(r#"
+        // Simple root handler without sessions
+        content.push_str(
+            r#"
     async fn root() -> impl IntoResponse {
         html! {
             html {
@@ -925,9 +957,11 @@ fn routes(app_state: AppState) -> axum::Router {
             }
         }
     }
-    "#);
-        } else {
-            content.push_str(r#"
+    "#,
+        );
+    } else {
+        content.push_str(
+            r#"
     struct SiteSession {
         inner: CJASession,
     }
@@ -995,11 +1029,13 @@ fn routes(app_state: AppState) -> axum::Router {
             }
         }
     }
-    "#);
-        }
+    "#,
+        );
+    }
 
     // Spawn application tasks function
-    content.push_str(r#"
+    content.push_str(
+        r#"
 /// Spawn all application background tasks
 fn spawn_application_tasks(
     app_state: &AppState,
@@ -1012,11 +1048,13 @@ fn spawn_application_tasks(
     } else {
         info!("Server Disabled");
     }
-"#);
+"#,
+    );
 
     // Add jobs worker if jobs are enabled
     if !no_jobs {
-        content.push_str(r#"
+        content.push_str(
+            r#"
     // Initialize job worker if enabled
     if is_feature_enabled("JOBS") {
         info!("Jobs Enabled");
@@ -1027,12 +1065,14 @@ fn spawn_application_tasks(
     } else {
         info!("Jobs Disabled");
     }
-"#);
+"#,
+        );
     }
 
     // Add cron worker if cron is enabled
     if !no_cron {
-        content.push_str(r#"
+        content.push_str(
+            r#"
     // Initialize cron worker if enabled
     if is_feature_enabled("CRON") {
         info!("Cron Enabled");
@@ -1040,10 +1080,12 @@ fn spawn_application_tasks(
     } else {
         info!("Cron Disabled");
     }
-"#);
+"#,
+        );
     }
 
-    content.push_str(r#"
+    content.push_str(
+        r#"
     info!("All application tasks spawned successfully");
     futures
 }
@@ -1055,11 +1097,13 @@ fn is_feature_enabled(feature: &str) -> bool {
 
     value != "true"
 }
-"#);
+"#,
+    );
 
     // Add jobs module if jobs are enabled
     if !no_jobs {
-        content.push_str(r#"
+        content.push_str(
+            r#"
 mod jobs {
     use serde::{Deserialize, Serialize};
 
@@ -1079,24 +1123,28 @@ mod jobs {
 
     cja::impl_job_registry!(AppState, NoopJob);
 }
-"#);
+"#,
+        );
     }
 
     // Add cron module if cron is enabled
     if !no_cron {
-        content.push_str(r"
+        content.push_str(
+            r"
 mod cron {
     use std::time::Duration;
 
     use cja::cron::{CronRegistry, Worker};
-");
-        
+",
+        );
+
         // Only import NoopJob if jobs are also enabled
         if !no_jobs {
             content.push_str("\n    use crate::jobs::NoopJob;\n");
         }
-        
-        content.push_str(r"
+
+        content.push_str(
+            r"
     use super::AppState;
 
     pub(crate) async fn run_cron(app_state: AppState) -> cja::Result<()> {
@@ -1105,17 +1153,20 @@ mod cron {
 
     fn cron_registry() -> cja::cron::CronRegistry<AppState> {
         let mut registry = CronRegistry::new();
-");
-        
+",
+        );
+
         // Only register NoopJob if jobs are enabled
         if !no_jobs {
             content.push_str("        registry.register_job(NoopJob, Duration::from_secs(60));\n");
         }
-        
-        content.push_str(r"        registry
+
+        content.push_str(
+            r"        registry
     }
 }
-");
+",
+        );
     }
 
     content
@@ -1175,12 +1226,15 @@ CREATE TABLE
     context TEXT NOT NULL
   );
 ";
-    
+
     fs::write(
-        project_path.join("migrations").join("20231210151519_AddJobsTable.sql"),
-        jobs_migration
-    ).context("Failed to write jobs migration")?;
-    
+        project_path
+            .join("migrations")
+            .join("20231210151519_AddJobsTable.sql"),
+        jobs_migration,
+    )
+    .context("Failed to write jobs migration")?;
+
     Ok(())
 }
 
@@ -1246,17 +1300,23 @@ CREATE UNIQUE INDEX idx_crons_name ON Crons (name);
     let cron_down_migration = r"-- Add migration script here
 DROP TABLE Crons;
 ";
-    
+
     fs::write(
-        project_path.join("migrations").join("20240228040146_AddCrons.up.sql"),
-        cron_up_migration
-    ).context("Failed to write cron up migration")?;
-    
+        project_path
+            .join("migrations")
+            .join("20240228040146_AddCrons.up.sql"),
+        cron_up_migration,
+    )
+    .context("Failed to write cron up migration")?;
+
     fs::write(
-        project_path.join("migrations").join("20240228040146_AddCrons.down.sql"),
-        cron_down_migration
-    ).context("Failed to write cron down migration")?;
-    
+        project_path
+            .join("migrations")
+            .join("20240228040146_AddCrons.down.sql"),
+        cron_down_migration,
+    )
+    .context("Failed to write cron down migration")?;
+
     Ok(())
 }
 
@@ -1352,16 +1412,22 @@ DROP TABLE IF EXISTS Sessions;
 
 DROP FUNCTION IF EXISTS update_updated_at_column ();
 ";
-    
+
     fs::write(
-        project_path.join("migrations").join("20250413182934_AddSessions.up.sql"),
-        session_up_migration
-    ).context("Failed to write session up migration")?;
-    
+        project_path
+            .join("migrations")
+            .join("20250413182934_AddSessions.up.sql"),
+        session_up_migration,
+    )
+    .context("Failed to write session up migration")?;
+
     fs::write(
-        project_path.join("migrations").join("20250413182934_AddSessions.down.sql"),
-        session_down_migration
-    ).context("Failed to write session down migration")?;
-    
+        project_path
+            .join("migrations")
+            .join("20250413182934_AddSessions.down.sql"),
+        session_down_migration,
+    )
+    .context("Failed to write session down migration")?;
+
     Ok(())
 }
