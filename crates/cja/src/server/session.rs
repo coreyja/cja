@@ -7,16 +7,16 @@ use crate::app_state::AppState;
 use super::cookies::CookieJar;
 
 /// Core session data that all sessions must contain.
-/// 
+///
 /// This struct represents the minimal session information stored in the database.
 /// Custom session implementations should include this as a field and add any
 /// additional data needed by the application.
-/// 
+///
 /// # Example
-/// 
+///
 /// ```rust
 /// use cja::server::session::CJASession;
-/// 
+///
 /// #[derive(Debug, Clone)]
 /// struct MySession {
 ///     // Required: include the core session data
@@ -129,24 +129,24 @@ impl CJASession {
 // }
 
 /// A trait for implementing custom session types that integrate with the framework's session management.
-/// 
+///
 /// Sessions are automatically created when needed and persisted across requests using secure cookies.
 /// Your session type must include the `CJASession` as an inner field and can add any additional
 /// fields needed by your application.
-/// 
+///
 /// # Example
-/// 
+///
 /// ```rust,no_run
 /// use cja::server::session::{AppSession, CJASession};
 /// use serde::{Serialize, Deserialize};
-/// 
+///
 /// #[derive(Debug, Clone)]
 /// struct UserSession {
 ///     inner: CJASession,
 ///     user_id: Option<i32>,
 ///     preferences: serde_json::Value,
 /// }
-/// 
+///
 /// #[async_trait::async_trait]
 /// impl AppSession for UserSession {
 ///     async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
@@ -183,8 +183,8 @@ impl CJASession {
 ///     }
 ///     
 ///     fn from_inner(inner: CJASession) -> Self {
-///         Self { 
-///             inner, 
+///         Self {
+///             inner,
 ///             user_id: None,
 ///             preferences: serde_json::json!({}),
 ///         }
@@ -195,17 +195,17 @@ impl CJASession {
 ///     }
 /// }
 /// ```
-/// 
+///
 /// # Using Sessions in Handlers
-/// 
+///
 /// ```rust
 /// use axum::response::IntoResponse;
 /// use cja::server::session::Session;
 /// # use cja::server::session::{AppSession, CJASession};
-/// # 
+/// #
 /// # #[derive(Debug, Clone)]
 /// # struct UserSession { inner: CJASession, user_id: Option<i32> }
-/// # 
+/// #
 /// # #[async_trait::async_trait]
 /// # impl AppSession for UserSession {
 /// #     async fn from_db(_: &sqlx::PgPool, _: uuid::Uuid) -> cja::Result<Self> { todo!() }
@@ -213,37 +213,37 @@ impl CJASession {
 /// #     fn from_inner(inner: CJASession) -> Self { Self { inner, user_id: None } }
 /// #     fn inner(&self) -> &CJASession { &self.inner }
 /// # }
-/// 
+///
 /// async fn handler(
 ///     Session(session): Session<UserSession>
 /// ) -> impl IntoResponse {
-///     format!("Session ID: {}, User: {:?}", 
-///             session.session_id(), 
+///     format!("Session ID: {}, User: {:?}",
+///             session.session_id(),
 ///             session.user_id)
 /// }
 /// ```
 #[async_trait::async_trait]
 pub trait AppSession: Sized {
     /// Load a session from the database by its ID.
-    /// 
+    ///
     /// This method should fetch the session record and any associated data
     /// from your sessions table.
     async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> crate::Result<Self>;
 
     /// Create a new session in the database.
-    /// 
+    ///
     /// This method should insert a new session record with default values
     /// and return the created session.
     async fn create(pool: &sqlx::PgPool) -> crate::Result<Self>;
 
     /// Create a session instance from the inner CJASession.
-    /// 
+    ///
     /// This is used internally when reconstructing sessions. Custom fields
     /// should be initialized with default values.
     fn from_inner(inner: CJASession) -> Self;
 
     /// Get a reference to the inner CJASession.
-    /// 
+    ///
     /// This provides access to the core session fields like ID and timestamps.
     fn inner(&self) -> &CJASession;
 
@@ -261,34 +261,34 @@ pub trait AppSession: Sized {
 }
 
 /// An Axum extractor that provides access to the current session.
-/// 
+///
 /// This extractor automatically handles session creation and loading based on cookies.
 /// If no session exists, a new one is created automatically.
-/// 
+///
 /// # Example
-/// 
+///
 /// ```rust
 /// use axum::{Router, routing::get, response::IntoResponse};
 /// use cja::server::session::Session;
 /// # use cja::server::session::{AppSession, CJASession};
-/// # 
+/// #
 /// # #[derive(Debug, Clone)]
-/// # struct UserSession { 
-/// #     inner: CJASession, 
+/// # struct UserSession {
+/// #     inner: CJASession,
 /// #     user_id: Option<i32>,
 /// #     login_count: i32,
 /// # }
-/// # 
+/// #
 /// # #[async_trait::async_trait]
 /// # impl AppSession for UserSession {
 /// #     async fn from_db(_: &sqlx::PgPool, _: uuid::Uuid) -> cja::Result<Self> { todo!() }
 /// #     async fn create(_: &sqlx::PgPool) -> cja::Result<Self> { todo!() }
-/// #     fn from_inner(inner: CJASession) -> Self { 
-/// #         Self { inner, user_id: None, login_count: 0 } 
+/// #     fn from_inner(inner: CJASession) -> Self {
+/// #         Self { inner, user_id: None, login_count: 0 }
 /// #     }
 /// #     fn inner(&self) -> &CJASession { &self.inner }
 /// # }
-/// 
+///
 /// async fn profile_handler(
 ///     Session(session): Session<UserSession>
 /// ) -> impl IntoResponse {
@@ -297,7 +297,7 @@ pub trait AppSession: Sized {
 ///         None => "Please log in".to_string(),
 ///     }
 /// }
-/// 
+///
 /// async fn login_handler(
 ///     Session(mut session): Session<UserSession>,
 ///     // ... other extractors for login data
@@ -309,7 +309,7 @@ pub trait AppSession: Sized {
 ///     
 ///     "Logged in successfully"
 /// }
-/// 
+///
 /// # #[derive(Clone)]
 /// # struct MyAppState;
 /// # impl cja::app_state::AppState for MyAppState {

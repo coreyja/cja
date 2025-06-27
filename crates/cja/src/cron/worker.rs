@@ -23,7 +23,7 @@ impl<AppState: AS> Worker<AppState> {
         tracing::debug!("Starting cron loop");
         loop {
             let last_runs = sqlx::query(
-                "SELECT name, max(last_run_at) as last_run_at FROM Crons GROUP BY name"
+                "SELECT name, max(last_run_at) as last_run_at FROM Crons GROUP BY name",
             )
             .fetch_all(self.state.db())
             .await

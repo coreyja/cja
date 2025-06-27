@@ -14,23 +14,23 @@ pub enum EnqueueError {
 }
 
 /// A trait for defining background jobs that can be enqueued and processed asynchronously.
-/// 
+///
 /// Jobs must be serializable and provide a unique name identifier. The job system
 /// handles persistence, retries, and concurrent execution automatically.
-/// 
+///
 /// # Example
-/// 
+///
 /// ```rust
 /// use cja::jobs::Job;
 /// use serde::{Serialize, Deserialize};
-/// 
+///
 /// #[derive(Debug, Serialize, Deserialize, Clone)]
 /// struct EmailJob {
 ///     to: String,
 ///     subject: String,
 ///     body: String,
 /// }
-/// 
+///
 /// #[async_trait::async_trait]
 /// impl<AS: cja::app_state::AppState> Job<AS> for EmailJob {
 ///     const NAME: &'static str = "EmailJob";
@@ -43,9 +43,9 @@ pub enum EnqueueError {
 ///     }
 /// }
 /// ```
-/// 
+///
 /// # Enqueuing Jobs
-/// 
+///
 /// ```rust,no_run
 /// # use cja::jobs::Job;
 /// # use serde::{Serialize, Deserialize};
@@ -62,25 +62,25 @@ pub enum EnqueueError {
 ///     subject: "Welcome!".to_string(),
 ///     body: "Thank you for signing up!".to_string(),
 /// };
-/// 
+///
 /// // Enqueue the job with a context string for debugging
 /// job.enqueue(app_state, "user-signup".to_string()).await?;
 /// # Ok(())
 /// # }
 /// ```
-/// 
+///
 /// # Job with Database Access
-/// 
+///
 /// ```rust,no_run
 /// use cja::jobs::Job;
 /// use serde::{Serialize, Deserialize};
-/// 
+///
 /// #[derive(Debug, Serialize, Deserialize, Clone)]
 /// struct ProcessPaymentJob {
 ///     user_id: i32,
 ///     amount_cents: i64,
 /// }
-/// 
+///
 /// #[async_trait::async_trait]
 /// impl<AS: cja::app_state::AppState> Job<AS> for ProcessPaymentJob {
 ///     const NAME: &'static str = "ProcessPaymentJob";
@@ -94,7 +94,7 @@ pub enum EnqueueError {
 ///         //     .await?;
 ///         
 ///         // Process payment logic here
-///         println!("Processing payment of {} cents for user {}", 
+///         println!("Processing payment of {} cents for user {}",
 ///                  self.amount_cents, self.user_id);
 ///         
 ///         // Update payment status in database
@@ -113,13 +113,13 @@ pub trait Job<AppState: AS>:
     const NAME: &'static str;
 
     /// Execute the job logic.
-    /// 
+    ///
     /// This method has access to the full application state,
     /// including the database connection pool.
     async fn run(&self, app_state: AppState) -> color_eyre::Result<()>;
 
     /// Internal method used by the job system to deserialize and run jobs.
-    /// 
+    ///
     /// You typically won't call this directly - it's used by the job worker.
     #[instrument(name = "jobs.run_from_value", skip(app_state), fields(job.name = Self::NAME), err)]
     async fn run_from_value(
@@ -132,16 +132,16 @@ pub trait Job<AppState: AS>:
     }
 
     /// Enqueue this job for asynchronous execution.
-    /// 
+    ///
     /// The job will be persisted to the database and picked up by a worker process.
     /// Jobs are executed with at-least-once semantics and automatic retries on failure.
-    /// 
+    ///
     /// # Arguments
     /// * `app_state` - The application state containing the database connection
     /// * `context` - A string describing why this job was enqueued (useful for debugging)
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```rust,no_run
     /// # use cja::jobs::Job;
     /// # use serde::{Serialize, Deserialize};
