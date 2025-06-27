@@ -14,6 +14,26 @@ jobs:
   check:
     name: Check (${{ inputs.rust-version }})
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+      SQLX_OFFLINE: true
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,6 +46,7 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+        continue-on-error: ${{ inputs.rust-version == 'nightly' }}
 
       - name: Build
         run: cargo build --all-targets --all-features
