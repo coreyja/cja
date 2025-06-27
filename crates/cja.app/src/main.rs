@@ -195,6 +195,7 @@ fn spawn_application_tasks(
     }
 
     // Initialize job worker if enabled
+    #[cfg(feature = "jobs")]
     if is_feature_enabled("JOBS") {
         info!("Jobs Enabled");
         futures.push(tokio::spawn(cja::jobs::worker::job_worker(
@@ -204,13 +205,24 @@ fn spawn_application_tasks(
     } else {
         info!("Jobs Disabled");
     }
+    
+    #[cfg(not(feature = "jobs"))]
+    {
+        info!("Jobs feature not compiled in");
+    }
 
     // Initialize cron worker if enabled
+    #[cfg(feature = "cron")]
     if is_feature_enabled("CRON") {
         info!("Cron Enabled");
         futures.push(tokio::spawn(cron::run_cron(app_state.clone())));
     } else {
         info!("Cron Disabled");
+    }
+    
+    #[cfg(not(feature = "cron"))]
+    {
+        info!("Cron feature not compiled in");
     }
 
     info!("All application tasks spawned successfully");
@@ -225,6 +237,7 @@ fn is_feature_enabled(feature: &str) -> bool {
     value != "true"
 }
 
+#[cfg(feature = "jobs")]
 mod jobs {
     use serde::{Deserialize, Serialize};
 
@@ -245,11 +258,13 @@ mod jobs {
     cja::impl_job_registry!(AppState, NoopJob);
 }
 
+#[cfg(feature = "cron")]
 mod cron {
-    use std::time::Duration;
-
     use cja::cron::{CronRegistry, Worker};
 
+    #[cfg(feature = "jobs")]
+    use std::time::Duration;
+    #[cfg(feature = "jobs")]
     use crate::jobs::NoopJob;
 
     use super::AppState;
@@ -259,7 +274,9 @@ mod cron {
     }
 
     fn cron_registry() -> cja::cron::CronRegistry<AppState> {
+        #[cfg_attr(not(feature = "jobs"), allow(unused_mut))]
         let mut registry = CronRegistry::new();
+        #[cfg(feature = "jobs")]
         registry.register_job(NoopJob, Duration::from_secs(60));
         registry
     }
