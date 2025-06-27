@@ -3,7 +3,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 pub async fn setup_test_db() -> cja::Result<(PgPool, super::TestDbGuard)> {
-    let db_name = format!("cja_test_{}", Uuid::new_v4().to_string().replace("-", ""));
+    let db_name = format!("cja_test_{}", Uuid::new_v4().to_string().replace('-', ""));
     let pool = super::ensure_test_db(&db_name).await?;
 
     // Run migrations
@@ -14,6 +14,7 @@ pub async fn setup_test_db() -> cja::Result<(PgPool, super::TestDbGuard)> {
     Ok((pool, guard))
 }
 
+#[allow(dead_code)]
 pub async fn seed_test_session(pool: &PgPool) -> cja::Result<Uuid> {
     let session_id = Uuid::new_v4();
 
@@ -25,6 +26,7 @@ pub async fn seed_test_session(pool: &PgPool) -> cja::Result<Uuid> {
     Ok(session_id)
 }
 
+#[allow(dead_code)]
 pub async fn seed_test_job(
     pool: &PgPool,
     job_name: &str,
@@ -50,6 +52,7 @@ pub async fn seed_test_job(
     Ok(job_id)
 }
 
+#[allow(dead_code)]
 pub async fn get_job_by_id(pool: &PgPool, job_id: Uuid) -> cja::Result<Option<JobInfo>> {
     let row = sqlx::query(
         "SELECT job_id, name, payload, locked_at, locked_by FROM jobs WHERE job_id = $1",
@@ -67,6 +70,7 @@ pub async fn get_job_by_id(pool: &PgPool, job_id: Uuid) -> cja::Result<Option<Jo
     }))
 }
 
+#[allow(dead_code)]
 pub async fn count_unlocked_jobs(pool: &PgPool) -> cja::Result<i64> {
     let row = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE locked_at IS NULL")
         .fetch_one(pool)
@@ -75,6 +79,7 @@ pub async fn count_unlocked_jobs(pool: &PgPool) -> cja::Result<i64> {
     Ok(row.get::<Option<i64>, _>("count").unwrap_or(0))
 }
 
+#[allow(dead_code)]
 pub struct JobInfo {
     pub job_id: Uuid,
     pub name: String,

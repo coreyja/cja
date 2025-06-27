@@ -1,12 +1,12 @@
 pub mod app;
 pub mod db;
 
-use once_cell::sync::Lazy;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-pub static DB_MUTEX: Lazy<Arc<Mutex<()>>> = Lazy::new(|| Arc::new(Mutex::new(())));
+pub static DB_MUTEX: std::sync::LazyLock<Arc<Mutex<()>>> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(())));
 
 pub fn test_db_url(db_name: &str) -> String {
     let base_url = std::env::var("DATABASE_URL")
@@ -20,7 +20,7 @@ pub fn test_db_url(db_name: &str) -> String {
         base_url
     };
 
-    format!("{}/{}", base_url, db_name)
+    format!("{base_url}/{db_name}")
 }
 
 pub async fn ensure_test_db(db_name: &str) -> sqlx::Result<sqlx::PgPool> {
@@ -35,12 +35,12 @@ pub async fn ensure_test_db(db_name: &str) -> sqlx::Result<sqlx::PgPool> {
         .await?;
 
     // Drop database if exists
-    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{}\"", db_name))
+    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
         .execute(&base_pool)
         .await;
 
     // Create fresh database
-    sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
         .execute(&base_pool)
         .await?;
 
@@ -79,7 +79,7 @@ impl Drop for TestDbGuard {
                     .connect(&base_url)
                     .await
                 {
-                    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{}\"", db_name))
+                    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
                         .execute(&base_pool)
                         .await;
                     base_pool.close().await;

@@ -5,6 +5,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 struct TestSession {
     inner: CJASession,
+    #[allow(dead_code)]
     user_id: Option<i32>,
 }
 

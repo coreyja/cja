@@ -236,13 +236,13 @@ pub trait AppSession: Sized {
     /// and return the created session.
     async fn create(pool: &sqlx::PgPool) -> crate::Result<Self>;
 
-    /// Create a session instance from the inner CJASession.
+    /// Create a session instance from the inner `CJASession`.
     ///
     /// This is used internally when reconstructing sessions. Custom fields
     /// should be initialized with default values.
     fn from_inner(inner: CJASession) -> Self;
 
-    /// Get a reference to the inner CJASession.
+    /// Get a reference to the inner `CJASession`.
     ///
     /// This provides access to the core session fields like ID and timestamps.
     fn inner(&self) -> &CJASession;

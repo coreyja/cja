@@ -18,8 +18,8 @@ struct FailingJob {
 }
 
 // Track job executions for testing
-static JOB_EXECUTIONS: once_cell::sync::Lazy<Arc<Mutex<Vec<String>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+static JOB_EXECUTIONS: std::sync::LazyLock<Arc<Mutex<Vec<String>>>> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
 
 #[async_trait::async_trait]
 impl<AS: cja::app_state::AppState> Job<AS> for TestJob {
@@ -87,10 +87,10 @@ async fn test_job_with_priority() {
     // Enqueue multiple jobs
     for i in 0..3 {
         let job = TestJob {
-            id: format!("priority-test-{}", i),
+            id: format!("priority-test-{i}"),
             value: i,
         };
-        job.enqueue(app_state.clone(), format!("priority-{}", i))
+        job.enqueue(app_state.clone(), format!("priority-{i}"))
             .await
             .unwrap();
     }
@@ -190,11 +190,10 @@ async fn test_concurrent_job_enqueue() {
         let state = app_state.clone();
         let handle = tokio::spawn(async move {
             let job = TestJob {
-                id: format!("concurrent-{}", i),
+                id: format!("concurrent-{i}"),
                 value: i,
             };
-            job.enqueue(state, format!("concurrent-context-{}", i))
-                .await
+            job.enqueue(state, format!("concurrent-context-{i}")).await
         });
         handles.push(handle);
     }

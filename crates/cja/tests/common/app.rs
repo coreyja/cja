@@ -11,7 +11,7 @@ pub struct TestAppState {
 }
 
 impl AppState for TestAppState {
-    fn version(&self) -> &str {
+    fn version(&self) -> &'static str {
         "test-1.0.0"
     }
 
@@ -33,6 +33,7 @@ impl TestAppState {
     }
 }
 
+#[allow(dead_code)]
 pub fn create_test_router<AS: AppState>(state: AS) -> Router {
     Router::new()
         .route("/health", axum::routing::get(|| async { "OK" }))
@@ -40,16 +41,19 @@ pub fn create_test_router<AS: AppState>(state: AS) -> Router {
         .with_state(state)
 }
 
+#[allow(dead_code)]
 async fn session_handler<AS: AppState>(State(_state): State<AS>) -> &'static str {
     "Session OK"
 }
 
+#[allow(dead_code)]
 pub struct TestClient {
     client: reqwest::Client,
     base_url: String,
     cookies: Arc<Jar>,
 }
 
+#[allow(dead_code)]
 impl TestClient {
     pub fn new(port: u16) -> Self {
         let cookie_jar = Arc::new(Jar::default());
@@ -60,7 +64,7 @@ impl TestClient {
 
         Self {
             client,
-            base_url: format!("http://localhost:{}", port),
+            base_url: format!("http://localhost:{port}"),
             cookies: cookie_jar,
         }
     }
@@ -72,7 +76,7 @@ impl TestClient {
             .await
     }
 
-    pub async fn post(&self, path: &str) -> reqwest::RequestBuilder {
+    pub fn post(&self, path: &str) -> reqwest::RequestBuilder {
         self.client.post(format!("{}{}", self.base_url, path))
     }
 
@@ -83,15 +87,14 @@ impl TestClient {
 
         header_str
             .split(';')
-            .find(|cookie| cookie.trim().starts_with(&format!("{}=", name)))
+            .find(|cookie| cookie.trim().starts_with(&format!("{name}=")))
             .and_then(|cookie| cookie.split('=').nth(1))
-            .map(|value| value.to_string())
+            .map(std::string::ToString::to_string)
     }
 }
 
-pub async fn spawn_test_server<AS: AppState + 'static>(
-    router: Router,
-) -> (TestClient, tokio::task::JoinHandle<()>) {
+#[allow(dead_code)]
+pub async fn spawn_test_server(router: Router) -> (TestClient, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind to port");

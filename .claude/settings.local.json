@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(mkdir:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)"
     ],
     "deny": []
   }
