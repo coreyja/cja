@@ -36,7 +36,7 @@ use crate::server::cookies::CookieKey;
 ///
 /// # Using with Axum
 ///
-/// ```rust,no_run
+/// ```rust
 /// use cja::app_state::AppState;
 /// use cja::server::cookies::CookieKey;
 /// use sqlx::postgres::PgPoolOptions;
@@ -58,24 +58,25 @@ use crate::server::cookies::CookieKey;
 ///     format!("App version: {}", state.version())
 /// }
 ///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let db = PgPoolOptions::new()
-///         .connect("postgres://localhost/myapp")
-///         .await?;
+///  async fn example() -> Result<(), Box<dyn std::error::Error>> {
+///  use sqlx::postgres::PgPoolOptions;
+/// let db = PgPoolOptions::new()
+///      .connect(&std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://test".to_string()))
+///      .await
+///      .map_err(|_| "Database connection failed")?;
 ///     
-///     let state = MyAppState {
-///         db,
-///         cookie_key: CookieKey::from_env_or_generate()?,
-///     };
-///     
-///     let app: Router = Router::new()
-///         .route("/", get(handler))
-///         .with_state(state);
-///     
-///     // Run the server
-///     # Ok(())
-/// }
+/// let state = MyAppState {
+///     db,
+///     cookie_key: CookieKey::from_env_or_generate()?,
+/// };
+///
+/// let app: Router = Router::new()
+///     .route("/", get(handler))
+///     .with_state(state);
+///
+/// // Run the server
+/// # Ok(())
+/// # }
 /// ```
 pub trait AppState: Clone + Send + Sync + 'static {
     /// Returns the version string for the application.

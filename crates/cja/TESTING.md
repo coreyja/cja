@@ -11,12 +11,14 @@ This document outlines the comprehensive testing approach for the CJA meta-frame
 ## Test Infrastructure
 
 ### Database Management
+
 - Each test suite creates isolated PostgreSQL test databases
 - Automatic cleanup after tests complete
 - Connection pooling for efficient resource usage
 - Migrations are automatically run for each test database
 
 ### Test Helpers (`tests/common/`)
+
 - `mod.rs`: Core test utilities and database lifecycle management
 - `db.rs`: Database helpers for seeding test data
 - `app.rs`: Test application state and HTTP client utilities
@@ -25,58 +27,28 @@ This document outlines the comprehensive testing approach for the CJA meta-frame
 
 Doc tests serve dual purposes: providing usage examples and verifying API functionality.
 
-### Completed Doc Tests
-
-1. **AppState Trait** (`src/app_state.rs`)
-   - Basic implementation example
-   - Integration with Axum router
-   - Demonstrates cloning behavior
-
-2. **Job System** (`src/jobs/mod.rs`, `src/jobs/registry.rs`)
-   - Job trait implementation
-   - Enqueueing jobs with context
-   - Database access within jobs
-   - Job registry macro usage
-
-3. **Session Management** (`src/server/session.rs`)
-   - Custom session implementation
-   - Session lifecycle (create, load, persist)
-   - Integration with Axum extractors
-   - Cookie-based session tracking
-
-## Integration Tests
-
-### Session Management Tests (`tests/integration/sessions.rs`)
-- Session creation and persistence
-- Session lifecycle with timestamps
-- Concurrent session creation
-- Error handling for missing sessions
-
-### Job System Tests (`tests/integration/jobs.rs`)
-- Job enqueueing with payload serialization
-- Job priority handling
-- Job locking mechanism for concurrent workers
-- Context tracking for debugging
-- Concurrent job creation
-
 ## Running Tests
 
 ### All Tests
+
 ```bash
 cargo test
 ```
 
 ### Doc Tests Only
+
 ```bash
 cargo test --doc
 ```
 
 ### Integration Tests Only
+
 ```bash
 cargo test --test lib
 ```
 
 ### Specific Test Suite
+
 ```bash
 cargo test sessions --test lib
 cargo test jobs --test lib
@@ -91,16 +63,19 @@ Each test creates a unique database with the pattern `cja_test_<uuid>` to avoid 
 ## Future Testing Areas
 
 ### High Priority
+
 - Cron system integration tests
 - End-to-end server tests with routing
 - Job worker lifecycle and retry logic
 
 ### Medium Priority
+
 - Cookie encryption and security
 - Middleware integration
 - Performance benchmarks
 
 ### Low Priority
+
 - Migration rollback testing
 - Database connection pool limits
 - Concurrent request handling

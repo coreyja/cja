@@ -19,10 +19,25 @@ pub trait JobRegistry<AppState: app_state::AppState> {
 ///
 /// # Usage
 ///
-/// ```text
+/// ```rust
 /// use cja::impl_job_registry;
 /// use cja::jobs::Job;
+/// use cja::app_state::AppState;
+/// use cja::server::cookies::CookieKey;
 /// use serde::{Serialize, Deserialize};
+///
+/// // Define your app state
+/// #[derive(Clone)]
+/// struct MyAppState {
+///     db: sqlx::PgPool,
+///     cookie_key: CookieKey,
+/// }
+///
+/// impl AppState for MyAppState {
+///     fn version(&self) -> &str { "1.0.0" }
+///     fn db(&self) -> &sqlx::PgPool { &self.db }
+///     fn cookie_key(&self) -> &CookieKey { &self.cookie_key }
+/// }
 ///
 /// // Define your job types
 /// #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -39,18 +54,18 @@ pub trait JobRegistry<AppState: app_state::AppState> {
 ///
 /// // Implement the Job trait for each job type
 /// #[async_trait::async_trait]
-/// impl<AS: cja::app_state::AppState> Job<AS> for ProcessPaymentJob {
+/// impl Job<MyAppState> for ProcessPaymentJob {
 ///     const NAME: &'static str = "ProcessPaymentJob";
-///     async fn run(&self, _: AS) -> color_eyre::Result<()> {
+///     async fn run(&self, _: MyAppState) -> color_eyre::Result<()> {
 ///         println!("Processing payment for user {}", self.user_id);
 ///         Ok(())
 ///     }
 /// }
 ///
 /// #[async_trait::async_trait]
-/// impl<AS: cja::app_state::AppState> Job<AS> for SendNotificationJob {
+/// impl Job<MyAppState> for SendNotificationJob {
 ///     const NAME: &'static str = "SendNotificationJob";
-///     async fn run(&self, _: AS) -> color_eyre::Result<()> {
+///     async fn run(&self, _: MyAppState) -> color_eyre::Result<()> {
 ///         println!("Sending notification to user {}: {}", self.user_id, self.message);
 ///         Ok(())
 ///     }
@@ -58,16 +73,6 @@ pub trait JobRegistry<AppState: app_state::AppState> {
 ///
 /// // Register all your job types with the macro
 /// impl_job_registry!(MyAppState, ProcessPaymentJob, SendNotificationJob);
-///
-/// // You can register as many job types as needed
-/// impl_job_registry!(
-///     MyAppState,
-///     EmailJob,
-///     ReportJob,
-///     CleanupJob,
-///     DataImportJob,
-///     // ... more job types
-/// );
 /// ```
 #[macro_export]
 macro_rules! impl_job_registry {

@@ -73,7 +73,7 @@ impl<AppState: AS> CronJob<AppState> {
     pub(crate) async fn tick(
         &self,
         app_state: AppState,
-        last_enqueue_map: &HashMap<String, chrono::DateTime<Utc>>,
+        last_enqueue_map: &HashMap<&str, chrono::DateTime<Utc>>,
     ) -> Result<(), TickError> {
         let last_enqueue = last_enqueue_map.get(self.name);
         let context = format!("Cron@{}", app_state.version());

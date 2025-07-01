@@ -24,6 +24,16 @@ pub enum EnqueueError {
 /// use cja::jobs::Job;
 /// use serde::{Serialize, Deserialize};
 ///
+/// # #[derive(Debug, Clone)]
+/// # struct MyAppState {
+/// #     db: sqlx::PgPool,
+/// # }
+/// # impl cja::app_state::AppState for MyAppState {
+/// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+/// #     fn version(&self) -> &str { "1.0.0" }
+/// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
+/// # }
+///
 /// #[derive(Debug, Serialize, Deserialize, Clone)]
 /// struct EmailJob {
 ///     to: String,
@@ -32,10 +42,10 @@ pub enum EnqueueError {
 /// }
 ///
 /// #[async_trait::async_trait]
-/// impl<AS: cja::app_state::AppState> Job<AS> for EmailJob {
+/// impl Job<MyAppState> for EmailJob {
 ///     const NAME: &'static str = "EmailJob";
 ///     
-///     async fn run(&self, app_state: AS) -> color_eyre::Result<()> {
+///     async fn run(&self, app_state: MyAppState) -> color_eyre::Result<()> {
 ///         // Send email logic here
 ///         println!("Sending email to {} with subject: {}", self.to, self.subject);
 ///         // You can access the database through app_state.db()
@@ -46,17 +56,24 @@ pub enum EnqueueError {
 ///
 /// # Enqueuing Jobs
 ///
-/// ```rust,no_run
+/// ```rust
 /// # use cja::jobs::Job;
 /// # use serde::{Serialize, Deserialize};
 /// # #[derive(Debug, Serialize, Deserialize, Clone)]
 /// # struct EmailJob { to: String, subject: String, body: String }
-/// # #[async_trait::async_trait]
-/// # impl<AS: cja::app_state::AppState> Job<AS> for EmailJob {
-/// #     const NAME: &'static str = "EmailJob";
-/// #     async fn run(&self, _: AS) -> color_eyre::Result<()> { Ok(()) }
+/// # #[derive(Debug, Clone)]
+/// # struct MyAppState { db: sqlx::PgPool }
+/// # impl cja::app_state::AppState for MyAppState {
+/// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+/// #     fn version(&self) -> &str { "1.0.0" }
+/// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
 /// # }
-/// # async fn example(app_state: impl cja::app_state::AppState) -> Result<(), cja::jobs::EnqueueError> {
+/// # #[async_trait::async_trait]
+/// # impl Job<MyAppState> for EmailJob {
+/// #     const NAME: &'static str = "EmailJob";
+/// #     async fn run(&self, _: MyAppState) -> color_eyre::Result<()> { Ok(()) }
+/// # }
+/// # async fn example(app_state: MyAppState) -> Result<(), cja::jobs::EnqueueError> {
 /// let job = EmailJob {
 ///     to: "user@example.com".to_string(),
 ///     subject: "Welcome!".to_string(),
@@ -71,9 +88,19 @@ pub enum EnqueueError {
 ///
 /// # Job with Database Access
 ///
-/// ```rust,no_run
+/// ```rust
 /// use cja::jobs::Job;
 /// use serde::{Serialize, Deserialize};
+///
+/// # #[derive(Debug, Clone)]
+/// # struct MyAppState {
+/// #     db: sqlx::PgPool,
+/// # }
+/// # impl cja::app_state::AppState for MyAppState {
+/// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+/// #     fn version(&self) -> &str { "1.0.0" }
+/// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
+/// # }
 ///
 /// #[derive(Debug, Serialize, Deserialize, Clone)]
 /// struct ProcessPaymentJob {
@@ -82,23 +109,27 @@ pub enum EnqueueError {
 /// }
 ///
 /// #[async_trait::async_trait]
-/// impl<AS: cja::app_state::AppState> Job<AS> for ProcessPaymentJob {
+/// impl Job<MyAppState> for ProcessPaymentJob {
 ///     const NAME: &'static str = "ProcessPaymentJob";
 ///     
-///     async fn run(&self, app_state: AS) -> color_eyre::Result<()> {
+///     async fn run(&self, app_state: MyAppState) -> color_eyre::Result<()> {
+///         use crate::cja::app_state::AppState;
+///         use sqlx::Row;
+///
 ///         // Access the database through app_state
-///         // In a real app, you'd query your users table here
-///         // let _user = sqlx::query("SELECT * FROM users WHERE id = $1")
-///         //     .bind(self.user_id)
-///         //     .fetch_one(app_state.db())
-///         //     .await?;
+///         let user = sqlx::query("SELECT name FROM users WHERE id = $1")
+///             .bind(self.user_id)
+///             .fetch_one(app_state.db())
+///             .await?;
 ///         
-///         // Process payment logic here
-///         println!("Processing payment of {} cents for user {}",
-///                  self.amount_cents, self.user_id);
-///         
-///         // Update payment status in database
-///         // sqlx::query("INSERT INTO payments ...")
+///         println!("Processing payment of {} cents for user {} #{}",
+///                  self.amount_cents, user.get::<String, _>("name"), self.user_id);
+///
+///         sqlx::query("INSERT INTO payments (user_id, amount_cents) VALUES ($1, $2)")
+///             .bind(self.user_id)
+///             .bind(self.amount_cents)
+///             .execute(app_state.db())
+///             .await?;
 ///         
 ///         Ok(())
 ///     }
@@ -142,17 +173,24 @@ pub trait Job<AppState: AS>:
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// # use cja::jobs::Job;
     /// # use serde::{Serialize, Deserialize};
     /// # #[derive(Debug, Serialize, Deserialize, Clone)]
     /// # struct MyJob { data: String }
-    /// # #[async_trait::async_trait]
-    /// # impl<AS: cja::app_state::AppState> Job<AS> for MyJob {
-    /// #     const NAME: &'static str = "MyJob";
-    /// #     async fn run(&self, _: AS) -> color_eyre::Result<()> { Ok(()) }
+    /// # #[derive(Debug, Clone)]
+    /// # struct MyAppState { db: sqlx::PgPool }
+    /// # impl cja::app_state::AppState for MyAppState {
+    /// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+    /// #     fn version(&self) -> &str { "1.0.0" }
+    /// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
     /// # }
-    /// # async fn example(app_state: impl cja::app_state::AppState) -> Result<(), cja::jobs::EnqueueError> {
+    /// # #[async_trait::async_trait]
+    /// # impl Job<MyAppState> for MyJob {
+    /// #     const NAME: &'static str = "MyJob";
+    /// #     async fn run(&self, _: MyAppState) -> color_eyre::Result<()> { Ok(()) }
+    /// # }
+    /// # async fn example(app_state: MyAppState) -> Result<(), cja::jobs::EnqueueError> {
     /// let job = MyJob { data: "important work".to_string() };
     /// job.enqueue(app_state, "user-requested".to_string()).await?;
     /// # Ok(())
