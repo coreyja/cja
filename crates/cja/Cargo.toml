@@ -29,5 +29,9 @@ tracing-common = { path = "../tracing-common" }
 color-eyre = "0.6.3"
 maud.workspace = true
 
+[dev-dependencies]
+reqwest = { workspace = true, features = ["cookies"] }
+once_cell = "1.19"
+
 [lints]
 workspace = true
