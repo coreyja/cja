@@ -6,7 +6,7 @@ authors.workspace = true
 
 [features]
 default = ["cron", "jobs"]
-cron = []
+cron = ["jobs"]
 jobs = []
 
 [dependencies]
