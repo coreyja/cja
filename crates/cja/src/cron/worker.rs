@@ -21,16 +21,14 @@ impl<AppState: AS> Worker<AppState> {
 
         tracing::debug!("Starting cron loop");
         loop {
-            let last_runs = sqlx::query!(
-                "SELECT name, max(last_run_at) as last_run_at FROM Crons GROUP BY name"
-            )
-            .fetch_all(self.state.db())
-            .await
-            .map_err(TickError::SqlxError)?;
+            let last_runs = sqlx::query!("SELECT name, last_run_at FROM Crons")
+                .fetch_all(self.state.db())
+                .await
+                .map_err(TickError::SqlxError)?;
 
             let last_run_map: HashMap<&str, DateTime<Utc>> = last_runs
                 .iter()
-                .map(|row| (row.name.as_str(), row.last_run_at.unwrap_or_default()))
+                .map(|row| (row.name.as_str(), row.last_run_at))
                 .collect();
             self.tick(&worker_id, &last_run_map).await?;
 
