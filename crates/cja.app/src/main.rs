@@ -205,7 +205,7 @@ fn spawn_application_tasks(
     } else {
         info!("Jobs Disabled");
     }
-    
+
     #[cfg(not(feature = "jobs"))]
     {
         info!("Jobs feature not compiled in");
@@ -219,7 +219,7 @@ fn spawn_application_tasks(
     } else {
         info!("Cron Disabled");
     }
-    
+
     #[cfg(not(feature = "cron"))]
     {
         info!("Cron feature not compiled in");
@@ -263,9 +263,9 @@ mod cron {
     use cja::cron::{CronRegistry, Worker};
 
     #[cfg(feature = "jobs")]
-    use std::time::Duration;
-    #[cfg(feature = "jobs")]
     use crate::jobs::NoopJob;
+    #[cfg(feature = "jobs")]
+    use std::time::Duration;
 
     use super::AppState;
 
