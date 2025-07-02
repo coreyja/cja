@@ -4,6 +4,11 @@ description = "Cron, Jobs and Axum a meta-framework for building web application
 edition.workspace = true
 authors.workspace = true
 
+[features]
+default = ["cron", "jobs"]
+cron = ["jobs"]
+jobs = []
+
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true

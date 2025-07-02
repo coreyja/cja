@@ -3,7 +3,9 @@ use std::{collections::HashMap, error::Error, future::Future, pin::Pin, time::Du
 use chrono::{OutOfRangeError, Utc};
 use tracing::error;
 
-use crate::{app_state::AppState as AS, jobs::Job};
+use crate::app_state::AppState as AS;
+#[cfg(feature = "jobs")]
+use crate::jobs::Job;
 
 pub struct CronRegistry<AppState: AS> {
     pub(super) jobs: HashMap<&'static str, CronJob<AppState>>,
@@ -148,6 +150,7 @@ impl<AppState: AS> CronRegistry<AppState> {
         self.jobs.insert(name, cron_job);
     }
 
+    #[cfg(feature = "jobs")]
     #[tracing::instrument(name = "cron.register_job", skip_all, fields(cron_job.name = J::NAME, cron_job.interval = ?interval))]
     pub fn register_job<J: Job<AppState>>(&mut self, job: J, interval: Duration) {
         self.register(J::NAME, interval, move |app_state, context| {

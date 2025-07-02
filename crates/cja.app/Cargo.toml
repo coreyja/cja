@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[features]
+default = ["cron", "jobs"]
+cron = ["cja/cron", "jobs"]
+jobs = ["cja/jobs"]
+
 [dependencies]
 cja = { path = "../cja" }
 
