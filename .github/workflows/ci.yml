@@ -21,6 +21,9 @@ jobs:
     with:
       rust-version: nightly
 
+  sqlx-check:
+    uses: ./.github/workflows/sqlx-check.yml
+
   cargo-deny:
     name: Cargo Deny
     runs-on: ubuntu-latest

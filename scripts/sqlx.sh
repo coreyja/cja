@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 
-cargo sqlx prepare --all --workspace -- --all-targets
+cargo sqlx prepare --all --workspace "$@" -- --all-targets
