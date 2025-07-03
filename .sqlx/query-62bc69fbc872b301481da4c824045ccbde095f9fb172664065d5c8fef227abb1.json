@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)\n            VALUES ($1, $2, $3, $3, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "62bc69fbc872b301481da4c824045ccbde095f9fb172664065d5c8fef227abb1"
+}

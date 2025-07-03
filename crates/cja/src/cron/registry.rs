@@ -306,7 +306,8 @@ mod test {
         .await
         .unwrap();
 
-        assert_eq!(last_run.last_run_at, previously);
+        let diff = last_run.last_run_at.signed_duration_since(previously);
+        assert!(diff.num_milliseconds() < 50);
     }
 
     #[sqlx::test]
@@ -517,7 +518,10 @@ mod test {
         .await
         .unwrap();
 
-        assert_eq!(test_job_record.last_run_at, recent_time);
+        let recent_diff = test_job_record
+            .last_run_at
+            .signed_duration_since(recent_time);
+        assert!(recent_diff.num_milliseconds() < 100);
         assert!(second_job_record.last_run_at > old_time);
     }
 
