@@ -17,18 +17,20 @@ impl CookieKey {
     pub fn from_env_or_generate() -> Result<Self, DecodeError> {
         let cookie_key = std::env::var("COOKIE_KEY");
         let cookie_key = if let Ok(cookie_key) = cookie_key {
+            tracing::info!("Using cookie key from environment");
             let cookie_key =
                 base64::engine::general_purpose::STANDARD.decode(cookie_key.as_bytes())?;
 
-            tower_cookies::Key::derive_from(&cookie_key)
+            Self(tower_cookies::Key::derive_from(&cookie_key))
         } else {
             tracing::info!("Generating new cookie key");
-            let k = tower_cookies::Key::generate();
-            let based = base64::engine::general_purpose::STANDARD.encode(k.master());
-            dbg!(&based);
-            k
+            Self::generate()
         };
-        Ok(Self(cookie_key))
+        Ok(cookie_key)
+    }
+
+    pub fn generate() -> Self {
+        Self(tower_cookies::Key::generate())
     }
 }
 
