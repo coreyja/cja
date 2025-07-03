@@ -75,7 +75,7 @@ impl<AppState: AS> CronJob<AppState> {
     pub(crate) async fn tick(
         &self,
         app_state: AppState,
-        last_enqueue_map: &HashMap<&str, chrono::DateTime<Utc>>,
+        last_enqueue_map: &HashMap<String, chrono::DateTime<Utc>>,
     ) -> Result<(), TickError> {
         let last_enqueue = last_enqueue_map.get(self.name);
         let context = format!("Cron@{}", app_state.version());
@@ -84,17 +84,18 @@ impl<AppState: AS> CronJob<AppState> {
         if let Some(last_enqueue) = last_enqueue {
             let elapsed = now - last_enqueue;
             let elapsed = elapsed.to_std().map_err(TickError::NegativeDuration)?;
-            if elapsed > self.interval {
-                tracing::info!(
-                    task_name = self.name,
-                    time_since_last_run =? elapsed,
-                    "Enqueuing Task"
-                );
-                (self.func)
-                    .run(app_state.clone(), context)
-                    .await
-                    .map_err(TickError::JobError)?;
+            if elapsed <= self.interval {
+                return Ok(());
             }
+            tracing::info!(
+                task_name = self.name,
+                time_since_last_run =? elapsed,
+                "Enqueuing Task"
+            );
+            (self.func)
+                .run(app_state.clone(), context)
+                .await
+                .map_err(TickError::JobError)?;
         } else {
             tracing::info!(task_name = self.name, "Enqueuing Task for first time");
             (self.func)
@@ -162,5 +163,173 @@ impl<AppState: AS> CronRegistry<AppState> {
 impl<AppState: AS> Default for CronRegistry<AppState> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::app_state::AppState;
+    use crate::server::cookies::CookieKey;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestAppState {
+        db: sqlx::PgPool,
+        cookie_key: CookieKey,
+    }
+
+    impl AppState for TestAppState {
+        fn db(&self) -> &sqlx::PgPool {
+            &self.db
+        }
+
+        fn version(&self) -> &'static str {
+            "test"
+        }
+
+        fn cookie_key(&self) -> &CookieKey {
+            &self.cookie_key
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct TestJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for TestJob {
+        const NAME: &'static str = "test_job";
+
+        async fn run(&self, _app_state: TestAppState) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn create_test_db(db_name: &str) {
+        let setup_db = sqlx::PgPool::connect("postgresql://localhost/postgres")
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {db_name}"))
+            .execute(&setup_db)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE DATABASE {db_name}"))
+            .execute(&setup_db)
+            .await
+            .unwrap();
+        setup_db.close().await;
+    }
+
+    async fn drop_test_db(db_name: &str) {
+        let setup_db = sqlx::PgPool::connect("postgresql://localhost/postgres")
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP DATABASE {db_name}"))
+            .execute(&setup_db)
+            .await
+            .unwrap();
+    }
+
+    async fn run_test<F, Fut>(test: F)
+    where
+        F: FnOnce(TestAppState) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let uuid = uuid::Uuid::new_v4().to_string().replace('-', "_");
+        let db_name = format!("cja_test_{uuid}");
+        create_test_db(&db_name).await;
+
+        let db = sqlx::PgPool::connect(&format!("postgresql://localhost/{db_name}"))
+            .await
+            .unwrap();
+        crate::db::run_migrations(&db).await.unwrap();
+
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        test(app_state).await;
+
+        db.close().await;
+
+        drop_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_creates_new_cron_record() {
+        run_test(async move |app_state: TestAppState| {
+            let mut registry = CronRegistry::new();
+            registry.register_job(TestJob, Duration::from_secs(1));
+
+            let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
+            assert_eq!(cron_job.name, TestJob::NAME);
+            assert_eq!(cron_job.interval, Duration::from_secs(1));
+
+            let worker = crate::cron::Worker::new(app_state.clone(), registry);
+
+            let existing_record =
+                sqlx::query!("SELECT cron_id FROM Crons where name = $1", TestJob::NAME)
+                    .fetch_optional(&app_state.db)
+                    .await
+                    .unwrap();
+            assert!(
+                existing_record.is_none(),
+                "Record should not exist {} in DB {:?}",
+                existing_record.unwrap().cron_id,
+                app_state.db
+            );
+
+            worker.tick().await.unwrap();
+
+            let last_run = sqlx::query!(
+                "SELECT last_run_at FROM Crons WHERE name = $1",
+                TestJob::NAME
+            )
+            .fetch_one(&app_state.db)
+            .await
+            .unwrap();
+
+            let now = Utc::now();
+            let last_run_at = last_run.last_run_at;
+            let diff = now.signed_duration_since(last_run_at);
+            assert!(diff.num_milliseconds() < 1000);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_tick_updates_existing_cron_record() {
+        run_test(async move |app_state: TestAppState| {
+            let mut registry = CronRegistry::new();
+            registry.register_job(TestJob, Duration::from_secs(60));
+            let worker = crate::cron::Worker::new(app_state.clone(), registry);
+
+            let previously = Utc::now();
+            sqlx::query!(
+                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $3, $3)
+            ON CONFLICT (name)
+            DO UPDATE SET
+            last_run_at = $3",
+            uuid::Uuid::new_v4(),
+            TestJob::NAME,
+            previously
+        )
+        .execute(&app_state.db)
+        .await
+        .unwrap();
+
+        worker.tick().await.unwrap();
+
+        let last_run = sqlx::query!(
+            "SELECT last_run_at FROM Crons WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_one(&app_state.db)
+        .await
+        .unwrap();
+
+        assert_eq!(last_run.last_run_at, previously);
     }
 }
