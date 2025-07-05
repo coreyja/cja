@@ -325,6 +325,7 @@ pub trait AppSession: Sized {
 /// # app
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct Session<A: AppSession>(pub A);
 
 impl<A: AppState + Send + Sync, S: AppSession + Send + Sync> FromRequestParts<A> for Session<S> {
