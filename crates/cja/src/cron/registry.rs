@@ -49,7 +49,7 @@ impl<
 }
 
 #[derive(Clone, Debug)]
-pub struct IntervalSchedule(Duration);
+pub struct IntervalSchedule(pub Duration);
 
 impl IntervalSchedule {
     fn should_run(
@@ -88,7 +88,7 @@ impl IntervalSchedule {
 }
 
 #[derive(Clone, Debug)]
-pub struct CronSchedule(Box<cron::Schedule>);
+pub struct CronSchedule(pub Box<cron::Schedule>);
 
 impl CronSchedule {
     fn should_run(
@@ -224,6 +224,10 @@ impl<AppState: AS> CronJob<AppState> {
         }
 
         Ok(())
+    }
+
+    pub async fn run(&self, app_state: AppState, context: String) -> Result<(), String> {
+        (self.func).run(app_state, context).await
     }
 }
 
