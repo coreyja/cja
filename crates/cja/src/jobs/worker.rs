@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 use tracing::Span;
 
@@ -29,14 +31,16 @@ struct Worker<AppState: AS, R: JobRegistry<AppState>> {
     id: uuid::Uuid,
     state: AppState,
     registry: R,
+    sleep_duration: Duration,
 }
 
 impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
-    fn new(state: AppState, registry: R) -> Self {
+    fn new(state: AppState, registry: R, sleep_duration: Duration) -> Self {
         Self {
             id: uuid::Uuid::new_v4(),
             state,
             registry,
+            sleep_duration,
         }
     }
 
@@ -141,7 +145,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         let job = self.fetch_next_job().await?;
 
         let Some(job) = job else {
-            let duration = std::time::Duration::from_secs(5);
+            let duration = self.sleep_duration;
             tracing::debug!(worker.id =% self.id, ?duration, "No Job to Run, sleeping for requested duration");
 
             tokio::time::sleep(duration).await;
@@ -172,8 +176,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 pub async fn job_worker<AppState: AS>(
     app_state: AppState,
     registry: impl JobRegistry<AppState>,
+    sleep_duration: Duration,
 ) -> color_eyre::Result<()> {
-    let worker = Worker::new(app_state, registry);
+    let worker = Worker::new(app_state, registry, sleep_duration);
 
     loop {
         worker.tick().await?;

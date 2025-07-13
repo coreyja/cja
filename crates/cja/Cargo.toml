@@ -29,6 +29,8 @@ tower-service = "0.3.2"
 tower = "0.5.2"
 socket2 = { version = "0.5.6", features = ["all"] }
 listenfd = "1.0.2"
+cron = "0.12.1"
+chrono-tz = "0.10.0"
 
 tracing-common = { path = "../tracing-common" }
 color-eyre = "0.6.3"

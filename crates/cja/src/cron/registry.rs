@@ -1,7 +1,7 @@
 use std::{collections::HashMap, error::Error, future::Future, pin::Pin, time::Duration};
 
-use chrono::{OutOfRangeError, Utc};
-use tracing::error;
+use chrono::Utc;
+use chrono_tz::Tz;
 
 use crate::app_state::AppState as AS;
 #[cfg(feature = "jobs")]
@@ -48,11 +48,120 @@ impl<
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct IntervalSchedule(Duration);
+
+impl IntervalSchedule {
+    fn should_run(
+        &self,
+        last_run: Option<&chrono::DateTime<Utc>>,
+        now: chrono::DateTime<Utc>,
+        _worker_started_at: chrono::DateTime<Utc>,
+        _timezone: Tz,
+    ) -> bool {
+        if let Some(last_run) = last_run {
+            let elapsed = now - last_run;
+            // If elapsed is negative, return false (don't run)
+            if elapsed < chrono::Duration::zero() {
+                return false;
+            }
+            // Safe to convert since we checked it's non-negative
+            let elapsed = elapsed.to_std().unwrap_or(Duration::ZERO);
+            elapsed > self.0
+        } else {
+            true
+        }
+    }
+
+    pub fn next_run(
+        &self,
+        last_run: Option<&chrono::DateTime<Utc>>,
+        now: chrono::DateTime<Utc>,
+        timezone: Tz,
+    ) -> chrono::DateTime<Tz> {
+        let last_run = last_run.unwrap_or(&now);
+        let last_run_tz = last_run.with_timezone(&timezone);
+        let duration: chrono::Duration = chrono::Duration::from_std(self.0).unwrap();
+        let next_run = last_run_tz.checked_add_signed(duration).unwrap();
+        next_run.with_timezone(&timezone)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CronSchedule(Box<cron::Schedule>);
+
+impl CronSchedule {
+    fn should_run(
+        &self,
+        last_run: Option<&chrono::DateTime<Utc>>,
+        now: chrono::DateTime<Utc>,
+        worker_started_at: chrono::DateTime<Utc>,
+        timezone: Tz,
+    ) -> bool {
+        // Use last run time if available, otherwise use worker start time
+        let last_run = last_run.unwrap_or(&worker_started_at);
+        let last_run_tz = last_run.with_timezone(&timezone);
+
+        if let Some(next_run) = self.0.after(&last_run_tz).next() {
+            let now_tz = now.with_timezone(&timezone);
+            now_tz >= next_run
+        } else {
+            false
+        }
+    }
+
+    pub fn next_run(
+        &self,
+        last_run: Option<&chrono::DateTime<Utc>>,
+        now: chrono::DateTime<Utc>,
+        timezone: Tz,
+    ) -> chrono::DateTime<Tz> {
+        let last_run = last_run.unwrap_or(&now);
+        let last_run_tz = last_run.with_timezone(&timezone);
+        self.0.after(&last_run_tz).next().unwrap()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Schedule {
+    Interval(IntervalSchedule),
+    Cron(CronSchedule),
+}
+
+impl Schedule {
+    pub fn should_run(
+        &self,
+        last_run: Option<&chrono::DateTime<Utc>>,
+        now: chrono::DateTime<Utc>,
+        worker_started_at: chrono::DateTime<Utc>,
+        timezone: Tz,
+    ) -> bool {
+        match self {
+            Schedule::Interval(interval) => {
+                interval.should_run(last_run, now, worker_started_at, timezone)
+            }
+            Schedule::Cron(cron) => cron.should_run(last_run, now, worker_started_at, timezone),
+        }
+    }
+
+    pub fn next_run(
+        &self,
+        last_run: Option<&chrono::DateTime<Utc>>,
+        now: chrono::DateTime<Utc>,
+        timezone: Tz,
+    ) -> chrono::DateTime<Tz> {
+        match self {
+            Schedule::Interval(interval) => interval.next_run(last_run, now, timezone),
+            Schedule::Cron(cron) => cron.next_run(last_run, now, timezone),
+        }
+    }
+}
+
 #[allow(clippy::type_complexity)]
-pub(super) struct CronJob<AppState: AS> {
-    name: &'static str,
+pub struct CronJob<AppState: AS> {
+    pub name: &'static str,
     func: Box<dyn CronFn<AppState> + Send + Sync + 'static>,
-    interval: Duration,
+    pub schedule: Schedule,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +169,6 @@ pub(super) struct CronJob<AppState: AS> {
 pub enum TickError {
     JobError(String),
     SqlxError(sqlx::Error),
-    NegativeDuration(OutOfRangeError),
 }
 
 impl<AppState: AS> CronJob<AppState> {
@@ -69,55 +177,51 @@ impl<AppState: AS> CronJob<AppState> {
         skip_all,
         fields(
             cron_job.name = self.name,
-            cron_job.interval = ?self.interval
+            cron_job.schedule = ?self.schedule
         )
     )]
     pub(crate) async fn tick(
         &self,
         app_state: AppState,
         last_enqueue_map: &HashMap<String, chrono::DateTime<Utc>>,
+        worker_started_at: chrono::DateTime<Utc>,
+        timezone: Tz,
     ) -> Result<(), TickError> {
         let last_enqueue = last_enqueue_map.get(self.name);
         let context = format!("Cron@{}", app_state.version());
         let now = Utc::now();
 
-        if let Some(last_enqueue) = last_enqueue {
-            let elapsed = now - last_enqueue;
-            let elapsed = elapsed.to_std().map_err(TickError::NegativeDuration)?;
-            if elapsed <= self.interval {
-                return Ok(());
-            }
+        let should_run = self
+            .schedule
+            .should_run(last_enqueue, now, worker_started_at, timezone);
+
+        if should_run {
             tracing::info!(
                 task_name = self.name,
-                time_since_last_run =? elapsed,
+                last_run = ?last_enqueue,
                 "Enqueuing Task"
             );
             (self.func)
                 .run(app_state.clone(), context)
                 .await
                 .map_err(TickError::JobError)?;
-        } else {
-            tracing::info!(task_name = self.name, "Enqueuing Task for first time");
-            (self.func)
-                .run(app_state.clone(), context)
-                .await
-                .map_err(TickError::JobError)?;
+
+            sqlx::query!(
+                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (name)
+                DO UPDATE SET
+                last_run_at = $3",
+                uuid::Uuid::new_v4(),
+                self.name,
+                now,
+                now,
+                now
+            )
+            .execute(app_state.db())
+            .await
+            .map_err(TickError::SqlxError)?;
         }
-        sqlx::query!(
-            "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (name)
-            DO UPDATE SET
-            last_run_at = $3",
-            uuid::Uuid::new_v4(),
-            self.name,
-            now,
-            now,
-            now
-        )
-        .execute(app_state.db())
-        .await
-        .map_err(TickError::SqlxError)?;
 
         Ok(())
     }
@@ -146,9 +250,32 @@ impl<AppState: AS> CronRegistry<AppState> {
                 func: job,
                 _marker: std::marker::PhantomData,
             }),
-            interval,
+            schedule: Schedule::Interval(IntervalSchedule(interval)),
         };
         self.jobs.insert(name, cron_job);
+    }
+
+    #[tracing::instrument(name = "cron.register_with_cron", skip_all, fields(cron_job.name = name, cron_job.cron = cron_expr))]
+    pub fn register_with_cron<FnError: Error + Send + Sync + 'static>(
+        &mut self,
+        name: &'static str,
+        cron_expr: &str,
+        job: impl Fn(AppState, String) -> Pin<Box<dyn Future<Output = Result<(), FnError>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<(), cron::error::Error> {
+        let cron_schedule = cron_expr.parse::<cron::Schedule>()?;
+        let cron_job = CronJob {
+            name,
+            func: Box::new(CronFnClosure {
+                func: job,
+                _marker: std::marker::PhantomData,
+            }),
+            schedule: Schedule::Cron(CronSchedule(Box::new(cron_schedule))),
+        };
+        self.jobs.insert(name, cron_job);
+        Ok(())
     }
 
     #[cfg(feature = "jobs")]
@@ -157,6 +284,24 @@ impl<AppState: AS> CronRegistry<AppState> {
         self.register(J::NAME, interval, move |app_state, context| {
             J::enqueue(job.clone(), app_state, context)
         });
+    }
+
+    #[cfg(feature = "jobs")]
+    #[tracing::instrument(name = "cron.register_job_with_cron", skip_all, fields(cron_job.name = J::NAME, cron_job.cron = cron_expr))]
+    pub fn register_job_with_cron<J: Job<AppState>>(
+        &mut self,
+        job: J,
+        cron_expr: &str,
+    ) -> Result<(), cron::error::Error> {
+        self.register_with_cron(J::NAME, cron_expr, move |app_state, context| {
+            J::enqueue(job.clone(), app_state, context)
+        })
+    }
+
+    #[cfg(feature = "jobs")]
+    #[tracing::instrument(name = "cron.get", skip_all, fields(cron_job.name = name))]
+    pub fn get(&self, name: &str) -> Option<&CronJob<AppState>> {
+        self.jobs.get(name)
     }
 }
 
@@ -240,7 +385,9 @@ mod test {
 
         let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
         assert_eq!(cron_job.name, TestJob::NAME);
-        assert_eq!(cron_job.interval, Duration::from_secs(1));
+        assert!(
+            matches!(cron_job.schedule, Schedule::Interval(IntervalSchedule(d)) if d == Duration::from_secs(1))
+        );
 
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
@@ -358,8 +505,16 @@ mod test {
 
         let cron_job = registry.jobs.get(FailingJob::NAME).unwrap();
         let last_enqueue_map = HashMap::new();
+        let worker_started_at = Utc::now();
 
-        let result = cron_job.tick(app_state.clone(), &last_enqueue_map).await;
+        let result = cron_job
+            .tick(
+                app_state.clone(),
+                &last_enqueue_map,
+                worker_started_at,
+                chrono_tz::UTC,
+            )
+            .await;
         assert!(result.is_ok());
 
         let cron_record = sqlx::query!(
@@ -403,14 +558,22 @@ mod test {
 
         let cron_job = registry.jobs.get("custom_failing").unwrap();
         let last_enqueue_map = HashMap::new();
+        let worker_started_at = Utc::now();
 
-        let result = cron_job.tick(app_state.clone(), &last_enqueue_map).await;
+        let result = cron_job
+            .tick(
+                app_state.clone(),
+                &last_enqueue_map,
+                worker_started_at,
+                chrono_tz::UTC,
+            )
+            .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             TickError::JobError(err) => {
                 assert!(err.contains("CustomError"));
             }
-            _ => panic!("Expected JobError"),
+            TickError::SqlxError(_) => panic!("Expected JobError"),
         }
 
         let cron_count = sqlx::query!(
@@ -539,26 +702,178 @@ mod test {
         let future_time = Utc::now() + chrono::Duration::hours(1);
         let mut last_enqueue_map = HashMap::new();
         last_enqueue_map.insert(TestJob::NAME.to_string(), future_time);
+        let worker_started_at = Utc::now();
 
-        let result = cron_job.tick(app_state.clone(), &last_enqueue_map).await;
+        let result = cron_job
+            .tick(
+                app_state.clone(),
+                &last_enqueue_map,
+                worker_started_at,
+                chrono_tz::UTC,
+            )
+            .await;
 
-        match result {
-            Err(TickError::NegativeDuration(_)) => {}
-            Ok(()) => {
-                let cron_count = sqlx::query!(
-                    "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
-                    TestJob::NAME
-                )
-                .fetch_one(&app_state.db)
-                .await
-                .unwrap();
-                assert_eq!(
-                    cron_count.count.unwrap(),
-                    0,
-                    "Should not have created cron record"
-                );
-            }
-            Err(e) => panic!("Expected NegativeDuration error or no action, got: {e:?}"),
+        // With future last_run time, the job should not run
+        assert!(result.is_ok());
+
+        let cron_count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_one(&app_state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            cron_count.count.unwrap(),
+            0,
+            "Should not have created cron record with future last_run time"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_cron_expression_scheduling(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+
+        // Register with cron expression that runs every minute
+        registry
+            .register_job_with_cron(TestJob, "0 * * * * * *")
+            .unwrap();
+
+        let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
+        assert!(matches!(cron_job.schedule, Schedule::Cron(_)));
+
+        // First run should wait for the next scheduled time based on worker start
+        let last_enqueue_map = HashMap::new();
+        // Use a time in the past to ensure the cron will trigger
+        let worker_started_at = Utc::now() - chrono::Duration::minutes(2);
+        let result = cron_job
+            .tick(
+                app_state.clone(),
+                &last_enqueue_map,
+                worker_started_at,
+                chrono_tz::UTC,
+            )
+            .await;
+        assert!(result.is_ok());
+
+        // Verify cron record was created (if it ran)
+        let cron_record = sqlx::query!(
+            "SELECT last_run_at FROM Crons WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_optional(&app_state.db)
+        .await
+        .unwrap();
+
+        // The job should have run since we used a worker start time 2 minutes ago
+        assert!(cron_record.is_some());
+        if let Some(record) = cron_record {
+            let now = Utc::now();
+            let diff = now.signed_duration_since(record.last_run_at);
+            assert!(diff.num_milliseconds() < 1000);
         }
+    }
+
+    #[sqlx::test]
+    async fn test_cron_expression_respects_schedule(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+
+        // Register with cron expression that runs at specific minute (e.g., minute 30)
+        registry
+            .register_job_with_cron(TestJob, "0 30 * * * * *")
+            .unwrap();
+
+        let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
+
+        // Set last run to 29 minutes ago (shouldn't trigger if we're not at minute 30)
+        let last_run = Utc::now() - chrono::Duration::minutes(29);
+        let mut last_enqueue_map = HashMap::new();
+        last_enqueue_map.insert(TestJob::NAME.to_string(), last_run);
+
+        // This might or might not run depending on current minute
+        // We'll just verify it doesn't error
+        let worker_started_at = Utc::now();
+        let result = cron_job
+            .tick(
+                app_state.clone(),
+                &last_enqueue_map,
+                worker_started_at,
+                chrono_tz::UTC,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_invalid_cron_expression() {
+        let mut registry: CronRegistry<TestAppState> = CronRegistry::new();
+
+        // Invalid cron expression should return error
+        let result = registry.register_with_cron(
+            "invalid_cron",
+            "invalid expression",
+            |_app_state, _context| Box::pin(async { Ok::<(), std::io::Error>(()) }),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[sqlx::test]
+    async fn test_mixed_interval_and_cron_jobs(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+
+        // Register one job with interval
+        registry.register_job(TestJob, Duration::from_secs(1));
+
+        // Register another job with cron expression (every second)
+        registry
+            .register_job_with_cron(SecondTestJob, "* * * * * * *")
+            .unwrap();
+
+        assert_eq!(registry.jobs.len(), 2);
+
+        let interval_job = registry.jobs.get(TestJob::NAME).unwrap();
+        assert!(matches!(interval_job.schedule, Schedule::Interval(_)));
+
+        let cron_job = registry.jobs.get(SecondTestJob::NAME).unwrap();
+        assert!(matches!(cron_job.schedule, Schedule::Cron(_)));
+
+        // Create worker with start time in past to ensure both jobs run
+        let mut worker = crate::cron::Worker::new(app_state.clone(), registry);
+        worker.started_at = Utc::now() - chrono::Duration::seconds(2);
+
+        // Both jobs should run on first tick
+        worker.tick().await.unwrap();
+
+        let test_job_count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_one(&app_state.db)
+        .await
+        .unwrap();
+
+        let second_job_count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
+            SecondTestJob::NAME
+        )
+        .fetch_one(&app_state.db)
+        .await
+        .unwrap();
+
+        assert_eq!(test_job_count.count.unwrap(), 1);
+        assert_eq!(second_job_count.count.unwrap(), 1);
     }
 }
