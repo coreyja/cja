@@ -197,10 +197,13 @@ fn spawn_application_tasks(
     // Initialize job worker if enabled
     #[cfg(feature = "jobs")]
     if is_feature_enabled("JOBS") {
+        use std::time::Duration;
+
         info!("Jobs Enabled");
         futures.push(tokio::spawn(cja::jobs::worker::job_worker(
             app_state.clone(),
             jobs::Jobs,
+            Duration::from_secs(60),
         )));
     } else {
         info!("Jobs Disabled");
@@ -260,6 +263,7 @@ mod jobs {
 
 #[cfg(feature = "cron")]
 mod cron {
+    use chrono_tz::US::Eastern;
     use cja::cron::{CronRegistry, Worker};
 
     #[cfg(feature = "jobs")]
@@ -270,7 +274,11 @@ mod cron {
     use super::AppState;
 
     pub(crate) async fn run_cron(app_state: AppState) -> cja::Result<()> {
-        Ok(Worker::new(app_state, cron_registry()).run().await?)
+        Ok(
+            Worker::new_with_timezone(app_state, cron_registry(), Eastern, Duration::from_secs(60))
+                .run()
+                .await?,
+        )
     }
 
     fn cron_registry() -> cja::cron::CronRegistry<AppState> {
