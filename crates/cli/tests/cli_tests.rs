@@ -1,5 +1,4 @@
 use assert_cmd::Command;
-use assert_fs;
 use assert_fs::prelude::*;
 use predicates::str;
 

@@ -108,10 +108,10 @@ use std::process::Command as ProcessCommand;
 /// cja --help
 /// cja --version
 /// ```
-fn main() -> Result<()> {
+fn build_cli() -> Command {
     const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")");
-
-    let matches = Command::new("cja")
+    
+    Command::new("cja")
         .version(VERSION)
         .about("CJA CLI for project scaffolding")
         .subcommand_required(true)
@@ -204,7 +204,10 @@ fn main() -> Result<()> {
                         .requires("github"),
                 ),
         )
-        .get_matches();
+}
+
+fn main() -> Result<()> {
+    let matches = build_cli().get_matches();
 
     match matches.subcommand() {
         Some(("new", sub_matches)) => {
@@ -215,8 +218,7 @@ fn main() -> Result<()> {
             let github_repo = sub_matches.get_one::<String>("github");
             let branch = sub_matches
                 .get_one::<String>("branch")
-                .map(String::as_str)
-                .unwrap_or("main");
+                .map_or("main", String::as_str);
 
             // Warn if both --no-jobs and --no-cron are specified
             if no_jobs && no_cron {
@@ -242,8 +244,7 @@ fn main() -> Result<()> {
             let github_repo = sub_matches.get_one::<String>("github");
             let branch = sub_matches
                 .get_one::<String>("branch")
-                .map(String::as_str)
-                .unwrap_or("main");
+                .map_or("main", String::as_str);
 
             // Warn if both --no-jobs and --no-cron are specified
             if no_jobs && no_cron {
@@ -399,7 +400,6 @@ fn create_project(
 /// - Not in a Cargo project directory
 /// - Unable to read or parse Cargo.toml
 /// - Unable to create necessary directories or files
-/// - cargo add command fails
 fn init_project(
     bin_name: Option<&String>,
     no_cron: bool,
@@ -433,11 +433,10 @@ fn init_project(
     // Check if a binary with this name already exists in Cargo.toml
     if let Some(bins) = toml_value.get("bin").and_then(|b| b.as_array()) {
         for bin in bins {
-            if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
-                if name == bin_name {
+            if let Some(name) = bin.get("name").and_then(|n| n.as_str())
+                && name == bin_name {
                     anyhow::bail!("A binary named '{}' already exists in Cargo.toml", bin_name);
                 }
-            }
         }
     }
 
@@ -459,6 +458,47 @@ fn init_project(
         fs::create_dir(migrations_dir).context("Failed to create migrations directory")?;
     }
 
+    // Add dependencies
+    add_dependencies(github_repo, branch)?;
+    
+    // Update Cargo.toml with [[bin]] section
+    update_cargo_toml_bin(bin_name)?;
+
+    // Create the binary file
+    let main_content = generate_main_rs(no_cron, no_jobs, no_sessions);
+    fs::write(&bin_file_path, main_content)
+        .with_context(|| format!("Failed to write {}", bin_file_path.display()))?;
+
+    // Create build.rs if it doesn't exist
+    let build_rs_path = Path::new("build.rs");
+    if !build_rs_path.exists() {
+        let build_rs_content = generate_build_rs();
+        fs::write(build_rs_path, build_rs_content).context("Failed to write build.rs")?;
+    }
+
+    // Copy migration files based on feature flags
+    if !no_jobs {
+        copy_jobs_migration(Path::new("."))?;
+    }
+
+    if !no_cron && !no_jobs {
+        copy_cron_migrations(Path::new("."))?;
+    }
+
+    if !no_sessions {
+        copy_session_migrations(Path::new("."))?;
+    }
+
+    println!("Successfully initialized CJA in your project!");
+    println!("Binary created at: {}", bin_file_path.display());
+    println!("\nTo run your CJA application:");
+    println!("  cargo run --bin {bin_name}");
+
+    Ok(())
+}
+
+// Helper function to add dependencies to a Cargo project  
+fn add_dependencies(github_repo: Option<&String>, branch: &str) -> Result<()> {
     // Add CJA dependency using cargo add
     println!("Adding CJA dependency...");
     let mut cargo_add_cmd = ProcessCommand::new("cargo");
@@ -469,7 +509,7 @@ fn init_project(
         cargo_add_cmd.arg("cja"); // Specify the package name from the workspace
         cargo_add_cmd.arg("--git").arg(repo);
         cargo_add_cmd.arg("--branch").arg(branch);
-        println!("Using GitHub repository: {} (branch: {})", repo, branch);
+        println!("Using GitHub repository: {repo} (branch: {branch})");
     } else {
         cargo_add_cmd.arg("cja");
     }
@@ -553,7 +593,13 @@ fn init_project(
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    
+    Ok(())
+}
 
+/// Helper function to update Cargo.toml with [[bin]] section
+fn update_cargo_toml_bin(bin_name: &str) -> Result<()> {
+    let cargo_toml_path = Path::new("Cargo.toml");
     let cargo_toml_content =
         fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
 
@@ -565,62 +611,33 @@ fn init_project(
     let mut bin_exists = false;
     if let Some(bins) = toml_check.get("bin").and_then(|b| b.as_array()) {
         for bin in bins {
-            if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
-                if name == bin_name {
+            if let Some(name) = bin.get("name").and_then(|n| n.as_str())
+                && name == bin_name {
                     bin_exists = true;
                     break;
                 }
-            }
         }
     }
 
     // Add [[bin]] section if it doesn't exist
     if !bin_exists {
         let mut updated_cargo_toml = cargo_toml_content;
-        updated_cargo_toml.push_str(&format!(
+        use std::fmt::Write;
+        write!(updated_cargo_toml,
             r#"
 
 [[bin]]
 name = "{bin_name}"
 path = "src/bin/{bin_name}.rs"
 "#
-        ));
+        ).unwrap();
 
         fs::write(cargo_toml_path, updated_cargo_toml).context("Failed to update Cargo.toml")?;
     }
-
-    // Create the binary file
-    let main_content = generate_main_rs(no_cron, no_jobs, no_sessions);
-    fs::write(&bin_file_path, main_content)
-        .with_context(|| format!("Failed to write {}", bin_file_path.display()))?;
-
-    // Create build.rs if it doesn't exist
-    let build_rs_path = Path::new("build.rs");
-    if !build_rs_path.exists() {
-        let build_rs_content = generate_build_rs();
-        fs::write(build_rs_path, build_rs_content).context("Failed to write build.rs")?;
-    }
-
-    // Copy migration files based on feature flags
-    if !no_jobs {
-        copy_jobs_migration(Path::new("."))?;
-    }
-
-    if !no_cron && !no_jobs {
-        copy_cron_migrations(Path::new("."))?;
-    }
-
-    if !no_sessions {
-        copy_session_migrations(Path::new("."))?;
-    }
-
-    println!("Successfully initialized CJA in your project!");
-    println!("Binary created at: {}", bin_file_path.display());
-    println!("\nTo run your CJA application:");
-    println!("  cargo run --bin {bin_name}");
-
+    
     Ok(())
 }
+
 
 /// Generates the `Cargo.toml` content for a new CJA project.
 ///
@@ -675,7 +692,7 @@ fn generate_cargo_toml(
 ) -> String {
     // Build CJA dependency line
     let cja_dep = if let Some(repo) = github_repo {
-        format!(r#"cja = {{ git = "{}", branch = "{}" }}"#, repo, branch)
+        format!(r#"cja = {{ git = "{repo}", branch = "{branch}" }}"#)
     } else {
         r#"cja = { version = "0.0.0" }"#.to_string()
     };
@@ -721,11 +738,11 @@ vergen = {{ version = "8", features = ["build", "git", "gitcl"] }}
 /// # Generated Code
 ///
 /// The build script:
-/// - Uses vergen's EmitBuilder to capture build and git metadata
-/// - Emits environment variables like VERGEN_GIT_SHA that can be used at runtime
+/// - Uses vergen's `EmitBuilder` to capture build and git metadata
+/// - Emits environment variables like `VERGEN_GIT_SHA` that can be used at runtime
 /// - Follows the same pattern as the CJA CLI's own build.rs
 fn generate_build_rs() -> String {
-    r#"use vergen::EmitBuilder;
+    r"use vergen::EmitBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     EmitBuilder::builder()
@@ -735,7 +752,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-"#
+"
     .to_string()
 }
 
@@ -832,11 +849,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// assert!(!minimal_app.contains("jobs::"));
 /// assert!(!minimal_app.contains("cron::"));
 /// ```
-fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
-    let mut content = String::new();
-
-    // Base imports
-    content.push_str(
+fn generate_imports(no_sessions: bool) -> String {
+    let mut imports = String::from(
         r"use axum::response::IntoResponse;
 use cja::{
     color_eyre::{
@@ -851,18 +865,25 @@ use cja::{
 
     // Session imports only if sessions are enabled
     if !no_sessions {
-        content.push_str("        session::{AppSession, CJASession, Session},\n");
+        imports.push_str("        session::{AppSession, CJASession, Session},\n");
     }
 
-    content.push_str(
-        r#"    },
+    imports.push_str(
+        r"    },
     setup::{setup_sentry, setup_tracing},
 };
 use maud::html;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::info;
 use async_trait::async_trait;
+",
+    );
+    
+    imports
+}
 
+fn generate_app_state_impl() -> &'static str {
+    r#"
 #[derive(Clone)]
 struct AppState {
     db: sqlx::PgPool,
@@ -965,104 +986,101 @@ fn routes(app_state: AppState) -> axum::Router {
         .route("/", axum::routing::get(root))
         .with_state(app_state)
 }
-"#,
-    );
+"#
+}
 
-    // Sessions implementation only if sessions are enabled
+fn generate_session_handler(no_sessions: bool) -> &'static str {
     if no_sessions {
         // Simple root handler without sessions
-        content.push_str(
-            r#"
-    async fn root() -> impl IntoResponse {
-        html! {
-            html {
-                head {
-                    title { "CJA Site" }
-                }
-                body {
-                    h1 { "Hello, World!" }
-                }
+        r#"
+async fn root() -> impl IntoResponse {
+    html! {
+        html {
+            head {
+                title { "CJA Site" }
+            }
+            body {
+                h1 { "Hello, World!" }
             }
         }
     }
-    "#,
-        );
+}
+"#
     } else {
-        content.push_str(
-            r#"
-    struct SiteSession {
-        inner: CJASession,
-    }
+        r#"
+struct SiteSession {
+    inner: CJASession,
+}
 
-    #[async_trait::async_trait]
-    impl AppSession for SiteSession {
-        async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
-            let row = sqlx::query!(
-                "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
-                session_id
-            )
-            .fetch_one(pool)
-            .await?;
+#[async_trait::async_trait]
+impl AppSession for SiteSession {
+    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
+        let row = sqlx::query!(
+            "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
+            session_id
+        )
+        .fetch_one(pool)
+        .await?;
 
-            let session = SiteSession {
-                inner: CJASession {
-                    session_id: row.session_id,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                },
-            };
-
-            Ok(session)
-        }
-
-        async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
-            let row = sqlx::query!(
-                "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",
-            )
-            .fetch_one(pool)
-            .await?;
-
-            let inner = CJASession {
+        let session = SiteSession {
+            inner: CJASession {
                 session_id: row.session_id,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
-            };
+            },
+        };
 
-            Ok(Self { inner })
-        }
-
-        fn from_inner(inner: CJASession) -> Self {
-            Self { inner }
-        }
-
-        fn inner(&self) -> &CJASession {
-            &self.inner
-        }
+        Ok(session)
     }
 
-    async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
-        html! {
-            html {
-                head {
-                    title { "CJA Site" }
-                }
-                body {
-                    h1 { "Hello, World!" }
+    async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
+        let row = sqlx::query!(
+            "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",
+        )
+        .fetch_one(pool)
+        .await?;
 
-                    h4 { "Session" }
-                    p { "Session ID: " (session.session_id()) }
-                    p { "Created At: " (session.created_at()) }
-                    p { "Updated At: " (session.updated_at()) }
-                }
+        let inner = CJASession {
+            session_id: row.session_id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        };
+
+        Ok(Self { inner })
+    }
+
+    fn from_inner(inner: CJASession) -> Self {
+        Self { inner }
+    }
+
+    fn inner(&self) -> &CJASession {
+        &self.inner
+    }
+}
+
+async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
+    html! {
+        html {
+            head {
+                title { "CJA Site" }
+            }
+            body {
+                h1 { "Hello, World!" }
+
+                h4 { "Session" }
+                p { "Session ID: " (session.session_id()) }
+                p { "Created At: " (session.created_at()) }
+                p { "Updated At: " (session.updated_at()) }
             }
         }
     }
-    "#,
-        );
+}
+"#
     }
+}
 
-    // Spawn application tasks function
-    content.push_str(
+fn generate_spawn_tasks(no_jobs: bool, no_cron: bool) -> String {
+    let mut tasks = String::from(
         r#"
 /// Spawn all application background tasks
 fn spawn_application_tasks(
@@ -1081,7 +1099,7 @@ fn spawn_application_tasks(
 
     // Add jobs worker if jobs are enabled
     if !no_jobs {
-        content.push_str(
+        tasks.push_str(
             r#"
     // Initialize job worker if enabled
     if is_feature_enabled("JOBS") {
@@ -1099,7 +1117,7 @@ fn spawn_application_tasks(
 
     // Add cron worker if cron is enabled
     if !no_cron {
-        content.push_str(
+        tasks.push_str(
             r#"
     // Initialize cron worker if enabled
     if is_feature_enabled("CRON") {
@@ -1112,7 +1130,7 @@ fn spawn_application_tasks(
         );
     }
 
-    content.push_str(
+    tasks.push_str(
         r#"
     info!("All application tasks spawned successfully");
     futures
@@ -1127,74 +1145,91 @@ fn is_feature_enabled(feature: &str) -> bool {
 }
 "#,
     );
+    
+    tasks
+}
 
-    // Add jobs module if jobs are enabled
-    if !no_jobs {
-        content.push_str(
-            r#"
+fn generate_jobs_module() -> &'static str {
+    r#"
 mod jobs {
+    use cja::jobs::{Job, JobInfo};
     use serde::{Deserialize, Serialize};
 
-    use super::AppState;
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct NoopJob;
+    // Example job
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ExampleJob {
+        pub message: String,
+    }
 
     #[async_trait::async_trait]
-    impl cja::jobs::Job<AppState> for NoopJob {
-        const NAME: &'static str = "NoopJob";
+    impl Job for ExampleJob {
+        const NAME: &'static str = "ExampleJob";
 
-        async fn run(&self, _app_state: AppState) -> cja::Result<()> {
+        async fn run(&self, _app_state: impl cja::app_state::AppState) -> cja::Result<()> {
+            tracing::info!("Running ExampleJob with message: {}", self.message);
             Ok(())
         }
     }
 
-    cja::impl_job_registry!(AppState, NoopJob);
+    // Job registry
+    #[derive(Clone)]
+    pub struct Jobs;
+
+    cja::impl_job_registry!(Jobs => ExampleJob);
 }
-"#,
-        );
+"#
+}
+
+fn generate_cron_module() -> &'static str {
+    r#"
+mod cron {
+    use cja::cron::{Cron, CronRegistry};
+
+    pub async fn run_cron(app_state: impl cja::app_state::AppState) -> cja::Result<()> {
+        let mut cron = CronRegistry::new(app_state);
+
+        // Example cron job that runs every hour
+        // cron.register_fn(
+        //     "hourly_task",
+        //     "@hourly",
+        //     |app_state| async move {
+        //         let job = super::jobs::ExampleJob {
+        //             message: "Hourly cron job".to_string(),
+        //         };
+        //         job.enqueue(&app_state).await?;
+        //         Ok(())
+        //     }
+        // )?;
+
+        cron.run().await
+    }
+}
+"#
+}
+
+fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
+    let mut content = String::new();
+
+    // Add imports
+    content.push_str(&generate_imports(no_sessions));
+    
+    // Add app state implementation
+    content.push_str(generate_app_state_impl());
+
+    // Add session handler
+    content.push_str(generate_session_handler(no_sessions));
+    
+    // Add spawn tasks function
+    content.push_str(&generate_spawn_tasks(no_jobs, no_cron));
+
+    // Add jobs module if jobs are enabled
+    if !no_jobs {
+        content.push_str(generate_jobs_module());
     }
 
     // Add cron module if cron is enabled
-    if !no_cron {
-        content.push_str(
-            r"
-mod cron {
-    use std::time::Duration;
-
-    use cja::cron::{CronRegistry, Worker};
-",
-        );
-
-        // Only import NoopJob if jobs are also enabled
-        if !no_jobs {
-            content.push_str("\n    use crate::jobs::NoopJob;\n");
-        }
-
-        content.push_str(
-            r"
-    use super::AppState;
-
-    pub(crate) async fn run_cron(app_state: AppState) -> cja::Result<()> {
-        Ok(Worker::new(app_state, cron_registry()).run().await?)
-    }
-
-    fn cron_registry() -> cja::cron::CronRegistry<AppState> {
-        let mut registry = CronRegistry::new();
-",
-        );
-
-        // Only register NoopJob if jobs are enabled
-        if !no_jobs {
-            content.push_str("        registry.register_job(NoopJob, Duration::from_secs(60));\n");
-        }
-
-        content.push_str(
-            r"        registry
-    }
-}
-",
-        );
+    if !no_cron && !no_jobs {
+        content.push_str(generate_cron_module());
     }
 
     content

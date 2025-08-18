@@ -14,7 +14,8 @@
       "Bash(mv:*)",
       "Bash(rg:*)",
       "Bash(rm:*)",
-      "WebFetch(domain:docs.rs)"
+      "WebFetch(domain:docs.rs)",
+      "Bash(jj status:*)"
     ],
     "deny": []
   }
