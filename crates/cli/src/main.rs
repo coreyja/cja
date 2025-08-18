@@ -383,7 +383,7 @@ fn create_project(
 ///
 /// * `bin_name` - Optional binary name (defaults to project name from Cargo.toml)
 /// * `no_cron` - If true, excludes cron scheduling functionality
-/// * `no_jobs` - If true, excludes background job processing functionality  
+/// * `no_jobs` - If true, excludes background job processing functionality
 /// * `no_sessions` - If true, excludes session management functionality
 /// * `github_repo` - Optional GitHub repository URL to use instead of crates.io
 /// * `branch` - GitHub branch to use (defaults to "main")
@@ -430,13 +430,24 @@ fn init_project(
 
     let bin_name = bin_name.map_or(package_name, std::string::String::as_str);
 
+    // Check if a binary with this name already exists in Cargo.toml
+    if let Some(bins) = toml_value.get("bin").and_then(|b| b.as_array()) {
+        for bin in bins {
+            if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
+                if name == bin_name {
+                    anyhow::bail!("A binary named '{}' already exists in Cargo.toml", bin_name);
+                }
+            }
+        }
+    }
+
     // Create src/bin directory if it doesn't exist
     let bin_dir = Path::new("src").join("bin");
     if !bin_dir.exists() {
         fs::create_dir_all(&bin_dir).context("Failed to create src/bin directory")?;
     }
 
-    // Check if the binary already exists
+    // Check if the binary file already exists
     let bin_file_path = bin_dir.join(format!("{bin_name}.rs"));
     if bin_file_path.exists() {
         anyhow::bail!("Binary file '{}' already exists", bin_file_path.display());
@@ -497,7 +508,7 @@ fn init_project(
     for (dep, version, features) in deps {
         let mut cmd = ProcessCommand::new("cargo");
         cmd.arg("add");
-        
+
         // Use name@version syntax
         if let Some(v) = version {
             cmd.arg(format!("{dep}@{v}"));
@@ -543,6 +554,41 @@ fn init_project(
         );
     }
 
+    let cargo_toml_content =
+        fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
+
+    // Parse the Cargo.toml to check for existing [[bin]] sections
+    let toml_check: toml::Value = cargo_toml_content
+        .parse()
+        .context("Failed to parse updated Cargo.toml")?;
+
+    let mut bin_exists = false;
+    if let Some(bins) = toml_check.get("bin").and_then(|b| b.as_array()) {
+        for bin in bins {
+            if let Some(name) = bin.get("name").and_then(|n| n.as_str()) {
+                if name == bin_name {
+                    bin_exists = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Add [[bin]] section if it doesn't exist
+    if !bin_exists {
+        let mut updated_cargo_toml = cargo_toml_content;
+        updated_cargo_toml.push_str(&format!(
+            r#"
+
+[[bin]]
+name = "{bin_name}"
+path = "src/bin/{bin_name}.rs"
+"#
+        ));
+
+        fs::write(cargo_toml_path, updated_cargo_toml).context("Failed to update Cargo.toml")?;
+    }
+
     // Create the binary file
     let main_content = generate_main_rs(no_cron, no_jobs, no_sessions);
     fs::write(&bin_file_path, main_content)
@@ -553,24 +599,6 @@ fn init_project(
     if !build_rs_path.exists() {
         let build_rs_content = generate_build_rs();
         fs::write(build_rs_path, build_rs_content).context("Failed to write build.rs")?;
-    }
-
-    // Add [[bin]] entry to Cargo.toml
-    let mut cargo_toml_content =
-        fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
-
-    // Check if [[bin]] section already exists for this binary
-    if !cargo_toml_content.contains(&format!("name = \"{bin_name}\"")) {
-        cargo_toml_content.push_str(&format!(
-            r#"
-
-[[bin]]
-name = "{bin_name}"
-path = "src/bin/{bin_name}.rs"
-"#
-        ));
-
-        fs::write(cargo_toml_path, cargo_toml_content).context("Failed to update Cargo.toml")?;
     }
 
     // Copy migration files based on feature flags
@@ -704,7 +732,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .all_build()
         .all_git()
         .emit()?;
-    
+
     Ok(())
 }
 "#
@@ -719,7 +747,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # Arguments
 ///
 /// * `no_cron` - If true, excludes cron scheduling module and worker spawning
-/// * `no_jobs` - If true, excludes background job module and worker spawning  
+/// * `no_jobs` - If true, excludes background job module and worker spawning
 /// * `no_sessions` - If true, excludes session management and uses simple route handlers
 ///
 /// # Returns
