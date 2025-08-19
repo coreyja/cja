@@ -110,7 +110,7 @@ use std::process::Command as ProcessCommand;
 /// ```
 fn build_cli() -> Command {
     const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")");
-    
+
     Command::new("cja")
         .version(VERSION)
         .about("CJA CLI for project scaffolding")
@@ -434,9 +434,10 @@ fn init_project(
     if let Some(bins) = toml_value.get("bin").and_then(|b| b.as_array()) {
         for bin in bins {
             if let Some(name) = bin.get("name").and_then(|n| n.as_str())
-                && name == bin_name {
-                    anyhow::bail!("A binary named '{}' already exists in Cargo.toml", bin_name);
-                }
+                && name == bin_name
+            {
+                anyhow::bail!("A binary named '{}' already exists in Cargo.toml", bin_name);
+            }
         }
     }
 
@@ -460,7 +461,7 @@ fn init_project(
 
     // Add dependencies
     add_dependencies(github_repo, branch)?;
-    
+
     // Update Cargo.toml with [[bin]] section
     update_cargo_toml_bin(bin_name)?;
 
@@ -497,7 +498,7 @@ fn init_project(
     Ok(())
 }
 
-// Helper function to add dependencies to a Cargo project  
+// Helper function to add dependencies to a Cargo project
 fn add_dependencies(github_repo: Option<&String>, branch: &str) -> Result<()> {
     // Add CJA dependency using cargo add
     println!("Adding CJA dependency...");
@@ -593,7 +594,7 @@ fn add_dependencies(github_repo: Option<&String>, branch: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    
+
     Ok(())
 }
 
@@ -612,10 +613,11 @@ fn update_cargo_toml_bin(bin_name: &str) -> Result<()> {
     if let Some(bins) = toml_check.get("bin").and_then(|b| b.as_array()) {
         for bin in bins {
             if let Some(name) = bin.get("name").and_then(|n| n.as_str())
-                && name == bin_name {
-                    bin_exists = true;
-                    break;
-                }
+                && name == bin_name
+            {
+                bin_exists = true;
+                break;
+            }
         }
     }
 
@@ -623,21 +625,22 @@ fn update_cargo_toml_bin(bin_name: &str) -> Result<()> {
     if !bin_exists {
         let mut updated_cargo_toml = cargo_toml_content;
         use std::fmt::Write;
-        write!(updated_cargo_toml,
+        write!(
+            updated_cargo_toml,
             r#"
 
 [[bin]]
 name = "{bin_name}"
 path = "src/bin/{bin_name}.rs"
 "#
-        ).unwrap();
+        )
+        .unwrap();
 
         fs::write(cargo_toml_path, updated_cargo_toml).context("Failed to update Cargo.toml")?;
     }
-    
+
     Ok(())
 }
-
 
 /// Generates the `Cargo.toml` content for a new CJA project.
 ///
@@ -878,7 +881,7 @@ use tracing::info;
 use async_trait::async_trait;
 ",
     );
-    
+
     imports
 }
 
@@ -1145,7 +1148,7 @@ fn is_feature_enabled(feature: &str) -> bool {
 }
 "#,
     );
-    
+
     tasks
 }
 
@@ -1212,13 +1215,13 @@ fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
 
     // Add imports
     content.push_str(&generate_imports(no_sessions));
-    
+
     // Add app state implementation
     content.push_str(generate_app_state_impl());
 
     // Add session handler
     content.push_str(generate_session_handler(no_sessions));
-    
+
     // Add spawn tasks function
     content.push_str(&generate_spawn_tasks(no_jobs, no_cron));
 

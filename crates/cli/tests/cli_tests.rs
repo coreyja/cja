@@ -11,7 +11,7 @@ fn test_version_flag() {
         .stdout(str::contains("cja"));
 }
 
-#[test] 
+#[test]
 fn test_version_short_flag() {
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("-V")
@@ -82,10 +82,16 @@ fn test_new_command_with_no_sessions_flag() {
 fn test_new_command_with_all_flags() {
     let temp = assert_fs::TempDir::new().unwrap();
     let mut cmd = Command::cargo_bin("cja").unwrap();
-    cmd.args(["new", "test-project-5", "--no-cron", "--no-jobs", "--no-sessions"])
-        .current_dir(&temp)
-        .assert()
-        .success();
+    cmd.args([
+        "new",
+        "test-project-5",
+        "--no-cron",
+        "--no-jobs",
+        "--no-sessions",
+    ])
+    .current_dir(&temp)
+    .assert()
+    .success();
 }
 
 #[test]
@@ -142,12 +148,17 @@ fn test_init_command_github_flag_help() {
 #[test]
 fn test_init_command_branch_requires_github() {
     let temp_dir = assert_fs::TempDir::new().unwrap();
-    temp_dir.child("Cargo.toml").write_str(r#"[package]
+    temp_dir
+        .child("Cargo.toml")
+        .write_str(
+            r#"[package]
 name = "test-project"
 version = "0.1.0"
 edition = "2021"
-"#).unwrap();
-    
+"#,
+        )
+        .unwrap();
+
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.current_dir(&temp_dir)
         .args(["init", "--branch", "develop"])
