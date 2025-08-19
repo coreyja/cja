@@ -1,14 +1,21 @@
 {
   "permissions": {
     "allow": [
-      "Bash(mkdir:*)",
-      "Bash(cargo clippy:*)",
-      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
       "Bash(cargo check:*)",
       "Bash(cargo clippy:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo test:*)",
+      "Bash(gh pr comment:*)",
       "Bash(gh pr view:*)",
+      "Bash(grep:*)",
+      "Bash(jj new:*)",
+      "Bash(mkdir:*)",
+      "Bash(mv:*)",
       "Bash(rg:*)",
-      "Bash(gh pr comment:*)"
+      "Bash(rm:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(jj status:*)"
     ],
     "deny": []
   }
