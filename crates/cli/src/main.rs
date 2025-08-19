@@ -1,6 +1,6 @@
 //! # CJA CLI
 //!
-//! A command-line interface for scaffolding new [CJA](https://github.com/your-org/cja) projects.
+//! A command-line interface for scaffolding new [CJA](https://github.com/coreyja/cja) projects.
 //!
 //! CJA CLI generates fully functional web applications built on the CJA framework,
 //! with configurable features including background jobs, cron scheduling, and session management.
@@ -362,7 +362,7 @@ fn create_project(
         copy_jobs_migration(project_path)?;
     }
 
-    if !no_cron {
+    if !no_cron && !no_jobs {
         copy_cron_migrations(project_path)?;
     }
 
@@ -694,10 +694,11 @@ fn generate_cargo_toml(
     _no_sessions: bool,
 ) -> String {
     // Build CJA dependency line
+    let cja_version = env!("CARGO_PKG_VERSION");
     let cja_dep = if let Some(repo) = github_repo {
         format!(r#"cja = {{ git = "{repo}", branch = "{branch}" }}"#)
     } else {
-        r#"cja = { version = "0.0.0" }"#.to_string()
+        format!(r#"cja = {{ version = "{cja_version}" }}"#)
     };
 
     format!(

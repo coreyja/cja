@@ -7,9 +7,7 @@ description = "Command-line interface for scaffolding CJA projects"
 keywords = ["cli", "web", "scaffold", "generator", "cja"]
 categories = ["command-line-utilities", "development-tools", "web-programming"]
 readme = "README.md"
-repository = "https://github.com/your-org/cja"
-license = "MIT OR Apache-2.0"
-documentation = "https://docs.rs/cja-cli"
+repository = "https://github.com/coreyja/cja/crates/cli"
 
 [[bin]]
 name = "cja"
