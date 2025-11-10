@@ -18,6 +18,14 @@ pub enum EnqueueError {
 /// Jobs must be serializable and provide a unique name identifier. The job system
 /// handles persistence, retries, and concurrent execution automatically.
 ///
+/// # Automatic Retry Behavior
+///
+/// All jobs are automatically retried on failure with exponential backoff:
+/// - Failed jobs are requeued with increasing delays: 2, 4, 8, 16, 32... seconds
+/// - Error messages and failure timestamps are tracked in the database
+/// - Jobs are permanently deleted after exceeding the configured max retries (default: 20)
+/// - No manual intervention required for transient failures
+///
 /// # Example
 ///
 /// ```rust
@@ -44,7 +52,7 @@ pub enum EnqueueError {
 /// #[async_trait::async_trait]
 /// impl Job<MyAppState> for EmailJob {
 ///     const NAME: &'static str = "EmailJob";
-///     
+///
 ///     async fn run(&self, app_state: MyAppState) -> color_eyre::Result<()> {
 ///         // Send email logic here
 ///         println!("Sending email to {} with subject: {}", self.to, self.subject);
@@ -111,7 +119,7 @@ pub enum EnqueueError {
 /// #[async_trait::async_trait]
 /// impl Job<MyAppState> for ProcessPaymentJob {
 ///     const NAME: &'static str = "ProcessPaymentJob";
-///     
+///
 ///     async fn run(&self, app_state: MyAppState) -> color_eyre::Result<()> {
 ///         use crate::cja::app_state::AppState;
 ///         use sqlx::Row;
@@ -121,7 +129,7 @@ pub enum EnqueueError {
 ///             .bind(self.user_id)
 ///             .fetch_one(app_state.db())
 ///             .await?;
-///         
+///
 ///         println!("Processing payment of {} cents for user {} #{}",
 ///                  self.amount_cents, user.get::<String, _>("name"), self.user_id);
 ///
@@ -130,7 +138,7 @@ pub enum EnqueueError {
 ///             .bind(self.amount_cents)
 ///             .execute(app_state.db())
 ///             .await?;
-///         
+///
 ///         Ok(())
 ///     }
 /// }
@@ -147,6 +155,9 @@ pub trait Job<AppState: AS>:
     ///
     /// This method has access to the full application state,
     /// including the database connection pool.
+    ///
+    /// If this method returns an error, the job will be automatically retried
+    /// with exponential backoff until it succeeds or exceeds max retries.
     async fn run(&self, app_state: AppState) -> color_eyre::Result<()>;
 
     /// Internal method used by the job system to deserialize and run jobs.

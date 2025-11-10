@@ -204,6 +204,7 @@ fn spawn_application_tasks(
             app_state.clone(),
             jobs::Jobs,
             Duration::from_secs(60),
+            20,
         )));
     } else {
         info!("Jobs Disabled");
