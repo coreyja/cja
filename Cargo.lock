@@ -423,6 +423,7 @@ dependencies = [
  "assert_fs",
  "clap",
  "predicates",
+ "serde_json",
  "toml",
  "vergen",
 ]

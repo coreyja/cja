@@ -241,7 +241,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 /// When a job fails:
 /// - The error count is incremented
 /// - The error message and timestamp are recorded
-/// - The job is requeued with exponential backoff: delay = `2^(error_count)` seconds
+/// - The job is requeued with exponential backoff: delay = `2^(error_count + 1)` seconds
+///   (first retry: 2s, second: 4s, third: 8s, fourth: 16s, etc.)
 /// - If `error_count` >= `max_retries`, the job is permanently deleted
 ///
 /// # Example

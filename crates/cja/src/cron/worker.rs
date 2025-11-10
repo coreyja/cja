@@ -63,7 +63,7 @@ impl<AppState: AS> Worker<AppState> {
 
         let last_run_map: HashMap<String, DateTime<Utc>> = last_runs
             .iter()
-            .map(|row| (row.name.to_string(), row.last_run_at))
+            .map(|row| (row.name.clone(), row.last_run_at))
             .collect();
 
         Ok(last_run_map)

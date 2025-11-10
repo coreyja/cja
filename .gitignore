@@ -2,5 +2,3 @@ target/
 .env
 .envrc
 crates/cli/test-project-*
-
-agent-os/specs/

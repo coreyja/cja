@@ -154,7 +154,7 @@ async fn test_job_locking() {
     // Lock the job
     let worker_id = "test-worker-1";
     let locked = sqlx::query(
-        "UPDATE jobs SET locked_at = NOW(), locked_by = $1 
+        "UPDATE jobs SET locked_at = NOW(), locked_by = $1
          WHERE job_id = $2 AND locked_at IS NULL",
     )
     .bind(worker_id)
@@ -167,7 +167,7 @@ async fn test_job_locking() {
 
     // Try to lock again (should fail)
     let locked_again = sqlx::query(
-        "UPDATE jobs SET locked_at = NOW(), locked_by = $1 
+        "UPDATE jobs SET locked_at = NOW(), locked_by = $1
          WHERE job_id = $2 AND locked_at IS NULL",
     )
     .bind("another-worker")
@@ -234,4 +234,249 @@ async fn test_job_context() {
         .unwrap();
 
     assert_eq!(row.get::<String, _>("context"), context);
+}
+
+#[tokio::test]
+async fn test_failing_job_enqueue() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+    let app_state = crate::common::app::TestAppState::new(pool.clone());
+
+    let job = FailingJob {
+        id: "fail-test-1".to_string(),
+        should_fail: true,
+    };
+
+    // Enqueue the job
+    let result = job.enqueue(app_state, "test-failing".to_string()).await;
+    assert!(result.is_ok());
+
+    // Verify job is in database with initial error_count of 0
+    let row = sqlx::query(
+        "SELECT name, error_count, last_error_message, last_failed_at FROM jobs WHERE name = $1",
+    )
+    .bind(<FailingJob as Job<crate::common::app::TestAppState>>::NAME)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.get::<String, _>("name"), "FailingJob");
+    assert_eq!(row.get::<i32, _>("error_count"), 0);
+    assert!(row.get::<Option<String>, _>("last_error_message").is_none());
+    assert!(row
+        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_error_tracking_fields_present() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+    let app_state = crate::common::app::TestAppState::new(pool.clone());
+
+    let job = TestJob {
+        id: "error-fields-test".to_string(),
+        value: 42,
+    };
+
+    job.enqueue(app_state, "test-context".to_string())
+        .await
+        .unwrap();
+
+    // Verify error tracking fields exist and have correct defaults
+    let row = sqlx::query(
+        "SELECT error_count, last_error_message, last_failed_at FROM jobs WHERE name = $1",
+    )
+    .bind(<TestJob as Job<crate::common::app::TestAppState>>::NAME)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.get::<i32, _>("error_count"), 0);
+    assert!(row.get::<Option<String>, _>("last_error_message").is_none());
+    assert!(row
+        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_job_error_count_increment() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+
+    // Directly insert a job and simulate a failure update
+    let job_id = uuid::Uuid::new_v4();
+    let worker_id = "test-worker";
+
+    sqlx::query(
+        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW())",
+    )
+    .bind(job_id)
+    .bind("TestJob")
+    .bind(serde_json::json!({"id": "test", "value": 1}))
+    .bind(0)
+    .bind("test")
+    .bind(0)
+    .bind(worker_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Simulate job failure with exponential backoff (like the worker does)
+    let error_message = "Test error occurred";
+    sqlx::query(
+        "UPDATE jobs
+         SET locked_by = NULL,
+             locked_at = NULL,
+             error_count = error_count + 1,
+             last_error_message = $3,
+             last_failed_at = NOW(),
+             run_at = NOW() + (POWER(2, error_count + 1)) * interval '1 second'
+         WHERE job_id = $1 AND locked_by = $2",
+    )
+    .bind(job_id)
+    .bind(worker_id)
+    .bind(error_message)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Verify error tracking was updated
+    let row = sqlx::query(
+        "SELECT error_count, last_error_message, last_failed_at, run_at FROM jobs WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.get::<i32, _>("error_count"), 1);
+    assert_eq!(
+        row.get::<Option<String>, _>("last_error_message"),
+        Some(error_message.to_string())
+    );
+    assert!(row
+        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+        .is_some());
+
+    // Verify run_at was pushed forward (should be at least 2 seconds in future)
+    let run_at = row.get::<chrono::DateTime<chrono::Utc>, _>("run_at");
+    assert!(run_at > chrono::Utc::now());
+}
+
+#[tokio::test]
+async fn test_exponential_backoff_calculation() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+
+    // Test that exponential backoff follows 2^(error_count + 1) formula
+    let job_id = uuid::Uuid::new_v4();
+    let worker_id = "test-worker";
+
+    // Start with error_count = 5 to test higher backoff values
+    sqlx::query(
+        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW())",
+    )
+    .bind(job_id)
+    .bind("TestJob")
+    .bind(serde_json::json!({"id": "test", "value": 1}))
+    .bind(0)
+    .bind("test")
+    .bind(5) // error_count = 5
+    .bind(worker_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let before_update = chrono::Utc::now();
+
+    // Simulate failure - should set run_at to NOW() + 2^6 seconds = 64 seconds
+    sqlx::query(
+        "UPDATE jobs
+         SET locked_by = NULL,
+             locked_at = NULL,
+             error_count = error_count + 1,
+             last_error_message = $3,
+             last_failed_at = NOW(),
+             run_at = NOW() + (POWER(2, error_count + 1)) * interval '1 second'
+         WHERE job_id = $1 AND locked_by = $2",
+    )
+    .bind(job_id)
+    .bind(worker_id)
+    .bind("test error")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let row = sqlx::query("SELECT error_count, run_at FROM jobs WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<i32, _>("error_count"), 6);
+
+    // run_at should be approximately 64 seconds (2^6) in the future
+    // Allow some tolerance for test execution time
+    let run_at = row.get::<chrono::DateTime<chrono::Utc>, _>("run_at");
+    let actual_delay = run_at - before_update;
+
+    // Should be between 63 and 66 seconds to account for timing
+    assert!(
+        actual_delay >= chrono::Duration::seconds(63)
+            && actual_delay <= chrono::Duration::seconds(66),
+        "Expected delay ~64 seconds, got {:?}",
+        actual_delay
+    );
+}
+
+#[tokio::test]
+async fn test_max_retries_exceeded_deletes_job() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+
+    let job_id = uuid::Uuid::new_v4();
+    let worker_id = "test-worker";
+    let max_retries = 20;
+
+    // Insert a job that has already hit max retries
+    sqlx::query(
+        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW())",
+    )
+    .bind(job_id)
+    .bind("TestJob")
+    .bind(serde_json::json!({"id": "test", "value": 1}))
+    .bind(0)
+    .bind("test")
+    .bind(max_retries) // At max retries
+    .bind(worker_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Verify job exists
+    let count_before = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get::<Option<i64>, _>("count")
+        .unwrap();
+    assert_eq!(count_before, 1);
+
+    // Simulate the worker deleting the job after max retries
+    sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Verify job was deleted
+    let count_after = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get::<Option<i64>, _>("count")
+        .unwrap();
+    assert_eq!(count_after, 0);
 }
