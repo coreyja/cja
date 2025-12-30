@@ -108,6 +108,7 @@ use std::process::Command as ProcessCommand;
 /// cja --help
 /// cja --version
 /// ```
+#[allow(clippy::too_many_lines)]
 fn build_cli() -> Command {
     const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")");
 
@@ -204,6 +205,16 @@ fn build_cli() -> Command {
                         .requires("github"),
                 ),
         )
+        .subcommand(
+            Command::new("sync-migrations")
+                .about("Sync migration files from the CJA crate to your project")
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .help("Show what would be copied without actually copying")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
 }
 
 fn main() -> Result<()> {
@@ -255,7 +266,157 @@ fn main() -> Result<()> {
 
             init_project(bin_name, no_cron, no_jobs, no_sessions, github_repo, branch)?;
         }
+        Some(("sync-migrations", sub_matches)) => {
+            let dry_run = sub_matches.get_flag("dry-run");
+            sync_migrations(dry_run)?;
+        }
         _ => unreachable!("Subcommand required"),
+    }
+
+    Ok(())
+}
+
+/// Syncs migration files from the installed CJA crate to the current project.
+///
+/// This function uses `cargo metadata` to locate the installed CJA crate,
+/// finds its migrations directory, and copies all migration files to the
+/// current project's migrations directory.
+///
+/// # Arguments
+///
+/// * `dry_run` - If true, shows what would be copied without actually copying
+///
+/// # Returns
+///
+/// - `Ok(())` on successful sync
+/// - `Err(anyhow::Error)` if sync fails
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - Not in a Cargo project directory
+/// - CJA crate is not found in dependencies
+/// - CJA crate's migrations directory doesn't exist
+/// - Unable to create migrations directory
+/// - File copying fails
+fn sync_migrations(dry_run: bool) -> Result<()> {
+    // Check if we're in a Cargo project
+    let cargo_toml_path = Path::new("Cargo.toml");
+    if !cargo_toml_path.exists() {
+        anyhow::bail!("No Cargo.toml found. Please run this command in a Rust project directory.");
+    }
+
+    // Create migrations directory if it doesn't exist
+    let migrations_dir = Path::new("migrations");
+    if !migrations_dir.exists() && !dry_run {
+        fs::create_dir(migrations_dir).context("Failed to create migrations directory")?;
+        println!("Created migrations directory");
+    }
+
+    // Use cargo metadata to find the cja crate
+    let output = ProcessCommand::new("cargo")
+        .args(["metadata", "--format-version=1"])
+        .output()
+        .context("Failed to run cargo metadata")?;
+
+    if !output.status.success() {
+        anyhow::bail!("cargo metadata failed");
+    }
+
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("Failed to parse cargo metadata")?;
+
+    // Find the cja package in the dependency graph
+    let packages = metadata["packages"]
+        .as_array()
+        .context("Invalid metadata format")?;
+
+    let cja_package = packages
+        .iter()
+        .find(|p| p["name"].as_str() == Some("cja"))
+        .context(
+            "CJA crate not found in dependencies. Please ensure cja is listed in Cargo.toml",
+        )?;
+
+    let cja_manifest_path = cja_package["manifest_path"]
+        .as_str()
+        .context("Could not find cja manifest path")?;
+
+    // Get the directory containing the manifest
+    let cja_dir = Path::new(cja_manifest_path)
+        .parent()
+        .context("Could not determine cja crate directory")?;
+
+    let cja_migrations_dir = cja_dir.join("migrations");
+
+    if !cja_migrations_dir.exists() {
+        anyhow::bail!(
+            "CJA migrations directory not found at: {}",
+            cja_migrations_dir.display()
+        );
+    }
+
+    // Read all migration files from the cja crate
+    let entries = fs::read_dir(&cja_migrations_dir).with_context(|| {
+        format!(
+            "Failed to read CJA migrations directory: {}",
+            cja_migrations_dir.display()
+        )
+    })?;
+
+    let mut copied_count = 0;
+    let mut skipped_count = 0;
+
+    for entry in entries {
+        let entry = entry.context("Failed to read directory entry")?;
+        let path = entry.path();
+
+        // Skip if not a file
+        if !path.is_file() {
+            continue;
+        }
+
+        let file_name = path
+            .file_name()
+            .context("Could not get file name")?
+            .to_str()
+            .context("File name is not valid UTF-8")?;
+
+        // Only copy .sql files
+        if !std::path::Path::new(file_name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+        {
+            continue;
+        }
+
+        let dest_path = migrations_dir.join(file_name);
+
+        if dest_path.exists() {
+            println!("  ⏭️  Skipping {file_name} (already exists)");
+            skipped_count += 1;
+            continue;
+        }
+
+        if dry_run {
+            println!("  📋 Would copy: {file_name}");
+        } else {
+            fs::copy(&path, &dest_path).with_context(|| format!("Failed to copy {file_name}"))?;
+            println!("  ✅ Copied: {file_name}");
+        }
+        copied_count += 1;
+    }
+
+    println!("\n🎉 Migration sync complete!");
+    if dry_run {
+        println!("   Would copy: {copied_count} file(s)");
+    } else {
+        println!("   Copied: {copied_count} file(s)");
+    }
+    println!("   Skipped: {skipped_count} file(s) (already exist)");
+
+    if dry_run {
+        println!("\nRun without --dry-run to actually copy the files.");
     }
 
     Ok(())
@@ -360,6 +521,7 @@ fn create_project(
     // Copy migration files based on feature flags
     if !no_jobs {
         copy_jobs_migration(project_path)?;
+        copy_job_error_tracking_migration(project_path)?;
     }
 
     if !no_cron && !no_jobs {
@@ -480,6 +642,7 @@ fn init_project(
     // Copy migration files based on feature flags
     if !no_jobs {
         copy_jobs_migration(Path::new("."))?;
+        copy_job_error_tracking_migration(Path::new("."))?;
     }
 
     if !no_cron && !no_jobs {
@@ -1107,10 +1270,14 @@ fn spawn_application_tasks(
             r#"
     // Initialize job worker if enabled
     if is_feature_enabled("JOBS") {
+        use std::time::Duration;
+
         info!("Jobs Enabled");
         futures.push(tokio::spawn(cja::jobs::worker::job_worker(
             app_state.clone(),
             jobs::Jobs,
+            Duration::from_secs(60),
+            cja::jobs::DEFAULT_MAX_RETRIES,
         )));
     } else {
         info!("Jobs Disabled");
@@ -1440,6 +1607,68 @@ DROP TABLE Crons;
 /// DROP FUNCTION IF EXISTS update_updated_at_column();
 /// ```
 ///
+/// Copies the job error tracking migration file to the new project.
+///
+/// Creates the SQL migration file for job error tracking. This migration
+/// adds error tracking fields to the Jobs table to support retry logic
+/// and error reporting.
+///
+/// # Arguments
+///
+/// * `project_path` - Path to the project directory where migrations should be created
+///
+/// # Returns
+///
+/// - `Ok(())` on successful migration file creation
+/// - `Err(anyhow::Error)` if file writing fails
+///
+/// # Generated Migration
+///
+/// Creates `migrations/20251109000000_AddJobErrorTracking.sql` with:
+/// - `error_count` column to track number of failures
+/// - `last_error_message` column to store most recent error message
+/// - `last_failed_at` column to store timestamp of most recent failure
+///
+/// # Database Schema
+///
+/// ```sql
+/// ALTER TABLE Jobs
+/// ADD COLUMN IF NOT EXISTS error_count INTEGER NOT NULL DEFAULT 0;
+///
+/// ALTER TABLE Jobs
+/// ADD COLUMN IF NOT EXISTS last_error_message TEXT;
+///
+/// ALTER TABLE Jobs
+/// ADD COLUMN IF NOT EXISTS last_failed_at TIMESTAMPTZ;
+/// ```
+fn copy_job_error_tracking_migration(project_path: &Path) -> Result<()> {
+    let job_error_tracking_migration = r"-- Add error tracking fields to jobs table
+-- Add migration script here
+
+-- Add error_count column (tracks number of failures)
+ALTER TABLE Jobs
+ADD COLUMN IF NOT EXISTS error_count INTEGER NOT NULL DEFAULT 0;
+
+-- Add last_error_message column (stores most recent error message)
+ALTER TABLE Jobs
+ADD COLUMN IF NOT EXISTS last_error_message TEXT;
+
+-- Add last_failed_at column (stores timestamp of most recent failure)
+ALTER TABLE Jobs
+ADD COLUMN IF NOT EXISTS last_failed_at TIMESTAMPTZ;
+";
+
+    fs::write(
+        project_path
+            .join("migrations")
+            .join("20251109000000_AddJobErrorTracking.sql"),
+        job_error_tracking_migration,
+    )
+    .context("Failed to write job error tracking migration")?;
+
+    Ok(())
+}
+
 /// # `PostgreSQL` Features
 ///
 /// - Uses `gen_random_uuid()` for automatic UUID generation

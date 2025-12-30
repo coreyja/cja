@@ -36,8 +36,8 @@ pub async fn seed_test_job(
     let job_id = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(job_id)
     .bind(job_name)
@@ -46,6 +46,7 @@ pub async fn seed_test_job(
     .bind(chrono::Utc::now())
     .bind(chrono::Utc::now())
     .bind(context)
+    .bind(0)
     .execute(pool)
     .await?;
 
@@ -55,7 +56,8 @@ pub async fn seed_test_job(
 #[allow(dead_code)]
 pub async fn get_job_by_id(pool: &PgPool, job_id: Uuid) -> cja::Result<Option<JobInfo>> {
     let row = sqlx::query(
-        "SELECT job_id, name, payload, locked_at, locked_by FROM jobs WHERE job_id = $1",
+        "SELECT job_id, name, payload, locked_at, locked_by, error_count, last_error_message, last_failed_at
+         FROM jobs WHERE job_id = $1",
     )
     .bind(job_id)
     .fetch_optional(pool)
@@ -67,6 +69,9 @@ pub async fn get_job_by_id(pool: &PgPool, job_id: Uuid) -> cja::Result<Option<Jo
         payload: r.get("payload"),
         locked_at: r.get("locked_at"),
         locked_by: r.get("locked_by"),
+        error_count: r.get("error_count"),
+        last_error_message: r.get("last_error_message"),
+        last_failed_at: r.get("last_failed_at"),
     }))
 }
 
@@ -86,4 +91,7 @@ pub struct JobInfo {
     pub payload: serde_json::Value,
     pub locked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub locked_by: Option<String>,
+    pub error_count: i32,
+    pub last_error_message: Option<String>,
+    pub last_failed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
