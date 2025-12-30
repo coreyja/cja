@@ -262,9 +262,10 @@ async fn test_failing_job_enqueue() {
     assert_eq!(row.get::<String, _>("name"), "FailingJob");
     assert_eq!(row.get::<i32, _>("error_count"), 0);
     assert!(row.get::<Option<String>, _>("last_error_message").is_none());
-    assert!(row
-        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
-        .is_none());
+    assert!(
+        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -292,9 +293,10 @@ async fn test_error_tracking_fields_present() {
 
     assert_eq!(row.get::<i32, _>("error_count"), 0);
     assert!(row.get::<Option<String>, _>("last_error_message").is_none());
-    assert!(row
-        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
-        .is_none());
+    assert!(
+        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -353,9 +355,10 @@ async fn test_job_error_count_increment() {
         row.get::<Option<String>, _>("last_error_message"),
         Some(error_message.to_string())
     );
-    assert!(row
-        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
-        .is_some());
+    assert!(
+        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+            .is_some()
+    );
 
     // Verify run_at was pushed forward (should be at least 2 seconds in future)
     let run_at = row.get::<chrono::DateTime<chrono::Utc>, _>("run_at");
@@ -423,8 +426,7 @@ async fn test_exponential_backoff_calculation() {
     assert!(
         actual_delay >= chrono::Duration::seconds(63)
             && actual_delay <= chrono::Duration::seconds(66),
-        "Expected delay ~64 seconds, got {:?}",
-        actual_delay
+        "Expected delay ~64 seconds, got {actual_delay:?}"
     );
 }
 

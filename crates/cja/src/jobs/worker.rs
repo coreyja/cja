@@ -7,6 +7,14 @@ use crate::app_state::AppState as AS;
 
 use super::registry::JobRegistry;
 
+/// Default maximum number of retry attempts before a job is permanently deleted.
+///
+/// With exponential backoff (`2^(error_count+1)` seconds), 20 retries means:
+/// - First retry after 2 seconds
+/// - Last retry after ~6 days
+/// - Total retry window of ~12 days
+pub const DEFAULT_MAX_RETRIES: i32 = 20;
+
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
 #[derive(Debug)]

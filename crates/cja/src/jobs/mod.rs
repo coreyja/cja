@@ -5,6 +5,8 @@ use tracing::instrument;
 
 pub mod registry;
 
+pub use worker::DEFAULT_MAX_RETRIES;
+
 #[derive(Debug, Error)]
 pub enum EnqueueError {
     #[error("SqlxError: {0}")]

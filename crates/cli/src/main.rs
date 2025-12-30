@@ -1277,7 +1277,7 @@ fn spawn_application_tasks(
             app_state.clone(),
             jobs::Jobs,
             Duration::from_secs(60),
-            20,
+            cja::jobs::DEFAULT_MAX_RETRIES,
         )));
     } else {
         info!("Jobs Disabled");
