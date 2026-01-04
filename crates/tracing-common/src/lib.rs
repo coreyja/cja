@@ -1,6 +1,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use color_eyre::eyre::Context;
+use eyes_subscriber::{EyesLayer, EyesSubscriberBuilder};
 use opentelemetry_otlp::WithExportConfig;
 use sentry::ClientInitGuard;
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -8,6 +9,10 @@ use tracing_subscriber::{
     layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter, Layer as _, Registry,
 };
 use tracing_tree::HierarchicalLayer;
+use uuid::Uuid;
+
+// Re-export for consumers
+pub use eyes_subscriber::EyesShutdownHandle;
 
 pub fn setup_sentry() -> Option<ClientInitGuard> {
     let git_commit: Option<std::borrow::Cow<_>> =
@@ -33,7 +38,20 @@ pub fn setup_sentry() -> Option<ClientInitGuard> {
     }
 }
 
-pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<()> {
+/// Sets up tracing with optional Eyes, Honeycomb, and stdout layers.
+///
+/// Returns an optional `EyesShutdownHandle` that should be used for graceful shutdown
+/// when Eyes is configured (via `EYES_ORG_ID` and `EYES_APP_ID` environment variables).
+///
+/// # Environment Variables
+///
+/// - `RUST_LOG`: Log filter (defaults to `info,{crate_name}=trace,tower_http=debug,serenity=error`)
+/// - `JSON_LOGS`: If set, outputs JSON logs instead of hierarchical
+/// - `HONEYCOMB_API_KEY`: Enables Honeycomb tracing
+/// - `EYES_ORG_ID`: Eyes organization ID (UUID)
+/// - `EYES_APP_ID`: Eyes application ID (UUID)
+/// - `EYES_URL`: Eyes server URL (defaults to `https://eyes.coreyja.com`)
+pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<Option<EyesShutdownHandle>> {
     let rust_log = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| format!("info,{crate_name}=trace,tower_http=debug,serenity=error"));
 
@@ -67,6 +85,9 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<()> {
         None
     };
 
+    // Setup Eyes layer if configured
+    let (eyes_layer, eyes_shutdown_handle) = setup_eyes_layer()?;
+
     let stdout_layer = if std::env::var("JSON_LOGS").is_ok() {
         println!("Logging to STDOUT as JSON");
 
@@ -93,8 +114,45 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<()> {
     Registry::default()
         .with(stdout_layer)
         .with(opentelemetry_layer)
+        .with(eyes_layer)
         .with(env_filter)
         .try_init()?;
 
-    Ok(())
+    Ok(eyes_shutdown_handle)
+}
+
+/// Sets up the Eyes tracing layer if EYES_ORG_ID and EYES_APP_ID are configured.
+fn setup_eyes_layer() -> color_eyre::Result<(Option<EyesLayer>, Option<EyesShutdownHandle>)> {
+    let org_id = std::env::var("EYES_ORG_ID").ok();
+    let app_id = std::env::var("EYES_APP_ID").ok();
+
+    match (org_id, app_id) {
+        (Some(org_id_str), Some(app_id_str)) => {
+            let org_id = Uuid::parse_str(&org_id_str)
+                .wrap_err_with(|| format!("Invalid EYES_ORG_ID: {org_id_str}"))?;
+            let app_id = Uuid::parse_str(&app_id_str)
+                .wrap_err_with(|| format!("Invalid EYES_APP_ID: {app_id_str}"))?;
+
+            let (layer, shutdown_handle) = EyesSubscriberBuilder::build_from_env(org_id, app_id)
+                .wrap_err("Failed to build Eyes subscriber")?;
+
+            let eyes_url = std::env::var("EYES_URL")
+                .unwrap_or_else(|_| "https://eyes.coreyja.com".to_string());
+            println!("Eyes layer configured (org: {org_id}, app: {app_id}, url: {eyes_url})");
+
+            Ok((Some(layer), Some(shutdown_handle)))
+        }
+        (Some(_), None) => {
+            println!("Skipping Eyes layer: EYES_ORG_ID set but EYES_APP_ID missing");
+            Ok((None, None))
+        }
+        (None, Some(_)) => {
+            println!("Skipping Eyes layer: EYES_APP_ID set but EYES_ORG_ID missing");
+            Ok((None, None))
+        }
+        (None, None) => {
+            println!("Skipping Eyes layer");
+            Ok((None, None))
+        }
+    }
 }

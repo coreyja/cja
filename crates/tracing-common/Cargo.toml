@@ -24,3 +24,5 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 
 color-eyre = "0.6.3"
+eyes-subscriber = "0.1.2"
+uuid = { workspace = true }
