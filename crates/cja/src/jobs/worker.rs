@@ -308,7 +308,13 @@ pub async fn job_worker<AppState: AS>(
     max_retries: i32,
     lock_timeout: Duration,
 ) -> color_eyre::Result<()> {
-    let worker = Worker::new(app_state, registry, sleep_duration, max_retries, lock_timeout);
+    let worker = Worker::new(
+        app_state,
+        registry,
+        sleep_duration,
+        max_retries,
+        lock_timeout,
+    );
 
     loop {
         worker.tick().await?;
