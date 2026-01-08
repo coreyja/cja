@@ -16,6 +16,13 @@ use super::registry::JobRegistry;
 /// - Total retry window of ~12 days
 pub const DEFAULT_MAX_RETRIES: i32 = 20;
 
+/// Default lock timeout duration (2 hours).
+///
+/// Jobs locked for longer than this duration will be considered abandoned and
+/// made available for other workers to pick up. This handles cases where a worker
+/// crashes or becomes unresponsive while processing a job.
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
 #[derive(Debug)]
@@ -45,7 +52,8 @@ struct Worker<AppState: AS, R: JobRegistry<AppState>> {
     registry: R,
     sleep_duration: Duration,
     max_retries: i32,
-    cancellation_token: CancellationToken,
+cancellation_token: CancellationToken,
+    lock_timeout: Duration,
 }
 
 impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
@@ -55,6 +63,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         sleep_duration: Duration,
         max_retries: i32,
         cancellation_token: CancellationToken,
+        lock_timeout: Duration,
     ) -> Self {
         Self {
             id: uuid::Uuid::new_v4(),
@@ -63,6 +72,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             sleep_duration,
             max_retries,
             cancellation_token,
+            lock_timeout,
         }
     }
 
@@ -171,10 +181,15 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             worker.id = %self.id,
             job.id,
             job.name,
+            lock_timeout_secs = self.lock_timeout.as_secs(),
         ),
         err,
     )]
+    #[allow(clippy::cast_possible_wrap)]
     async fn fetch_next_job(&self) -> color_eyre::Result<Option<JobFromDB>> {
+        // Cast is safe: lock timeouts are typically hours, not approaching i64::MAX seconds
+        let lock_timeout_secs = self.lock_timeout.as_secs() as i64;
+
         let job = sqlx::query_as::<_, JobFromDB>(
             "
             UPDATE jobs
@@ -182,7 +197,11 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             WHERE job_id = (
                 SELECT job_id
                 FROM jobs
-                WHERE run_at <= NOW() AND locked_by IS NULL
+                WHERE run_at <= NOW()
+                  AND (
+                    locked_by IS NULL
+                    OR locked_at < NOW() - ($2 || ' seconds')::interval
+                  )
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -191,6 +210,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             ",
         )
         .bind(self.id.to_string())
+        .bind(lock_timeout_secs.to_string())
         .fetch_optional(self.state.db())
         .await?;
 
@@ -283,6 +303,8 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// * `max_retries` - Maximum number of times to retry a failed job before permanent deletion (default: 20)
 /// * `shutdown_token` - Cancellation token for graceful shutdown. When cancelled, the worker
 ///   will stop accepting new jobs and release database locks before exiting.
+/// * `lock_timeout` - How long a job can be locked before it's considered abandoned and
+///   becomes available for other workers (default: 2 hours)
 ///
 /// # Retry Behavior
 ///
@@ -298,7 +320,14 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// When the `shutdown_token` is cancelled:
 /// - The worker stops polling for new jobs
 /// - Any currently executing job is allowed to complete
-/// - Database locks are released immediately (instead of waiting for 2-hour timeout)
+/// - Database locks are released immediately (instead of waiting for the lock timeout)
+///
+/// # Lock Timeout
+///
+/// If a worker crashes or becomes unresponsive while processing a job, the job will remain
+/// locked in the database. The `lock_timeout` parameter controls how long to wait before
+/// considering such jobs abandoned. After the timeout expires, any worker can pick up the
+/// job and retry it.
 ///
 /// # Example
 ///
@@ -309,14 +338,15 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// let shutdown_token = CancellationToken::new();
 /// let worker_token = shutdown_token.clone();
 ///
-/// // Start worker with graceful shutdown support
+/// // Start worker with graceful shutdown support and lock timeout
 /// tokio::spawn(async move {
 ///     cja::jobs::worker::job_worker(
 ///         app_state,
 ///         registry,
-///         Duration::from_secs(60),
-///         20,
-///         worker_token,
+///         Duration::from_secs(60),      // poll every 60s when idle
+///         20,                            // max 20 retries
+///         worker_token,                  // for graceful shutdown
+///         Duration::from_secs(2 * 3600), // 2 hour lock timeout
 ///     ).await.unwrap();
 /// });
 ///
@@ -329,6 +359,7 @@ pub async fn job_worker<AppState: AS>(
     sleep_duration: Duration,
     max_retries: i32,
     shutdown_token: CancellationToken,
+    lock_timeout: Duration,
 ) -> color_eyre::Result<()> {
     let worker = Worker::new(
         app_state,
@@ -336,6 +367,7 @@ pub async fn job_worker<AppState: AS>(
         sleep_duration,
         max_retries,
         shutdown_token.clone(),
+        lock_timeout,
     );
 
     loop {
