@@ -205,6 +205,7 @@ fn spawn_application_tasks(
             jobs::Jobs,
             Duration::from_secs(60),
             cja::jobs::DEFAULT_MAX_RETRIES,
+            cja::jobs::DEFAULT_LOCK_TIMEOUT,
         )));
     } else {
         info!("Jobs Disabled");

@@ -15,6 +15,13 @@ use super::registry::JobRegistry;
 /// - Total retry window of ~12 days
 pub const DEFAULT_MAX_RETRIES: i32 = 20;
 
+/// Default lock timeout duration (2 hours).
+///
+/// Jobs locked for longer than this duration will be considered abandoned and
+/// made available for other workers to pick up. This handles cases where a worker
+/// crashes or becomes unresponsive while processing a job.
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
 #[derive(Debug)]
@@ -44,16 +51,24 @@ struct Worker<AppState: AS, R: JobRegistry<AppState>> {
     registry: R,
     sleep_duration: Duration,
     max_retries: i32,
+    lock_timeout: Duration,
 }
 
 impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
-    fn new(state: AppState, registry: R, sleep_duration: Duration, max_retries: i32) -> Self {
+    fn new(
+        state: AppState,
+        registry: R,
+        sleep_duration: Duration,
+        max_retries: i32,
+        lock_timeout: Duration,
+    ) -> Self {
         Self {
             id: uuid::Uuid::new_v4(),
             state,
             registry,
             sleep_duration,
             max_retries,
+            lock_timeout,
         }
     }
 
@@ -160,10 +175,15 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             worker.id = %self.id,
             job.id,
             job.name,
+            lock_timeout_secs = self.lock_timeout.as_secs(),
         ),
         err,
     )]
+    #[allow(clippy::cast_possible_wrap)]
     async fn fetch_next_job(&self) -> color_eyre::Result<Option<JobFromDB>> {
+        // Cast is safe: lock timeouts are typically hours, not approaching i64::MAX seconds
+        let lock_timeout_secs = self.lock_timeout.as_secs() as i64;
+
         let job = sqlx::query_as::<_, JobFromDB>(
             "
             UPDATE jobs
@@ -171,7 +191,11 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             WHERE job_id = (
                 SELECT job_id
                 FROM jobs
-                WHERE run_at <= NOW() AND locked_by IS NULL
+                WHERE run_at <= NOW()
+                  AND (
+                    locked_by IS NULL
+                    OR locked_at < NOW() - ($2 || ' seconds')::interval
+                  )
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -180,6 +204,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             ",
         )
         .bind(self.id.to_string())
+        .bind(lock_timeout_secs.to_string())
         .fetch_optional(self.state.db())
         .await?;
 
@@ -243,6 +268,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 /// * `registry` - The job registry that maps job names to their implementations
 /// * `sleep_duration` - How long to sleep when no jobs are available
 /// * `max_retries` - Maximum number of times to retry a failed job before permanent deletion (default: 20)
+/// * `lock_timeout` - How long a job can be locked before it's considered abandoned and
+///   becomes available for other workers (default: 2 hours)
 ///
 /// # Retry Behavior
 ///
@@ -253,17 +280,25 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 ///   (first retry: 2s, second: 4s, third: 8s, fourth: 16s, etc.)
 /// - If `error_count` >= `max_retries`, the job is permanently deleted
 ///
+/// # Lock Timeout
+///
+/// If a worker crashes or becomes unresponsive while processing a job, the job will remain
+/// locked in the database. The `lock_timeout` parameter controls how long to wait before
+/// considering such jobs abandoned. After the timeout expires, any worker can pick up the
+/// job and retry it.
+///
 /// # Example
 ///
 /// ```ignore
 /// use std::time::Duration;
 ///
-/// // Start worker with default 20 max retries
+/// // Start worker with default settings
 /// cja::jobs::worker::job_worker(
 ///     app_state,
 ///     registry,
-///     Duration::from_secs(60),
-///     20,
+///     Duration::from_secs(60),      // poll every 60s when idle
+///     20,                            // max 20 retries
+///     Duration::from_secs(2 * 3600), // 2 hour lock timeout
 /// ).await.unwrap();
 /// ```
 pub async fn job_worker<AppState: AS>(
@@ -271,8 +306,15 @@ pub async fn job_worker<AppState: AS>(
     registry: impl JobRegistry<AppState>,
     sleep_duration: Duration,
     max_retries: i32,
+    lock_timeout: Duration,
 ) -> color_eyre::Result<()> {
-    let worker = Worker::new(app_state, registry, sleep_duration, max_retries);
+    let worker = Worker::new(
+        app_state,
+        registry,
+        sleep_duration,
+        max_retries,
+        lock_timeout,
+    );
 
     loop {
         worker.tick().await?;
