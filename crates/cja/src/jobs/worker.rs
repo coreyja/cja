@@ -45,16 +45,24 @@ struct Worker<AppState: AS, R: JobRegistry<AppState>> {
     registry: R,
     sleep_duration: Duration,
     max_retries: i32,
+    cancellation_token: CancellationToken,
 }
 
 impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
-    fn new(state: AppState, registry: R, sleep_duration: Duration, max_retries: i32) -> Self {
+    fn new(
+        state: AppState,
+        registry: R,
+        sleep_duration: Duration,
+        max_retries: i32,
+        cancellation_token: CancellationToken,
+    ) -> Self {
         Self {
             id: uuid::Uuid::new_v4(),
             state,
             registry,
             sleep_duration,
             max_retries,
+            cancellation_token,
         }
     }
 
@@ -74,7 +82,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         err,
     )]
     async fn run_job(&self, job: &JobFromDB) -> color_eyre::Result<()> {
-        self.registry.run_job(job, self.state.clone()).await
+        self.registry
+            .run_job(job, self.state.clone(), self.cancellation_token.clone())
+            .await
     }
 
     pub(crate) async fn run_next_job(&self, job: JobFromDB) -> color_eyre::Result<RunJobResult> {
@@ -320,7 +330,13 @@ pub async fn job_worker<AppState: AS>(
     max_retries: i32,
     shutdown_token: CancellationToken,
 ) -> color_eyre::Result<()> {
-    let worker = Worker::new(app_state, registry, sleep_duration, max_retries);
+    let worker = Worker::new(
+        app_state,
+        registry,
+        sleep_duration,
+        max_retries,
+        shutdown_token.clone(),
+    );
 
     loop {
         tokio::select! {

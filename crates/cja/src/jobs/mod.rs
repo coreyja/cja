@@ -163,17 +163,78 @@ pub trait Job<AppState: AS>:
     /// with exponential backoff until it succeeds or exceeds max retries.
     async fn run(&self, app_state: AppState) -> color_eyre::Result<()>;
 
+    /// Execute the job logic with an optional cancellation token for graceful shutdown.
+    ///
+    /// Long-running jobs can override this method to check the cancellation token
+    /// periodically and exit early during shutdown. The default implementation
+    /// ignores the token and calls `run()`, so existing jobs continue to work
+    /// without changes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use cja::jobs::{Job, CancellationToken};
+    /// # use serde::{Serialize, Deserialize};
+    /// # #[derive(Debug, Serialize, Deserialize, Clone)]
+    /// # struct LongJob { iterations: u32 }
+    /// # #[derive(Debug, Clone)]
+    /// # struct MyAppState { db: sqlx::PgPool }
+    /// # impl cja::app_state::AppState for MyAppState {
+    /// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+    /// #     fn version(&self) -> &str { "1.0.0" }
+    /// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
+    /// # }
+    /// #[async_trait::async_trait]
+    /// impl Job<MyAppState> for LongJob {
+    ///     const NAME: &'static str = "LongJob";
+    ///
+    ///     async fn run(&self, _app_state: MyAppState) -> color_eyre::Result<()> {
+    ///         // Simple implementation without cancellation support
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn run_with_cancellation(
+    ///         &self,
+    ///         app_state: MyAppState,
+    ///         cancellation_token: CancellationToken,
+    ///     ) -> color_eyre::Result<()> {
+    ///         for i in 0..self.iterations {
+    ///             // Check if shutdown was requested
+    ///             if cancellation_token.is_cancelled() {
+    ///                 tracing::info!("Job cancelled after {} iterations", i);
+    ///                 return Err(color_eyre::eyre::eyre!("Job cancelled during shutdown"));
+    ///             }
+    ///
+    ///             // Do some work
+    ///             process_iteration(i, app_state.clone()).await?;
+    ///         }
+    ///         Ok(())
+    ///     }
+    /// }
+    /// # async fn process_iteration(_i: u32, _app_state: MyAppState) -> color_eyre::Result<()> { Ok(()) }
+    /// ```
+    async fn run_with_cancellation(
+        &self,
+        app_state: AppState,
+        _cancellation_token: CancellationToken,
+    ) -> color_eyre::Result<()> {
+        // Default implementation ignores cancellation token
+        self.run(app_state).await
+    }
+
     /// Internal method used by the job system to deserialize and run jobs.
     ///
     /// You typically won't call this directly - it's used by the job worker.
-    #[instrument(name = "jobs.run_from_value", skip(app_state), fields(job.name = Self::NAME), err)]
+    #[instrument(name = "jobs.run_from_value", skip(app_state, cancellation_token), fields(job.name = Self::NAME), err)]
     async fn run_from_value(
         value: serde_json::Value,
         app_state: AppState,
+        cancellation_token: CancellationToken,
     ) -> color_eyre::Result<()> {
         let job: Self = serde_json::from_value(value)?;
 
-        job.run(app_state).await
+        job.run_with_cancellation(app_state, cancellation_token)
+            .await
     }
 
     /// Enqueue this job for asynchronous execution.
