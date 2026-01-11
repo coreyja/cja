@@ -211,7 +211,7 @@ async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
 /// Spawn all application background tasks
 fn spawn_application_tasks(
     app_state: &AppState,
-    shutdown_token: &cja::jobs::CancellationToken,
+    #[allow(unused_variables)] shutdown_token: &cja::jobs::CancellationToken,
 ) -> std::vec::Vec<tokio::task::JoinHandle<std::result::Result<(), cja::color_eyre::Report>>> {
     let mut futures = vec![];
 
