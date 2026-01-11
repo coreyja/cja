@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::Span;
 
 use crate::app_state::AppState as AS;
@@ -232,6 +233,33 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
     }
 }
 
+/// Release database locks held by a worker.
+///
+/// This should be called during graceful shutdown to immediately release any job locks
+/// held by this worker, rather than waiting for the 2-hour lock timeout.
+async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
+    worker: &Worker<AppState, R>,
+) -> color_eyre::Result<()> {
+    tracing::info!(worker_id = %worker.id, "Releasing database locks");
+
+    let result = sqlx::query(
+        "UPDATE jobs
+         SET locked_by = NULL, locked_at = NULL
+         WHERE locked_by = $1",
+    )
+    .bind(worker.id.to_string())
+    .execute(worker.state.db())
+    .await?;
+
+    tracing::info!(
+        worker_id = %worker.id,
+        locks_released = result.rows_affected(),
+        "Database locks released"
+    );
+
+    Ok(())
+}
+
 /// Start a job worker that processes jobs from the queue.
 ///
 /// The worker will continuously poll for jobs and execute them using the provided registry.
@@ -243,6 +271,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 /// * `registry` - The job registry that maps job names to their implementations
 /// * `sleep_duration` - How long to sleep when no jobs are available
 /// * `max_retries` - Maximum number of times to retry a failed job before permanent deletion (default: 20)
+/// * `shutdown_token` - Cancellation token for graceful shutdown. When cancelled, the worker
+///   will stop accepting new jobs and release database locks before exiting.
 ///
 /// # Retry Behavior
 ///
@@ -253,28 +283,58 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 ///   (first retry: 2s, second: 4s, third: 8s, fourth: 16s, etc.)
 /// - If `error_count` >= `max_retries`, the job is permanently deleted
 ///
+/// # Graceful Shutdown
+///
+/// When the `shutdown_token` is cancelled:
+/// - The worker stops polling for new jobs
+/// - Any currently executing job is allowed to complete
+/// - Database locks are released immediately (instead of waiting for 2-hour timeout)
+///
 /// # Example
 ///
 /// ```ignore
 /// use std::time::Duration;
+/// use tokio_util::sync::CancellationToken;
 ///
-/// // Start worker with default 20 max retries
-/// cja::jobs::worker::job_worker(
-///     app_state,
-///     registry,
-///     Duration::from_secs(60),
-///     20,
-/// ).await.unwrap();
+/// let shutdown_token = CancellationToken::new();
+/// let worker_token = shutdown_token.clone();
+///
+/// // Start worker with graceful shutdown support
+/// tokio::spawn(async move {
+///     cja::jobs::worker::job_worker(
+///         app_state,
+///         registry,
+///         Duration::from_secs(60),
+///         20,
+///         worker_token,
+///     ).await.unwrap();
+/// });
+///
+/// // Later, trigger shutdown
+/// shutdown_token.cancel();
 /// ```
 pub async fn job_worker<AppState: AS>(
     app_state: AppState,
     registry: impl JobRegistry<AppState>,
     sleep_duration: Duration,
     max_retries: i32,
+    shutdown_token: CancellationToken,
 ) -> color_eyre::Result<()> {
     let worker = Worker::new(app_state, registry, sleep_duration, max_retries);
 
     loop {
-        worker.tick().await?;
+        tokio::select! {
+            result = worker.tick() => {
+                result?;
+            }
+            () = shutdown_token.cancelled() => {
+                tracing::info!(worker_id = %worker.id, "Job worker shutdown requested");
+                break;
+            }
+        }
     }
+
+    cleanup_worker_locks(&worker).await?;
+    tracing::info!(worker_id = %worker.id, "Job worker shutdown complete");
+    Ok(())
 }

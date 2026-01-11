@@ -5,6 +5,7 @@ use tracing::instrument;
 
 pub mod registry;
 
+pub use tokio_util::sync::CancellationToken;
 pub use worker::DEFAULT_MAX_RETRIES;
 
 #[derive(Debug, Error)]

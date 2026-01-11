@@ -200,11 +200,15 @@ fn spawn_application_tasks(
         use std::time::Duration;
 
         info!("Jobs Enabled");
+        // Note: In a real application, you would wire this shutdown_token to signal handlers
+        // (SIGTERM/SIGINT) for graceful shutdown
+        let shutdown_token = cja::jobs::CancellationToken::new();
         futures.push(tokio::spawn(cja::jobs::worker::job_worker(
             app_state.clone(),
             jobs::Jobs,
             Duration::from_secs(60),
             cja::jobs::DEFAULT_MAX_RETRIES,
+            shutdown_token,
         )));
     } else {
         info!("Jobs Disabled");
@@ -219,7 +223,10 @@ fn spawn_application_tasks(
     #[cfg(feature = "cron")]
     if is_feature_enabled("CRON") {
         info!("Cron Enabled");
-        futures.push(tokio::spawn(cron::run_cron(app_state.clone())));
+        // Note: In a real application, you would wire this shutdown_token to signal handlers
+        // (SIGTERM/SIGINT) for graceful shutdown
+        let shutdown_token = cja::cron::CancellationToken::new();
+        futures.push(tokio::spawn(cron::run_cron(app_state.clone(), shutdown_token)));
     } else {
         info!("Cron Disabled");
     }
@@ -265,19 +272,21 @@ mod jobs {
 #[cfg(feature = "cron")]
 mod cron {
     use chrono_tz::US::Eastern;
-    use cja::cron::{CronRegistry, Worker};
+    use cja::cron::{CancellationToken, CronRegistry, Worker};
+    use std::time::Duration;
 
     #[cfg(feature = "jobs")]
     use crate::jobs::NoopJob;
-    #[cfg(feature = "jobs")]
-    use std::time::Duration;
 
     use super::AppState;
 
-    pub(crate) async fn run_cron(app_state: AppState) -> cja::Result<()> {
+    pub(crate) async fn run_cron(
+        app_state: AppState,
+        shutdown_token: CancellationToken,
+    ) -> cja::Result<()> {
         Ok(
             Worker::new_with_timezone(app_state, cron_registry(), Eastern, Duration::from_secs(60))
-                .run()
+                .run(shutdown_token)
                 .await?,
         )
     }
