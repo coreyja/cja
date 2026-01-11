@@ -226,7 +226,10 @@ fn spawn_application_tasks(
         // Note: In a real application, you would wire this shutdown_token to signal handlers
         // (SIGTERM/SIGINT) for graceful shutdown
         let shutdown_token = cja::cron::CancellationToken::new();
-        futures.push(tokio::spawn(cron::run_cron(app_state.clone(), shutdown_token)));
+        futures.push(tokio::spawn(cron::run_cron(
+            app_state.clone(),
+            shutdown_token,
+        )));
     } else {
         info!("Cron Disabled");
     }
