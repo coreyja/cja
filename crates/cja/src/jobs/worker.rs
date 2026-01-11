@@ -386,3 +386,191 @@ pub async fn job_worker<AppState: AS>(
     tracing::info!(worker_id = %worker.id, "Job worker shutdown complete");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::AppState;
+    use crate::impl_job_registry;
+    use crate::jobs::Job;
+    use crate::server::cookies::CookieKey;
+
+    #[derive(Clone)]
+    struct TestAppState {
+        db: sqlx::PgPool,
+        cookie_key: CookieKey,
+    }
+
+    impl AppState for TestAppState {
+        fn db(&self) -> &sqlx::PgPool {
+            &self.db
+        }
+
+        fn version(&self) -> &'static str {
+            "test"
+        }
+
+        fn cookie_key(&self) -> &CookieKey {
+            &self.cookie_key
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct TestJob {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for TestJob {
+        const NAME: &'static str = "TestJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl_job_registry!(TestAppState, TestJob);
+
+    /// Test that fetch_next_job picks up a job with a stale lock (lock older than timeout)
+    #[sqlx::test]
+    async fn test_fetch_next_job_picks_up_stale_locked_job(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let job_id = uuid::Uuid::new_v4();
+        let stale_worker_id = "crashed-worker";
+
+        // Insert a job locked 120 seconds ago
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '120 seconds')",
+        )
+        .bind(job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "stale-lock-test"}))
+        .bind(0)
+        .bind("test-stale-lock")
+        .bind(0)
+        .bind(stale_worker_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Create a worker with 60 second lock timeout
+        let worker = Worker::new(
+            app_state,
+            Jobs,
+            Duration::from_secs(1),
+            20,
+            CancellationToken::new(),
+            Duration::from_secs(60), // 60 second timeout
+        );
+
+        // fetch_next_job should pick up the stale locked job
+        let fetched = worker.fetch_next_job().await.unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().job_id, job_id);
+    }
+
+    /// Test that fetch_next_job does NOT pick up a job with a fresh lock
+    #[sqlx::test]
+    async fn test_fetch_next_job_skips_recently_locked_job(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let job_id = uuid::Uuid::new_v4();
+        let active_worker_id = "active-worker";
+
+        // Insert a job locked only 10 seconds ago
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '10 seconds')",
+        )
+        .bind(job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "recent-lock-test"}))
+        .bind(0)
+        .bind("test-recent-lock")
+        .bind(0)
+        .bind(active_worker_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Create a worker with 1 hour lock timeout
+        let worker = Worker::new(
+            app_state,
+            Jobs,
+            Duration::from_secs(1),
+            20,
+            CancellationToken::new(),
+            Duration::from_secs(3600), // 1 hour timeout
+        );
+
+        // fetch_next_job should NOT pick up the recently locked job
+        let fetched = worker.fetch_next_job().await.unwrap();
+        assert!(fetched.is_none());
+    }
+
+    /// Test that unlocked jobs are picked up before stale locked jobs (by priority)
+    #[sqlx::test]
+    async fn test_fetch_next_job_prefers_unlocked_by_priority(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let unlocked_job_id = uuid::Uuid::new_v4();
+        let stale_locked_job_id = uuid::Uuid::new_v4();
+
+        // Insert unlocked job with higher priority
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6)",
+        )
+        .bind(unlocked_job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "unlocked"}))
+        .bind(10) // Higher priority
+        .bind("test-unlocked")
+        .bind(0)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Insert stale locked job with lower priority
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '120 seconds')",
+        )
+        .bind(stale_locked_job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "stale-locked"}))
+        .bind(5) // Lower priority
+        .bind("test-stale")
+        .bind(0)
+        .bind("crashed-worker")
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Create a worker with 60 second lock timeout
+        let worker = Worker::new(
+            app_state,
+            Jobs,
+            Duration::from_secs(1),
+            20,
+            CancellationToken::new(),
+            Duration::from_secs(60),
+        );
+
+        // Should pick the higher priority unlocked job first
+        let fetched = worker.fetch_next_job().await.unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().job_id, unlocked_job_id);
+    }
+}
