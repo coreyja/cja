@@ -291,7 +291,78 @@ mod jobs {
         }
     }
 
-    cja::impl_job_registry!(AppState, NoopJob);
+    /// Demo job that shows how to use the cancellation token for graceful shutdown.
+    ///
+    /// This job simulates a long-running task by looping and sleeping, checking
+    /// the cancellation token periodically to exit early during shutdown.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct CancellableDemoJob {
+        /// Number of iterations to perform (each takes ~1 second)
+        pub iterations: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl cja::jobs::Job<AppState> for CancellableDemoJob {
+        const NAME: &'static str = "CancellableDemoJob";
+
+        async fn run(&self, _app_state: AppState) -> cja::Result<()> {
+            // Simple implementation without cancellation support
+            for i in 0..self.iterations {
+                tracing::info!(
+                    iteration = i,
+                    total = self.iterations,
+                    "CancellableDemoJob: processing iteration (no cancellation support)"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            tracing::info!("CancellableDemoJob: completed all iterations");
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            _app_state: AppState,
+            cancellation_token: cja::jobs::CancellationToken,
+        ) -> cja::Result<()> {
+            tracing::info!(
+                iterations = self.iterations,
+                "CancellableDemoJob: starting with cancellation support"
+            );
+
+            for i in 0..self.iterations {
+                // Check if shutdown was requested
+                if cancellation_token.is_cancelled() {
+                    tracing::warn!(
+                        iteration = i,
+                        total = self.iterations,
+                        "CancellableDemoJob: cancelled during shutdown, exiting early"
+                    );
+                    return Err(cja::color_eyre::eyre::eyre!(
+                        "Job cancelled at iteration {}/{} during shutdown",
+                        i,
+                        self.iterations
+                    ));
+                }
+
+                tracing::info!(
+                    iteration = i,
+                    total = self.iterations,
+                    "CancellableDemoJob: processing iteration"
+                );
+
+                // Simulate work by sleeping for 1 second
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+
+            tracing::info!(
+                iterations = self.iterations,
+                "CancellableDemoJob: completed all iterations successfully"
+            );
+            Ok(())
+        }
+    }
+
+    cja::impl_job_registry!(AppState, NoopJob, CancellableDemoJob);
 }
 
 #[cfg(feature = "cron")]
