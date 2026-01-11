@@ -52,7 +52,7 @@ struct Worker<AppState: AS, R: JobRegistry<AppState>> {
     registry: R,
     sleep_duration: Duration,
     max_retries: i32,
-cancellation_token: CancellationToken,
+    cancellation_token: CancellationToken,
     lock_timeout: Duration,
 }
 

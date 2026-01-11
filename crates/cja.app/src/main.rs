@@ -233,7 +233,7 @@ fn spawn_application_tasks(
             jobs::Jobs,
             Duration::from_secs(60),
             cja::jobs::DEFAULT_MAX_RETRIES,
-shutdown_token.clone(),
+            shutdown_token.clone(),
             cja::jobs::DEFAULT_LOCK_TIMEOUT,
         )));
     } else {
