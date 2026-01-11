@@ -67,3 +67,4 @@ path-absolutize = "3.0"
 axum = "0.8.4"
 async-trait = "0.1.77"
 maud = { version = "0.27.0", features = ["axum"] }
+tokio-util = { version = "0.7", features = ["rt"] }

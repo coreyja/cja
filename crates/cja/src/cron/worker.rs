@@ -2,6 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
+use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState as AS;
 
@@ -46,13 +47,57 @@ impl<AppState: AS> Worker<AppState> {
         }
     }
 
-    pub async fn run(self) -> Result<(), TickError> {
-        tracing::debug!("Starting Cron loop");
+    /// Run the cron worker until the shutdown token is cancelled.
+    ///
+    /// The worker will execute cron jobs on their configured schedules until shutdown
+    /// is requested. When the `shutdown_token` is cancelled:
+    /// - The worker stops scheduling new cron job executions
+    /// - Any currently running tick completes before shutdown
+    /// - The sleep between ticks can be interrupted for faster shutdown
+    ///
+    /// # Arguments
+    ///
+    /// * `shutdown_token` - Cancellation token for graceful shutdown
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// let shutdown_token = CancellationToken::new();
+    /// let worker_token = shutdown_token.clone();
+    ///
+    /// tokio::spawn(async move {
+    ///     worker.run(worker_token).await.unwrap();
+    /// });
+    ///
+    /// // Later, trigger shutdown
+    /// shutdown_token.cancel();
+    /// ```
+    pub async fn run(self, shutdown_token: CancellationToken) -> Result<(), TickError> {
+        tracing::debug!(cron_worker_id = %self.id, "Starting Cron loop");
         loop {
-            self.tick().await?;
+            tokio::select! {
+                result = self.tick() => {
+                    result?;
+                }
+                () = shutdown_token.cancelled() => {
+                    tracing::info!(cron_worker_id = %self.id, "Cron worker shutdown requested");
+                    break;
+                }
+            }
 
-            tokio::time::sleep(self.sleep_duration).await;
+            tokio::select! {
+                () = tokio::time::sleep(self.sleep_duration) => {}
+                () = shutdown_token.cancelled() => {
+                    tracing::info!(cron_worker_id = %self.id, "Cron worker shutdown during sleep");
+                    break;
+                }
+            }
         }
+
+        tracing::info!(cron_worker_id = %self.id, "Cron worker shutdown complete");
+        Ok(())
     }
 
     async fn last_enqueue_map(&self) -> Result<HashMap<String, DateTime<Utc>>, TickError> {

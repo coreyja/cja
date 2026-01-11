@@ -35,6 +35,7 @@ chrono-tz = "0.10.0"
 tracing-common = { path = "../tracing-common" }
 color-eyre = "0.6.3"
 maud.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["cookies"] }
