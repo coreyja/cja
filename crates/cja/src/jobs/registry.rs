@@ -9,7 +9,12 @@ use super::worker::JobFromDB;
 #[async_trait::async_trait]
 pub trait JobRegistry<AppState: app_state::AppState> {
     /// Run a job from the database by dispatching to the appropriate handler.
-    async fn run_job(&self, job: &JobFromDB, app_state: AppState) -> color_eyre::Result<()>;
+    async fn run_job(
+        &self,
+        job: &JobFromDB,
+        app_state: AppState,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> color_eyre::Result<()>;
 }
 
 /// A macro for implementing a job registry that handles job dispatch.
@@ -81,14 +86,19 @@ macro_rules! impl_job_registry {
 
         #[async_trait::async_trait]
         impl $crate::jobs::registry::JobRegistry<$state> for Jobs {
-            async fn run_job(&self, job: &$crate::jobs::worker::JobFromDB, app_state: $state) -> $crate::Result<()> {
+            async fn run_job(
+                &self,
+                job: &$crate::jobs::worker::JobFromDB,
+                app_state: $state,
+                cancellation_token: $crate::jobs::CancellationToken,
+            ) -> $crate::Result<()> {
                 use $crate::jobs::Job as _;
 
                 let payload = job.payload.clone();
 
                 match job.name.as_str() {
                     $(
-                        <$job_type>::NAME => <$job_type>::run_from_value(payload, app_state).await,
+                        <$job_type>::NAME => <$job_type>::run_from_value(payload, app_state, cancellation_token).await,
                     )*
                     _ => Err($crate::color_eyre::eyre::eyre!("Unknown job type: {}", job.name)),
                 }
