@@ -97,13 +97,40 @@ async fn run_application() -> cja::Result<()> {
 
     let app_state = AppState::from_env().await?;
 
+    // Create shutdown token for graceful shutdown
+    use cja::jobs::CancellationToken;
+    let shutdown_token = CancellationToken::new();
+
     // Spawn application tasks
     info!("Spawning application tasks");
-    let futures = spawn_application_tasks(&app_state);
+    let futures = spawn_application_tasks(&app_state, &shutdown_token);
+
+    // Set up signal handlers for graceful shutdown
+    let shutdown_handle = tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to create SIGTERM handler");
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("Failed to create SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, initiating graceful shutdown");
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT, initiating graceful shutdown");
+            }
+        }
+
+        shutdown_token.cancel();
+    });
 
     // Wait for all tasks to complete
-    futures::future::try_join_all(futures).await?;
+    let result = futures::future::try_join_all(futures).await;
 
+    // Cancel signal handler if tasks complete first
+    shutdown_handle.abort();
+
+    result?;
     Ok(())
 }
 
@@ -184,6 +211,7 @@ async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
 /// Spawn all application background tasks
 fn spawn_application_tasks(
     app_state: &AppState,
+    shutdown_token: &cja::jobs::CancellationToken,
 ) -> std::vec::Vec<tokio::task::JoinHandle<std::result::Result<(), cja::color_eyre::Report>>> {
     let mut futures = vec![];
 
@@ -200,15 +228,12 @@ fn spawn_application_tasks(
         use std::time::Duration;
 
         info!("Jobs Enabled");
-        // Note: In a real application, you would wire this shutdown_token to signal handlers
-        // (SIGTERM/SIGINT) for graceful shutdown
-        let shutdown_token = cja::jobs::CancellationToken::new();
         futures.push(tokio::spawn(cja::jobs::worker::job_worker(
             app_state.clone(),
             jobs::Jobs,
             Duration::from_secs(60),
             cja::jobs::DEFAULT_MAX_RETRIES,
-            shutdown_token,
+            shutdown_token.clone(),
         )));
     } else {
         info!("Jobs Disabled");
@@ -223,12 +248,9 @@ fn spawn_application_tasks(
     #[cfg(feature = "cron")]
     if is_feature_enabled("CRON") {
         info!("Cron Enabled");
-        // Note: In a real application, you would wire this shutdown_token to signal handlers
-        // (SIGTERM/SIGINT) for graceful shutdown
-        let shutdown_token = cja::cron::CancellationToken::new();
         futures.push(tokio::spawn(cron::run_cron(
             app_state.clone(),
-            shutdown_token,
+            shutdown_token.clone(),
         )));
     } else {
         info!("Cron Disabled");
