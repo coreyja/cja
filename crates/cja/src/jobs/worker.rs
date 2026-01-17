@@ -16,6 +16,13 @@ use super::registry::JobRegistry;
 /// - Total retry window of ~12 days
 pub const DEFAULT_MAX_RETRIES: i32 = 20;
 
+/// Default lock timeout duration (2 hours).
+///
+/// Jobs locked for longer than this duration will be considered abandoned and
+/// made available for other workers to pick up. This handles cases where a worker
+/// crashes or becomes unresponsive while processing a job.
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
 #[derive(Debug)]
@@ -46,6 +53,7 @@ struct Worker<AppState: AS, R: JobRegistry<AppState>> {
     sleep_duration: Duration,
     max_retries: i32,
     cancellation_token: CancellationToken,
+    lock_timeout: Duration,
 }
 
 impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
@@ -55,6 +63,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         sleep_duration: Duration,
         max_retries: i32,
         cancellation_token: CancellationToken,
+        lock_timeout: Duration,
     ) -> Self {
         Self {
             id: uuid::Uuid::new_v4(),
@@ -63,6 +72,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             sleep_duration,
             max_retries,
             cancellation_token,
+            lock_timeout,
         }
     }
 
@@ -171,10 +181,15 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             worker.id = %self.id,
             job.id,
             job.name,
+            lock_timeout_secs = self.lock_timeout.as_secs(),
         ),
         err,
     )]
+    #[allow(clippy::cast_possible_wrap)]
     async fn fetch_next_job(&self) -> color_eyre::Result<Option<JobFromDB>> {
+        // Cast is safe: lock timeouts are typically hours, not approaching i64::MAX seconds
+        let lock_timeout_secs = self.lock_timeout.as_secs() as i64;
+
         let job = sqlx::query_as::<_, JobFromDB>(
             "
             UPDATE jobs
@@ -182,7 +197,11 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             WHERE job_id = (
                 SELECT job_id
                 FROM jobs
-                WHERE run_at <= NOW() AND locked_by IS NULL
+                WHERE run_at <= NOW()
+                  AND (
+                    locked_by IS NULL
+                    OR locked_at < NOW() - ($2 || ' seconds')::interval
+                  )
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -191,6 +210,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             ",
         )
         .bind(self.id.to_string())
+        .bind(lock_timeout_secs.to_string())
         .fetch_optional(self.state.db())
         .await?;
 
@@ -283,6 +303,8 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// * `max_retries` - Maximum number of times to retry a failed job before permanent deletion (default: 20)
 /// * `shutdown_token` - Cancellation token for graceful shutdown. When cancelled, the worker
 ///   will stop accepting new jobs and release database locks before exiting.
+/// * `lock_timeout` - How long a job can be locked before it's considered abandoned and
+///   becomes available for other workers (default: 2 hours)
 ///
 /// # Retry Behavior
 ///
@@ -298,7 +320,14 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// When the `shutdown_token` is cancelled:
 /// - The worker stops polling for new jobs
 /// - Any currently executing job is allowed to complete
-/// - Database locks are released immediately (instead of waiting for 2-hour timeout)
+/// - Database locks are released immediately (instead of waiting for the lock timeout)
+///
+/// # Lock Timeout
+///
+/// If a worker crashes or becomes unresponsive while processing a job, the job will remain
+/// locked in the database. The `lock_timeout` parameter controls how long to wait before
+/// considering such jobs abandoned. After the timeout expires, any worker can pick up the
+/// job and retry it.
 ///
 /// # Example
 ///
@@ -309,14 +338,15 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// let shutdown_token = CancellationToken::new();
 /// let worker_token = shutdown_token.clone();
 ///
-/// // Start worker with graceful shutdown support
+/// // Start worker with graceful shutdown support and lock timeout
 /// tokio::spawn(async move {
 ///     cja::jobs::worker::job_worker(
 ///         app_state,
 ///         registry,
-///         Duration::from_secs(60),
-///         20,
-///         worker_token,
+///         Duration::from_secs(60),      // poll every 60s when idle
+///         20,                            // max 20 retries
+///         worker_token,                  // for graceful shutdown
+///         Duration::from_secs(2 * 3600), // 2 hour lock timeout
 ///     ).await.unwrap();
 /// });
 ///
@@ -329,6 +359,7 @@ pub async fn job_worker<AppState: AS>(
     sleep_duration: Duration,
     max_retries: i32,
     shutdown_token: CancellationToken,
+    lock_timeout: Duration,
 ) -> color_eyre::Result<()> {
     let worker = Worker::new(
         app_state,
@@ -336,6 +367,7 @@ pub async fn job_worker<AppState: AS>(
         sleep_duration,
         max_retries,
         shutdown_token.clone(),
+        lock_timeout,
     );
 
     loop {
@@ -353,4 +385,192 @@ pub async fn job_worker<AppState: AS>(
     cleanup_worker_locks(&worker).await?;
     tracing::info!(worker_id = %worker.id, "Job worker shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::AppState;
+    use crate::impl_job_registry;
+    use crate::jobs::Job;
+    use crate::server::cookies::CookieKey;
+
+    #[derive(Clone)]
+    struct TestAppState {
+        db: sqlx::PgPool,
+        cookie_key: CookieKey,
+    }
+
+    impl AppState for TestAppState {
+        fn db(&self) -> &sqlx::PgPool {
+            &self.db
+        }
+
+        fn version(&self) -> &'static str {
+            "test"
+        }
+
+        fn cookie_key(&self) -> &CookieKey {
+            &self.cookie_key
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct TestJob {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for TestJob {
+        const NAME: &'static str = "TestJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl_job_registry!(TestAppState, TestJob);
+
+    /// Test that `fetch_next_job` picks up a job with a stale lock (lock older than timeout)
+    #[sqlx::test]
+    async fn test_fetch_next_job_picks_up_stale_locked_job(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let job_id = uuid::Uuid::new_v4();
+        let stale_worker_id = "crashed-worker";
+
+        // Insert a job locked 120 seconds ago
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '120 seconds')",
+        )
+        .bind(job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "stale-lock-test"}))
+        .bind(0)
+        .bind("test-stale-lock")
+        .bind(0)
+        .bind(stale_worker_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Create a worker with 60 second lock timeout
+        let worker = Worker::new(
+            app_state,
+            Jobs,
+            Duration::from_secs(1),
+            20,
+            CancellationToken::new(),
+            Duration::from_secs(60), // 60 second timeout
+        );
+
+        // fetch_next_job should pick up the stale locked job
+        let fetched = worker.fetch_next_job().await.unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().job_id, job_id);
+    }
+
+    /// Test that `fetch_next_job` does NOT pick up a job with a fresh lock
+    #[sqlx::test]
+    async fn test_fetch_next_job_skips_recently_locked_job(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let job_id = uuid::Uuid::new_v4();
+        let active_worker_id = "active-worker";
+
+        // Insert a job locked only 10 seconds ago
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '10 seconds')",
+        )
+        .bind(job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "recent-lock-test"}))
+        .bind(0)
+        .bind("test-recent-lock")
+        .bind(0)
+        .bind(active_worker_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Create a worker with 1 hour lock timeout
+        let worker = Worker::new(
+            app_state,
+            Jobs,
+            Duration::from_secs(1),
+            20,
+            CancellationToken::new(),
+            Duration::from_secs(3600), // 1 hour timeout
+        );
+
+        // fetch_next_job should NOT pick up the recently locked job
+        let fetched = worker.fetch_next_job().await.unwrap();
+        assert!(fetched.is_none());
+    }
+
+    /// Test that unlocked jobs are picked up before stale locked jobs (by priority)
+    #[sqlx::test]
+    async fn test_fetch_next_job_prefers_unlocked_by_priority(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let unlocked_job_id = uuid::Uuid::new_v4();
+        let stale_locked_job_id = uuid::Uuid::new_v4();
+
+        // Insert unlocked job with higher priority
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6)",
+        )
+        .bind(unlocked_job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "unlocked"}))
+        .bind(10) // Higher priority
+        .bind("test-unlocked")
+        .bind(0)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Insert stale locked job with lower priority
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '120 seconds')",
+        )
+        .bind(stale_locked_job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "stale-locked"}))
+        .bind(5) // Lower priority
+        .bind("test-stale")
+        .bind(0)
+        .bind("crashed-worker")
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Create a worker with 60 second lock timeout
+        let worker = Worker::new(
+            app_state,
+            Jobs,
+            Duration::from_secs(1),
+            20,
+            CancellationToken::new(),
+            Duration::from_secs(60),
+        );
+
+        // Should pick the higher priority unlocked job first
+        let fetched = worker.fetch_next_job().await.unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().job_id, unlocked_job_id);
+    }
 }

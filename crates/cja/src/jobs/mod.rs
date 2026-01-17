@@ -6,7 +6,7 @@ use tracing::instrument;
 pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
-pub use worker::DEFAULT_MAX_RETRIES;
+pub use worker::{DEFAULT_LOCK_TIMEOUT, DEFAULT_MAX_RETRIES};
 
 #[derive(Debug, Error)]
 pub enum EnqueueError {
@@ -28,6 +28,15 @@ pub enum EnqueueError {
 /// - Error messages and failure timestamps are tracked in the database
 /// - Jobs are permanently deleted after exceeding the configured max retries (default: 20)
 /// - No manual intervention required for transient failures
+///
+/// # Lock Timeout (Abandoned Job Recovery)
+///
+/// Jobs are locked while being processed to prevent multiple workers from running the same
+/// job. If a worker crashes or becomes unresponsive, the lock remains but the job is never
+/// completed. The lock timeout mechanism handles this:
+/// - Jobs locked longer than the timeout (default: 2 hours) are considered abandoned
+/// - Any worker can pick up abandoned jobs and retry them
+/// - This ensures jobs are eventually processed even after worker failures
 ///
 /// # Example
 ///
