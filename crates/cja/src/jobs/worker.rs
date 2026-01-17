@@ -431,7 +431,7 @@ mod tests {
 
     impl_job_registry!(TestAppState, TestJob);
 
-    /// Test that fetch_next_job picks up a job with a stale lock (lock older than timeout)
+    /// Test that `fetch_next_job` picks up a job with a stale lock (lock older than timeout)
     #[sqlx::test]
     async fn test_fetch_next_job_picks_up_stale_locked_job(db: sqlx::PgPool) {
         let app_state = TestAppState {
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(fetched.unwrap().job_id, job_id);
     }
 
-    /// Test that fetch_next_job does NOT pick up a job with a fresh lock
+    /// Test that `fetch_next_job` does NOT pick up a job with a fresh lock
     #[sqlx::test]
     async fn test_fetch_next_job_skips_recently_locked_job(db: sqlx::PgPool) {
         let app_state = TestAppState {
