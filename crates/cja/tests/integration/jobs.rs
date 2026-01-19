@@ -1,6 +1,5 @@
 use cja::jobs::Job;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -51,10 +50,6 @@ impl<AS: cja::app_state::AppState> Job<AS> for FailingJob {
     }
 }
 
-// For now, comment out the registry macro since it has type inference issues in tests
-// We'll test the jobs directly without the registry
-// impl_job_registry!(crate::common::app::TestAppState, TestJob, FailingJob);
-
 #[tokio::test]
 async fn test_job_enqueue() {
     let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
@@ -70,13 +65,16 @@ async fn test_job_enqueue() {
     assert!(result.is_ok());
 
     // Verify job is in database
-    let count = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE name = $1")
-        .bind(<TestJob as Job<crate::common::app::TestAppState>>::NAME)
-        .fetch_one(&pool)
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) as count FROM jobs WHERE name = $1",
+            &[&<TestJob as Job<crate::common::app::TestAppState>>::NAME],
+        )
         .await
         .unwrap();
 
-    assert_eq!(count.get::<Option<i64>, _>("count").unwrap(), 1);
+    assert_eq!(row.get::<_, Option<i64>>(0).unwrap(), 1);
 }
 
 #[tokio::test]
@@ -96,12 +94,13 @@ async fn test_job_with_priority() {
     }
 
     // Verify all jobs are enqueued
-    let count = sqlx::query("SELECT COUNT(*) as count FROM jobs")
-        .fetch_one(&pool)
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_one("SELECT COUNT(*) as count FROM jobs", &[])
         .await
         .unwrap();
 
-    assert_eq!(count.get::<Option<i64>, _>("count").unwrap(), 3);
+    assert_eq!(row.get::<_, Option<i64>>(0).unwrap(), 3);
 }
 
 #[tokio::test]
@@ -119,13 +118,17 @@ async fn test_job_payload_serialization() {
         .unwrap();
 
     // Retrieve and verify payload
-    let row = sqlx::query("SELECT payload FROM jobs WHERE name = $1")
-        .bind(<TestJob as Job<crate::common::app::TestAppState>>::NAME)
-        .fetch_one(&pool)
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT payload FROM jobs WHERE name = $1",
+            &[&<TestJob as Job<crate::common::app::TestAppState>>::NAME],
+        )
         .await
         .unwrap();
 
-    let deserialized: TestJob = serde_json::from_value(row.get("payload")).unwrap();
+    let payload: serde_json::Value = row.get(0);
+    let deserialized: TestJob = serde_json::from_value(payload).unwrap();
     assert_eq!(deserialized.id, "serialization-test");
     assert_eq!(deserialized.value, 123);
 }
@@ -145,38 +148,41 @@ async fn test_job_locking() {
         .unwrap();
 
     // Get the job_id
-    let job_row = sqlx::query("SELECT job_id FROM jobs WHERE name = $1")
-        .bind(<TestJob as Job<crate::common::app::TestAppState>>::NAME)
-        .fetch_one(&pool)
+    let client = pool.get().await.unwrap();
+    let job_row = client
+        .query_one(
+            "SELECT job_id FROM jobs WHERE name = $1",
+            &[&<TestJob as Job<crate::common::app::TestAppState>>::NAME],
+        )
         .await
         .unwrap();
 
+    let job_id: Uuid = job_row.get(0);
+
     // Lock the job
     let worker_id = "test-worker-1";
-    let locked = sqlx::query(
-        "UPDATE jobs SET locked_at = NOW(), locked_by = $1
-         WHERE job_id = $2 AND locked_at IS NULL",
-    )
-    .bind(worker_id)
-    .bind(job_row.get::<Uuid, _>("job_id"))
-    .execute(&pool)
-    .await
-    .unwrap();
+    let locked = client
+        .execute(
+            "UPDATE jobs SET locked_at = NOW(), locked_by = $1
+             WHERE job_id = $2 AND locked_at IS NULL",
+            &[&worker_id, &job_id],
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(locked.rows_affected(), 1);
+    assert_eq!(locked, 1);
 
     // Try to lock again (should fail)
-    let locked_again = sqlx::query(
-        "UPDATE jobs SET locked_at = NOW(), locked_by = $1
-         WHERE job_id = $2 AND locked_at IS NULL",
-    )
-    .bind("another-worker")
-    .bind(job_row.get::<Uuid, _>("job_id"))
-    .execute(&pool)
-    .await
-    .unwrap();
+    let locked_again = client
+        .execute(
+            "UPDATE jobs SET locked_at = NOW(), locked_by = $1
+             WHERE job_id = $2 AND locked_at IS NULL",
+            &[&"another-worker", &job_id],
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(locked_again.rows_affected(), 0);
+    assert_eq!(locked_again, 0);
 }
 
 #[tokio::test]
@@ -205,12 +211,13 @@ async fn test_concurrent_job_enqueue() {
     }
 
     // Verify all jobs were enqueued
-    let count = sqlx::query("SELECT COUNT(*) as count FROM jobs")
-        .fetch_one(&pool)
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_one("SELECT COUNT(*) as count FROM jobs", &[])
         .await
         .unwrap();
 
-    assert_eq!(count.get::<Option<i64>, _>("count").unwrap(), 10);
+    assert_eq!(row.get::<_, Option<i64>>(0).unwrap(), 10);
 }
 
 #[tokio::test]
@@ -227,13 +234,16 @@ async fn test_job_context() {
     job.enqueue(app_state, context.to_string()).await.unwrap();
 
     // Verify context is stored
-    let row = sqlx::query("SELECT context FROM jobs WHERE name = $1")
-        .bind(<TestJob as Job<crate::common::app::TestAppState>>::NAME)
-        .fetch_one(&pool)
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT context FROM jobs WHERE name = $1",
+            &[&<TestJob as Job<crate::common::app::TestAppState>>::NAME],
+        )
         .await
         .unwrap();
 
-    assert_eq!(row.get::<String, _>("context"), context);
+    assert_eq!(row.get::<_, String>(0), context);
 }
 
 #[tokio::test]
@@ -251,21 +261,19 @@ async fn test_failing_job_enqueue() {
     assert!(result.is_ok());
 
     // Verify job is in database with initial error_count of 0
-    let row = sqlx::query(
-        "SELECT name, error_count, last_error_message, last_failed_at FROM jobs WHERE name = $1",
-    )
-    .bind(<FailingJob as Job<crate::common::app::TestAppState>>::NAME)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT name, error_count, last_error_message, last_failed_at FROM jobs WHERE name = $1",
+            &[&<FailingJob as Job<crate::common::app::TestAppState>>::NAME],
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(row.get::<String, _>("name"), "FailingJob");
-    assert_eq!(row.get::<i32, _>("error_count"), 0);
-    assert!(row.get::<Option<String>, _>("last_error_message").is_none());
-    assert!(
-        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
-            .is_none()
-    );
+    assert_eq!(row.get::<_, String>(0), "FailingJob");
+    assert_eq!(row.get::<_, i32>(1), 0);
+    assert!(row.get::<_, Option<String>>(2).is_none());
+    assert!(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3).is_none());
 }
 
 #[tokio::test]
@@ -283,20 +291,18 @@ async fn test_error_tracking_fields_present() {
         .unwrap();
 
     // Verify error tracking fields exist and have correct defaults
-    let row = sqlx::query(
-        "SELECT error_count, last_error_message, last_failed_at FROM jobs WHERE name = $1",
-    )
-    .bind(<TestJob as Job<crate::common::app::TestAppState>>::NAME)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT error_count, last_error_message, last_failed_at FROM jobs WHERE name = $1",
+            &[&<TestJob as Job<crate::common::app::TestAppState>>::NAME],
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(row.get::<i32, _>("error_count"), 0);
-    assert!(row.get::<Option<String>, _>("last_error_message").is_none());
-    assert!(
-        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
-            .is_none()
-    );
+    assert_eq!(row.get::<_, i32>(0), 0);
+    assert!(row.get::<_, Option<String>>(1).is_none());
+    assert!(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(2).is_none());
 }
 
 #[tokio::test]
@@ -306,62 +312,64 @@ async fn test_job_error_count_increment() {
     // Directly insert a job and simulate a failure update
     let job_id = uuid::Uuid::new_v4();
     let worker_id = "test-worker";
+    let now = chrono::Utc::now();
 
-    sqlx::query(
-        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
-         VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW())",
-    )
-    .bind(job_id)
-    .bind("TestJob")
-    .bind(serde_json::json!({"id": "test", "value": 1}))
-    .bind(0)
-    .bind("test")
-    .bind(0)
-    .bind(worker_id)
-    .execute(&pool)
-    .await
-    .unwrap();
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &job_id,
+                &"TestJob",
+                &serde_json::json!({"id": "test", "value": 1}),
+                &0i32,
+                &now,
+                &now,
+                &"test",
+                &0i32,
+                &worker_id,
+                &now,
+            ],
+        )
+        .await
+        .unwrap();
 
     // Simulate job failure with exponential backoff (like the worker does)
     let error_message = "Test error occurred";
-    sqlx::query(
-        "UPDATE jobs
-         SET locked_by = NULL,
-             locked_at = NULL,
-             error_count = error_count + 1,
-             last_error_message = $3,
-             last_failed_at = NOW(),
-             run_at = NOW() + (POWER(2, error_count + 1)) * interval '1 second'
-         WHERE job_id = $1 AND locked_by = $2",
-    )
-    .bind(job_id)
-    .bind(worker_id)
-    .bind(error_message)
-    .execute(&pool)
-    .await
-    .unwrap();
+    client
+        .execute(
+            "UPDATE jobs
+             SET locked_by = NULL,
+                 locked_at = NULL,
+                 error_count = error_count + 1,
+                 last_error_message = $3,
+                 last_failed_at = NOW(),
+                 run_at = NOW() + (POWER(2, error_count + 1)) * interval '1 second'
+             WHERE job_id = $1 AND locked_by = $2",
+            &[&job_id, &worker_id, &error_message],
+        )
+        .await
+        .unwrap();
 
     // Verify error tracking was updated
-    let row = sqlx::query(
-        "SELECT error_count, last_error_message, last_failed_at, run_at FROM jobs WHERE job_id = $1",
-    )
-    .bind(job_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row = client
+        .query_one(
+            "SELECT error_count, last_error_message, last_failed_at, run_at FROM jobs WHERE job_id = $1",
+            &[&job_id],
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(row.get::<i32, _>("error_count"), 1);
+    assert_eq!(row.get::<_, i32>(0), 1);
     assert_eq!(
-        row.get::<Option<String>, _>("last_error_message"),
+        row.get::<_, Option<String>>(1),
         Some(error_message.to_string())
     );
-    assert!(
-        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
-            .is_some()
-    );
+    assert!(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(2).is_some());
 
     // Verify run_at was pushed forward (should be at least 2 seconds in future)
-    let run_at = row.get::<chrono::DateTime<chrono::Utc>, _>("run_at");
+    let run_at: chrono::DateTime<chrono::Utc> = row.get(3);
     assert!(run_at > chrono::Utc::now());
 }
 
@@ -372,54 +380,61 @@ async fn test_exponential_backoff_calculation() {
     // Test that exponential backoff follows 2^(error_count + 1) formula
     let job_id = uuid::Uuid::new_v4();
     let worker_id = "test-worker";
+    let now = chrono::Utc::now();
 
     // Start with error_count = 5 to test higher backoff values
-    sqlx::query(
-        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
-         VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW())",
-    )
-    .bind(job_id)
-    .bind("TestJob")
-    .bind(serde_json::json!({"id": "test", "value": 1}))
-    .bind(0)
-    .bind("test")
-    .bind(5) // error_count = 5
-    .bind(worker_id)
-    .execute(&pool)
-    .await
-    .unwrap();
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &job_id,
+                &"TestJob",
+                &serde_json::json!({"id": "test", "value": 1}),
+                &0i32,
+                &now,
+                &now,
+                &"test",
+                &5i32, // error_count = 5
+                &worker_id,
+                &now,
+            ],
+        )
+        .await
+        .unwrap();
 
     let before_update = chrono::Utc::now();
 
     // Simulate failure - should set run_at to NOW() + 2^6 seconds = 64 seconds
-    sqlx::query(
-        "UPDATE jobs
-         SET locked_by = NULL,
-             locked_at = NULL,
-             error_count = error_count + 1,
-             last_error_message = $3,
-             last_failed_at = NOW(),
-             run_at = NOW() + (POWER(2, error_count + 1)) * interval '1 second'
-         WHERE job_id = $1 AND locked_by = $2",
-    )
-    .bind(job_id)
-    .bind(worker_id)
-    .bind("test error")
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let row = sqlx::query("SELECT error_count, run_at FROM jobs WHERE job_id = $1")
-        .bind(job_id)
-        .fetch_one(&pool)
+    client
+        .execute(
+            "UPDATE jobs
+             SET locked_by = NULL,
+                 locked_at = NULL,
+                 error_count = error_count + 1,
+                 last_error_message = $3,
+                 last_failed_at = NOW(),
+                 run_at = NOW() + (POWER(2, error_count + 1)) * interval '1 second'
+             WHERE job_id = $1 AND locked_by = $2",
+            &[&job_id, &worker_id, &"test error"],
+        )
         .await
         .unwrap();
 
-    assert_eq!(row.get::<i32, _>("error_count"), 6);
+    let row = client
+        .query_one(
+            "SELECT error_count, run_at FROM jobs WHERE job_id = $1",
+            &[&job_id],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i32>(0), 6);
 
     // run_at should be approximately 64 seconds (2^6) in the future
     // Allow some tolerance for test execution time
-    let run_at = row.get::<chrono::DateTime<chrono::Utc>, _>("run_at");
+    let run_at: chrono::DateTime<chrono::Utc> = row.get(1);
     let actual_delay = run_at - before_update;
 
     // Should be between 63 and 66 seconds to account for timing
@@ -437,48 +452,60 @@ async fn test_max_retries_exceeded_deletes_job() {
     let job_id = uuid::Uuid::new_v4();
     let worker_id = "test-worker";
     let max_retries = 20;
+    let now = chrono::Utc::now();
 
     // Insert a job that has already hit max retries
-    sqlx::query(
-        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
-         VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW())",
-    )
-    .bind(job_id)
-    .bind("TestJob")
-    .bind(serde_json::json!({"id": "test", "value": 1}))
-    .bind(0)
-    .bind("test")
-    .bind(max_retries) // At max retries
-    .bind(worker_id)
-    .execute(&pool)
-    .await
-    .unwrap();
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &job_id,
+                &"TestJob",
+                &serde_json::json!({"id": "test", "value": 1}),
+                &0i32,
+                &now,
+                &now,
+                &"test",
+                &max_retries, // At max retries
+                &worker_id,
+                &now,
+            ],
+        )
+        .await
+        .unwrap();
 
     // Verify job exists
-    let count_before = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE job_id = $1")
-        .bind(job_id)
-        .fetch_one(&pool)
+    let count_before = client
+        .query_one(
+            "SELECT COUNT(*) as count FROM jobs WHERE job_id = $1",
+            &[&job_id],
+        )
         .await
         .unwrap()
-        .get::<Option<i64>, _>("count")
+        .get::<_, Option<i64>>(0)
         .unwrap();
     assert_eq!(count_before, 1);
 
     // Simulate the worker deleting the job after max retries
-    sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
-        .bind(job_id)
-        .bind(worker_id)
-        .execute(&pool)
+    client
+        .execute(
+            "DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2",
+            &[&job_id, &worker_id],
+        )
         .await
         .unwrap();
 
     // Verify job was deleted
-    let count_after = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE job_id = $1")
-        .bind(job_id)
-        .fetch_one(&pool)
+    let count_after = client
+        .query_one(
+            "SELECT COUNT(*) as count FROM jobs WHERE job_id = $1",
+            &[&job_id],
+        )
         .await
         .unwrap()
-        .get::<Option<i64>, _>("count")
+        .get::<_, Option<i64>>(0)
         .unwrap();
     assert_eq!(count_after, 0);
 }

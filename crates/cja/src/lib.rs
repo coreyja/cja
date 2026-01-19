@@ -18,5 +18,12 @@ pub use maud;
 
 pub mod db;
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
 pub use chrono;
 pub use chrono_tz;
+
+// Re-export the test macro when testing feature is enabled
+#[cfg(feature = "testing")]
+pub use cja_macros::test;

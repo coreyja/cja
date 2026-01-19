@@ -400,9 +400,11 @@ dependencies = [
  "base64 0.21.7",
  "chrono",
  "chrono-tz",
+ "cja-macros",
  "color-eyre",
  "cron",
  "deadpool-postgres",
+ "hex",
  "http 1.3.1",
  "listenfd",
  "maud",
@@ -410,6 +412,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
+ "sha2",
  "socket2 0.5.9",
  "sql-check",
  "sql-check-macros",
@@ -439,6 +442,15 @@ dependencies = [
  "serde_json",
  "toml",
  "vergen",
+]
+
+[[package]]
+name = "cja-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
+use cja::deadpool_postgres::Pool;
 use cja::server::session::{AppSession, CJASession};
-use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -11,36 +11,39 @@ struct TestSession {
 
 #[async_trait::async_trait]
 impl AppSession for TestSession {
-    async fn from_db(pool: &PgPool, session_id: Uuid) -> cja::Result<Self> {
-        let row = sqlx::query(
-            "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
-        )
-        .bind(session_id)
-        .fetch_one(pool)
-        .await?;
+    async fn from_db(pool: &Pool, session_id: Uuid) -> cja::Result<Self> {
+        let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+        let row = client
+            .query_one(
+                "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
+                &[&session_id],
+            )
+            .await?;
 
         Ok(Self {
             inner: CJASession {
-                session_id: row.get("session_id"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
+                session_id: row.get(0),
+                created_at: row.get(1),
+                updated_at: row.get(2),
             },
             user_id: None,
         })
     }
 
-    async fn create(pool: &PgPool) -> cja::Result<Self> {
-        let row = sqlx::query(
-            "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",
-        )
-        .fetch_one(pool)
-        .await?;
+    async fn create(pool: &Pool) -> cja::Result<Self> {
+        let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+        let row = client
+            .query_one(
+                "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",
+                &[],
+            )
+            .await?;
 
         Ok(Self {
             inner: CJASession {
-                session_id: row.get("session_id"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
+                session_id: row.get(0),
+                created_at: row.get(1),
+                updated_at: row.get(2),
             },
             user_id: None,
         })
@@ -87,9 +90,12 @@ async fn test_session_lifecycle() {
 
     // Update timestamp
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    sqlx::query("UPDATE sessions SET updated_at = NOW() WHERE session_id = $1")
-        .bind(session_id)
-        .execute(&pool)
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "UPDATE sessions SET updated_at = NOW() WHERE session_id = $1",
+            &[&session_id],
+        )
         .await
         .unwrap();
 

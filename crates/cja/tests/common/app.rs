@@ -1,12 +1,11 @@
 use axum::{Router, extract::State};
-use cja::{app_state::AppState, server::cookies::CookieKey};
+use cja::{app_state::AppState, deadpool_postgres::Pool, server::cookies::CookieKey};
 use reqwest::cookie::{CookieStore as _, Jar};
-use sqlx::PgPool;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct TestAppState {
-    pub db_pool: PgPool,
+    pub db_pool: Pool,
     pub cookie_key: CookieKey,
 }
 
@@ -15,7 +14,7 @@ impl AppState for TestAppState {
         "test-1.0.0"
     }
 
-    fn db(&self) -> &PgPool {
+    fn db(&self) -> &Pool {
         &self.db_pool
     }
 
@@ -25,7 +24,7 @@ impl AppState for TestAppState {
 }
 
 impl TestAppState {
-    pub fn new(db_pool: PgPool) -> Self {
+    pub fn new(db_pool: Pool) -> Self {
         Self {
             db_pool,
             cookie_key: CookieKey::from_env_or_generate().expect("Failed to generate cookie key"),

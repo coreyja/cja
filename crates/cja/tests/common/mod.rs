@@ -1,7 +1,7 @@
 pub mod app;
 pub mod db;
 
-use sqlx::postgres::PgPoolOptions;
+use cja::deadpool_postgres::Pool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -23,35 +23,31 @@ pub fn test_db_url(db_name: &str) -> String {
     format!("{base_url}/{db_name}")
 }
 
-pub async fn ensure_test_db(db_name: &str) -> sqlx::Result<sqlx::PgPool> {
+pub async fn ensure_test_db(db_name: &str) -> cja::Result<Pool> {
     let _lock = DB_MUTEX.lock().await;
 
     let base_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
 
-    let base_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&base_url)
-        .await?;
+    let base_pool = db::create_pool(&base_url).await?;
+    let base_client = base_pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
 
     // Drop database if exists
-    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
-        .execute(&base_pool)
+    let _ = base_client
+        .execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""), &[])
         .await;
 
     // Create fresh database
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&base_pool)
+    base_client
+        .execute(&format!("CREATE DATABASE \"{db_name}\""), &[])
         .await?;
 
-    base_pool.close().await;
+    drop(base_client);
+    base_pool.close();
 
     // Connect to the new test database
     let test_db_url = test_db_url(db_name);
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&test_db_url)
-        .await?;
+    let pool = db::create_pool(&test_db_url).await?;
 
     Ok(pool)
 }
@@ -67,22 +63,20 @@ pub struct TestDbGuard {
 impl Drop for TestDbGuard {
     fn drop(&mut self) {
         let db_name = self.db_name.clone();
-        // We'll use tokio::task::spawn_blocking to avoid the runtime-in-runtime issue
+        // We'll use std::thread::spawn to avoid the runtime-in-runtime issue
         let _ = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let base_url = std::env::var("DATABASE_URL")
                     .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
 
-                if let Ok(base_pool) = PgPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&base_url)
-                    .await
-                {
-                    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
-                        .execute(&base_pool)
-                        .await;
-                    base_pool.close().await;
+                if let Ok(base_pool) = db::create_pool(&base_url).await {
+                    if let Ok(client) = base_pool.get().await {
+                        let _ = client
+                            .execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""), &[])
+                            .await;
+                    }
+                    base_pool.close();
                 }
             });
         })
