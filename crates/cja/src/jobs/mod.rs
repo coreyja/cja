@@ -48,10 +48,10 @@ pub enum EnqueueError {
 ///
 /// # #[derive(Debug, Clone)]
 /// # struct MyAppState {
-/// #     db: sqlx::PgPool,
+/// #     db: cja::app_state::DbPool,
 /// # }
 /// # impl cja::app_state::AppState for MyAppState {
-/// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+/// #     fn db(&self) -> &cja::app_state::DbPool { &self.db }
 /// #     fn version(&self) -> &str { "1.0.0" }
 /// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
 /// # }
@@ -84,9 +84,9 @@ pub enum EnqueueError {
 /// # #[derive(Debug, Serialize, Deserialize, Clone)]
 /// # struct EmailJob { to: String, subject: String, body: String }
 /// # #[derive(Debug, Clone)]
-/// # struct MyAppState { db: sqlx::PgPool }
+/// # struct MyAppState { db: cja::app_state::DbPool }
 /// # impl cja::app_state::AppState for MyAppState {
-/// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+/// #     fn db(&self) -> &cja::app_state::DbPool { &self.db }
 /// #     fn version(&self) -> &str { "1.0.0" }
 /// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
 /// # }
@@ -110,16 +110,17 @@ pub enum EnqueueError {
 ///
 /// # Job with Database Access
 ///
-/// ```rust
+/// ```rust,no_run
 /// use cja::jobs::Job;
+/// use cja::app_state::AppState;
 /// use serde::{Serialize, Deserialize};
 ///
 /// # #[derive(Debug, Clone)]
 /// # struct MyAppState {
-/// #     db: sqlx::PgPool,
+/// #     db: cja::app_state::DbPool,
 /// # }
 /// # impl cja::app_state::AppState for MyAppState {
-/// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+/// #     fn db(&self) -> &cja::app_state::DbPool { &self.db }
 /// #     fn version(&self) -> &str { "1.0.0" }
 /// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
 /// # }
@@ -135,23 +136,23 @@ pub enum EnqueueError {
 ///     const NAME: &'static str = "ProcessPaymentJob";
 ///
 ///     async fn run(&self, app_state: MyAppState) -> color_eyre::Result<()> {
-///         use crate::cja::app_state::AppState;
-///         use sqlx::Row;
-///
 ///         // Access the database through app_state
-///         let user = sqlx::query("SELECT name FROM users WHERE id = $1")
-///             .bind(self.user_id)
-///             .fetch_one(app_state.db())
-///             .await?;
+///         let client = app_state.db().get().await
+///             .map_err(|e| color_eyre::eyre::eyre!("Pool error: {e}"))?;
+///
+///         let user = client.query_one(
+///             "SELECT name FROM users WHERE id = $1",
+///             &[&self.user_id]
+///         ).await?;
+///         let name: String = user.get(0);
 ///
 ///         println!("Processing payment of {} cents for user {} #{}",
-///                  self.amount_cents, user.get::<String, _>("name"), self.user_id);
+///                  self.amount_cents, name, self.user_id);
 ///
-///         sqlx::query("INSERT INTO payments (user_id, amount_cents) VALUES ($1, $2)")
-///             .bind(self.user_id)
-///             .bind(self.amount_cents)
-///             .execute(app_state.db())
-///             .await?;
+///         client.execute(
+///             "INSERT INTO payments (user_id, amount_cents) VALUES ($1, $2)",
+///             &[&self.user_id, &self.amount_cents]
+///         ).await?;
 ///
 ///         Ok(())
 ///     }
@@ -189,9 +190,9 @@ pub trait Job<AppState: AS>:
     /// # #[derive(Debug, Serialize, Deserialize, Clone)]
     /// # struct LongJob { iterations: u32 }
     /// # #[derive(Debug, Clone)]
-    /// # struct MyAppState { db: sqlx::PgPool }
+    /// # struct MyAppState { db: cja::app_state::DbPool }
     /// # impl cja::app_state::AppState for MyAppState {
-    /// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+    /// #     fn db(&self) -> &cja::app_state::DbPool { &self.db }
     /// #     fn version(&self) -> &str { "1.0.0" }
     /// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
     /// # }
@@ -265,9 +266,9 @@ pub trait Job<AppState: AS>:
     /// # #[derive(Debug, Serialize, Deserialize, Clone)]
     /// # struct MyJob { data: String }
     /// # #[derive(Debug, Clone)]
-    /// # struct MyAppState { db: sqlx::PgPool }
+    /// # struct MyAppState { db: cja::app_state::DbPool }
     /// # impl cja::app_state::AppState for MyAppState {
-    /// #     fn db(&self) -> &sqlx::PgPool { &self.db }
+    /// #     fn db(&self) -> &cja::app_state::DbPool { &self.db }
     /// #     fn version(&self) -> &str { "1.0.0" }
     /// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
     /// # }

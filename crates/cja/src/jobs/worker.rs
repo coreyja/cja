@@ -406,19 +406,109 @@ pub async fn job_worker<AppState: AS>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::AppState;
+    use crate::app_state::{AppState, DbPool};
+    use crate::db::Migrator;
     use crate::impl_job_registry;
     use crate::jobs::Job;
     use crate::server::cookies::CookieKey;
+    use deadpool_postgres::{Config, Pool, Runtime};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio_postgres::NoTls;
+
+    // Test database setup infrastructure
+    static TEST_DB_MUTEX: std::sync::LazyLock<Arc<Mutex<()>>> =
+        std::sync::LazyLock::new(|| Arc::new(Mutex::new(())));
+
+    fn base_db_url() -> String {
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/postgres".to_string())
+    }
+
+    fn url_without_db(url: &str) -> String {
+        if let Some(idx) = url.rfind('/') {
+            url[..idx].to_string()
+        } else {
+            url.to_string()
+        }
+    }
+
+    async fn create_pool(db_url: &str) -> Result<Pool, deadpool_postgres::CreatePoolError> {
+        let config = db_url
+            .parse::<tokio_postgres::Config>()
+            .expect("failed to parse DATABASE_URL");
+
+        let mut cfg = Config::new();
+        cfg.dbname = config.get_dbname().map(String::from);
+        cfg.host = config.get_hosts().first().map(|h| match h {
+            tokio_postgres::config::Host::Tcp(s) => s.clone(),
+            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+        });
+        cfg.port = config.get_ports().first().copied();
+        cfg.user = config.get_user().map(String::from);
+        cfg.password = config
+            .get_password()
+            .map(|p| String::from_utf8_lossy(p).into_owned());
+
+        cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+    }
+
+    async fn setup_test_db(test_name: &str) -> (Pool, String) {
+        let _lock = TEST_DB_MUTEX.lock().await;
+
+        let db_name = format!("cja_worker_test_{}_{}", test_name, uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let base_url = base_db_url();
+        let base_url_without_db = url_without_db(&base_url);
+
+        // Connect to the base database to create our test database
+        let base_pool = create_pool(&base_url).await.expect("failed to create base pool");
+        let base_client = base_pool.get().await.expect("failed to get base client");
+
+        // Drop existing test database if it exists (from a failed previous run)
+        let drop_sql = format!("DROP DATABASE IF EXISTS \"{db_name}\"");
+        base_client.execute(&drop_sql, &[]).await.expect("failed to drop test db");
+
+        // Create the test database
+        let create_sql = format!("CREATE DATABASE \"{db_name}\"");
+        base_client.execute(&create_sql, &[]).await.expect("failed to create test db");
+
+        drop(base_client);
+
+        // Connect to the new test database
+        let test_db_url = format!("{base_url_without_db}/{db_name}");
+        let test_pool = create_pool(&test_db_url).await.expect("failed to create test pool");
+
+        // Run migrations
+        let migrator = Migrator::from_path("./migrations").expect("failed to load migrations");
+        let client = test_pool.get().await.expect("failed to get client for migrations");
+        migrator.run(&client).await.expect("failed to run migrations");
+        drop(client);
+
+        (test_pool, db_name)
+    }
+
+    async fn cleanup_test_db(db_name: &str) {
+        let base_url = base_db_url();
+        if let Ok(base_pool) = create_pool(&base_url).await {
+            if let Ok(client) = base_pool.get().await {
+                // Terminate existing connections
+                let terminate_sql = format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}'"
+                );
+                let _ = client.execute(&terminate_sql, &[]).await;
+                // Drop the database
+                let _ = client.execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""), &[]).await;
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct TestAppState {
-        db: sqlx::PgPool,
+        db: DbPool,
         cookie_key: CookieKey,
     }
 
     impl AppState for TestAppState {
-        fn db(&self) -> &sqlx::PgPool {
+        fn db(&self) -> &DbPool {
             &self.db
         }
 
@@ -448,10 +538,11 @@ mod tests {
     impl_job_registry!(TestAppState, TestJob);
 
     /// Test that `fetch_next_job` picks up a job with a stale lock (lock older than timeout)
-    #[sqlx::test]
-    async fn test_fetch_next_job_picks_up_stale_locked_job(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_fetch_next_job_picks_up_stale_locked_job() {
+        let (pool, db_name) = setup_test_db("stale_lock").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
 
@@ -459,20 +550,24 @@ mod tests {
         let stale_worker_id = "crashed-worker";
 
         // Insert a job locked 120 seconds ago
-        sqlx::query(
-            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
-             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '120 seconds')",
-        )
-        .bind(job_id)
-        .bind("TestJob")
-        .bind(serde_json::json!({"id": "stale-lock-test"}))
-        .bind(0)
-        .bind("test-stale-lock")
-        .bind(0)
-        .bind(stale_worker_id)
-        .execute(&db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+                 VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '120 seconds')",
+                &[
+                    &job_id,
+                    &"TestJob",
+                    &serde_json::json!({"id": "stale-lock-test"}),
+                    &0i32,
+                    &"test-stale-lock",
+                    &0i32,
+                    &stale_worker_id,
+                ],
+            )
+            .await
+            .unwrap();
+        drop(client);
 
         // Create a worker with 60 second lock timeout
         let worker = Worker::new(
@@ -488,13 +583,17 @@ mod tests {
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().job_id, job_id);
+
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
     /// Test that `fetch_next_job` does NOT pick up a job with a fresh lock
-    #[sqlx::test]
-    async fn test_fetch_next_job_skips_recently_locked_job(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_fetch_next_job_skips_recently_locked_job() {
+        let (pool, db_name) = setup_test_db("recent_lock").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
 
@@ -502,20 +601,24 @@ mod tests {
         let active_worker_id = "active-worker";
 
         // Insert a job locked only 10 seconds ago
-        sqlx::query(
-            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
-             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '10 seconds')",
-        )
-        .bind(job_id)
-        .bind("TestJob")
-        .bind(serde_json::json!({"id": "recent-lock-test"}))
-        .bind(0)
-        .bind("test-recent-lock")
-        .bind(0)
-        .bind(active_worker_id)
-        .execute(&db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+                 VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '10 seconds')",
+                &[
+                    &job_id,
+                    &"TestJob",
+                    &serde_json::json!({"id": "recent-lock-test"}),
+                    &0i32,
+                    &"test-recent-lock",
+                    &0i32,
+                    &active_worker_id,
+                ],
+            )
+            .await
+            .unwrap();
+        drop(client);
 
         // Create a worker with 1 hour lock timeout
         let worker = Worker::new(
@@ -530,49 +633,60 @@ mod tests {
         // fetch_next_job should NOT pick up the recently locked job
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_none());
+
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
     /// Test that unlocked jobs are picked up before stale locked jobs (by priority)
-    #[sqlx::test]
-    async fn test_fetch_next_job_prefers_unlocked_by_priority(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_fetch_next_job_prefers_unlocked_by_priority() {
+        let (pool, db_name) = setup_test_db("priority").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
 
         let unlocked_job_id = uuid::Uuid::new_v4();
         let stale_locked_job_id = uuid::Uuid::new_v4();
 
+        let client = pool.get().await.unwrap();
+
         // Insert unlocked job with higher priority
-        sqlx::query(
-            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
-             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6)",
-        )
-        .bind(unlocked_job_id)
-        .bind("TestJob")
-        .bind(serde_json::json!({"id": "unlocked"}))
-        .bind(10) // Higher priority
-        .bind("test-unlocked")
-        .bind(0)
-        .execute(&db)
-        .await
-        .unwrap();
+        client
+            .execute(
+                "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
+                 VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6)",
+                &[
+                    &unlocked_job_id,
+                    &"TestJob",
+                    &serde_json::json!({"id": "unlocked"}),
+                    &10i32, // Higher priority
+                    &"test-unlocked",
+                    &0i32,
+                ],
+            )
+            .await
+            .unwrap();
 
         // Insert stale locked job with lower priority
-        sqlx::query(
-            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
-             VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '120 seconds')",
-        )
-        .bind(stale_locked_job_id)
-        .bind("TestJob")
-        .bind(serde_json::json!({"id": "stale-locked"}))
-        .bind(5) // Lower priority
-        .bind("test-stale")
-        .bind(0)
-        .bind("crashed-worker")
-        .execute(&db)
-        .await
-        .unwrap();
+        client
+            .execute(
+                "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count, locked_by, locked_at)
+                 VALUES ($1, $2, $3, $4, NOW(), NOW(), $5, $6, $7, NOW() - interval '120 seconds')",
+                &[
+                    &stale_locked_job_id,
+                    &"TestJob",
+                    &serde_json::json!({"id": "stale-locked"}),
+                    &5i32, // Lower priority
+                    &"test-stale",
+                    &0i32,
+                    &"crashed-worker",
+                ],
+            )
+            .await
+            .unwrap();
+        drop(client);
 
         // Create a worker with 60 second lock timeout
         let worker = Worker::new(
@@ -588,5 +702,8 @@ mod tests {
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().job_id, unlocked_job_id);
+
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 }

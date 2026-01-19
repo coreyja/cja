@@ -150,6 +150,7 @@ impl CJASession {
 ///
 /// ```rust,no_run
 /// use cja::server::session::{AppSession, CJASession};
+/// use cja::app_state::DbPool;
 /// use serde::{Serialize, Deserialize};
 ///
 /// #[derive(Debug, Clone)]
@@ -161,39 +162,40 @@ impl CJASession {
 ///
 /// #[async_trait::async_trait]
 /// impl AppSession for UserSession {
-///     async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
+///     async fn from_db(pool: &DbPool, session_id: uuid::Uuid) -> cja::Result<Self> {
 ///         // Query your session data including any custom fields
 ///         // In a real app, you'd have extended the sessions table with these columns
-///         let row = sqlx::query_as::<_, CJASession>(
-///             "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1"
-///         )
-///         .bind(session_id)
-///         .fetch_one(pool)
-///         .await?;
-///         
+///         let client = pool.get().await
+///             .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+///         let row = client.query_one(
+///             "SELECT session_id, updated_at, created_at FROM sessions WHERE session_id = $1",
+///             &[&session_id]
+///         ).await?;
+///
 ///         // For this example, we're just using default values for custom fields
 ///         // In a real app, you'd query your extended session data here
 ///         Ok(Self {
-///             inner: row,
+///             inner: CJASession::from_row(&row),
 ///             user_id: None,
 ///             preferences: serde_json::json!({}),
 ///         })
 ///     }
-///     
-///     async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
-///         let row = sqlx::query_as::<_, CJASession>(
-///             "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at"
-///         )
-///         .fetch_one(pool)
-///         .await?;
-///         
+///
+///     async fn create(pool: &DbPool) -> cja::Result<Self> {
+///         let client = pool.get().await
+///             .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+///         let row = client.query_one(
+///             "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, updated_at, created_at",
+///             &[]
+///         ).await?;
+///
 ///         Ok(Self {
-///             inner: row,
+///             inner: CJASession::from_row(&row),
 ///             user_id: None,
 ///             preferences: serde_json::json!({}),
 ///         })
 ///     }
-///     
+///
 ///     fn from_inner(inner: CJASession) -> Self {
 ///         Self {
 ///             inner,
@@ -201,7 +203,7 @@ impl CJASession {
 ///             preferences: serde_json::json!({}),
 ///         }
 ///     }
-///     
+///
 ///     fn inner(&self) -> &CJASession {
 ///         &self.inner
 ///     }
@@ -214,14 +216,15 @@ impl CJASession {
 /// use axum::response::IntoResponse;
 /// use cja::server::session::Session;
 /// # use cja::server::session::{AppSession, CJASession};
+/// # use cja::app_state::DbPool;
 /// #
 /// # #[derive(Debug, Clone)]
 /// # struct UserSession { inner: CJASession, user_id: Option<i32> }
 /// #
 /// # #[async_trait::async_trait]
 /// # impl AppSession for UserSession {
-/// #     async fn from_db(_: &sqlx::PgPool, _: uuid::Uuid) -> cja::Result<Self> { todo!() }
-/// #     async fn create(_: &sqlx::PgPool) -> cja::Result<Self> { todo!() }
+/// #     async fn from_db(_: &DbPool, _: uuid::Uuid) -> cja::Result<Self> { todo!() }
+/// #     async fn create(_: &DbPool) -> cja::Result<Self> { todo!() }
 /// #     fn from_inner(inner: CJASession) -> Self { Self { inner, user_id: None } }
 /// #     fn inner(&self) -> &CJASession { &self.inner }
 /// # }
@@ -283,6 +286,7 @@ pub trait AppSession: Sized {
 /// use axum::{Router, routing::get, response::IntoResponse};
 /// use cja::server::session::Session;
 /// # use cja::server::session::{AppSession, CJASession};
+/// # use cja::app_state::DbPool;
 /// #
 /// # #[derive(Debug, Clone)]
 /// # struct UserSession {
@@ -293,8 +297,8 @@ pub trait AppSession: Sized {
 /// #
 /// # #[async_trait::async_trait]
 /// # impl AppSession for UserSession {
-/// #     async fn from_db(_: &sqlx::PgPool, _: uuid::Uuid) -> cja::Result<Self> { todo!() }
-/// #     async fn create(_: &sqlx::PgPool) -> cja::Result<Self> { todo!() }
+/// #     async fn from_db(_: &DbPool, _: uuid::Uuid) -> cja::Result<Self> { todo!() }
+/// #     async fn create(_: &DbPool) -> cja::Result<Self> { todo!() }
 /// #     fn from_inner(inner: CJASession) -> Self {
 /// #         Self { inner, user_id: None, login_count: 0 }
 /// #     }
@@ -318,7 +322,7 @@ pub trait AppSession: Sized {
 ///     session.user_id = Some(123);
 ///     session.login_count += 1;
 ///     // Don't forget to save the session!
-///     
+///
 ///     "Logged in successfully"
 /// }
 ///
@@ -326,7 +330,7 @@ pub trait AppSession: Sized {
 /// # struct MyAppState;
 /// # impl cja::app_state::AppState for MyAppState {
 /// #     fn version(&self) -> &str { "1.0.0" }
-/// #     fn db(&self) -> &sqlx::PgPool { todo!() }
+/// #     fn db(&self) -> &DbPool { todo!() }
 /// #     fn cookie_key(&self) -> &cja::server::cookies::CookieKey { todo!() }
 /// # }
 /// # fn app() -> Router {

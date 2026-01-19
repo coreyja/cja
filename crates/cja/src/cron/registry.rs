@@ -323,19 +323,110 @@ impl<AppState: AS> Default for CronRegistry<AppState> {
 
 #[cfg(test)]
 mod test {
-    use crate::app_state::AppState;
+    use crate::app_state::{AppState, DbPool};
+    use crate::db::Migrator;
     use crate::server::cookies::CookieKey;
+    use deadpool_postgres::{Config, Pool, Runtime};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio_postgres::NoTls;
+    use uuid::Uuid;
 
     use super::*;
 
+    // Test database setup infrastructure
+    static TEST_DB_MUTEX: std::sync::LazyLock<Arc<Mutex<()>>> =
+        std::sync::LazyLock::new(|| Arc::new(Mutex::new(())));
+
+    fn base_db_url() -> String {
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/postgres".to_string())
+    }
+
+    fn url_without_db(url: &str) -> String {
+        if let Some(idx) = url.rfind('/') {
+            url[..idx].to_string()
+        } else {
+            url.to_string()
+        }
+    }
+
+    async fn create_pool(db_url: &str) -> Result<Pool, deadpool_postgres::CreatePoolError> {
+        let config = db_url
+            .parse::<tokio_postgres::Config>()
+            .expect("failed to parse DATABASE_URL");
+
+        let mut cfg = Config::new();
+        cfg.dbname = config.get_dbname().map(String::from);
+        cfg.host = config.get_hosts().first().map(|h| match h {
+            tokio_postgres::config::Host::Tcp(s) => s.clone(),
+            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+        });
+        cfg.port = config.get_ports().first().copied();
+        cfg.user = config.get_user().map(String::from);
+        cfg.password = config
+            .get_password()
+            .map(|p| String::from_utf8_lossy(p).into_owned());
+
+        cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+    }
+
+    async fn setup_test_db(test_name: &str) -> (Pool, String) {
+        let _lock = TEST_DB_MUTEX.lock().await;
+
+        let db_name = format!("cja_cron_test_{}_{}", test_name, Uuid::new_v4().to_string().replace('-', ""));
+        let base_url = base_db_url();
+        let base_url_without_db = url_without_db(&base_url);
+
+        // Connect to the base database to create our test database
+        let base_pool = create_pool(&base_url).await.expect("failed to create base pool");
+        let base_client = base_pool.get().await.expect("failed to get base client");
+
+        // Drop existing test database if it exists (from a failed previous run)
+        let drop_sql = format!("DROP DATABASE IF EXISTS \"{db_name}\"");
+        base_client.execute(&drop_sql, &[]).await.expect("failed to drop test db");
+
+        // Create the test database
+        let create_sql = format!("CREATE DATABASE \"{db_name}\"");
+        base_client.execute(&create_sql, &[]).await.expect("failed to create test db");
+
+        drop(base_client);
+
+        // Connect to the new test database
+        let test_db_url = format!("{base_url_without_db}/{db_name}");
+        let test_pool = create_pool(&test_db_url).await.expect("failed to create test pool");
+
+        // Run migrations
+        let migrator = Migrator::from_path("./migrations").expect("failed to load migrations");
+        let client = test_pool.get().await.expect("failed to get client for migrations");
+        migrator.run(&client).await.expect("failed to run migrations");
+        drop(client);
+
+        (test_pool, db_name)
+    }
+
+    async fn cleanup_test_db(db_name: &str) {
+        let base_url = base_db_url();
+        if let Ok(base_pool) = create_pool(&base_url).await {
+            if let Ok(client) = base_pool.get().await {
+                // Terminate existing connections
+                let terminate_sql = format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}'"
+                );
+                let _ = client.execute(&terminate_sql, &[]).await;
+                // Drop the database
+                let _ = client.execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""), &[]).await;
+            }
+        }
+    }
+
     #[derive(Clone)]
     struct TestAppState {
-        db: sqlx::PgPool,
+        db: DbPool,
         cookie_key: CookieKey,
     }
 
     impl AppState for TestAppState {
-        fn db(&self) -> &sqlx::PgPool {
+        fn db(&self) -> &DbPool {
             &self.db
         }
 
@@ -384,10 +475,11 @@ mod test {
         }
     }
 
-    #[sqlx::test]
-    async fn test_tick_creates_new_cron_record(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_tick_creates_new_cron_record() {
+        let (pool, db_name) = setup_test_db("tick_creates").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -401,37 +493,38 @@ mod test {
 
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
-        let existing_record =
-            sqlx::query!("SELECT cron_id FROM Crons where name = $1", TestJob::NAME)
-                .fetch_optional(&app_state.db)
-                .await
-                .unwrap();
+        let client = pool.get().await.unwrap();
+        let existing_record = client
+            .query_opt("SELECT cron_id FROM Crons where name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
         assert!(
             existing_record.is_none(),
-            "Record should not exist {}",
-            existing_record.unwrap().cron_id
+            "Record should not exist"
         );
 
         worker.tick().await.unwrap();
 
-        let last_run = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            TestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let row = client
+            .query_one("SELECT last_run_at FROM Crons WHERE name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
+        let last_run_at: chrono::DateTime<Utc> = row.get(0);
 
         let now = Utc::now();
-        let last_run_at = last_run.last_run_at;
         let diff = now.signed_duration_since(last_run_at);
         assert!(diff.num_milliseconds() < 1000);
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_tick_skips_updating_existing_cron_record(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_tick_skips_updating_existing_cron_record() {
+        let (pool, db_name) = setup_test_db("tick_skips").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -439,38 +532,40 @@ mod test {
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
         let previously = Utc::now();
-        sqlx::query!(
-            "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $3, $3)
-            ON CONFLICT (name)
-            DO UPDATE SET
-            last_run_at = $3",
-            uuid::Uuid::new_v4(),
-            TestJob::NAME,
-            previously
-        )
-        .execute(&app_state.db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
+                VALUES ($1, $2, $3, $3, $3)
+                ON CONFLICT (name)
+                DO UPDATE SET
+                last_run_at = $3",
+                &[&Uuid::new_v4(), &TestJob::NAME, &previously],
+            )
+            .await
+            .unwrap();
 
         worker.tick().await.unwrap();
 
-        let last_run = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            TestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let row = client
+            .query_one("SELECT last_run_at FROM Crons WHERE name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
+        let last_run_at: chrono::DateTime<Utc> = row.get(0);
 
-        let diff = last_run.last_run_at.signed_duration_since(previously);
+        let diff = last_run_at.signed_duration_since(previously);
         assert!(diff.num_milliseconds() < 50);
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_tick_updates_cron_record_when_interval_elapsed(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_tick_updates_cron_record_when_interval_elapsed() {
+        let (pool, db_name) = setup_test_db("tick_updates").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -478,36 +573,38 @@ mod test {
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
         let two_seconds_ago = Utc::now() - chrono::Duration::seconds(2);
-        sqlx::query!(
-            "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $3, $3)",
-            uuid::Uuid::new_v4(),
-            TestJob::NAME,
-            two_seconds_ago
-        )
-        .execute(&app_state.db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
+                VALUES ($1, $2, $3, $3, $3)",
+                &[&Uuid::new_v4(), &TestJob::NAME, &two_seconds_ago],
+            )
+            .await
+            .unwrap();
 
         worker.tick().await.unwrap();
 
-        let last_run = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            TestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let row = client
+            .query_one("SELECT last_run_at FROM Crons WHERE name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
+        let last_run_at: chrono::DateTime<Utc> = row.get(0);
 
-        assert!(last_run.last_run_at > two_seconds_ago);
-        let diff = Utc::now().signed_duration_since(last_run.last_run_at);
+        assert!(last_run_at > two_seconds_ago);
+        let diff = Utc::now().signed_duration_since(last_run_at);
         assert!(diff.num_milliseconds() < 1000);
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_tick_enqueues_failing_job_successfully(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_tick_enqueues_failing_job_successfully() {
+        let (pool, db_name) = setup_test_db("tick_enqueues").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -527,32 +624,34 @@ mod test {
             .await;
         assert!(result.is_ok());
 
-        let cron_record = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            FailingJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        let row = client
+            .query_one("SELECT last_run_at FROM Crons WHERE name = $1", &[&FailingJob::NAME])
+            .await
+            .unwrap();
+        let last_run_at: chrono::DateTime<Utc> = row.get(0);
 
         let now = Utc::now();
-        let diff = now.signed_duration_since(cron_record.last_run_at);
+        let diff = now.signed_duration_since(last_run_at);
         assert!(diff.num_milliseconds() < 1000);
 
-        let job_count = sqlx::query!(
-            "SELECT COUNT(*) as count FROM jobs WHERE name = $1",
-            FailingJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
-        assert_eq!(job_count.count.unwrap(), 1);
+        let row = client
+            .query_one("SELECT COUNT(*) as count FROM jobs WHERE name = $1", &[&FailingJob::NAME])
+            .await
+            .unwrap();
+        let count: i64 = row.get(0);
+        assert_eq!(count, 1);
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_tick_with_custom_function_error(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_tick_with_custom_function_error() {
+        let (pool, db_name) = setup_test_db("tick_custom_error").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         #[derive(Debug, thiserror::Error)]
@@ -583,23 +682,27 @@ mod test {
             TickError::JobError(err) => {
                 assert!(err.contains("CustomError"));
             }
-            TickError::SqlxError(_) => panic!("Expected JobError"),
+            _ => panic!("Expected JobError"),
         }
 
-        let cron_count = sqlx::query!(
-            "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
-            "custom_failing"
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
-        assert_eq!(cron_count.count.unwrap(), 0);
+        let client = pool.get().await.unwrap();
+        let row = client
+            .query_one("SELECT COUNT(*) as count FROM Crons WHERE name = $1", &[&"custom_failing"])
+            .await
+            .unwrap();
+        let count: i64 = row.get(0);
+        assert_eq!(count, 0);
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_worker_tick_with_multiple_jobs(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_worker_tick_with_multiple_jobs() {
+        let (pool, db_name) = setup_test_db("worker_multiple").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -612,34 +715,36 @@ mod test {
 
         worker.tick().await.unwrap();
 
-        let test_job_record = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            TestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        let row1 = client
+            .query_one("SELECT last_run_at FROM Crons WHERE name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
+        let test_job_last_run: chrono::DateTime<Utc> = row1.get(0);
 
-        let second_job_record = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            SecondTestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let row2 = client
+            .query_one("SELECT last_run_at FROM Crons WHERE name = $1", &[&SecondTestJob::NAME])
+            .await
+            .unwrap();
+        let second_job_last_run: chrono::DateTime<Utc> = row2.get(0);
 
         let now = Utc::now();
-        let diff1 = now.signed_duration_since(test_job_record.last_run_at);
-        let diff2 = now.signed_duration_since(second_job_record.last_run_at);
+        let diff1 = now.signed_duration_since(test_job_last_run);
+        let diff2 = now.signed_duration_since(second_job_last_run);
 
         assert!(diff1.num_milliseconds() < 1000);
         assert!(diff2.num_milliseconds() < 1000);
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_worker_respects_existing_last_run_times(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_worker_respects_existing_last_run_times() {
+        let (pool, db_name) = setup_test_db("worker_respects").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -651,57 +756,53 @@ mod test {
         let recent_time = Utc::now() - chrono::Duration::seconds(3);
         let old_time = Utc::now() - chrono::Duration::seconds(10);
 
-        sqlx::query!(
-            "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
                 VALUES ($1, $2, $3, $3, $3)",
-            uuid::Uuid::new_v4(),
-            TestJob::NAME,
-            recent_time
-        )
-        .execute(&app_state.db)
-        .await
-        .unwrap();
+                &[&Uuid::new_v4(), &TestJob::NAME, &recent_time],
+            )
+            .await
+            .unwrap();
 
-        sqlx::query!(
-            "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
+        client
+            .execute(
+                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
                 VALUES ($1, $2, $3, $3, $3)",
-            uuid::Uuid::new_v4(),
-            SecondTestJob::NAME,
-            old_time
-        )
-        .execute(&app_state.db)
-        .await
-        .unwrap();
+                &[&Uuid::new_v4(), &SecondTestJob::NAME, &old_time],
+            )
+            .await
+            .unwrap();
 
         worker.tick().await.unwrap();
 
-        let test_job_record = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            TestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let row1 = client
+            .query_one("SELECT last_run_at FROM Crons WHERE name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
+        let test_job_last_run: chrono::DateTime<Utc> = row1.get(0);
 
-        let second_job_record = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            SecondTestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let row2 = client
+            .query_one("SELECT last_run_at FROM Crons WHERE name = $1", &[&SecondTestJob::NAME])
+            .await
+            .unwrap();
+        let second_job_last_run: chrono::DateTime<Utc> = row2.get(0);
 
-        let recent_diff = test_job_record
-            .last_run_at
-            .signed_duration_since(recent_time);
+        let recent_diff = test_job_last_run.signed_duration_since(recent_time);
         assert!(recent_diff.num_milliseconds() < 100);
-        assert!(second_job_record.last_run_at > old_time);
+        assert!(second_job_last_run > old_time);
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_tick_handles_future_last_run_time(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_tick_handles_future_last_run_time() {
+        let (pool, db_name) = setup_test_db("tick_future").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -726,24 +827,28 @@ mod test {
         // With future last_run time, the job should not run
         assert!(result.is_ok());
 
-        let cron_count = sqlx::query!(
-            "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
-            TestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        let row = client
+            .query_one("SELECT COUNT(*) as count FROM Crons WHERE name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
+        let count: i64 = row.get(0);
         assert_eq!(
-            cron_count.count.unwrap(),
+            count,
             0,
             "Should not have created cron record with future last_run time"
         );
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_cron_expression_scheduling(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_cron_expression_scheduling() {
+        let (pool, db_name) = setup_test_db("cron_expr").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -771,27 +876,31 @@ mod test {
         assert!(result.is_ok());
 
         // Verify cron record was created (if it ran)
-        let cron_record = sqlx::query!(
-            "SELECT last_run_at FROM Crons WHERE name = $1",
-            TestJob::NAME
-        )
-        .fetch_optional(&app_state.db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        let cron_record = client
+            .query_opt("SELECT last_run_at FROM Crons WHERE name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
 
         // The job should have run since we used a worker start time 2 minutes ago
         assert!(cron_record.is_some());
-        if let Some(record) = cron_record {
+        if let Some(row) = cron_record {
+            let last_run_at: chrono::DateTime<Utc> = row.get(0);
             let now = Utc::now();
-            let diff = now.signed_duration_since(record.last_run_at);
+            let diff = now.signed_duration_since(last_run_at);
             assert!(diff.num_milliseconds() < 1000);
         }
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
-    #[sqlx::test]
-    async fn test_cron_expression_respects_schedule(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_cron_expression_respects_schedule() {
+        let (pool, db_name) = setup_test_db("cron_respects").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -820,6 +929,9 @@ mod test {
             )
             .await;
         assert!(result.is_ok());
+
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 
     #[test]
@@ -836,10 +948,11 @@ mod test {
         assert!(result.is_err());
     }
 
-    #[sqlx::test]
-    async fn test_mixed_interval_and_cron_jobs(db: sqlx::PgPool) {
+    #[tokio::test]
+    async fn test_mixed_interval_and_cron_jobs() {
+        let (pool, db_name) = setup_test_db("mixed_jobs").await;
         let app_state = TestAppState {
-            db: db.clone(),
+            db: pool.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
@@ -867,23 +980,24 @@ mod test {
         // Both jobs should run on first tick
         worker.tick().await.unwrap();
 
-        let test_job_count = sqlx::query!(
-            "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
-            TestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let client = pool.get().await.unwrap();
+        let row1 = client
+            .query_one("SELECT COUNT(*) as count FROM Crons WHERE name = $1", &[&TestJob::NAME])
+            .await
+            .unwrap();
+        let test_job_count: i64 = row1.get(0);
 
-        let second_job_count = sqlx::query!(
-            "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
-            SecondTestJob::NAME
-        )
-        .fetch_one(&app_state.db)
-        .await
-        .unwrap();
+        let row2 = client
+            .query_one("SELECT COUNT(*) as count FROM Crons WHERE name = $1", &[&SecondTestJob::NAME])
+            .await
+            .unwrap();
+        let second_job_count: i64 = row2.get(0);
 
-        assert_eq!(test_job_count.count.unwrap(), 1);
-        assert_eq!(second_job_count.count.unwrap(), 1);
+        assert_eq!(test_job_count, 1);
+        assert_eq!(second_job_count, 1);
+
+        drop(client);
+        pool.close();
+        cleanup_test_db(&db_name).await;
     }
 }

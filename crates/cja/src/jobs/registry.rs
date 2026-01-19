@@ -34,13 +34,13 @@ pub trait JobRegistry<AppState: app_state::AppState> {
 /// // Define your app state
 /// #[derive(Clone)]
 /// struct MyAppState {
-///     db: sqlx::PgPool,
+///     db: cja::app_state::DbPool,
 ///     cookie_key: CookieKey,
 /// }
 ///
 /// impl AppState for MyAppState {
 ///     fn version(&self) -> &str { "1.0.0" }
-///     fn db(&self) -> &sqlx::PgPool { &self.db }
+///     fn db(&self) -> &cja::app_state::DbPool { &self.db }
 ///     fn cookie_key(&self) -> &CookieKey { &self.cookie_key }
 /// }
 ///

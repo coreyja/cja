@@ -49,8 +49,6 @@ cja-macros = { path = "../cja-macros", optional = true }
 [dev-dependencies]
 reqwest = { workspace = true, features = ["cookies"] }
 once_cell = "1.19"
-# SQLx still needed for tests during transition
-sqlx.workspace = true
 
 [lints]
 workspace = true

@@ -416,7 +416,6 @@ dependencies = [
  "socket2 0.5.9",
  "sql-check",
  "sql-check-macros",
- "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tokio-postgres",
