@@ -11,6 +11,8 @@ jobs = ["cja/jobs"]
 
 [dependencies]
 cja = { path = "../cja" }
+sql-check.workspace = true
+sql-check-macros.workspace = true
 
 axum.workspace = true
 tokio.workspace = true

@@ -410,6 +410,8 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+ "sql-check",
+ "sql-check-macros",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
@@ -450,6 +452,8 @@ dependencies = [
  "maud",
  "serde",
  "serde_json",
+ "sql-check",
+ "sql-check-macros",
  "sqlx",
  "tokio",
  "tracing",
@@ -2222,6 +2226,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 
 [[package]]
+name = "psm"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e944464ec8536cd1beb0bbfd96987eb5e3b72f2ecdafdc5c769a37f1fa2ae1f"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "publicsuffix"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2358,6 +2371,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
 dependencies = [
  "getrandom 0.3.2",
+]
+
+[[package]]
+name = "recursive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0786a43debb760f491b1bc0269fe5e84155353c67482b9e60d0cfb596054b43e"
+dependencies = [
+ "recursive-proc-macro-impl",
+ "stacker",
+]
+
+[[package]]
+name = "recursive-proc-macro-impl"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76009fbe0614077fc1a2ce255e3a1881a2e3a3527097d5dc6d8212c585e7e38b"
+dependencies = [
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -3012,6 +3045,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "sql-check"
+version = "0.1.0"
+source = "git+https://github.com/coreyja-studio/sql-check.git?branch=feature%2Fsqlx-support#24d7b03cc234b25afc625224a2accf3e7250a7d6"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "sqlx",
+ "thiserror 2.0.12",
+ "uuid",
+]
+
+[[package]]
+name = "sql-check-macros"
+version = "0.1.0"
+source = "git+https://github.com/coreyja-studio/sql-check.git?branch=feature%2Fsqlx-support#24d7b03cc234b25afc625224a2accf3e7250a7d6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "sql-check",
+ "syn",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.60.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "505aa16b045c4c1375bf5f125cce3813d0176325bfe9ffc4a903f423de7774ff"
+dependencies = [
+ "log",
+ "recursive",
+]
+
+[[package]]
 name = "sqlx"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3215,6 +3283,19 @@ name = "stable_deref_trait"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
+
+[[package]]
+name = "stacker"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cddb07e32ddb770749da91081d8d0ac3a16f1a569a18b20348cd371f5dead06b"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "psm",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "stringprep"

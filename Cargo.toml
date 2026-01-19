@@ -30,6 +30,8 @@ sqlx = { version = "0.8", default-features = false, features = [
   "uuid",
   "json",
 ] }
+sql-check = { git = "https://github.com/coreyja-studio/sql-check.git", branch = "feature/sqlx-support", features = ["sqlx-runtime"] }
+sql-check-macros = { git = "https://github.com/coreyja-studio/sql-check.git", branch = "feature/sqlx-support" }
 tokio = { version = "1.21", features = ["full"] }
 tracing = "0.1.37"
 uuid = { version = "1.6.1", features = ["v4", "serde"] }

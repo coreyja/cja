@@ -101,7 +101,7 @@ impl<AppState: AS> Worker<AppState> {
     }
 
     async fn last_enqueue_map(&self) -> Result<HashMap<String, DateTime<Utc>>, TickError> {
-        let last_runs = sqlx::query!("SELECT name, last_run_at FROM Crons")
+        let last_runs = sql_check_macros::sqlx_query!("SELECT name, last_run_at FROM crons")
             .fetch_all(self.state.db())
             .await
             .map_err(TickError::SqlxError)?;

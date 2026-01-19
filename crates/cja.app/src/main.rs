@@ -147,7 +147,7 @@ struct SiteSession {
 #[async_trait::async_trait]
 impl AppSession for SiteSession {
     async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
-        let row = sqlx::query!(
+        let row = sql_check_macros::sqlx_query!(
             "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
             session_id
         )
@@ -166,8 +166,8 @@ impl AppSession for SiteSession {
     }
 
     async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
-        let row = sqlx::query!(
-            "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",
+        let row = sql_check_macros::sqlx_query!(
+            "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at"
         )
         .fetch_one(pool)
         .await?;

@@ -206,8 +206,8 @@ impl<AppState: AS> CronJob<AppState> {
                 .await
                 .map_err(TickError::JobError)?;
 
-            sqlx::query!(
-                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
+            sql_check_macros::sqlx_query!(
+                "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (name)
                 DO UPDATE SET
