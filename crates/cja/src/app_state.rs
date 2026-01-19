@@ -1,5 +1,8 @@
 use crate::server::cookies::CookieKey;
 
+/// Type alias for the database pool used throughout the application.
+pub type DbPool = deadpool_postgres::Pool;
+
 /// A trait representing the application state that must be implemented by users of the cja framework.
 ///
 /// This trait provides access to core components like the database pool and cookie encryption key.
@@ -9,13 +12,12 @@ use crate::server::cookies::CookieKey;
 /// # Example
 ///
 /// ```rust
-/// use cja::app_state::AppState;
+/// use cja::app_state::{AppState, DbPool};
 /// use cja::server::cookies::CookieKey;
-/// use sqlx::PgPool;
 ///
 /// #[derive(Clone)]
 /// struct MyAppState {
-///     db: PgPool,
+///     db: DbPool,
 ///     cookie_key: CookieKey,
 /// }
 ///
@@ -23,60 +25,15 @@ use crate::server::cookies::CookieKey;
 ///     fn version(&self) -> &str {
 ///         "1.0.0"
 ///     }
-///     
-///     fn db(&self) -> &PgPool {
+///
+///     fn db(&self) -> &DbPool {
 ///         &self.db
 ///     }
-///     
+///
 ///     fn cookie_key(&self) -> &CookieKey {
 ///         &self.cookie_key
 ///     }
 /// }
-/// ```
-///
-/// # Using with Axum
-///
-/// ```rust
-/// use cja::app_state::AppState;
-/// use cja::server::cookies::CookieKey;
-/// use sqlx::postgres::PgPoolOptions;
-/// use axum::{Router, routing::get, extract::State};
-///
-/// #[derive(Clone)]
-/// struct MyAppState {
-///     db: sqlx::PgPool,
-///     cookie_key: CookieKey,
-/// }
-///
-/// impl AppState for MyAppState {
-///     fn version(&self) -> &str { "1.0.0" }
-///     fn db(&self) -> &sqlx::PgPool { &self.db }
-///     fn cookie_key(&self) -> &CookieKey { &self.cookie_key }
-/// }
-///
-/// async fn handler(State(state): State<MyAppState>) -> String {
-///     format!("App version: {}", state.version())
-/// }
-///
-///  async fn example() -> Result<(), Box<dyn std::error::Error>> {
-///  use sqlx::postgres::PgPoolOptions;
-/// let db = PgPoolOptions::new()
-///      .connect(&std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://test".to_string()))
-///      .await
-///      .map_err(|_| "Database connection failed")?;
-///     
-/// let state = MyAppState {
-///     db,
-///     cookie_key: CookieKey::from_env_or_generate()?,
-/// };
-///
-/// let app: Router = Router::new()
-///     .route("/", get(handler))
-///     .with_state(state);
-///
-/// // Run the server
-/// # Ok(())
-/// # }
 /// ```
 pub trait AppState: Clone + Send + Sync + 'static {
     /// Returns the version string for the application.
@@ -85,7 +42,7 @@ pub trait AppState: Clone + Send + Sync + 'static {
 
     /// Returns a reference to the database connection pool.
     /// The pool is typically shared across all requests.
-    fn db(&self) -> &sqlx::PgPool;
+    fn db(&self) -> &DbPool;
 
     /// Returns the cookie encryption key used for secure cookies.
     /// This key should be consistent across application restarts

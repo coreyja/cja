@@ -1,8 +1,9 @@
 use axum::response::IntoResponse;
 use cja::{
+    app_state::DbPool,
     color_eyre::{
         self,
-        eyre::{Context as _, eyre},
+        eyre::Context as _,
     },
     server::{
         cookies::CookieKey,
@@ -12,12 +13,11 @@ use cja::{
     setup::{setup_sentry, setup_tracing},
 };
 use maud::html;
-use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::info;
 
 #[derive(Clone)]
 struct AppState {
-    db: sqlx::PgPool,
+    db: DbPool,
     cookie_key: CookieKey,
 }
 
@@ -35,7 +35,7 @@ impl cja::app_state::AppState for AppState {
         "unknown"
     }
 
-    fn db(&self) -> &sqlx::PgPool {
+    fn db(&self) -> &DbPool {
         &self.db
     }
 
@@ -57,36 +57,36 @@ fn main() -> color_eyre::Result<()> {
 }
 
 #[tracing::instrument(err)]
-pub async fn setup_db_pool() -> cja::Result<PgPool> {
-    const MIGRATION_LOCK_ID: i64 = 0xDB_DB_DB_DB_DB_DB_DB;
+pub async fn setup_db_pool() -> cja::Result<DbPool> {
+    use deadpool_postgres::{Config, Runtime};
+    use tokio_postgres::NoTls;
 
     let database_url = std::env::var("DATABASE_URL").wrap_err("DATABASE_URL must be set")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await?;
 
-    sqlx::query!("SELECT pg_advisory_lock($1)", MIGRATION_LOCK_ID)
-        .execute(&pool)
-        .await?;
+    // Parse the database URL and create a deadpool config
+    let config = database_url
+        .parse::<tokio_postgres::Config>()
+        .wrap_err("Failed to parse DATABASE_URL")?;
 
-    sqlx::migrate!().run(&pool).await?;
+    let mut cfg = Config::new();
+    cfg.dbname = config.get_dbname().map(String::from);
+    cfg.host = config.get_hosts().first().map(|h| match h {
+        tokio_postgres::config::Host::Tcp(s) => s.clone(),
+        tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+    });
+    cfg.port = config.get_ports().first().copied();
+    cfg.user = config.get_user().map(String::from);
+    cfg.password = config
+        .get_password()
+        .map(|p| String::from_utf8_lossy(p).into_owned());
 
-    let unlock_result = sqlx::query!("SELECT pg_advisory_unlock($1)", MIGRATION_LOCK_ID)
-        .fetch_one(&pool)
-        .await?
-        .pg_advisory_unlock;
+    let pool = cfg
+        .create_pool(Some(Runtime::Tokio1), NoTls)
+        .wrap_err("Failed to create database pool")?;
 
-    match unlock_result {
-        Some(b) => {
-            if b {
-                tracing::info!("Migration lock unlocked");
-            } else {
-                tracing::info!("Failed to unlock migration lock");
-            }
-        }
-        None => return Err(eyre!("Failed to unlock migration lock")),
-    }
+    // Run migrations using sqlx-cli externally
+    // For now, just log that migrations should be run
+    tracing::warn!("Migrations should be run via sqlx-cli or refinery");
 
     Ok(pool)
 }
@@ -146,12 +146,13 @@ struct SiteSession {
 
 #[async_trait::async_trait]
 impl AppSession for SiteSession {
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
-        let row = sql_check_macros::sqlx_query!(
-            "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
+    async fn from_db(pool: &DbPool, session_id: uuid::Uuid) -> cja::Result<Self> {
+        let client = pool.get().await?;
+        let row = sql_check_macros::query!(
+            "SELECT session_id, updated_at, created_at FROM sessions WHERE session_id = $1",
             session_id
         )
-        .fetch_one(pool)
+        .fetch_one(&*client)
         .await?;
 
         let session = SiteSession {
@@ -165,11 +166,12 @@ impl AppSession for SiteSession {
         Ok(session)
     }
 
-    async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
-        let row = sql_check_macros::sqlx_query!(
-            "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at"
+    async fn create(pool: &DbPool) -> cja::Result<Self> {
+        let client = pool.get().await?;
+        let row = sql_check_macros::query!(
+            "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, updated_at, created_at"
         )
-        .fetch_one(pool)
+        .fetch_one(&*client)
         .await?;
 
         let inner = CJASession {

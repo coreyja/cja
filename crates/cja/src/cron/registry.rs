@@ -168,7 +168,8 @@ pub struct CronJob<AppState: AS> {
 #[error("TickError: {0}")]
 pub enum TickError {
     JobError(String),
-    SqlxError(sqlx::Error),
+    DbError(#[from] tokio_postgres::Error),
+    PoolError(String),
 }
 
 impl<AppState: AS> CronJob<AppState> {
@@ -206,7 +207,13 @@ impl<AppState: AS> CronJob<AppState> {
                 .await
                 .map_err(TickError::JobError)?;
 
-            sql_check_macros::sqlx_query!(
+            let client = app_state
+                .db()
+                .get()
+                .await
+                .map_err(|e| TickError::PoolError(e.to_string()))?;
+
+            sql_check_macros::query!(
                 "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (name)
@@ -218,9 +225,8 @@ impl<AppState: AS> CronJob<AppState> {
                 now,
                 now
             )
-            .execute(app_state.db())
-            .await
-            .map_err(TickError::SqlxError)?;
+            .execute(&*client)
+            .await?;
         }
 
         Ok(())

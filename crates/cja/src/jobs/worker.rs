@@ -28,7 +28,7 @@ pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 #[derive(Debug)]
 pub(super) struct RunJobSuccess(JobFromDB);
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 pub struct JobFromDB {
     pub job_id: uuid::Uuid,
     pub name: String,
@@ -40,6 +40,23 @@ pub struct JobFromDB {
     pub error_count: i32,
     pub last_error_message: Option<String>,
     pub last_failed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl JobFromDB {
+    fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self {
+            job_id: row.get(0),
+            name: row.get(1),
+            payload: row.get(2),
+            priority: row.get(3),
+            run_at: row.get(4),
+            created_at: row.get(5),
+            context: row.get(6),
+            error_count: row.get(7),
+            last_error_message: row.get(8),
+            last_failed_at: row.get(9),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -100,6 +117,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
     pub(crate) async fn run_next_job(&self, job: JobFromDB) -> color_eyre::Result<RunJobResult> {
         let job_result = self.run_job(&job).await;
 
+        let client = self.state.db().get().await?;
+
         if let Err(e) = job_result {
             // Extract error message from color_eyre::Report
             let error_message = format!("{e}");
@@ -115,15 +134,13 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     "Job permanently failed - max retries exceeded"
                 );
 
-                sqlx::query(
-                    "
-                    DELETE FROM jobs
-                    WHERE job_id = $1 AND locked_by = $2
-                    ",
+                sql_check_macros::query!(
+                    "DELETE FROM jobs
+                    WHERE job_id = $1 AND locked_by = $2",
+                    job.job_id,
+                    self.id.to_string()
                 )
-                .bind(job.job_id)
-                .bind(self.id.to_string())
-                .execute(self.state.db())
+                .execute(&*client)
                 .await?;
 
                 return Ok(Err(JobError(job, e)));
@@ -139,36 +156,32 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 job.error_count + 1
             );
 
-            sqlx::query(
-                "
-                UPDATE jobs
+            sql_check_macros::query!(
+                "UPDATE jobs
                 SET locked_by = NULL,
                     locked_at = NULL,
                     error_count = error_count + 1,
                     last_error_message = $3,
                     last_failed_at = NOW(),
                     run_at = NOW() + (POWER(2, error_count + 1)) * interval '1 second'
-                WHERE job_id = $1 AND locked_by = $2
-                ",
+                WHERE job_id = $1 AND locked_by = $2",
+                job.job_id,
+                self.id.to_string(),
+                error_message
             )
-            .bind(job.job_id)
-            .bind(self.id.to_string())
-            .bind(error_message)
-            .execute(self.state.db())
+            .execute(&*client)
             .await?;
 
             return Ok(Err(JobError(job, e)));
         }
 
-        sqlx::query(
-            "
-                DELETE FROM jobs
-                WHERE job_id = $1 AND locked_by = $2
-                ",
+        sql_check_macros::query!(
+            "DELETE FROM jobs
+            WHERE job_id = $1 AND locked_by = $2",
+            job.job_id,
+            self.id.to_string()
         )
-        .bind(job.job_id)
-        .bind(self.id.to_string())
-        .execute(self.state.db())
+        .execute(&*client)
         .await?;
 
         Ok(Ok(RunJobSuccess(job)))
@@ -190,29 +203,30 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         // Cast is safe: lock timeouts are typically hours, not approaching i64::MAX seconds
         let lock_timeout_secs = self.lock_timeout.as_secs() as i64;
 
-        let job = sqlx::query_as::<_, JobFromDB>(
-            "
-            UPDATE jobs
-            SET LOCKED_BY = $1, LOCKED_AT = NOW()
-            WHERE job_id = (
-                SELECT job_id
-                FROM jobs
-                WHERE run_at <= NOW()
-                  AND (
-                    locked_by IS NULL
-                    OR locked_at < NOW() - ($2 || ' seconds')::interval
-                  )
-                ORDER BY priority DESC, created_at ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
+        let client = self.state.db().get().await?;
+
+        let row = client
+            .query_opt(
+                "UPDATE jobs
+                SET LOCKED_BY = $1, LOCKED_AT = NOW()
+                WHERE job_id = (
+                    SELECT job_id
+                    FROM jobs
+                    WHERE run_at <= NOW()
+                      AND (
+                        locked_by IS NULL
+                        OR locked_at < NOW() - ($2 || ' seconds')::interval
+                      )
+                    ORDER BY priority DESC, created_at ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING job_id, name, payload, priority, run_at, created_at, context, error_count, last_error_message, last_failed_at",
+                &[&self.id.to_string(), &lock_timeout_secs.to_string()],
             )
-            RETURNING job_id, name, payload, priority, run_at, created_at, context, error_count, last_error_message, last_failed_at
-            ",
-        )
-        .bind(self.id.to_string())
-        .bind(lock_timeout_secs.to_string())
-        .fetch_optional(self.state.db())
-        .await?;
+            .await?;
+
+        let job = row.map(|row| JobFromDB::from_row(&row));
 
         if let Some(job) = &job {
             let span = Span::current();
@@ -272,18 +286,20 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 ) -> color_eyre::Result<()> {
     tracing::info!(worker_id = %worker.id, "Releasing database locks");
 
-    let result = sqlx::query(
+    let client = worker.state.db().get().await?;
+
+    let locks_released = sql_check_macros::query!(
         "UPDATE jobs
          SET locked_by = NULL, locked_at = NULL
          WHERE locked_by = $1",
+        worker.id.to_string()
     )
-    .bind(worker.id.to_string())
-    .execute(worker.state.db())
+    .execute(&*client)
     .await?;
 
     tracing::info!(
         worker_id = %worker.id,
-        locks_released = result.rows_affected(),
+        locks_released = locks_released,
         "Database locks released"
     );
 

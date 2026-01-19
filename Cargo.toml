@@ -21,6 +21,11 @@ items-after-statements = "allow"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
+# PostgreSQL - direct driver (replacing sqlx)
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+deadpool-postgres = "0.14"
+
+# SQLx - being phased out (only for tests/migrations during transition)
 sqlx = { version = "0.8", default-features = false, features = [
   "postgres",
   "runtime-tokio-rustls",
@@ -30,8 +35,11 @@ sqlx = { version = "0.8", default-features = false, features = [
   "uuid",
   "json",
 ] }
-sql-check = { git = "https://github.com/coreyja-studio/sql-check.git", branch = "feature/sqlx-support", features = ["sqlx-runtime"] }
-sql-check-macros = { git = "https://github.com/coreyja-studio/sql-check.git", branch = "feature/sqlx-support" }
+
+# sql-check - compile-time SQL validation
+sql-check = { path = "../sql-check-sqlx/crates/sql-check", features = ["runtime"] }
+sql-check-macros = { path = "../sql-check-sqlx/crates/sql-check-macros" }
+
 tokio = { version = "1.21", features = ["full"] }
 tracing = "0.1.37"
 uuid = { version = "1.6.1", features = ["v4", "serde"] }

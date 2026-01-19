@@ -1,4 +1,5 @@
-pub use sqlx;
+pub use deadpool_postgres;
+pub use tokio_postgres;
 pub use uuid;
 
 #[cfg(feature = "cron")]

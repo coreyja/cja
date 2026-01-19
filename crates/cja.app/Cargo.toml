@@ -16,17 +16,22 @@ sql-check-macros.workspace = true
 
 axum.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true
+deadpool-postgres.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 chrono-tz = "0.10.0"
-sqlx.workspace = true
 async-trait.workspace = true
 maud.workspace = true
 
 futures = "0.3.30"
+
+[dev-dependencies]
+# SQLx still needed for tests during transition
+sqlx.workspace = true
 
 [lints]
 workspace = true

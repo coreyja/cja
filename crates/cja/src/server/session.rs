@@ -28,7 +28,7 @@ use super::cookies::CookieJar;
 ///     last_page_visited: Option<String>,
 /// }
 /// ```
-#[derive(Debug, Clone, Deserialize, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CJASession {
     /// Unique identifier for this session
     pub session_id: uuid::Uuid,
@@ -36,6 +36,18 @@ pub struct CJASession {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Timestamp when the session was first created
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl CJASession {
+    /// Create a CJASession from a tokio_postgres Row.
+    /// Expected columns: session_id (0), updated_at (1), created_at (2)
+    pub fn from_row(row: &tokio_postgres::Row) -> Self {
+        Self {
+            session_id: row.get(0),
+            updated_at: row.get(1),
+            created_at: row.get(2),
+        }
+    }
 }
 
 impl CJASession {
@@ -228,13 +240,13 @@ pub trait AppSession: Sized {
     ///
     /// This method should fetch the session record and any associated data
     /// from your sessions table.
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> crate::Result<Self>;
+    async fn from_db(pool: &crate::app_state::DbPool, session_id: uuid::Uuid) -> crate::Result<Self>;
 
     /// Create a new session in the database.
     ///
     /// This method should insert a new session record with default values
     /// and return the created session.
-    async fn create(pool: &sqlx::PgPool) -> crate::Result<Self>;
+    async fn create(pool: &crate::app_state::DbPool) -> crate::Result<Self>;
 
     /// Create a session instance from the inner `CJASession`.
     ///
