@@ -4,7 +4,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn};
+use syn::{ItemFn, parse_macro_input};
 
 /// Marks an async function as a database test.
 ///
@@ -111,7 +111,9 @@ fn expand_test(args: TestArgs, mut input_fn: ItemFn) -> syn::Result<proc_macro2:
             let migrator = &#migrator_path;
         }
     } else {
-        let migrations_path = args.migrations.unwrap_or_else(|| "./migrations".to_string());
+        let migrations_path = args
+            .migrations
+            .unwrap_or_else(|| "./migrations".to_string());
         quote! {
             let migrator = ::cja::db::Migrator::from_path(#migrations_path)
                 .expect("failed to load migrations");

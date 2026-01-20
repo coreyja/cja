@@ -92,9 +92,7 @@ impl Migrator {
             return Ok(Self::new());
         }
 
-        let mut entries: Vec<_> = std::fs::read_dir(path)?
-            .filter_map(|e| e.ok())
-            .collect();
+        let mut entries: Vec<_> = std::fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
 
         for entry in entries {
@@ -244,13 +242,15 @@ impl Migrator {
                 message: "Migration not found in migrator".to_string(),
             })?;
 
-        let down_sql = migration.down_sql.as_ref().ok_or_else(|| {
-            MigrationError::MigrationFailed {
-                version,
-                name: name.clone(),
-                message: "No down migration available".to_string(),
-            }
-        })?;
+        let down_sql =
+            migration
+                .down_sql
+                .as_ref()
+                .ok_or_else(|| MigrationError::MigrationFailed {
+                    version,
+                    name: name.clone(),
+                    message: "No down migration available".to_string(),
+                })?;
 
         tracing::info!(version, name = %name, "Rolling back migration");
 
@@ -265,7 +265,10 @@ impl Migrator {
 
         // Remove from tracking table
         client
-            .execute("DELETE FROM _cja_migrations WHERE version = $1", &[&version])
+            .execute(
+                "DELETE FROM _cja_migrations WHERE version = $1",
+                &[&version],
+            )
             .await?;
 
         tracing::info!(version, name = %migration.name, "Rollback completed");
@@ -348,7 +351,8 @@ mod tests {
 
     #[test]
     fn test_parse_migration_filename_simple() {
-        let (version, name, is_down) = parse_migration_filename("20240101000000_create_users.sql").unwrap();
+        let (version, name, is_down) =
+            parse_migration_filename("20240101000000_create_users.sql").unwrap();
         assert_eq!(version, 20240101000000);
         assert_eq!(name, "create_users");
         assert!(!is_down);
@@ -356,7 +360,8 @@ mod tests {
 
     #[test]
     fn test_parse_migration_filename_up() {
-        let (version, name, is_down) = parse_migration_filename("20240101000000_create_users.up.sql").unwrap();
+        let (version, name, is_down) =
+            parse_migration_filename("20240101000000_create_users.up.sql").unwrap();
         assert_eq!(version, 20240101000000);
         assert_eq!(name, "create_users");
         assert!(!is_down);
@@ -364,7 +369,8 @@ mod tests {
 
     #[test]
     fn test_parse_migration_filename_down() {
-        let (version, name, is_down) = parse_migration_filename("20240101000000_create_users.down.sql").unwrap();
+        let (version, name, is_down) =
+            parse_migration_filename("20240101000000_create_users.down.sql").unwrap();
         assert_eq!(version, 20240101000000);
         assert_eq!(name, "create_users");
         assert!(is_down);

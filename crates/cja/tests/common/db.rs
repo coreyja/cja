@@ -9,7 +9,10 @@ pub async fn setup_test_db() -> cja::Result<(Pool, super::TestDbGuard)> {
 
     // Run migrations
     let migrator = Migrator::from_path("./migrations").expect("failed to load migrations");
-    let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
     migrator
         .run(&client)
         .await
@@ -24,7 +27,10 @@ pub async fn setup_test_db() -> cja::Result<(Pool, super::TestDbGuard)> {
 pub async fn seed_test_session(pool: &Pool) -> cja::Result<Uuid> {
     let session_id = Uuid::new_v4();
 
-    let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
     client
         .execute(
             "INSERT INTO sessions (session_id) VALUES ($1)",
@@ -45,7 +51,10 @@ pub async fn seed_test_job(
     let job_id = Uuid::new_v4();
     let now = chrono::Utc::now();
 
-    let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
     client
         .execute(
             "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
@@ -59,7 +68,10 @@ pub async fn seed_test_job(
 
 #[allow(dead_code)]
 pub async fn get_job_by_id(pool: &Pool, job_id: Uuid) -> cja::Result<Option<JobInfo>> {
-    let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
     let row = client
         .query_opt(
             "SELECT job_id, name, payload, locked_at, locked_by, error_count, last_error_message, last_failed_at
@@ -82,9 +94,15 @@ pub async fn get_job_by_id(pool: &Pool, job_id: Uuid) -> cja::Result<Option<JobI
 
 #[allow(dead_code)]
 pub async fn count_unlocked_jobs(pool: &Pool) -> cja::Result<i64> {
-    let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
     let row = client
-        .query_one("SELECT COUNT(*) as count FROM jobs WHERE locked_at IS NULL", &[])
+        .query_one(
+            "SELECT COUNT(*) as count FROM jobs WHERE locked_at IS NULL",
+            &[],
+        )
         .await?;
 
     Ok(row.get::<_, Option<i64>>(0).unwrap_or(0))

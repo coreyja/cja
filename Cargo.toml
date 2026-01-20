@@ -26,8 +26,8 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"
 deadpool-postgres = "0.14"
 
 # sql-check - compile-time SQL validation
-sql-check = { path = "../sql-check-sqlx/crates/sql-check", features = ["runtime"] }
-sql-check-macros = { path = "../sql-check-sqlx/crates/sql-check-macros" }
+sql-check = { git = "https://github.com/coreyja-studio/sql-check.git", features = ["runtime"] }
+sql-check-macros = { git = "https://github.com/coreyja-studio/sql-check.git" }
 
 tokio = { version = "1.21", features = ["full"] }
 tracing = "0.1.37"

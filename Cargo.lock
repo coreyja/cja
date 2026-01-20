@@ -2893,6 +2893,7 @@ dependencies = [
 [[package]]
 name = "sql-check"
 version = "0.1.0"
+source = "git+https://github.com/coreyja-studio/sql-check.git#375b64f4bc8228ecded9121e486982423199d58c"
 dependencies = [
  "serde",
  "serde_json",
@@ -2904,6 +2905,7 @@ dependencies = [
 [[package]]
 name = "sql-check-macros"
 version = "0.1.0"
+source = "git+https://github.com/coreyja-studio/sql-check.git#375b64f4bc8228ecded9121e486982423199d58c"
 dependencies = [
  "proc-macro2",
  "quote",

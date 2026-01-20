@@ -12,7 +12,10 @@ struct TestSession {
 #[async_trait::async_trait]
 impl AppSession for TestSession {
     async fn from_db(pool: &Pool, session_id: Uuid) -> cja::Result<Self> {
-        let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
         let row = client
             .query_one(
                 "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
@@ -31,7 +34,10 @@ impl AppSession for TestSession {
     }
 
     async fn create(pool: &Pool) -> cja::Result<Self> {
-        let client = pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
         let row = client
             .query_one(
                 "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",

@@ -30,7 +30,10 @@ pub async fn ensure_test_db(db_name: &str) -> cja::Result<Pool> {
         .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
 
     let base_pool = db::create_pool(&base_url).await?;
-    let base_client = base_pool.get().await.map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
+    let base_client = base_pool
+        .get()
+        .await
+        .map_err(|e| cja::color_eyre::eyre::eyre!("Pool error: {e}"))?;
 
     // Drop database if exists
     let _ = base_client

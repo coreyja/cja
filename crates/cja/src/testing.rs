@@ -149,10 +149,7 @@ async fn setup_test_db(
     migrator.run(&client).await?;
     drop(client);
 
-    let context = TestContext {
-        db_name,
-        base_url,
-    };
+    let context = TestContext { db_name, base_url };
 
     Ok((test_pool, context))
 }
@@ -213,12 +210,13 @@ pub async fn run_migrations(
     pool: &Pool,
     migrator: &Migrator,
 ) -> Result<(), crate::db::MigrationError> {
-    let client = pool.get().await.map_err(|e| {
-        crate::db::MigrationError::MigrationFailed {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| crate::db::MigrationError::MigrationFailed {
             version: 0,
             name: "connection".to_string(),
             message: e.to_string(),
-        }
-    })?;
+        })?;
     migrator.run(&client).await
 }

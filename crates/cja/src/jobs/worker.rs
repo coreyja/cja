@@ -421,7 +421,8 @@ mod tests {
         std::sync::LazyLock::new(|| Arc::new(Mutex::new(())));
 
     fn base_db_url() -> String {
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/postgres".to_string())
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/postgres".to_string())
     }
 
     fn url_without_db(url: &str) -> String {
@@ -455,32 +456,52 @@ mod tests {
     async fn setup_test_db(test_name: &str) -> (Pool, String) {
         let _lock = TEST_DB_MUTEX.lock().await;
 
-        let db_name = format!("cja_worker_test_{}_{}", test_name, uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let db_name = format!(
+            "cja_worker_test_{}_{}",
+            test_name,
+            uuid::Uuid::new_v4().to_string().replace('-', "")
+        );
         let base_url = base_db_url();
         let base_url_without_db = url_without_db(&base_url);
 
         // Connect to the base database to create our test database
-        let base_pool = create_pool(&base_url).await.expect("failed to create base pool");
+        let base_pool = create_pool(&base_url)
+            .await
+            .expect("failed to create base pool");
         let base_client = base_pool.get().await.expect("failed to get base client");
 
         // Drop existing test database if it exists (from a failed previous run)
         let drop_sql = format!("DROP DATABASE IF EXISTS \"{db_name}\"");
-        base_client.execute(&drop_sql, &[]).await.expect("failed to drop test db");
+        base_client
+            .execute(&drop_sql, &[])
+            .await
+            .expect("failed to drop test db");
 
         // Create the test database
         let create_sql = format!("CREATE DATABASE \"{db_name}\"");
-        base_client.execute(&create_sql, &[]).await.expect("failed to create test db");
+        base_client
+            .execute(&create_sql, &[])
+            .await
+            .expect("failed to create test db");
 
         drop(base_client);
 
         // Connect to the new test database
         let test_db_url = format!("{base_url_without_db}/{db_name}");
-        let test_pool = create_pool(&test_db_url).await.expect("failed to create test pool");
+        let test_pool = create_pool(&test_db_url)
+            .await
+            .expect("failed to create test pool");
 
         // Run migrations
         let migrator = Migrator::from_path("./migrations").expect("failed to load migrations");
-        let client = test_pool.get().await.expect("failed to get client for migrations");
-        migrator.run(&client).await.expect("failed to run migrations");
+        let client = test_pool
+            .get()
+            .await
+            .expect("failed to get client for migrations");
+        migrator
+            .run(&client)
+            .await
+            .expect("failed to run migrations");
         drop(client);
 
         (test_pool, db_name)
@@ -496,7 +517,9 @@ mod tests {
                 );
                 let _ = client.execute(&terminate_sql, &[]).await;
                 // Drop the database
-                let _ = client.execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""), &[]).await;
+                let _ = client
+                    .execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""), &[])
+                    .await;
             }
         }
     }

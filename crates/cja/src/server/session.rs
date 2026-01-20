@@ -243,7 +243,10 @@ pub trait AppSession: Sized {
     ///
     /// This method should fetch the session record and any associated data
     /// from your sessions table.
-    async fn from_db(pool: &crate::app_state::DbPool, session_id: uuid::Uuid) -> crate::Result<Self>;
+    async fn from_db(
+        pool: &crate::app_state::DbPool,
+        session_id: uuid::Uuid,
+    ) -> crate::Result<Self>;
 
     /// Create a new session in the database.
     ///

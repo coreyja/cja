@@ -273,7 +273,10 @@ async fn test_failing_job_enqueue() {
     assert_eq!(row.get::<_, String>(0), "FailingJob");
     assert_eq!(row.get::<_, i32>(1), 0);
     assert!(row.get::<_, Option<String>>(2).is_none());
-    assert!(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3).is_none());
+    assert!(
+        row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -302,7 +305,10 @@ async fn test_error_tracking_fields_present() {
 
     assert_eq!(row.get::<_, i32>(0), 0);
     assert!(row.get::<_, Option<String>>(1).is_none());
-    assert!(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(2).is_none());
+    assert!(
+        row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(2)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -366,7 +372,10 @@ async fn test_job_error_count_increment() {
         row.get::<_, Option<String>>(1),
         Some(error_message.to_string())
     );
-    assert!(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(2).is_some());
+    assert!(
+        row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(2)
+            .is_some()
+    );
 
     // Verify run_at was pushed forward (should be at least 2 seconds in future)
     let run_at: chrono::DateTime<chrono::Utc> = row.get(3);

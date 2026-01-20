@@ -1,10 +1,7 @@
 use axum::response::IntoResponse;
 use cja::{
     app_state::DbPool,
-    color_eyre::{
-        self,
-        eyre::Context as _,
-    },
+    color_eyre::{self, eyre::Context as _},
     server::{
         cookies::CookieKey,
         run_server,
