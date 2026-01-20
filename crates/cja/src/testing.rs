@@ -55,7 +55,7 @@ fn url_without_db(url: &str) -> String {
 }
 
 /// Create a pool connected to a specific database.
-async fn create_pool(db_url: &str) -> Result<Pool, deadpool_postgres::CreatePoolError> {
+fn create_pool(db_url: &str) -> Result<Pool, deadpool_postgres::CreatePoolError> {
     let config = db_url
         .parse::<tokio_postgres::Config>()
         .expect("failed to parse DATABASE_URL");
@@ -84,7 +84,7 @@ pub struct TestContext {
 impl TestContext {
     /// Clean up the test database.
     pub async fn cleanup(&self) {
-        let pool = match create_pool(&self.base_url).await {
+        let pool = match create_pool(&self.base_url) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("Failed to connect for cleanup: {e}");
@@ -127,7 +127,7 @@ async fn setup_test_db(
     let base_url_without_db = url_without_db(&base_url);
 
     // Connect to the base database to create our test database
-    let base_pool = create_pool(&base_url).await?;
+    let base_pool = create_pool(&base_url)?;
     let base_client = base_pool.get().await?;
 
     // Drop existing test database if it exists (from a failed previous run)
@@ -142,7 +142,7 @@ async fn setup_test_db(
 
     // Connect to the new test database
     let test_db_url = format!("{base_url_without_db}/{db_name}");
-    let test_pool = create_pool(&test_db_url).await?;
+    let test_pool = create_pool(&test_db_url)?;
 
     // Run migrations
     let client = test_pool.get().await?;
@@ -181,7 +181,7 @@ where
     // Run the test with panic catching
     let test_pool = pool.clone();
     let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(test_fn(test_pool))
+        rt.block_on(test_fn(test_pool));
     }));
 
     // Close the pool

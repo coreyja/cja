@@ -39,8 +39,8 @@ pub struct CJASession {
 }
 
 impl CJASession {
-    /// Create a CJASession from a tokio_postgres Row.
-    /// Expected columns: session_id (0), updated_at (1), created_at (2)
+    /// Create a `CJASession` from a `tokio_postgres` Row.
+    /// Expected columns: `session_id` (0), `updated_at` (1), `created_at` (2)
     pub fn from_row(row: &tokio_postgres::Row) -> Self {
         Self {
             session_id: row.get(0),

@@ -92,8 +92,8 @@ impl Migrator {
             return Ok(Self::new());
         }
 
-        let mut entries: Vec<_> = std::fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
-        entries.sort_by_key(|e| e.file_name());
+        let mut entries: Vec<_> = std::fs::read_dir(path)?.filter_map(Result::ok).collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
 
         for entry in entries {
             let file_name = entry.file_name();
@@ -148,13 +148,13 @@ impl Migrator {
         // Create migrations tracking table
         client
             .execute(
-                r#"
+                "
                 CREATE TABLE IF NOT EXISTS _cja_migrations (
                     version BIGINT PRIMARY KEY,
                     name TEXT NOT NULL,
                     applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
-                "#,
+                ",
                 &[],
             )
             .await?;
@@ -284,13 +284,13 @@ impl Migrator {
         // Create table if it doesn't exist (for checking status before running)
         client
             .execute(
-                r#"
+                "
                 CREATE TABLE IF NOT EXISTS _cja_migrations (
                     version BIGINT PRIMARY KEY,
                     name TEXT NOT NULL,
                     applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
-                "#,
+                ",
                 &[],
             )
             .await?;
@@ -318,13 +318,22 @@ impl Default for Migrator {
 
 /// Parse a migration filename to extract version, name, and whether it's a down migration.
 fn parse_migration_filename(filename: &str) -> Result<(i64, String, bool), MigrationError> {
+    use std::path::Path;
+
     // Remove .sql extension
     let without_sql = filename.trim_end_matches(".sql");
 
-    // Check for .up or .down suffix
-    let (base, is_down) = if without_sql.ends_with(".up") {
+    // Check for .up or .down suffix using Path for case-insensitive comparison
+    let path = Path::new(without_sql);
+    let (base, is_down) = if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("up"))
+    {
         (without_sql.trim_end_matches(".up"), false)
-    } else if without_sql.ends_with(".down") {
+    } else if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("down"))
+    {
         (without_sql.trim_end_matches(".down"), true)
     } else {
         (without_sql, false)
