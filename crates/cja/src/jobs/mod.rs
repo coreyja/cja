@@ -303,7 +303,7 @@ pub trait Job<AppState: AS>:
             now,
             context
         )
-        .execute(&*client)
+        .execute(&client)
         .await?;
 
         Ok(())

@@ -149,7 +149,7 @@ impl AppSession for SiteSession {
             "SELECT session_id, updated_at, created_at FROM sessions WHERE session_id = $1",
             session_id
         )
-        .fetch_one(&*client)
+        .fetch_one(&client)
         .await?;
 
         let session = SiteSession {
@@ -168,7 +168,7 @@ impl AppSession for SiteSession {
         let row = sql_check_macros::query!(
             "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, updated_at, created_at"
         )
-        .fetch_one(&*client)
+        .fetch_one(&client)
         .await?;
 
         let inner = CJASession {

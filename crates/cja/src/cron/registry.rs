@@ -167,9 +167,9 @@ pub struct CronJob<AppState: AS> {
 #[derive(Debug, thiserror::Error)]
 #[error("TickError: {0}")]
 pub enum TickError {
-    JobError(String),
-    DbError(#[from] tokio_postgres::Error),
-    PoolError(String),
+    Job(String),
+    Db(#[from] tokio_postgres::Error),
+    Pool(String),
 }
 
 impl<AppState: AS> CronJob<AppState> {
@@ -205,13 +205,13 @@ impl<AppState: AS> CronJob<AppState> {
             (self.func)
                 .run(app_state.clone(), context)
                 .await
-                .map_err(TickError::JobError)?;
+                .map_err(TickError::Job)?;
 
             let client = app_state
                 .db()
                 .get()
                 .await
-                .map_err(|e| TickError::PoolError(e.to_string()))?;
+                .map_err(|e| TickError::Pool(e.to_string()))?;
 
             sql_check_macros::query!(
                 "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
@@ -225,7 +225,7 @@ impl<AppState: AS> CronJob<AppState> {
                 now,
                 now
             )
-            .execute(&*client)
+            .execute(&client)
             .await?;
         }
 
@@ -717,7 +717,7 @@ mod test {
             .await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            TickError::JobError(err) => {
+            TickError::Job(err) => {
                 assert!(err.contains("CustomError"));
             }
             _ => panic!("Expected JobError"),

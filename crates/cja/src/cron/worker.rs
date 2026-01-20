@@ -106,12 +106,12 @@ impl<AppState: AS> Worker<AppState> {
             .db()
             .get()
             .await
-            .map_err(|e| TickError::PoolError(e.to_string()))?;
+            .map_err(|e| TickError::Pool(e.to_string()))?;
 
         let last_runs = sql_check_macros::query!("SELECT name, last_run_at FROM crons")
-            .fetch_all(&*client)
+            .fetch_all(&client)
             .await
-            .map_err(TickError::DbError)?;
+            .map_err(TickError::Db)?;
 
         let last_run_map: HashMap<String, DateTime<Utc>> = last_runs
             .iter()

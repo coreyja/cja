@@ -140,7 +140,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     job.job_id,
                     self.id.to_string()
                 )
-                .execute(&*client)
+                .execute(&client)
                 .await?;
 
                 return Ok(Err(JobError(job, e)));
@@ -169,7 +169,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 self.id.to_string(),
                 error_message
             )
-            .execute(&*client)
+            .execute(&client)
             .await?;
 
             return Ok(Err(JobError(job, e)));
@@ -181,7 +181,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             job.job_id,
             self.id.to_string()
         )
-        .execute(&*client)
+        .execute(&client)
         .await?;
 
         Ok(Ok(RunJobSuccess(job)))
@@ -294,7 +294,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
          WHERE locked_by = $1",
         worker.id.to_string()
     )
-    .execute(&*client)
+    .execute(&client)
     .await?;
 
     tracing::info!(
