@@ -121,7 +121,7 @@ pub struct JobInfo {
 }
 
 /// Create a pool for a specific database URL.
-pub async fn create_pool(db_url: &str) -> cja::Result<Pool> {
+pub fn create_pool(db_url: &str) -> cja::Result<Pool> {
     let config = db_url
         .parse::<cja::tokio_postgres::Config>()
         .map_err(|e| cja::color_eyre::eyre::eyre!("Failed to parse DATABASE_URL: {e}"))?;

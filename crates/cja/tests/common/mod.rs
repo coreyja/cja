@@ -29,7 +29,7 @@ pub async fn ensure_test_db(db_name: &str) -> cja::Result<Pool> {
     let base_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
 
-    let base_pool = db::create_pool(&base_url).await?;
+    let base_pool = db::create_pool(&base_url)?;
     let base_client = base_pool
         .get()
         .await
@@ -50,7 +50,7 @@ pub async fn ensure_test_db(db_name: &str) -> cja::Result<Pool> {
 
     // Connect to the new test database
     let test_db_url = test_db_url(db_name);
-    let pool = db::create_pool(&test_db_url).await?;
+    let pool = db::create_pool(&test_db_url)?;
 
     Ok(pool)
 }
@@ -73,7 +73,7 @@ impl Drop for TestDbGuard {
                 let base_url = std::env::var("DATABASE_URL")
                     .unwrap_or_else(|_| "postgres://localhost/postgres".to_string());
 
-                if let Ok(base_pool) = db::create_pool(&base_url).await {
+                if let Ok(base_pool) = db::create_pool(&base_url) {
                     if let Ok(client) = base_pool.get().await {
                         let _ = client
                             .execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""), &[])

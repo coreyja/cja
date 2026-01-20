@@ -433,7 +433,7 @@ mod tests {
         }
     }
 
-    async fn create_pool(db_url: &str) -> Result<Pool, deadpool_postgres::CreatePoolError> {
+    fn create_pool(db_url: &str) -> Result<Pool, deadpool_postgres::CreatePoolError> {
         let config = db_url
             .parse::<tokio_postgres::Config>()
             .expect("failed to parse DATABASE_URL");
@@ -465,9 +465,7 @@ mod tests {
         let base_url_without_db = url_without_db(&base_url);
 
         // Connect to the base database to create our test database
-        let base_pool = create_pool(&base_url)
-            .await
-            .expect("failed to create base pool");
+        let base_pool = create_pool(&base_url).expect("failed to create base pool");
         let base_client = base_pool.get().await.expect("failed to get base client");
 
         // Drop existing test database if it exists (from a failed previous run)
@@ -488,9 +486,7 @@ mod tests {
 
         // Connect to the new test database
         let test_db_url = format!("{base_url_without_db}/{db_name}");
-        let test_pool = create_pool(&test_db_url)
-            .await
-            .expect("failed to create test pool");
+        let test_pool = create_pool(&test_db_url).expect("failed to create test pool");
 
         // Run migrations
         let migrator = Migrator::from_path("./migrations").expect("failed to load migrations");
@@ -509,7 +505,9 @@ mod tests {
 
     async fn cleanup_test_db(db_name: &str) {
         let base_url = base_db_url();
-        if let Ok(base_pool) = create_pool(&base_url).await {
+        // Can't collapse: create_pool is sync but get() is async
+        #[allow(clippy::collapsible_if)]
+        if let Ok(base_pool) = create_pool(&base_url) {
             if let Ok(client) = base_pool.get().await {
                 // Terminate existing connections
                 let terminate_sql = format!(

@@ -362,7 +362,7 @@ mod tests {
     fn test_parse_migration_filename_simple() {
         let (version, name, is_down) =
             parse_migration_filename("20240101000000_create_users.sql").unwrap();
-        assert_eq!(version, 20240101000000);
+        assert_eq!(version, 20_240_101_000_000);
         assert_eq!(name, "create_users");
         assert!(!is_down);
     }
@@ -371,7 +371,7 @@ mod tests {
     fn test_parse_migration_filename_up() {
         let (version, name, is_down) =
             parse_migration_filename("20240101000000_create_users.up.sql").unwrap();
-        assert_eq!(version, 20240101000000);
+        assert_eq!(version, 20_240_101_000_000);
         assert_eq!(name, "create_users");
         assert!(!is_down);
     }
@@ -380,7 +380,7 @@ mod tests {
     fn test_parse_migration_filename_down() {
         let (version, name, is_down) =
             parse_migration_filename("20240101000000_create_users.down.sql").unwrap();
-        assert_eq!(version, 20240101000000);
+        assert_eq!(version, 20_240_101_000_000);
         assert_eq!(name, "create_users");
         assert!(is_down);
     }
