@@ -392,7 +392,7 @@ mod cron {
         #[cfg_attr(not(feature = "jobs"), allow(unused_mut))]
         let mut registry = CronRegistry::new();
         #[cfg(feature = "jobs")]
-        registry.register_job(NoopJob, Duration::from_secs(60));
+        registry.register_job(NoopJob, Some("A test no-op job"), Duration::from_secs(60));
         registry
     }
 }
