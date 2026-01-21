@@ -160,6 +160,7 @@ impl Schedule {
 #[allow(clippy::type_complexity)]
 pub struct CronJob<AppState: AS> {
     pub name: &'static str,
+    pub description: Option<&'static str>,
     func: Box<dyn CronFn<AppState> + Send + Sync + 'static>,
     pub schedule: Schedule,
 }
@@ -248,8 +249,23 @@ impl<AppState: AS> CronRegistry<AppState> {
         + Sync
         + 'static,
     ) {
+        self.register_with_description(name, None, interval, job);
+    }
+
+    #[tracing::instrument(name = "cron.register_with_description", skip_all, fields(cron_job.name = name, cron_job.interval = ?interval))]
+    pub fn register_with_description<FnError: Error + Send + Sync + 'static>(
+        &mut self,
+        name: &'static str,
+        description: Option<&'static str>,
+        interval: Duration,
+        job: impl Fn(AppState, String) -> Pin<Box<dyn Future<Output = Result<(), FnError>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) {
         let cron_job = CronJob {
             name,
+            description,
             func: Box::new(CronFnClosure {
                 func: job,
                 _marker: std::marker::PhantomData,
@@ -269,9 +285,24 @@ impl<AppState: AS> CronRegistry<AppState> {
         + Sync
         + 'static,
     ) -> Result<(), cron::error::Error> {
+        self.register_with_cron_and_description(name, None, cron_expr, job)
+    }
+
+    #[tracing::instrument(name = "cron.register_with_cron_and_description", skip_all, fields(cron_job.name = name, cron_job.cron = cron_expr))]
+    pub fn register_with_cron_and_description<FnError: Error + Send + Sync + 'static>(
+        &mut self,
+        name: &'static str,
+        description: Option<&'static str>,
+        cron_expr: &str,
+        job: impl Fn(AppState, String) -> Pin<Box<dyn Future<Output = Result<(), FnError>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<(), cron::error::Error> {
         let cron_schedule = cron_expr.parse::<cron::Schedule>()?;
         let cron_job = CronJob {
             name,
+            description,
             func: Box::new(CronFnClosure {
                 func: job,
                 _marker: std::marker::PhantomData,
@@ -285,7 +316,18 @@ impl<AppState: AS> CronRegistry<AppState> {
     #[cfg(feature = "jobs")]
     #[tracing::instrument(name = "cron.register_job", skip_all, fields(cron_job.name = J::NAME, cron_job.interval = ?interval))]
     pub fn register_job<J: Job<AppState>>(&mut self, job: J, interval: Duration) {
-        self.register(J::NAME, interval, move |app_state, context| {
+        self.register_job_with_description(job, None, interval);
+    }
+
+    #[cfg(feature = "jobs")]
+    #[tracing::instrument(name = "cron.register_job_with_description", skip_all, fields(cron_job.name = J::NAME, cron_job.interval = ?interval))]
+    pub fn register_job_with_description<J: Job<AppState>>(
+        &mut self,
+        job: J,
+        description: Option<&'static str>,
+        interval: Duration,
+    ) {
+        self.register_with_description(J::NAME, description, interval, move |app_state, context| {
             J::enqueue(job.clone(), app_state, context)
         });
     }
@@ -297,15 +339,34 @@ impl<AppState: AS> CronRegistry<AppState> {
         job: J,
         cron_expr: &str,
     ) -> Result<(), cron::error::Error> {
-        self.register_with_cron(J::NAME, cron_expr, move |app_state, context| {
-            J::enqueue(job.clone(), app_state, context)
-        })
+        self.register_job_with_cron_and_description(job, None, cron_expr)
+    }
+
+    #[cfg(feature = "jobs")]
+    #[tracing::instrument(name = "cron.register_job_with_cron_and_description", skip_all, fields(cron_job.name = J::NAME, cron_job.cron = cron_expr))]
+    pub fn register_job_with_cron_and_description<J: Job<AppState>>(
+        &mut self,
+        job: J,
+        description: Option<&'static str>,
+        cron_expr: &str,
+    ) -> Result<(), cron::error::Error> {
+        self.register_with_cron_and_description(
+            J::NAME,
+            description,
+            cron_expr,
+            move |app_state, context| J::enqueue(job.clone(), app_state, context),
+        )
     }
 
     #[cfg(feature = "jobs")]
     #[tracing::instrument(name = "cron.get", skip_all, fields(cron_job.name = name))]
     pub fn get(&self, name: &str) -> Option<&CronJob<AppState>> {
         self.jobs.get(name)
+    }
+
+    /// Returns a reference to all registered cron jobs.
+    pub fn jobs(&self) -> &HashMap<&'static str, CronJob<AppState>> {
+        &self.jobs
     }
 }
 
