@@ -160,6 +160,7 @@ impl Schedule {
 #[allow(clippy::type_complexity)]
 pub struct CronJob<AppState: AS> {
     pub name: &'static str,
+    pub description: Option<&'static str>,
     func: Box<dyn CronFn<AppState> + Send + Sync + 'static>,
     pub schedule: Schedule,
 }
@@ -242,6 +243,7 @@ impl<AppState: AS> CronRegistry<AppState> {
     pub fn register<FnError: Error + Send + Sync + 'static>(
         &mut self,
         name: &'static str,
+        description: Option<&'static str>,
         interval: Duration,
         job: impl Fn(AppState, String) -> Pin<Box<dyn Future<Output = Result<(), FnError>> + Send>>
         + Send
@@ -250,6 +252,7 @@ impl<AppState: AS> CronRegistry<AppState> {
     ) {
         let cron_job = CronJob {
             name,
+            description,
             func: Box::new(CronFnClosure {
                 func: job,
                 _marker: std::marker::PhantomData,
@@ -263,6 +266,7 @@ impl<AppState: AS> CronRegistry<AppState> {
     pub fn register_with_cron<FnError: Error + Send + Sync + 'static>(
         &mut self,
         name: &'static str,
+        description: Option<&'static str>,
         cron_expr: &str,
         job: impl Fn(AppState, String) -> Pin<Box<dyn Future<Output = Result<(), FnError>> + Send>>
         + Send
@@ -272,6 +276,7 @@ impl<AppState: AS> CronRegistry<AppState> {
         let cron_schedule = cron_expr.parse::<cron::Schedule>()?;
         let cron_job = CronJob {
             name,
+            description,
             func: Box::new(CronFnClosure {
                 func: job,
                 _marker: std::marker::PhantomData,
@@ -284,8 +289,13 @@ impl<AppState: AS> CronRegistry<AppState> {
 
     #[cfg(feature = "jobs")]
     #[tracing::instrument(name = "cron.register_job", skip_all, fields(cron_job.name = J::NAME, cron_job.interval = ?interval))]
-    pub fn register_job<J: Job<AppState>>(&mut self, job: J, interval: Duration) {
-        self.register(J::NAME, interval, move |app_state, context| {
+    pub fn register_job<J: Job<AppState>>(
+        &mut self,
+        job: J,
+        description: Option<&'static str>,
+        interval: Duration,
+    ) {
+        self.register(J::NAME, description, interval, move |app_state, context| {
             J::enqueue(job.clone(), app_state, context)
         });
     }
@@ -295,17 +305,26 @@ impl<AppState: AS> CronRegistry<AppState> {
     pub fn register_job_with_cron<J: Job<AppState>>(
         &mut self,
         job: J,
+        description: Option<&'static str>,
         cron_expr: &str,
     ) -> Result<(), cron::error::Error> {
-        self.register_with_cron(J::NAME, cron_expr, move |app_state, context| {
-            J::enqueue(job.clone(), app_state, context)
-        })
+        self.register_with_cron(
+            J::NAME,
+            description,
+            cron_expr,
+            move |app_state, context| J::enqueue(job.clone(), app_state, context),
+        )
     }
 
     #[cfg(feature = "jobs")]
     #[tracing::instrument(name = "cron.get", skip_all, fields(cron_job.name = name))]
     pub fn get(&self, name: &str) -> Option<&CronJob<AppState>> {
         self.jobs.get(name)
+    }
+
+    /// Returns a reference to all registered cron jobs.
+    pub fn jobs(&self) -> &HashMap<&'static str, CronJob<AppState>> {
+        &self.jobs
     }
 }
 
@@ -385,7 +404,7 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, Duration::from_secs(1));
+        registry.register_job(TestJob, None, Duration::from_secs(1));
 
         let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
         assert_eq!(cron_job.name, TestJob::NAME);
@@ -429,7 +448,7 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, Duration::from_secs(60));
+        registry.register_job(TestJob, None, Duration::from_secs(60));
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
         let previously = Utc::now();
@@ -468,7 +487,7 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, Duration::from_secs(1));
+        registry.register_job(TestJob, None, Duration::from_secs(1));
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
         let two_seconds_ago = Utc::now() - chrono::Duration::seconds(2);
@@ -505,7 +524,7 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(FailingJob, Duration::from_secs(1));
+        registry.register_job(FailingJob, None, Duration::from_secs(1));
 
         let cron_job = registry.jobs.get(FailingJob::NAME).unwrap();
         let last_enqueue_map = HashMap::new();
@@ -556,6 +575,7 @@ mod test {
         let mut registry = CronRegistry::new();
         registry.register(
             "custom_failing",
+            None,
             Duration::from_secs(1),
             |_app_state, _context| Box::pin(async { Err(CustomError) }),
         );
@@ -597,8 +617,8 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, Duration::from_secs(1));
-        registry.register_job(SecondTestJob, Duration::from_secs(1));
+        registry.register_job(TestJob, None, Duration::from_secs(1));
+        registry.register_job(SecondTestJob, None, Duration::from_secs(1));
 
         assert_eq!(registry.jobs.len(), 2);
 
@@ -637,8 +657,8 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, Duration::from_secs(10));
-        registry.register_job(SecondTestJob, Duration::from_secs(5));
+        registry.register_job(TestJob, None, Duration::from_secs(10));
+        registry.register_job(SecondTestJob, None, Duration::from_secs(5));
 
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
@@ -699,7 +719,7 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, Duration::from_secs(1));
+        registry.register_job(TestJob, None, Duration::from_secs(1));
 
         let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
 
@@ -744,7 +764,7 @@ mod test {
 
         // Register with cron expression that runs every minute
         registry
-            .register_job_with_cron(TestJob, "0 * * * * * *")
+            .register_job_with_cron(TestJob, None, "0 * * * * * *")
             .unwrap();
 
         let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
@@ -792,7 +812,7 @@ mod test {
 
         // Register with cron expression that runs at specific minute (e.g., minute 30)
         registry
-            .register_job_with_cron(TestJob, "0 30 * * * * *")
+            .register_job_with_cron(TestJob, None, "0 30 * * * * *")
             .unwrap();
 
         let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
@@ -823,6 +843,7 @@ mod test {
         // Invalid cron expression should return error
         let result = registry.register_with_cron(
             "invalid_cron",
+            None,
             "invalid expression",
             |_app_state, _context| Box::pin(async { Ok::<(), std::io::Error>(()) }),
         );
@@ -839,11 +860,11 @@ mod test {
         let mut registry = CronRegistry::new();
 
         // Register one job with interval
-        registry.register_job(TestJob, Duration::from_secs(1));
+        registry.register_job(TestJob, None, Duration::from_secs(1));
 
         // Register another job with cron expression (every second)
         registry
-            .register_job_with_cron(SecondTestJob, "* * * * * * *")
+            .register_job_with_cron(SecondTestJob, None, "* * * * * * *")
             .unwrap();
 
         assert_eq!(registry.jobs.len(), 2);
