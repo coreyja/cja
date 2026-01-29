@@ -6,6 +6,8 @@ pub mod cron;
 #[cfg(feature = "jobs")]
 pub mod jobs;
 pub mod server;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub mod app_state;
 pub mod setup;

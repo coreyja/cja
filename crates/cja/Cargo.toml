@@ -8,6 +8,7 @@ authors.workspace = true
 default = ["cron", "jobs"]
 cron = ["jobs"]
 jobs = []
+testing = ["serde_urlencoded"]
 
 [dependencies]
 async-trait.workspace = true
@@ -34,6 +35,7 @@ chrono-tz = "0.10.0"
 
 tracing-common = { path = "../tracing-common" }
 color-eyre = "0.6.3"
+serde_urlencoded = { version = "0.7", optional = true }
 maud.workspace = true
 tokio-util.workspace = true
 
