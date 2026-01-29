@@ -61,7 +61,9 @@ pub async fn authorize(
             login: params
                 .mock_user_login
                 .unwrap_or_else(|| String::from("mock_user")),
-            name: params.mock_user_name.or_else(|| Some(String::from("Mock User"))),
+            name: params
+                .mock_user_name
+                .or_else(|| Some(String::from("Mock User"))),
             email: params
                 .mock_user_email
                 .or_else(|| Some(String::from("mock@example.com"))),
