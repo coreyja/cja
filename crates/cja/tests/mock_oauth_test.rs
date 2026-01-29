@@ -80,7 +80,10 @@ async fn test_full_oauth_flow() {
         .await
         .unwrap();
 
-    assert!(token_resp.status().is_success(), "Token exchange should succeed");
+    assert!(
+        token_resp.status().is_success(),
+        "Token exchange should succeed"
+    );
 
     let token_json: serde_json::Value = token_resp.json().await.unwrap();
     let access_token = token_json["access_token"].as_str().unwrap();
@@ -100,7 +103,10 @@ async fn test_full_oauth_flow() {
         .await
         .unwrap();
 
-    assert!(user_resp.status().is_success(), "User request should succeed");
+    assert!(
+        user_resp.status().is_success(),
+        "User request should succeed"
+    );
 
     let user_json: serde_json::Value = user_resp.json().await.unwrap();
     assert_eq!(user_json["id"], 12345);
@@ -297,7 +303,10 @@ async fn test_form_urlencoded_token_response() {
         body.contains("access_token="),
         "Should contain access_token"
     );
-    assert!(body.contains("token_type=bearer"), "Should contain token_type");
+    assert!(
+        body.contains("token_type=bearer"),
+        "Should contain token_type"
+    );
     assert!(body.contains("scope="), "Should contain scope");
 
     handle.abort();
