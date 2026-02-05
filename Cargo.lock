@@ -448,7 +448,6 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "cja",
- "futures",
  "maud",
  "serde",
  "serde_json",
