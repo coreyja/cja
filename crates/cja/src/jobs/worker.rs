@@ -132,13 +132,11 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 .execute(&mut *tx)
                 .await?;
 
-                sqlx::query(
-                    "DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2",
-                )
-                .bind(job.job_id)
-                .bind(self.id.to_string())
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
+                    .bind(job.job_id)
+                    .bind(self.id.to_string())
+                    .execute(&mut *tx)
+                    .await?;
 
                 tx.commit().await?;
 
