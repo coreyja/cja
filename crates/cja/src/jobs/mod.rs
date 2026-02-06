@@ -26,7 +26,7 @@ pub enum EnqueueError {
 /// All jobs are automatically retried on failure with exponential backoff:
 /// - Failed jobs are requeued with increasing delays: 2, 4, 8, 16, 32... seconds
 /// - Error messages and failure timestamps are tracked in the database
-/// - Jobs are permanently deleted after exceeding the configured max retries (default: 20)
+/// - Jobs are moved to a dead letter queue after exceeding the configured max retries (default: 20)
 /// - No manual intervention required for transient failures
 ///
 /// # Lock Timeout (Abandoned Job Recovery)

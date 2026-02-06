@@ -8,7 +8,7 @@ use crate::app_state::AppState as AS;
 
 use super::registry::JobRegistry;
 
-/// Default maximum number of retry attempts before a job is permanently deleted.
+/// Default maximum number of retry attempts before a job is moved to the dead letter queue.
 ///
 /// With exponential backoff (`2^(error_count+1)` seconds), 20 retries means:
 /// - First retry after 2 seconds
@@ -106,25 +106,41 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 
             // Check if job has exceeded max retries
             if job.error_count >= self.max_retries {
-                // Permanently delete job that has exceeded max retries
+                // Move job to dead letter queue
                 tracing::error!(
                     worker.id = %self.id,
                     job_id = %job.job_id,
                     error_count = job.error_count,
                     max_retries = self.max_retries,
-                    "Job permanently failed - max retries exceeded"
+                    "Job permanently failed - moved to dead letter queue"
                 );
 
+                let mut tx = self.state.db().begin().await?;
+
                 sqlx::query(
-                    "
-                    DELETE FROM jobs
-                    WHERE job_id = $1 AND locked_by = $2
-                    ",
+                    "INSERT INTO dead_letter_jobs (original_job_id, name, payload, context, priority, error_count, last_error_message, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(job.job_id)
+                .bind(&job.name)
+                .bind(&job.payload)
+                .bind(&job.context)
+                .bind(job.priority)
+                .bind(job.error_count)
+                .bind(&error_message)
+                .bind(job.created_at)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    "DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2",
                 )
                 .bind(job.job_id)
                 .bind(self.id.to_string())
-                .execute(self.state.db())
+                .execute(&mut *tx)
                 .await?;
+
+                tx.commit().await?;
 
                 return Ok(Err(JobError(job, e)));
             }
@@ -300,7 +316,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// * `app_state` - The application state containing database connection and configuration
 /// * `registry` - The job registry that maps job names to their implementations
 /// * `sleep_duration` - How long to sleep when no jobs are available
-/// * `max_retries` - Maximum number of times to retry a failed job before permanent deletion (default: 20)
+/// * `max_retries` - Maximum number of times to retry a failed job before moving to the dead letter queue (default: 20)
 /// * `shutdown_token` - Cancellation token for graceful shutdown. When cancelled, the worker
 ///   will stop accepting new jobs and release database locks before exiting.
 /// * `lock_timeout` - How long a job can be locked before it's considered abandoned and
@@ -313,7 +329,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// - The error message and timestamp are recorded
 /// - The job is requeued with exponential backoff: delay = `2^(error_count + 1)` seconds
 ///   (first retry: 2s, second: 4s, third: 8s, fourth: 16s, etc.)
-/// - If `error_count` >= `max_retries`, the job is permanently deleted
+/// - If `error_count` >= `max_retries`, the job is moved to the dead letter queue
 ///
 /// # Graceful Shutdown
 ///
