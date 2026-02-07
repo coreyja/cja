@@ -17,6 +17,11 @@ struct FailingJob {
     should_fail: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct LowPriorityJob {
+    id: String,
+}
+
 // Track job executions for testing
 static JOB_EXECUTIONS: std::sync::LazyLock<Arc<Mutex<Vec<String>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
@@ -47,6 +52,16 @@ impl<AS: cja::app_state::AppState> Job<AS> for FailingJob {
         if self.should_fail {
             color_eyre::eyre::bail!("Job failed as requested");
         }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl<AS: cja::app_state::AppState> Job<AS> for LowPriorityJob {
+    const NAME: &'static str = "LowPriorityJob";
+    const PRIORITY: i32 = -10;
+
+    async fn run(&self, _app_state: AS) -> color_eyre::Result<()> {
         Ok(())
     }
 }
@@ -566,4 +581,42 @@ async fn test_dead_letter_queue_preserves_original_job_id() {
                 .unwrap();
         assert_eq!(row.get::<Uuid, _>("original_job_id"), *job_id);
     }
+}
+
+#[tokio::test]
+async fn test_job_priority_const() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+    let app_state = crate::common::app::TestAppState::new(pool.clone());
+
+    // Default priority job
+    let normal_job = TestJob {
+        id: "normal".to_string(),
+        value: 1,
+    };
+    normal_job
+        .enqueue(app_state.clone(), "normal-priority".to_string())
+        .await
+        .unwrap();
+
+    // Low priority job
+    let low_job = LowPriorityJob {
+        id: "low".to_string(),
+    };
+    low_job
+        .enqueue(app_state, "low-priority".to_string())
+        .await
+        .unwrap();
+
+    // Verify priorities are stored correctly
+    let normal_row = sqlx::query("SELECT priority FROM jobs WHERE name = 'TestJob'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(normal_row.get::<i32, _>("priority"), 0);
+
+    let low_row = sqlx::query("SELECT priority FROM jobs WHERE name = 'LowPriorityJob'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(low_row.get::<i32, _>("priority"), -10);
 }

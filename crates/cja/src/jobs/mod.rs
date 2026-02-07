@@ -163,6 +163,10 @@ pub trait Job<AppState: AS>:
     /// This is used for routing jobs to their handlers.
     const NAME: &'static str;
 
+    /// The priority for this job type. Higher values are processed first.
+    /// Default is 0. Use negative values for background/low-priority work.
+    const PRIORITY: i32 = 0;
+
     /// Execute the job logic.
     ///
     /// This method has access to the full application state,
@@ -280,7 +284,7 @@ pub trait Job<AppState: AS>:
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(name = "jobs.enqueue", skip(app_state), fields(job.name = Self::NAME), err)]
+    #[instrument(name = "jobs.enqueue", skip(app_state), fields(job.name = Self::NAME, job.priority = Self::PRIORITY), err)]
     async fn enqueue(self, app_state: AppState, context: String) -> Result<(), EnqueueError> {
         sqlx::query(
             "
@@ -290,7 +294,7 @@ pub trait Job<AppState: AS>:
         .bind(uuid::Uuid::new_v4())
         .bind(Self::NAME)
         .bind(serde_json::to_value(self)?)
-        .bind(0)
+        .bind(Self::PRIORITY)
         .bind(chrono::Utc::now())
         .bind(chrono::Utc::now())
         .bind(context)
