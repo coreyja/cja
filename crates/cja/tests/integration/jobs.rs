@@ -431,12 +431,14 @@ async fn test_exponential_backoff_calculation() {
 }
 
 #[tokio::test]
-async fn test_max_retries_exceeded_deletes_job() {
+async fn test_max_retries_exceeded_moves_to_dead_letter_queue() {
     let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
 
     let job_id = uuid::Uuid::new_v4();
     let worker_id = "test-worker";
     let max_retries = 20;
+    let error_message = "Final failure";
+    let payload = serde_json::json!({"id": "test", "value": 1});
 
     // Insert a job that has already hit max retries
     sqlx::query(
@@ -445,40 +447,123 @@ async fn test_max_retries_exceeded_deletes_job() {
     )
     .bind(job_id)
     .bind("TestJob")
-    .bind(serde_json::json!({"id": "test", "value": 1}))
+    .bind(&payload)
     .bind(0)
-    .bind("test")
-    .bind(max_retries) // At max retries
+    .bind("test-context")
+    .bind(max_retries)
     .bind(worker_id)
     .execute(&pool)
     .await
     .unwrap();
 
-    // Verify job exists
-    let count_before = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE job_id = $1")
-        .bind(job_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .get::<Option<i64>, _>("count")
-        .unwrap();
-    assert_eq!(count_before, 1);
+    // Simulate what the worker now does: insert into dead_letter_jobs, then delete from jobs
+    let mut tx = pool.begin().await.unwrap();
 
-    // Simulate the worker deleting the job after max retries
+    sqlx::query(
+        "INSERT INTO dead_letter_jobs (original_job_id, name, payload, context, priority, error_count, last_error_message, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+    )
+    .bind(job_id)
+    .bind("TestJob")
+    .bind(&payload)
+    .bind("test-context")
+    .bind(0)
+    .bind(max_retries)
+    .bind(error_message)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
     sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
         .bind(job_id)
         .bind(worker_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
 
-    // Verify job was deleted
-    let count_after = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE job_id = $1")
+    tx.commit().await.unwrap();
+
+    // Verify job was removed from jobs table
+    let jobs_count = sqlx::query("SELECT COUNT(*) as count FROM jobs WHERE job_id = $1")
         .bind(job_id)
         .fetch_one(&pool)
         .await
         .unwrap()
         .get::<Option<i64>, _>("count")
         .unwrap();
-    assert_eq!(count_after, 0);
+    assert_eq!(jobs_count, 0);
+
+    // Verify job was added to dead_letter_jobs
+    let dlq_row = sqlx::query(
+        "SELECT original_job_id, name, payload, context, priority, error_count, last_error_message, failed_at
+         FROM dead_letter_jobs WHERE original_job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(dlq_row.get::<Uuid, _>("original_job_id"), job_id);
+    assert_eq!(dlq_row.get::<String, _>("name"), "TestJob");
+    assert_eq!(dlq_row.get::<String, _>("context"), "test-context");
+    assert_eq!(dlq_row.get::<i32, _>("priority"), 0);
+    assert_eq!(dlq_row.get::<i32, _>("error_count"), max_retries);
+    assert_eq!(
+        dlq_row.get::<Option<String>, _>("last_error_message"),
+        Some(error_message.to_string())
+    );
+    assert!(
+        dlq_row
+            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at")
+            .is_some()
+    );
+
+    // Verify payload was preserved correctly
+    let dlq_payload: serde_json::Value = dlq_row.get("payload");
+    assert_eq!(dlq_payload, payload);
+}
+
+#[tokio::test]
+async fn test_dead_letter_queue_preserves_original_job_id() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+
+    // Insert multiple failed jobs into dead letter queue
+    let job_ids: Vec<Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+
+    for (i, job_id) in job_ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO dead_letter_jobs (original_job_id, name, payload, context, priority, error_count, last_error_message, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+        )
+        .bind(job_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": format!("dead-{i}")}))
+        .bind(format!("context-{i}"))
+        .bind(0)
+        .bind(20)
+        .bind(format!("error-{i}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Verify all three are in the dead letter queue
+    let count = sqlx::query("SELECT COUNT(*) as count FROM dead_letter_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get::<Option<i64>, _>("count")
+        .unwrap();
+    assert_eq!(count, 3);
+
+    // Verify each job can be found by its original_job_id
+    for job_id in &job_ids {
+        let row =
+            sqlx::query("SELECT original_job_id FROM dead_letter_jobs WHERE original_job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.get::<Uuid, _>("original_job_id"), *job_id);
+    }
 }
