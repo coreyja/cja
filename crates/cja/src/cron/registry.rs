@@ -296,7 +296,7 @@ impl<AppState: AS> CronRegistry<AppState> {
         interval: Duration,
     ) {
         self.register(J::NAME, description, interval, move |app_state, context| {
-            J::enqueue(job.clone(), app_state, context)
+            J::enqueue(job.clone(), app_state, context, None)
         });
     }
 
@@ -312,7 +312,7 @@ impl<AppState: AS> CronRegistry<AppState> {
             J::NAME,
             description,
             cron_expr,
-            move |app_state, context| J::enqueue(job.clone(), app_state, context),
+            move |app_state, context| J::enqueue(job.clone(), app_state, context, None),
         )
     }
 

@@ -101,7 +101,7 @@ pub enum EnqueueError {
 /// };
 ///
 /// // Enqueue the job with a context string for debugging
-/// job.enqueue(app_state, "user-signup".to_string()).await?;
+/// job.enqueue(app_state, "user-signup".to_string(), None).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -254,6 +254,8 @@ pub trait Job<AppState: AS>:
     /// # Arguments
     /// * `app_state` - The application state containing the database connection
     /// * `context` - A string describing why this job was enqueued (useful for debugging)
+    /// * `priority` - Optional priority for this job instance. Higher values run first.
+    ///   Defaults to 0 if `None`. Use negative values for lower-priority background work.
     ///
     /// # Example
     ///
@@ -276,12 +278,20 @@ pub trait Job<AppState: AS>:
     /// # }
     /// # async fn example(app_state: MyAppState) -> Result<(), cja::jobs::EnqueueError> {
     /// let job = MyJob { data: "important work".to_string() };
-    /// job.enqueue(app_state, "user-requested".to_string()).await?;
+    /// // Default priority
+    /// job.clone().enqueue(app_state.clone(), "user-requested".to_string(), None).await?;
+    /// // Low priority background work
+    /// job.enqueue(app_state, "background-cleanup".to_string(), Some(-10)).await?;
     /// # Ok(())
     /// # }
     /// ```
     #[instrument(name = "jobs.enqueue", skip(app_state), fields(job.name = Self::NAME), err)]
-    async fn enqueue(self, app_state: AppState, context: String) -> Result<(), EnqueueError> {
+    async fn enqueue(
+        self,
+        app_state: AppState,
+        context: String,
+        priority: Option<i32>,
+    ) -> Result<(), EnqueueError> {
         sqlx::query(
             "
         INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
@@ -290,7 +300,7 @@ pub trait Job<AppState: AS>:
         .bind(uuid::Uuid::new_v4())
         .bind(Self::NAME)
         .bind(serde_json::to_value(self)?)
-        .bind(0)
+        .bind(priority.unwrap_or(0))
         .bind(chrono::Utc::now())
         .bind(chrono::Utc::now())
         .bind(context)

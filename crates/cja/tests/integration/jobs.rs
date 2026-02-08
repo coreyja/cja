@@ -66,7 +66,9 @@ async fn test_job_enqueue() {
     };
 
     // Enqueue the job
-    let result = job.enqueue(app_state, "test-context".to_string()).await;
+    let result = job
+        .enqueue(app_state, "test-context".to_string(), None)
+        .await;
     assert!(result.is_ok());
 
     // Verify job is in database
@@ -90,18 +92,65 @@ async fn test_job_with_priority() {
             id: format!("priority-test-{i}"),
             value: i,
         };
-        job.enqueue(app_state.clone(), format!("priority-{i}"))
+        job.enqueue(app_state.clone(), format!("priority-{i}"), Some(i))
             .await
             .unwrap();
     }
 
-    // Verify all jobs are enqueued
-    let count = sqlx::query("SELECT COUNT(*) as count FROM jobs")
+    // Verify all jobs are enqueued with correct priorities
+    let rows = sqlx::query("SELECT priority FROM jobs ORDER BY priority ASC")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get::<i32, _>("priority"), 0);
+    assert_eq!(rows[1].get::<i32, _>("priority"), 1);
+    assert_eq!(rows[2].get::<i32, _>("priority"), 2);
+}
+
+#[tokio::test]
+async fn test_enqueue_priority_none_defaults_to_zero() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+    let app_state = crate::common::app::TestAppState::new(pool.clone());
+
+    let job = TestJob {
+        id: "default-priority".to_string(),
+        value: 1,
+    };
+
+    job.enqueue(app_state, "test".to_string(), None)
+        .await
+        .unwrap();
+
+    let row = sqlx::query("SELECT priority FROM jobs")
         .fetch_one(&pool)
         .await
         .unwrap();
 
-    assert_eq!(count.get::<Option<i64>, _>("count").unwrap(), 3);
+    assert_eq!(row.get::<i32, _>("priority"), 0);
+}
+
+#[tokio::test]
+async fn test_enqueue_with_negative_priority() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+    let app_state = crate::common::app::TestAppState::new(pool.clone());
+
+    let job = TestJob {
+        id: "low-priority".to_string(),
+        value: 1,
+    };
+
+    job.enqueue(app_state, "background-work".to_string(), Some(-10))
+        .await
+        .unwrap();
+
+    let row = sqlx::query("SELECT priority FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<i32, _>("priority"), -10);
 }
 
 #[tokio::test]
@@ -114,7 +163,7 @@ async fn test_job_payload_serialization() {
         value: 123,
     };
 
-    job.enqueue(app_state, "serialization-context".to_string())
+    job.enqueue(app_state, "serialization-context".to_string(), None)
         .await
         .unwrap();
 
@@ -140,7 +189,7 @@ async fn test_job_locking() {
         value: 999,
     };
 
-    job.enqueue(app_state, "lock-context".to_string())
+    job.enqueue(app_state, "lock-context".to_string(), None)
         .await
         .unwrap();
 
@@ -193,7 +242,8 @@ async fn test_concurrent_job_enqueue() {
                 id: format!("concurrent-{i}"),
                 value: i,
             };
-            job.enqueue(state, format!("concurrent-context-{i}")).await
+            job.enqueue(state, format!("concurrent-context-{i}"), None)
+                .await
         });
         handles.push(handle);
     }
@@ -224,7 +274,9 @@ async fn test_job_context() {
     };
 
     let context = "user-requested-action";
-    job.enqueue(app_state, context.to_string()).await.unwrap();
+    job.enqueue(app_state, context.to_string(), None)
+        .await
+        .unwrap();
 
     // Verify context is stored
     let row = sqlx::query("SELECT context FROM jobs WHERE name = $1")
@@ -247,7 +299,9 @@ async fn test_failing_job_enqueue() {
     };
 
     // Enqueue the job
-    let result = job.enqueue(app_state, "test-failing".to_string()).await;
+    let result = job
+        .enqueue(app_state, "test-failing".to_string(), None)
+        .await;
     assert!(result.is_ok());
 
     // Verify job is in database with initial error_count of 0
@@ -278,7 +332,7 @@ async fn test_error_tracking_fields_present() {
         value: 42,
     };
 
-    job.enqueue(app_state, "test-context".to_string())
+    job.enqueue(app_state, "test-context".to_string(), None)
         .await
         .unwrap();
 
