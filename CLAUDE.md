@@ -11,7 +11,6 @@ CJA (Cron, Jobs and Axum) is a Rust web framework for full-stack development tha
 The project uses a Cargo workspace with these main crates:
 - `crates/cja/` - Core framework library providing jobs, cron, server, and session management
 - `crates/cja.app/` - Example application demonstrating the framework
-- `crates/tracing-common/` - Shared tracing utilities
 
 ### Key Components
 
