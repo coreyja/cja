@@ -5,7 +5,12 @@ on:
     branches:
       - main
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   format:
@@ -39,3 +44,12 @@ jobs:
 
       - name: Run cargo deny
         run: cargo deny check bans
+
+  pr-title:
+    uses: ./.github/workflows/_pr-title.yml
+
+  release:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [format, check-stable, check-nightly, sqlx-check, cargo-deny]
+    uses: ./.github/workflows/_release.yml
+    secrets: inherit

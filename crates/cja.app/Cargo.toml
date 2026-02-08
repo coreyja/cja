@@ -3,6 +3,7 @@ name = "cja-site"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+publish = false
 
 [features]
 default = ["cron", "jobs"]
