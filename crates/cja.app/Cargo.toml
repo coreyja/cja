@@ -24,7 +24,5 @@ sqlx.workspace = true
 async-trait.workspace = true
 maud.workspace = true
 
-futures = "0.3.30"
-
 [lints]
 workspace = true

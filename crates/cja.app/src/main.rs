@@ -10,6 +10,7 @@ use cja::{
         session::{AppSession, CJASession, Session},
     },
     setup::{setup_sentry, setup_tracing},
+    tasks::NamedTask,
 };
 use maud::html;
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -103,10 +104,10 @@ async fn run_application() -> cja::Result<()> {
 
     // Spawn application tasks
     info!("Spawning application tasks");
-    let futures = spawn_application_tasks(&app_state, &shutdown_token);
+    let mut tasks = spawn_application_tasks(&app_state, &shutdown_token);
 
-    // Set up signal handlers for graceful shutdown
-    let shutdown_handle = tokio::spawn(async move {
+    // Set up signal handler as a named task
+    tasks.push(NamedTask::spawn("signal-handler", async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("Failed to create SIGTERM handler");
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -122,16 +123,11 @@ async fn run_application() -> cja::Result<()> {
         }
 
         shutdown_token.cancel();
-    });
+        Ok(())
+    }));
 
-    // Wait for all tasks to complete
-    let result = futures::future::try_join_all(futures).await;
-
-    // Cancel signal handler if tasks complete first
-    shutdown_handle.abort();
-
-    result?;
-    Ok(())
+    // Wait for any task to exit — all run forever, so any exit is an error
+    cja::tasks::wait_for_first_error(tasks).await
 }
 
 fn routes(app_state: AppState) -> axum::Router {
@@ -212,12 +208,15 @@ async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
 fn spawn_application_tasks(
     app_state: &AppState,
     #[allow(unused_variables)] shutdown_token: &cja::jobs::CancellationToken,
-) -> std::vec::Vec<tokio::task::JoinHandle<std::result::Result<(), cja::color_eyre::Report>>> {
-    let mut futures = vec![];
+) -> Vec<NamedTask> {
+    let mut tasks = vec![];
 
     if is_feature_enabled("SERVER") {
         info!("Server Enabled");
-        futures.push(tokio::spawn(run_server(routes(app_state.clone()))));
+        tasks.push(NamedTask::spawn(
+            "server",
+            run_server(routes(app_state.clone())),
+        ));
     } else {
         info!("Server Disabled");
     }
@@ -228,14 +227,17 @@ fn spawn_application_tasks(
         use std::time::Duration;
 
         info!("Jobs Enabled");
-        futures.push(tokio::spawn(cja::jobs::worker::job_worker(
-            app_state.clone(),
-            jobs::Jobs,
-            Duration::from_secs(60),
-            cja::jobs::DEFAULT_MAX_RETRIES,
-            shutdown_token.clone(),
-            cja::jobs::DEFAULT_LOCK_TIMEOUT,
-        )));
+        tasks.push(NamedTask::spawn(
+            "jobs",
+            cja::jobs::worker::job_worker(
+                app_state.clone(),
+                jobs::Jobs,
+                Duration::from_secs(60),
+                cja::jobs::DEFAULT_MAX_RETRIES,
+                shutdown_token.clone(),
+                cja::jobs::DEFAULT_LOCK_TIMEOUT,
+            ),
+        ));
     } else {
         info!("Jobs Disabled");
     }
@@ -249,10 +251,10 @@ fn spawn_application_tasks(
     #[cfg(feature = "cron")]
     if is_feature_enabled("CRON") {
         info!("Cron Enabled");
-        futures.push(tokio::spawn(cron::run_cron(
-            app_state.clone(),
-            shutdown_token.clone(),
-        )));
+        tasks.push(NamedTask::spawn(
+            "cron",
+            cron::run_cron(app_state.clone(), shutdown_token.clone()),
+        ));
     } else {
         info!("Cron Disabled");
     }
@@ -263,7 +265,7 @@ fn spawn_application_tasks(
     }
 
     info!("All application tasks spawned successfully");
-    futures
+    tasks
 }
 
 /// Check if a feature is enabled based on environment variables
