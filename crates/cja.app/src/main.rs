@@ -1,9 +1,6 @@
 use axum::response::IntoResponse;
 use cja::{
-    color_eyre::{
-        self,
-        eyre::{Context as _, eyre},
-    },
+    color_eyre::{self, eyre::Context as _},
     server::{
         cookies::CookieKey,
         run_server,
@@ -59,35 +56,13 @@ fn main() -> color_eyre::Result<()> {
 
 #[tracing::instrument(err)]
 pub async fn setup_db_pool() -> cja::Result<PgPool> {
-    const MIGRATION_LOCK_ID: i64 = 0xDB_DB_DB_DB_DB_DB_DB;
-
     let database_url = std::env::var("DATABASE_URL").wrap_err("DATABASE_URL must be set")?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await?;
 
-    sqlx::query!("SELECT pg_advisory_lock($1)", MIGRATION_LOCK_ID)
-        .execute(&pool)
-        .await?;
-
     sqlx::migrate!().run(&pool).await?;
-
-    let unlock_result = sqlx::query!("SELECT pg_advisory_unlock($1)", MIGRATION_LOCK_ID)
-        .fetch_one(&pool)
-        .await?
-        .pg_advisory_unlock;
-
-    match unlock_result {
-        Some(b) => {
-            if b {
-                tracing::info!("Migration lock unlocked");
-            } else {
-                tracing::info!("Failed to unlock migration lock");
-            }
-        }
-        None => return Err(eyre!("Failed to unlock migration lock")),
-    }
 
     Ok(pool)
 }
