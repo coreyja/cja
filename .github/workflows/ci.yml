@@ -39,3 +39,18 @@ jobs:
 
       - name: Run cargo deny
         run: cargo deny check bans
+
+  ready:
+    if: always()
+    needs: [format, check-stable, check-nightly, sqlx-check, cargo-deny]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          for result in $results; do
+            if [[ "$result" != "success" ]]; then
+              echo "Job result: $result (expected success)"
+              exit 1
+            fi
+          done
