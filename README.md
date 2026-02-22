@@ -37,15 +37,16 @@ impl AppState for App {
 
 ## Documentation
 
-Full API documentation is available via `cargo doc`:
+- **[User Guide](crates/cja/README.md)** — Getting started, configuration, usage examples (also renders on crates.io)
+- **[Architecture](docs/architecture.md)** — System design, module tree, database schema, data flow
+- **[Development](docs/development.md)** — Setup, testing, hot reload, migrations
+- **[Conventions](docs/conventions.md)** — Error handling, tracing, clippy, naming, extensibility patterns
+
+API docs via `cargo doc`:
 
 ```bash
 cargo doc --open -p cja
 ```
-
-The crate-level docs include a getting started guide, configuration reference,
-and usage examples for jobs, cron, and the HTTP server. Each module has detailed
-documentation for its types and functions.
 
 ## Example Application
 
