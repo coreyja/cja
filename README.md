@@ -35,7 +35,17 @@ impl AppState for App {
 }
 ```
 
-See [`crates/cja/README.md`](crates/cja/README.md) for the full user guide covering jobs, cron, server, sessions, and configuration.
+## Documentation
+
+Full API documentation is available via `cargo doc`:
+
+```bash
+cargo doc --open -p cja
+```
+
+The crate-level docs include a getting started guide, configuration reference,
+and usage examples for jobs, cron, and the HTTP server. Each module has detailed
+documentation for its types and functions.
 
 ## Example Application
 
@@ -57,12 +67,41 @@ cja new my-project
 
 Supports `--no-jobs`, `--no-cron`, and `--no-sessions` flags.
 
-## Documentation
+## Development
 
-- **[User Guide](crates/cja/README.md)** — Getting started, configuration, job system, cron, server
-- **[Architecture](docs/architecture.md)** — System design, module tree, data flow, database schema
-- **[Development](docs/development.md)** — Setup, testing, linting, migrations
-- **[Conventions](docs/conventions.md)** — Error handling, tracing, feature flags, naming
+### Prerequisites
+
+- Rust (edition 2024) — install via [rustup](https://rustup.rs/)
+- PostgreSQL
+- systemfd (optional, for zero-downtime hot reload)
+
+### Setup
+
+```bash
+git clone https://github.com/coreyja/cja.git
+cd cja
+createdb cja_dev
+export DATABASE_URL="postgres:///cja_dev"
+cargo build
+```
+
+### Testing
+
+```bash
+cargo test
+```
+
+See `crates/cja/TESTING.md` for the full testing philosophy. Tests use real
+PostgreSQL with isolated databases per test.
+
+### Linting
+
+Clippy is configured as pedantic (deny level). Unsafe code is forbidden workspace-wide.
+
+```bash
+cargo clippy --workspace --all-targets
+cargo fmt --check
+```
 
 ## Tech Stack
 
