@@ -1,3 +1,21 @@
+//! Application setup: Sentry error tracking and tracing/observability initialization.
+//!
+//! Call [`setup_sentry`] before building the Tokio runtime, and [`setup_tracing`]
+//! inside the async context. The tracing function returns an optional
+//! [`EyesShutdownHandle`] — keep it alive in your `main` scope:
+//!
+//! ```rust,ignore
+//! let _sentry_guard = setup_sentry();
+//! let _eyes_handle = setup_tracing("my-app")?;
+//! ```
+//!
+//! # Supported Backends
+//!
+//! - **Console**: Tree-formatted logs (default) or JSON with `JSON_LOGS` env var
+//! - **Sentry**: Error tracking via `SENTRY_DSN`
+//! - **Honeycomb**: OpenTelemetry export via `HONEYCOMB_API_KEY`
+//! - **Eyes**: Distributed tracing via `EYES_ORG_ID` + `EYES_APP_ID` (both required)
+
 use std::{collections::HashMap, time::Duration};
 
 use color_eyre::eyre::Context;
