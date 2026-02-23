@@ -1,4 +1,3 @@
-use axum::response::IntoResponse;
 use cja::{
     color_eyre::{
         self,
@@ -7,17 +6,19 @@ use cja::{
     server::{
         cookies::CookieKey,
         run_server,
-        session::{AppSession, CJASession, Session},
+        session::{AppSession, CJASession},
     },
     setup::{setup_sentry, setup_tracing},
     tasks::NamedTask,
 };
-use maud::html;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::info;
 
+mod routes;
+mod templates;
+
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     db: sqlx::PgPool,
     cookie_key: CookieKey,
 }
@@ -46,10 +47,8 @@ impl cja::app_state::AppState for AppState {
 }
 
 fn main() -> color_eyre::Result<()> {
-    // Initialize Sentry for error tracking
     let _sentry_guard = setup_sentry();
 
-    // Create and run the tokio runtime
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -93,20 +92,23 @@ pub async fn setup_db_pool() -> cja::Result<PgPool> {
 }
 
 async fn run_application() -> cja::Result<()> {
-    // Initialize tracing
     setup_tracing("cja-site")?;
 
     let app_state = AppState::from_env().await?;
 
-    // Create shutdown token for graceful shutdown
-    use cja::jobs::CancellationToken;
-    let shutdown_token = CancellationToken::new();
-
-    // Spawn application tasks
     info!("Spawning application tasks");
-    let mut tasks = spawn_application_tasks(&app_state, &shutdown_token);
+    let mut tasks = vec![];
 
-    // Set up signal handler as a named task
+    if is_feature_enabled("SERVER") {
+        info!("Server Enabled");
+        tasks.push(NamedTask::spawn(
+            "server",
+            run_server(routes::router(app_state.clone())),
+        ));
+    } else {
+        info!("Server Disabled");
+    }
+
     tasks.push(NamedTask::spawn("signal-handler", async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("Failed to create SIGTERM handler");
@@ -122,21 +124,14 @@ async fn run_application() -> cja::Result<()> {
             }
         }
 
-        shutdown_token.cancel();
         Ok(())
     }));
 
-    // Wait for any task to exit — all run forever, so any exit is an error
     cja::tasks::wait_for_first_error(tasks).await
 }
 
-fn routes(app_state: AppState) -> axum::Router {
-    axum::Router::new()
-        .route("/", axum::routing::get(root))
-        .with_state(app_state)
-}
-
-struct SiteSession {
+#[allow(dead_code)]
+pub(crate) struct SiteSession {
     inner: CJASession,
 }
 
@@ -186,215 +181,9 @@ impl AppSession for SiteSession {
     }
 }
 
-async fn root(Session(session): Session<SiteSession>) -> impl IntoResponse {
-    html! {
-        html {
-            head {
-                title { "CJA Site" }
-            }
-            body {
-                h1 { "Hello, World!" }
-
-                h4 { "Session" }
-                p { "Session ID: " (session.session_id()) }
-                p { "Created At: " (session.created_at()) }
-                p { "Updated At: " (session.updated_at()) }
-            }
-        }
-    }
-}
-
-/// Spawn all application background tasks
-fn spawn_application_tasks(
-    app_state: &AppState,
-    #[allow(unused_variables)] shutdown_token: &cja::jobs::CancellationToken,
-) -> Vec<NamedTask> {
-    let mut tasks = vec![];
-
-    if is_feature_enabled("SERVER") {
-        info!("Server Enabled");
-        tasks.push(NamedTask::spawn(
-            "server",
-            run_server(routes(app_state.clone())),
-        ));
-    } else {
-        info!("Server Disabled");
-    }
-
-    // Initialize job worker if enabled
-    #[cfg(feature = "jobs")]
-    if is_feature_enabled("JOBS") {
-        use std::time::Duration;
-
-        info!("Jobs Enabled");
-        tasks.push(NamedTask::spawn(
-            "jobs",
-            cja::jobs::worker::job_worker(
-                app_state.clone(),
-                jobs::Jobs,
-                Duration::from_secs(60),
-                cja::jobs::DEFAULT_MAX_RETRIES,
-                shutdown_token.clone(),
-                cja::jobs::DEFAULT_LOCK_TIMEOUT,
-            ),
-        ));
-    } else {
-        info!("Jobs Disabled");
-    }
-
-    #[cfg(not(feature = "jobs"))]
-    {
-        info!("Jobs feature not compiled in");
-    }
-
-    // Initialize cron worker if enabled
-    #[cfg(feature = "cron")]
-    if is_feature_enabled("CRON") {
-        info!("Cron Enabled");
-        tasks.push(NamedTask::spawn(
-            "cron",
-            cron::run_cron(app_state.clone(), shutdown_token.clone()),
-        ));
-    } else {
-        info!("Cron Disabled");
-    }
-
-    #[cfg(not(feature = "cron"))]
-    {
-        info!("Cron feature not compiled in");
-    }
-
-    info!("All application tasks spawned successfully");
-    tasks
-}
-
-/// Check if a feature is enabled based on environment variables
 fn is_feature_enabled(feature: &str) -> bool {
     let env_var_name = format!("{feature}_DISABLED");
     let value = std::env::var(&env_var_name).unwrap_or_else(|_| "false".to_string());
 
     value != "true"
-}
-
-#[cfg(feature = "jobs")]
-mod jobs {
-    use serde::{Deserialize, Serialize};
-
-    use super::AppState;
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct NoopJob;
-
-    #[async_trait::async_trait]
-    impl cja::jobs::Job<AppState> for NoopJob {
-        const NAME: &'static str = "NoopJob";
-
-        async fn run(&self, _app_state: AppState) -> cja::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Demo job that shows how to use the cancellation token for graceful shutdown.
-    ///
-    /// This job simulates a long-running task by looping and sleeping, checking
-    /// the cancellation token periodically to exit early during shutdown.
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct CancellableDemoJob {
-        /// Number of iterations to perform (each takes ~1 second)
-        pub iterations: u32,
-    }
-
-    #[async_trait::async_trait]
-    impl cja::jobs::Job<AppState> for CancellableDemoJob {
-        const NAME: &'static str = "CancellableDemoJob";
-
-        async fn run(&self, _app_state: AppState) -> cja::Result<()> {
-            // Simple implementation without cancellation support
-            for i in 0..self.iterations {
-                tracing::info!(
-                    iteration = i,
-                    total = self.iterations,
-                    "CancellableDemoJob: processing iteration (no cancellation support)"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            tracing::info!("CancellableDemoJob: completed all iterations");
-            Ok(())
-        }
-
-        async fn run_with_cancellation(
-            &self,
-            _app_state: AppState,
-            cancellation_token: cja::jobs::CancellationToken,
-        ) -> cja::Result<()> {
-            tracing::info!(
-                iterations = self.iterations,
-                "CancellableDemoJob: starting with cancellation support"
-            );
-
-            for i in 0..self.iterations {
-                // Check if shutdown was requested
-                if cancellation_token.is_cancelled() {
-                    tracing::warn!(
-                        iteration = i,
-                        total = self.iterations,
-                        "CancellableDemoJob: cancelled during shutdown, exiting early"
-                    );
-                    return Err(cja::color_eyre::eyre::eyre!(
-                        "Job cancelled at iteration {}/{} during shutdown",
-                        i,
-                        self.iterations
-                    ));
-                }
-
-                tracing::info!(
-                    iteration = i,
-                    total = self.iterations,
-                    "CancellableDemoJob: processing iteration"
-                );
-
-                // Simulate work by sleeping for 1 second
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-
-            tracing::info!(
-                iterations = self.iterations,
-                "CancellableDemoJob: completed all iterations successfully"
-            );
-            Ok(())
-        }
-    }
-
-    cja::impl_job_registry!(AppState, NoopJob, CancellableDemoJob);
-}
-
-#[cfg(feature = "cron")]
-mod cron {
-    use chrono_tz::US::Eastern;
-    use cja::cron::{CancellationToken, CronRegistry, Worker};
-    use std::time::Duration;
-
-    #[cfg(feature = "jobs")]
-    use crate::jobs::NoopJob;
-
-    use super::AppState;
-
-    pub(crate) async fn run_cron(
-        app_state: AppState,
-        shutdown_token: CancellationToken,
-    ) -> cja::Result<()> {
-        Ok(
-            Worker::new_with_timezone(app_state, cron_registry(), Eastern, Duration::from_secs(60))
-                .run(shutdown_token)
-                .await?,
-        )
-    }
-
-    fn cron_registry() -> cja::cron::CronRegistry<AppState> {
-        #[cfg_attr(not(feature = "jobs"), allow(unused_mut))]
-        let mut registry = CronRegistry::new();
-        #[cfg(feature = "jobs")]
-        registry.register_job(NoopJob, Some("A test no-op job"), Duration::from_secs(60));
-        registry
-    }
 }
