@@ -3,11 +3,7 @@ use cja::{
         self,
         eyre::{Context as _, eyre},
     },
-    server::{
-        cookies::CookieKey,
-        run_server,
-        session::{AppSession, CJASession},
-    },
+    server::{cookies::CookieKey, run_server},
     setup::{setup_sentry, setup_tracing},
     tasks::NamedTask,
 };
@@ -128,57 +124,6 @@ async fn run_application() -> cja::Result<()> {
     }));
 
     cja::tasks::wait_for_first_error(tasks).await
-}
-
-#[allow(dead_code)]
-pub(crate) struct SiteSession {
-    inner: CJASession,
-}
-
-#[async_trait::async_trait]
-impl AppSession for SiteSession {
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
-        let row = sqlx::query!(
-            "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
-            session_id
-        )
-        .fetch_one(pool)
-        .await?;
-
-        let session = SiteSession {
-            inner: CJASession {
-                session_id: row.session_id,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-            },
-        };
-
-        Ok(session)
-    }
-
-    async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
-        let row = sqlx::query!(
-            "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at",
-        )
-        .fetch_one(pool)
-        .await?;
-
-        let inner = CJASession {
-            session_id: row.session_id,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        };
-
-        Ok(Self { inner })
-    }
-
-    fn from_inner(inner: CJASession) -> Self {
-        Self { inner }
-    }
-
-    fn inner(&self) -> &CJASession {
-        &self.inner
-    }
 }
 
 fn is_feature_enabled(feature: &str) -> bool {

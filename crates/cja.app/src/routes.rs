@@ -9,7 +9,7 @@ pub fn router(app_state: AppState) -> Router {
     let docs_path = std::env::var("DOCS_PATH").unwrap_or_else(|_| "./target/doc".to_string());
 
     let docs_service = ServeDir::new(docs_path).fallback(get(|| async {
-        Redirect::permanent("/docs/cja/index.html")
+        Redirect::temporary("/docs/cja/index.html")
     }));
 
     Router::new()

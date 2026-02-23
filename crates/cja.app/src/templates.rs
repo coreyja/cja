@@ -57,11 +57,11 @@ impl AppState for App {
     fn cookie_key(&self) -> &CookieKey { &self.cookie_key }
 }
 
-fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let app = App::from_env().await?;
     let tasks = vec![
         NamedTask::spawn("server", run_server(routes(app.clone()))),
-        NamedTask::spawn("jobs", job_worker(app.clone(), Jobs, ...)),
+        NamedTask::spawn("jobs", job_worker(app, Jobs)),
     ];
     wait_for_first_error(tasks).await
 }"#, "rust"))
@@ -161,7 +161,9 @@ fn code_showcase_section() -> Markup {
                 div class="section-heading" {
                     h2 { "A complete app in 30 lines" }
                 }
-                (code_block(r#"use cja::prelude::*;
+                (code_block(r#"use cja::app_state::AppState;
+use cja::server::cookies::CookieKey;
+use cja::jobs::Job;
 
 #[derive(Clone)]
 struct App { db: PgPool, cookie_key: CookieKey }
@@ -260,7 +262,7 @@ fn footer_section() -> Markup {
                     }
                 }
                 div class="footer-bottom" {
-                    p { "© 2025 CJA" }
+                    p { "© 2026 CJA" }
                 }
             }
         }
