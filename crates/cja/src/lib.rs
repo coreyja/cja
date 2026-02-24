@@ -1,3 +1,4 @@
+#![doc(html_favicon_url = "https://cja.app/favicon.svg")]
 //! # CJA — Cron, Jobs and Axum
 //!
 //! > **ALPHA**: CJA is under active development. APIs may change between releases.
