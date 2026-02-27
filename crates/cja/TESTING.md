@@ -29,16 +29,10 @@ Doc tests serve dual purposes: providing usage examples and verifying API functi
 
 ## Running Tests
 
-### All Tests
+### All Tests (Library + Integration)
 
 ```bash
-cargo test
-```
-
-### Doc Tests Only
-
-```bash
-cargo test --doc
+cargo test --package cja --lib --test lib
 ```
 
 ### Integration Tests Only
@@ -53,6 +47,27 @@ cargo test --test lib
 cargo test sessions --test lib
 cargo test jobs --test lib
 ```
+
+### Doc Tests
+
+Doc tests (`cargo test --doc`) **do not work** for this project because `sqlx::query!`
+macros require a live database connection at compile time, and doctest crates don't
+inherit the `DATABASE_URL` environment variable. Use `--lib --test lib` instead.
+
+### Unix Socket Database (Linux / Lima VM)
+
+If PostgreSQL uses Unix sockets, two different `DATABASE_URL` formats are needed:
+
+```bash
+# Compile-time (query! macro validation):
+DATABASE_URL="postgres:///cja_dev?host=/var/run/postgresql" cargo test --package cja --no-run
+
+# Runtime (test execution):
+DATABASE_URL="postgres://%2Fvar%2Frun%2Fpostgresql/postgres" cargo test --package cja --lib --test lib -- --test-threads=1
+```
+
+The two formats are needed because the test infrastructure's URL parser (`rfind('/')`)
+breaks on `?host=` query parameters at runtime.
 
 ## Test Database Configuration
 

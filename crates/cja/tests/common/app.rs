@@ -4,6 +4,7 @@ use reqwest::cookie::{CookieStore as _, Jar};
 use sqlx::PgPool;
 use std::sync::Arc;
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct TestAppState {
     pub db_pool: PgPool,
@@ -24,6 +25,7 @@ impl AppState for TestAppState {
     }
 }
 
+#[allow(dead_code)]
 impl TestAppState {
     pub fn new(db_pool: PgPool) -> Self {
         Self {
