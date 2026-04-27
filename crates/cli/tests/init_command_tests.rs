@@ -30,7 +30,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success()
         .stdout(predicate::str::contains("Successfully initialized CJA"))
@@ -84,7 +84,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--bin-name", "web-server"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -122,7 +122,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--no-jobs"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 
@@ -160,7 +160,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--no-cron"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 
@@ -200,7 +200,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--no-sessions"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 
@@ -236,7 +236,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--no-jobs", "--no-cron", "--no-sessions"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success()
         .stderr(predicate::str::contains("--no-jobs implies --no-cron"));
@@ -305,7 +305,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 
@@ -345,7 +345,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 
@@ -387,7 +387,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(temp.child("my-app").path())
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 
@@ -445,7 +445,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 
@@ -479,7 +479,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 
@@ -518,7 +518,7 @@ test-case = "3.0"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .assert()
         .success();
 

@@ -27,7 +27,7 @@ pub struct Worker<AppState: AS> {
 impl<AppState: AS> Worker<AppState> {
     /// Create a new Worker with UTC as the default timezone
     pub fn new(state: AppState, registry: CronRegistry<AppState>) -> Self {
-        Self::new_with_timezone(state, registry, chrono_tz::UTC, Duration::from_secs(60))
+        Self::new_with_timezone(state, registry, chrono_tz::UTC, Duration::from_mins(1))
     }
 
     /// Create a new Worker with a specific timezone
