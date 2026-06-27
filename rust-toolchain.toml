@@ -1,0 +1,9 @@
+# Pinned Rust toolchain. CI's stable lane and local development both read this
+# file, so a new stable release can't silently introduce clippy lints that break
+# CI (see the `duration_suboptimal_units` break in Rust 1.96.0).
+#
+# Bumps are proposed automatically by .github/workflows/update-rust.yml, which
+# opens a PR when a newer stable is released so CI can vet it before we adopt it.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
