@@ -1,0 +1,19 @@
+<!-- Rustdoc theme overrides for CJA brand colors.
+     CSS custom properties verified against rustdoc from Rust 1.85.
+     If colors break after a toolchain update, check rustdoc's CSS source. -->
+<style>
+    :root {
+        --main-background-color: #121131;
+        --main-color: #F0F0FF;
+        --settings-input-color: #F0F0FF;
+        --sidebar-background-color: #181845;
+        --sidebar-background-color-hover: #1e1e5a;
+    }
+    :root[data-theme="dark"], :root[data-theme="ayu"] {
+        --main-background-color: #121131;
+        --main-color: #F0F0FF;
+        --sidebar-background-color: #181845;
+        --sidebar-background-color-hover: #1e1e5a;
+        --code-block-background-color: #0e0e30;
+    }
+</style>

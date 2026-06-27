@@ -1,3 +1,42 @@
+//! HTTP server built on Axum with cookies, sessions, and zero-downtime reload.
+//!
+//! # Routes
+//!
+//! Build routes using standard Axum patterns and pass them to [`run_server`]:
+//!
+//! ```rust,ignore
+//! fn routes(app_state: MyAppState) -> axum::Router {
+//!     axum::Router::new()
+//!         .route("/", axum::routing::get(index))
+//!         .route("/api/health", axum::routing::get(health))
+//!         .with_state(app_state)
+//! }
+//! ```
+//!
+//! # Sessions
+//!
+//! Implement [`session::AppSession`] for your session type, then use
+//! [`session::Session<T>`](session::Session) as an Axum extractor:
+//!
+//! ```rust,ignore
+//! async fn index(Session(session): Session<MySession>) -> impl IntoResponse {
+//!     html! {
+//!         p { "Session: " (session.inner().session_id) }
+//!     }
+//! }
+//! ```
+//!
+//! Sessions are automatically created on first access and persisted via encrypted cookies.
+//!
+//! # Zero-Downtime Reload
+//!
+//! ```bash
+//! systemfd --no-pid -s http::3000 -- cargo watch -x 'run -p my-app'
+//! ```
+//!
+//! CJA checks for the `LISTEN_FDS` environment variable set by `systemfd` and reuses
+//! the existing socket when present, allowing restarts without dropping connections.
+
 use axum::{extract::Request, response::Response};
 use color_eyre::eyre::WrapErr;
 use listenfd::ListenFd;
