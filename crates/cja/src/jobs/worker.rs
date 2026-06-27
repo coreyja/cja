@@ -640,7 +640,7 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         );
 
         // Both jobs share a priority; the one due longest (smaller run_at) wins,
