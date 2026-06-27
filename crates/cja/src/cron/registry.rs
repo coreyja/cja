@@ -448,7 +448,7 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, None, Duration::from_secs(60));
+        registry.register_job(TestJob, None, Duration::from_mins(1));
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
         let previously = Utc::now();

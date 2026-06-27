@@ -51,10 +51,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Resolve the concrete toolchain. For the stable lane we use the version
+      # pinned in rust-toolchain.toml so a new stable release can't introduce
+      # lints that break CI without a deliberate bump (see update-rust.yml).
+      # Other lanes (nightly) pass through verbatim. RUSTUP_TOOLCHAIN is exported
+      # so every cargo invocation selects this toolchain regardless of the
+      # rust-toolchain.toml file (the env var has higher precedence than the
+      # file), which is what lets the nightly lane override the pin.
+      - name: Resolve Rust toolchain
+        run: |
+          if [ "${{ inputs.rust-version }}" = "stable" ]; then
+            ver="$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          else
+            ver="${{ inputs.rust-version }}"
+          fi
+          echo "Resolved toolchain: $ver"
+          echo "RUST_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ inputs.rust-version }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
       - name: Run clippy

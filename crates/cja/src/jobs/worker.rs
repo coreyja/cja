@@ -21,7 +21,7 @@ pub const DEFAULT_MAX_RETRIES: i32 = 20;
 /// Jobs locked for longer than this duration will be considered abandoned and
 /// made available for other workers to pick up. This handles cases where a worker
 /// crashes or becomes unresponsive while processing a job.
-pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_hours(2);
 
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
@@ -479,7 +479,7 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_secs(60), // 60 second timeout
+            Duration::from_mins(1), // 60 second timeout
         );
 
         // fetch_next_job should pick up the stale locked job
@@ -522,7 +522,7 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_secs(3600), // 1 hour timeout
+            Duration::from_hours(1), // 1 hour timeout
         );
 
         // fetch_next_job should NOT pick up the recently locked job
@@ -579,7 +579,7 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         );
 
         // Should pick the higher priority unlocked job first
