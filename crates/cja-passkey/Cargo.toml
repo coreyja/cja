@@ -1,0 +1,33 @@
+[package]
+name = "cja-passkey"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cja = { path = "../cja", default-features = false }
+webauthn-rs = { version = "0.5", features = [
+    "danger-allow-state-serialisation",
+] }
+axum = { workspace = true, features = ["macros"] }
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tokio = { workspace = true }
+url = "2"
+tracing.workspace = true
+http = "1"
+async-trait.workspace = true
+tower-cookies = { version = "0.11.0", features = ["private"] }
+
+[dev-dependencies]
+sqlx.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-cookies = { version = "0.11.0", features = ["private"] }
+http-body-util = "0.1"

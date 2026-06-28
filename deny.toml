@@ -8,7 +8,9 @@ deny = [
   # is a direct dependency of the otherwise banned crate
   #{ name = "ansi_term", version = "=0.11.0", wrappers = [] },
 
-  { name = "openssl" },
+  # openssl is allowed only as a transitive dep of webauthn-rs-core
+  # (used internally for attestation verification). Direct use is banned.
+  { name = "openssl", wrappers = ["webauthn-attestation-ca", "webauthn-rs-core"] },
 ]
 
 [sources.allow-org]
