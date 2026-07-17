@@ -190,6 +190,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 
     #[tracing::instrument(
         name = "worker.fetch_next_job",
+        level = "trace",
         skip(self),
         fields(
             worker.id = %self.id,
@@ -239,6 +240,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 
     #[tracing::instrument(
         name = "worker.tick",
+        level = "trace",
         skip(self),
         fields(
             worker.id = %self.id,
