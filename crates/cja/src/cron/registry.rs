@@ -175,6 +175,7 @@ pub enum TickError {
 impl<AppState: AS> CronJob<AppState> {
     #[tracing::instrument(
         name = "cron_job.tick",
+        level = "trace",
         skip_all,
         fields(
             cron_job.name = self.name,
