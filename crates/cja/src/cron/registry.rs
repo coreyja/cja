@@ -327,6 +327,28 @@ impl<AppState: AS> CronRegistry<AppState> {
     pub fn jobs(&self) -> &HashMap<&'static str, CronJob<AppState>> {
         &self.jobs
     }
+
+    /// Returns each registered cron job's name and schedule string, sorted by name.
+    ///
+    /// Interval schedules use the `Duration` `Debug` form (e.g. `"300s"`),
+    /// matching what the `cron.register` span records. Cron-expression
+    /// schedules use the original expression (e.g. `"0 0 * * * * *"`).
+    #[must_use]
+    pub fn entries(&self) -> Vec<(&'static str, String)> {
+        let mut entries: Vec<(&'static str, String)> = self
+            .jobs
+            .values()
+            .map(|job| {
+                let schedule = match &job.schedule {
+                    Schedule::Interval(IntervalSchedule(duration)) => format!("{duration:?}"),
+                    Schedule::Cron(CronSchedule(schedule)) => schedule.to_string(),
+                };
+                (job.name, schedule)
+            })
+            .collect();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+        entries
+    }
 }
 
 impl<AppState: AS> Default for CronRegistry<AppState> {
@@ -901,5 +923,133 @@ mod test {
 
         assert_eq!(test_job_count.count.unwrap(), 1);
         assert_eq!(second_job_count.count.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_entries_lists_names_and_schedule_strings() {
+        let mut registry: CronRegistry<TestAppState> = CronRegistry::new();
+
+        registry.register(
+            "interval_job",
+            None,
+            Duration::from_mins(5),
+            |_app_state, _context| Box::pin(async { Ok::<(), std::io::Error>(()) }),
+        );
+        registry
+            .register_with_cron(
+                "cron_expr_job",
+                None,
+                "0 0 9 * * * *",
+                |_app_state, _context| Box::pin(async { Ok::<(), std::io::Error>(()) }),
+            )
+            .unwrap();
+
+        let entries = registry.entries();
+        assert_eq!(
+            entries,
+            vec![
+                ("cron_expr_job", "0 0 9 * * * *".to_string()),
+                ("interval_job", "300s".to_string()),
+            ]
+        );
+    }
+
+    /// Regression test for the cron starvation bug fixed in 4f29b39 ("Fix Cron (#5)"):
+    /// `last_run_at` used to be bumped on every worker tick (even when the job did
+    /// not fire), so any interval longer than the tick cadence never fired again
+    /// after its first run. This verifies a >60s interval survives multiple
+    /// non-firing ticks with `last_run_at` untouched, then fires once due.
+    #[sqlx::test]
+    async fn test_long_interval_last_run_only_advances_on_fire(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        // 5-minute interval: much longer than the worker's ~60s tick cadence
+        registry.register_job(TestJob, None, Duration::from_mins(5));
+        let worker = crate::cron::Worker::new(app_state.clone(), registry);
+
+        // Simulate a fire 2 minutes ago — the interval has NOT yet elapsed
+        let two_minutes_ago = Utc::now() - chrono::Duration::minutes(2);
+        sqlx::query!(
+            "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $3, $3)",
+            uuid::Uuid::new_v4(),
+            TestJob::NAME,
+            two_minutes_ago
+        )
+        .execute(&app_state.db)
+        .await
+        .unwrap();
+
+        // Multiple simulated worker ticks while the interval has not elapsed
+        for _ in 0..3 {
+            worker.tick().await.unwrap();
+
+            let last_run = sqlx::query!(
+                "SELECT last_run_at FROM Crons WHERE name = $1",
+                TestJob::NAME
+            )
+            .fetch_one(&app_state.db)
+            .await
+            .unwrap();
+
+            let drift = last_run
+                .last_run_at
+                .signed_duration_since(two_minutes_ago)
+                .num_milliseconds()
+                .abs();
+            assert!(
+                drift < 50,
+                "last_run_at must not advance on non-firing ticks (drifted {drift}ms)"
+            );
+        }
+
+        // No job should have been enqueued by the non-firing ticks
+        let job_count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM jobs WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_one(&app_state.db)
+        .await
+        .unwrap();
+        assert_eq!(job_count.count.unwrap(), 0);
+
+        // Now simulate the interval having elapsed: last fire 6 minutes ago
+        let six_minutes_ago = Utc::now() - chrono::Duration::minutes(6);
+        sqlx::query!(
+            "UPDATE Crons SET last_run_at = $1 WHERE name = $2",
+            six_minutes_ago,
+            TestJob::NAME
+        )
+        .execute(&app_state.db)
+        .await
+        .unwrap();
+
+        worker.tick().await.unwrap();
+
+        let last_run = sqlx::query!(
+            "SELECT last_run_at FROM Crons WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_one(&app_state.db)
+        .await
+        .unwrap();
+        assert!(
+            last_run.last_run_at > six_minutes_ago,
+            "cron should fire once the interval has elapsed"
+        );
+        let diff = Utc::now().signed_duration_since(last_run.last_run_at);
+        assert!(diff.num_milliseconds() < 1000);
+
+        let job_count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM jobs WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_one(&app_state.db)
+        .await
+        .unwrap();
+        assert_eq!(job_count.count.unwrap(), 1);
     }
 }
