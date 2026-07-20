@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE Crons SET last_run_at = $1 WHERE name = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a51dd3189e2fd05a5e55124185798314eadaa1e63ad415c45d4e71aef100e646"
+}

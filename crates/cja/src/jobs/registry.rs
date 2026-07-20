@@ -15,6 +15,15 @@ pub trait JobRegistry<AppState: app_state::AppState> {
         app_state: AppState,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> color_eyre::Result<()>;
+
+    /// The names of every job type registered with this registry.
+    ///
+    /// Used for boot-time manifest emission (see [`crate::eyes_manifest`]).
+    /// The `impl_job_registry!` macro implements this automatically from the
+    /// registered job types' `NAME` constants.
+    fn job_names() -> &'static [&'static str]
+    where
+        Self: Sized;
 }
 
 /// A macro for implementing a job registry that handles job dispatch.
@@ -103,6 +112,73 @@ macro_rules! impl_job_registry {
                     _ => Err($crate::color_eyre::eyre::eyre!("Unknown job type: {}", job.name)),
                 }
             }
+
+            fn job_names() -> &'static [&'static str] {
+                use $crate::jobs::Job as _;
+
+                &[$(<$job_type>::NAME),*]
+            }
         }
     };
+}
+
+#[cfg(test)]
+mod test {
+    use crate::app_state::AppState;
+    use crate::jobs::Job;
+    use crate::server::cookies::CookieKey;
+
+    #[derive(Clone)]
+    struct TestAppState {
+        db: sqlx::PgPool,
+        cookie_key: CookieKey,
+    }
+
+    impl AppState for TestAppState {
+        fn db(&self) -> &sqlx::PgPool {
+            &self.db
+        }
+
+        fn version(&self) -> &'static str {
+            "test"
+        }
+
+        fn cookie_key(&self) -> &CookieKey {
+            &self.cookie_key
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct FirstJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for FirstJob {
+        const NAME: &'static str = "FirstJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct SecondJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for SecondJob {
+        const NAME: &'static str = "SecondJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl_job_registry!(TestAppState, FirstJob, SecondJob);
+
+    #[test]
+    fn test_job_names_lists_all_registered_jobs() {
+        use crate::jobs::registry::JobRegistry;
+
+        let names = <Jobs as JobRegistry<TestAppState>>::job_names();
+        assert_eq!(names, &["FirstJob", "SecondJob"]);
+    }
 }

@@ -167,6 +167,8 @@ pub use uuid;
 #[cfg(feature = "cron")]
 pub mod cron;
 #[cfg(feature = "jobs")]
+pub mod eyes_manifest;
+#[cfg(feature = "jobs")]
 pub mod jobs;
 pub mod server;
 #[cfg(feature = "testing")]
