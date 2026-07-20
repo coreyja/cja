@@ -27,7 +27,7 @@ pub struct Worker<AppState: AS> {
 impl<AppState: AS> Worker<AppState> {
     /// Create a new Worker with UTC as the default timezone
     pub fn new(state: AppState, registry: CronRegistry<AppState>) -> Self {
-        Self::new_with_timezone(state, registry, chrono_tz::UTC, Duration::from_secs(60))
+        Self::new_with_timezone(state, registry, chrono_tz::UTC, Duration::from_mins(1))
     }
 
     /// Create a new Worker with a specific timezone
@@ -114,7 +114,7 @@ impl<AppState: AS> Worker<AppState> {
         Ok(last_run_map)
     }
 
-    #[tracing::instrument(name = "cron.tick", skip_all, fields(cron_worker.id = %self.id))]
+    #[tracing::instrument(name = "cron.tick", level = "trace", skip_all, fields(cron_worker.id = %self.id))]
     pub(crate) async fn tick(&self) -> Result<(), TickError> {
         let last_enqueue_map = self.last_enqueue_map().await?;
         for job in self.registry.jobs.values() {

@@ -21,7 +21,7 @@ pub const DEFAULT_MAX_RETRIES: i32 = 20;
 /// Jobs locked for longer than this duration will be considered abandoned and
 /// made available for other workers to pick up. This handles cases where a worker
 /// crashes or becomes unresponsive while processing a job.
-pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_hours(2);
 
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
@@ -190,6 +190,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 
     #[tracing::instrument(
         name = "worker.fetch_next_job",
+        level = "trace",
         skip(self),
         fields(
             worker.id = %self.id,
@@ -216,7 +217,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     locked_by IS NULL
                     OR locked_at < NOW() - ($2 || ' seconds')::interval
                   )
-                ORDER BY priority DESC, created_at ASC
+                ORDER BY priority DESC, run_at ASC, created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
@@ -239,6 +240,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 
     #[tracing::instrument(
         name = "worker.tick",
+        level = "trace",
         skip(self),
         fields(
             worker.id = %self.id,
@@ -479,7 +481,7 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_secs(60), // 60 second timeout
+            Duration::from_mins(1), // 60 second timeout
         );
 
         // fetch_next_job should pick up the stale locked job
@@ -522,7 +524,7 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_secs(3600), // 1 hour timeout
+            Duration::from_hours(1), // 1 hour timeout
         );
 
         // fetch_next_job should NOT pick up the recently locked job
@@ -579,12 +581,74 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         );
 
         // Should pick the higher priority unlocked job first
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().job_id, unlocked_job_id);
+    }
+
+    /// Test that among same-priority jobs, the one that became eligible earliest
+    /// (smaller `run_at`) is picked first — even when a competing job has an older
+    /// `created_at`. This guards the readiness-ordering contract: a job whose
+    /// `run_at` was pushed into the future by retry backoff must not cut in front
+    /// of a job that has been due longer, just because it was enqueued earlier.
+    #[sqlx::test]
+    async fn test_fetch_next_job_orders_by_run_at_over_created_at(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let older_created_later_run_id = uuid::Uuid::new_v4();
+        let newer_created_earlier_run_id = uuid::Uuid::new_v4();
+
+        // Job A: created earliest, but only became due 30 seconds ago (e.g. a
+        // job that failed and had its run_at pushed out by backoff).
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
+             VALUES ($1, $2, $3, $4, NOW() - interval '30 seconds', NOW() - interval '300 seconds', $5, $6)",
+        )
+        .bind(older_created_later_run_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "older-created-later-run"}))
+        .bind(0)
+        .bind("test-older-created")
+        .bind(0)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Job B: created more recently, but has been due longer (smaller run_at).
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
+             VALUES ($1, $2, $3, $4, NOW() - interval '120 seconds', NOW() - interval '60 seconds', $5, $6)",
+        )
+        .bind(newer_created_earlier_run_id)
+        .bind("TestJob")
+        .bind(serde_json::json!({"id": "newer-created-earlier-run"}))
+        .bind(0)
+        .bind("test-newer-created")
+        .bind(0)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let worker = Worker::new(
+            app_state,
+            Jobs,
+            Duration::from_secs(1),
+            20,
+            CancellationToken::new(),
+            Duration::from_mins(1),
+        );
+
+        // Both jobs share a priority; the one due longest (smaller run_at) wins,
+        // regardless of which was created first.
+        let fetched = worker.fetch_next_job().await.unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().job_id, newer_created_earlier_run_id);
     }
 }
