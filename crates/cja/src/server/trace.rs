@@ -1,8 +1,20 @@
 use tower_http::trace::{MakeSpan, OnResponse};
 use tracing::Level;
 
+/// `MakeSpan`/`OnResponse` implementation behind cja's `server.request` spans.
+///
+/// [`run_server`](super::run_server) installs this automatically. Apps that
+/// manage their own `axum::serve` loop (custom bind address, graceful
+/// shutdown) can attach it themselves to keep the same span vocabulary:
+///
+/// ```rust,ignore
+/// let tracer = cja::server::trace::Tracer;
+/// let trace_layer = tower_http::trace::TraceLayer::new_for_http()
+///     .make_span_with(tracer)
+///     .on_response(tracer);
+/// ```
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Tracer;
+pub struct Tracer;
 
 impl<Body> MakeSpan<Body> for Tracer {
     fn make_span(&mut self, request: &http::Request<Body>) -> tracing::Span {
@@ -27,7 +39,7 @@ impl<Body> MakeSpan<Body> for Tracer {
             http.request.header.host = request.headers().get("host").and_then(|h| h.to_str().ok()),
             http.request.header.forwarded_for = request.headers().get("x-forwarded-for").and_then(|h| h.to_str().ok()),
             http.request.header.forwarded_proto = request.headers().get("x-forwarded-proto").and_then(|h| h.to_str().ok()),
-            http.request.header.host = request.headers().get("x-forwarded-ssl").and_then(|h| h.to_str().ok()),
+            http.request.header.forwarded_ssl = request.headers().get("x-forwarded-ssl").and_then(|h| h.to_str().ok()),
             http.request.header.referer = request.headers().get("referer").and_then(|h| h.to_str().ok()),
             http.request.header.fly_forwarded_port = request.headers().get("fly-forwarded-port").and_then(|h| h.to_str().ok()),
             http.request.header.fly_region = request.headers().get("fly-region").and_then(|h| h.to_str().ok()),
