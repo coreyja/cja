@@ -93,6 +93,11 @@ pub trait AppState: Clone + Send + Sync + 'static {
     fn cookie_key(&self) -> &CookieKey;
 
     /// Returns the application's public HTTP(S) origin or base URL for Eyes monitors.
+    ///
+    /// Root-relative monitor targets use URL join semantics and therefore discard
+    /// any path component here (`https://example.com/app` plus `/health` becomes
+    /// `https://example.com/health`). Path-prefixed apps should declare absolute
+    /// monitor targets instead.
     fn eyes_base_url(&self) -> Option<&str> {
         None
     }
