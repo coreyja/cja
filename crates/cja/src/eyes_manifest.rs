@@ -639,7 +639,7 @@ mod tests {
                 BootManifestDeclarationError::EmptyId,
             ),
             (
-                HttpMonitor::new(&"x".repeat(129), "https://example.com"),
+                HttpMonitor::new("x".repeat(129), "https://example.com"),
                 BootManifestDeclarationError::IdTooLong,
             ),
             (
