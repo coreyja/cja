@@ -153,6 +153,7 @@
 //! CJA re-exports key dependencies so you don't need to add them directly:
 //!
 //! ```rust
+//! use cja::eyes_subscriber;
 //! use cja::sqlx;
 //! use cja::uuid;
 //! use cja::color_eyre;
@@ -161,6 +162,7 @@
 //! use cja::chrono_tz;
 //! ```
 
+pub use eyes_subscriber;
 pub use sqlx;
 pub use uuid;
 
