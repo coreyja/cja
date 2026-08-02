@@ -568,7 +568,7 @@ mod tests {
         use std::time::Duration;
 
         let mut registry = crate::cron::CronRegistry::new();
-        registry.register_job(ManifestJobA, None, Duration::from_secs(300));
+        registry.register_job(ManifestJobA, None, Duration::from_mins(5));
         registry
             .register_job_with_cron(ManifestJobB, None, "0 0 9 * * * *")
             .unwrap();
