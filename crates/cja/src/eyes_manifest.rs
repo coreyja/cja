@@ -1,10 +1,34 @@
-//! Boot-time application manifest emission to Eyes.
+//! Boot-time app manifest emission to Eyes.
 //!
-//! Legacy builders emit monitor authority as `None` and transport failures never
-//! fail application boot. State-aware builders emit `Some`, where `Some([])`
-//! authoritatively removes all declarations. Their local declaration errors are
-//! synchronous and may fail boot when propagated. The server-only check which
-//! rejects the Eyes origin itself remains an asynchronously logged send failure.
+//! Telemetry shows what *happened*; the manifest tells Eyes what the app's
+//! *shape* is: registered jobs, cron entries, build metadata, and optionally
+//! HTTP monitors. Apps normally send one manifest at process start.
+//!
+//! Legacy emission is fire-and-forget: transport failures never fail boot, a
+//! missing Tokio runtime produces a warning, and missing `EYES_ORG_ID` or
+//! `EYES_APP_ID` makes sending a debug-logged no-op. State-aware builders add
+//! synchronous declaration validation. Legacy manifests use `monitors: None`
+//! (no monitor authority), while state-aware manifests use `Some`, including
+//! `Some([])` to authoritatively remove all monitors. The server-only rejection
+//! of a target equal to the Eyes origin remains an asynchronously logged error.
+//!
+//! # Intended call site
+//!
+//! Call once at boot after constructing job and cron registries:
+//!
+//! ```rust,ignore
+//! let _eyes_handle = cja::setup::setup_tracing("my-app")?;
+//! let app_state = AppState::from_env().await?;
+//! let cron_registry = cron_registry();
+//! cja::eyes_manifest::send_boot_manifest::<Jobs, AppState>(
+//!     Some(env!("CARGO_PKG_VERSION")),
+//!     option_env!("VERGEN_GIT_SHA"),
+//!     Some(&cron_registry),
+//! );
+//! ```
+//!
+//! `app_version` and `git_sha` are explicit because cja cannot read the
+//! application's compile-time environment. Pass `None` when unavailable.
 
 use std::collections::HashSet;
 
@@ -73,6 +97,11 @@ where
 
 #[cfg(feature = "cron")]
 #[must_use]
+/// Builds a legacy manifest from the job registry and optional cron registry.
+///
+/// Cron schedules come from [`crate::cron::CronRegistry::entries`]. This does
+/// not participate in HTTP monitor authority; prefer this API when monitors
+/// are managed elsewhere.
 pub fn build_boot_manifest<J, S>(
     app_version: Option<&str>,
     git_sha: Option<&str>,
@@ -99,6 +128,9 @@ where
 
 #[cfg(not(feature = "cron"))]
 #[must_use]
+/// Builds a legacy manifest from the job registry (without cron support).
+///
+/// The resulting manifest does not participate in HTTP monitor authority.
 pub fn build_boot_manifest<J, S>(app_version: Option<&str>, git_sha: Option<&str>) -> AppManifest
 where
     J: JobRegistry<S>,
@@ -171,6 +203,11 @@ fn monitor_declarations<S: AppState>(
 }
 
 #[cfg(feature = "cron")]
+/// Builds and validates an authoritative manifest from application state.
+///
+/// An empty declaration list becomes `Some([])`. Locally detectable invalid
+/// declarations are returned synchronously. Rejection of the Eyes server's own
+/// origin requires server context and is reported asynchronously when sent.
 pub fn build_boot_manifest_from_state<J, S>(
     state: &S,
     app_version: Option<&str>,
@@ -186,6 +223,11 @@ where
 }
 
 #[cfg(not(feature = "cron"))]
+/// Builds and validates an authoritative manifest from application state.
+///
+/// An empty declaration list becomes `Some([])`. Locally detectable invalid
+/// declarations are returned synchronously. Rejection of the Eyes server's own
+/// origin requires server context and is reported asynchronously when sent.
 pub fn build_boot_manifest_from_state<J, S>(
     state: &S,
     app_version: Option<&str>,
@@ -223,6 +265,11 @@ fn eyes_configured_from_env() -> bool {
 }
 
 #[cfg(feature = "cron")]
+/// Sends a legacy boot manifest to Eyes, fire-and-forget.
+///
+/// Missing configuration, a missing Tokio runtime, and transport/server errors
+/// are logged and never fail application boot. See the [module docs](self) for
+/// the intended call site and build metadata guidance.
 pub fn send_boot_manifest<J, S>(
     app_version: Option<&str>,
     git_sha: Option<&str>,
@@ -239,6 +286,9 @@ pub fn send_boot_manifest<J, S>(
 }
 
 #[cfg(not(feature = "cron"))]
+/// Sends a legacy boot manifest to Eyes, fire-and-forget (without cron support).
+///
+/// See the cron-enabled variant for configuration and failure behavior.
 pub fn send_boot_manifest<J, S>(app_version: Option<&str>, git_sha: Option<&str>)
 where
     J: JobRegistry<S>,
@@ -248,6 +298,11 @@ where
 }
 
 /// Sends an authoritative state-aware manifest. Use `::<Jobs, _>(&app_state, ...)`.
+///
+/// # Errors
+/// Returns a declaration error only when Eyes is configured. Callers should
+/// generally log and continue rather than use `?` during boot unless missing
+/// monitoring should make the application unavailable.
 #[cfg(feature = "cron")]
 pub fn send_boot_manifest_from_state<J, S>(
     state: &S,
@@ -259,19 +314,44 @@ where
     J: JobRegistry<S>,
     S: AppState,
 {
-    if !eyes_configured_from_env() {
-        return Ok(());
-    }
-    spawn_send(build_boot_manifest_from_state::<J, S>(
+    send_boot_manifest_from_state_inner::<J, S>(
+        eyes_configured_from_env(),
         state,
         app_version,
         git_sha,
         cron_registry,
-    )?);
+    )
+}
+
+#[cfg(feature = "cron")]
+fn send_boot_manifest_from_state_inner<J, S>(
+    configured: bool,
+    state: &S,
+    app_version: Option<&str>,
+    git_sha: Option<&str>,
+    cron_registry: Option<&crate::cron::CronRegistry<S>>,
+) -> Result<(), BootManifestDeclarationError>
+where
+    J: JobRegistry<S>,
+    S: AppState,
+{
+    if configured {
+        spawn_send(build_boot_manifest_from_state::<J, S>(
+            state,
+            app_version,
+            git_sha,
+            cron_registry,
+        )?);
+    }
     Ok(())
 }
 
 /// Sends an authoritative state-aware manifest. Use `::<Jobs, _>(&app_state, ...)`.
+///
+/// # Errors
+/// Returns a declaration error only when Eyes is configured. Callers should
+/// generally log and continue rather than use `?` during boot unless missing
+/// monitoring should make the application unavailable.
 #[cfg(not(feature = "cron"))]
 pub fn send_boot_manifest_from_state<J, S>(
     state: &S,
@@ -282,14 +362,32 @@ where
     J: JobRegistry<S>,
     S: AppState,
 {
-    if !eyes_configured_from_env() {
-        return Ok(());
-    }
-    spawn_send(build_boot_manifest_from_state::<J, S>(
+    send_boot_manifest_from_state_inner::<J, S>(
+        eyes_configured_from_env(),
         state,
         app_version,
         git_sha,
-    )?);
+    )
+}
+
+#[cfg(not(feature = "cron"))]
+fn send_boot_manifest_from_state_inner<J, S>(
+    configured: bool,
+    state: &S,
+    app_version: Option<&str>,
+    git_sha: Option<&str>,
+) -> Result<(), BootManifestDeclarationError>
+where
+    J: JobRegistry<S>,
+    S: AppState,
+{
+    if configured {
+        spawn_send(build_boot_manifest_from_state::<J, S>(
+            state,
+            app_version,
+            git_sha,
+        )?);
+    }
     Ok(())
 }
 
@@ -315,13 +413,14 @@ mod tests {
     use crate::{impl_job_registry, jobs::Job, server::cookies::CookieKey};
 
     #[derive(Clone)]
-    struct State {
+    struct TestAppState {
         db: sqlx::PgPool,
         key: CookieKey,
         base: Option<String>,
         monitors: Vec<HttpMonitor>,
+        panic_on_monitor_hooks: bool,
     }
-    impl AppState for State {
+    impl AppState for TestAppState {
         fn version(&self) -> &'static str {
             "test"
         }
@@ -332,42 +431,61 @@ mod tests {
             &self.key
         }
         fn eyes_base_url(&self) -> Option<&str> {
+            assert!(!self.panic_on_monitor_hooks, "base hook must not be called");
             self.base.as_deref()
         }
         fn eyes_http_monitors(&self) -> Vec<HttpMonitor> {
+            assert!(
+                !self.panic_on_monitor_hooks,
+                "monitor hook must not be called"
+            );
             self.monitors.clone()
         }
     }
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-    struct TestJob;
+    struct ManifestJobA;
     #[async_trait::async_trait]
-    impl Job<State> for TestJob {
-        const NAME: &'static str = "TestJob";
-        async fn run(&self, _app_state: State) -> color_eyre::Result<()> {
+    impl Job<TestAppState> for ManifestJobA {
+        const NAME: &'static str = "ManifestJobA";
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
             Ok(())
         }
     }
-    impl_job_registry!(State, TestJob);
-    fn state(base: Option<&str>, monitors: Vec<HttpMonitor>) -> State {
-        State {
+
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct ManifestJobB;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for ManifestJobB {
+        const NAME: &'static str = "ManifestJobB";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl_job_registry!(TestAppState, ManifestJobA, ManifestJobB);
+    fn test_state(base: Option<&str>, monitors: Vec<HttpMonitor>) -> TestAppState {
+        TestAppState {
             db: sqlx::PgPool::connect_lazy("postgres://localhost/cja_test").unwrap(),
             key: CookieKey::generate(),
             base: base.map(str::to_string),
             monitors,
+            panic_on_monitor_hooks: false,
         }
     }
     #[cfg(feature = "cron")]
-    fn build(s: &State) -> Result<AppManifest, BootManifestDeclarationError> {
-        build_boot_manifest_from_state::<Jobs, State>(s, None, None, None)
+    fn build_from_state(s: &TestAppState) -> Result<AppManifest, BootManifestDeclarationError> {
+        build_boot_manifest_from_state::<Jobs, TestAppState>(s, None, None, None)
     }
     #[cfg(not(feature = "cron"))]
-    fn build(s: &State) -> Result<AppManifest, BootManifestDeclarationError> {
-        build_boot_manifest_from_state::<Jobs, State>(s, None, None)
+    fn build_from_state(s: &TestAppState) -> Result<AppManifest, BootManifestDeclarationError> {
+        build_boot_manifest_from_state::<Jobs, TestAppState>(s, None, None)
     }
 
     #[tokio::test]
     async fn resolves_and_preserves_authority() {
-        let manifest = build(&state(
+        let manifest = build_from_state(&test_state(
             Some("https://example.com/app/"),
             vec![HttpMonitor::new("health", "/health")],
         ))
@@ -380,18 +498,63 @@ mod tests {
             manifest.monitors.unwrap()[0].target,
             "https://example.com/health"
         );
-        let empty = build(&state(None, vec![])).unwrap();
+        let without_trailing_slash = build_from_state(&test_state(
+            Some("https://example.com/app"),
+            vec![HttpMonitor::new("health", "/health")],
+        ))
+        .unwrap();
+        assert_eq!(
+            without_trailing_slash.monitors.unwrap()[0].target,
+            "https://example.com/health"
+        );
+        let empty = build_from_state(&test_state(None, vec![])).unwrap();
         assert_eq!(empty.monitors, Some(vec![]));
     }
-    #[tokio::test]
-    async fn legacy_manifest_does_not_participate_in_monitor_authority() {
+    #[test]
+    fn legacy_manifest_does_not_participate_in_monitor_authority() {
         #[cfg(feature = "cron")]
-        let manifest = build_boot_manifest::<Jobs, State>(Some("1.2.3"), Some("abc"), None);
+        let manifest = build_boot_manifest::<Jobs, TestAppState>(Some("1.2.3"), Some("abc"), None);
         #[cfg(not(feature = "cron"))]
-        let manifest = build_boot_manifest::<Jobs, State>(Some("1.2.3"), Some("abc"));
-        assert_eq!(manifest.jobs, vec!["TestJob"]);
+        let manifest = build_boot_manifest::<Jobs, TestAppState>(Some("1.2.3"), Some("abc"));
+        assert_eq!(manifest.app_version.as_deref(), Some("1.2.3"));
+        assert_eq!(manifest.git_sha.as_deref(), Some("abc"));
+        assert_eq!(manifest.jobs, vec!["ManifestJobA", "ManifestJobB"]);
         assert_eq!(manifest.base_url, None);
         assert_eq!(manifest.monitors, None);
+    }
+
+    #[cfg(feature = "cron")]
+    #[test]
+    fn cron_manifest_preserves_schedules_and_build_metadata() {
+        use std::time::Duration;
+
+        let mut registry = crate::cron::CronRegistry::new();
+        registry.register_job(ManifestJobA, None, Duration::from_secs(300));
+        registry
+            .register_job_with_cron(ManifestJobB, None, "0 0 9 * * * *")
+            .unwrap();
+
+        let manifest = build_boot_manifest::<Jobs, TestAppState>(
+            Some("1.2.3"),
+            Some("abc123"),
+            Some(&registry),
+        );
+        assert_eq!(manifest.app_version.as_deref(), Some("1.2.3"));
+        assert_eq!(manifest.git_sha.as_deref(), Some("abc123"));
+        assert_eq!(manifest.jobs, vec!["ManifestJobA", "ManifestJobB"]);
+        assert_eq!(
+            manifest.crons,
+            vec![
+                CronEntry {
+                    name: "ManifestJobA".into(),
+                    schedule: "300s".into(),
+                },
+                CronEntry {
+                    name: "ManifestJobB".into(),
+                    schedule: "0 0 9 * * * *".into(),
+                },
+            ]
+        );
     }
     #[tokio::test]
     async fn absolute_head_needs_no_base() {
@@ -399,7 +562,9 @@ mod tests {
             .method(HttpMethod::Head)
             .enabled(false);
         assert_eq!(
-            build(&state(None, vec![monitor.clone()])).unwrap().monitors,
+            build_from_state(&test_state(None, vec![monitor.clone()]))
+                .unwrap()
+                .monitors,
             Some(vec![monitor])
         );
     }
@@ -407,7 +572,7 @@ mod tests {
     async fn validates_base_and_targets() {
         for base in ["not a url", "ftp://example.com", "http://localhost:3000"] {
             assert!(matches!(
-                build(&state(Some(base), vec![])),
+                build_from_state(&test_state(Some(base), vec![])),
                 Err(BootManifestDeclarationError::Target(_))
             ));
         }
@@ -422,7 +587,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    build(&state(None, vec![HttpMonitor::new("x", target)])),
+                    build_from_state(&test_state(None, vec![HttpMonitor::new("x", target)])),
                     Err(BootManifestDeclarationError::Target(_))
                 ),
                 "{target}"
@@ -432,39 +597,120 @@ mod tests {
     #[tokio::test]
     async fn validates_structure() {
         let bad = [
-            HttpMonitor::new("", "https://example.com"),
-            HttpMonitor::new(" x", "https://example.com"),
-            HttpMonitor::new("x!", "https://example.com"),
-            HttpMonitor::new("é", "https://example.com"),
+            (
+                HttpMonitor::new("", "https://example.com"),
+                BootManifestDeclarationError::EmptyId,
+            ),
+            (
+                HttpMonitor::new(&"x".repeat(129), "https://example.com"),
+                BootManifestDeclarationError::IdTooLong,
+            ),
+            (
+                HttpMonitor::new(" x", "https://example.com"),
+                BootManifestDeclarationError::UntrimmedId,
+            ),
+            (
+                HttpMonitor::new("x!", "https://example.com"),
+                BootManifestDeclarationError::InvalidIdCharacter,
+            ),
+            (
+                HttpMonitor::new("é", "https://example.com"),
+                BootManifestDeclarationError::NonAsciiId,
+            ),
         ];
-        for monitor in bad {
-            assert!(build(&state(None, vec![monitor])).is_err());
+        for (monitor, expected) in bad {
+            assert_eq!(
+                build_from_state(&test_state(None, vec![monitor])),
+                Err(expected)
+            );
         }
         let mut monitors = vec![HttpMonitor::new("x", "https://example.com"); 2];
         assert!(matches!(
-            build(&state(None, monitors)),
+            build_from_state(&test_state(None, monitors)),
             Err(BootManifestDeclarationError::DuplicateId(_))
         ));
         monitors = (0..101)
             .map(|i| HttpMonitor::new(i.to_string(), "https://example.com"))
             .collect();
         assert_eq!(
-            build(&state(None, monitors)),
+            build_from_state(&test_state(None, monitors)),
             Err(BootManifestDeclarationError::TooManyMonitors)
         );
         let variants = [
-            HttpMonitor::new("x", "https://example.com").interval_seconds(0),
-            HttpMonitor::new("x", "https://example.com").timeout_seconds(0),
-            HttpMonitor::new("x", "https://example.com").failure_threshold(0),
-            HttpMonitor::new("x", "https://example.com")
-                .interval_seconds(1)
-                .timeout_seconds(2),
-            HttpMonitor::new("x", "https://example.com").expected_status(99, 200),
-            HttpMonitor::new("x", "https://example.com").expected_status(300, 200),
+            (
+                HttpMonitor::new("x", "https://example.com").interval_seconds(0),
+                BootManifestDeclarationError::InvalidInterval,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com").interval_seconds(i64::MAX as u64 + 1),
+                BootManifestDeclarationError::InvalidInterval,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com").timeout_seconds(0),
+                BootManifestDeclarationError::InvalidTimeout,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com").timeout_seconds(i64::MAX as u64 + 1),
+                BootManifestDeclarationError::InvalidTimeout,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com").failure_threshold(0),
+                BootManifestDeclarationError::InvalidFailureThreshold,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com").failure_threshold(i32::MAX as u32 + 1),
+                BootManifestDeclarationError::InvalidFailureThreshold,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com")
+                    .interval_seconds(1)
+                    .timeout_seconds(2),
+                BootManifestDeclarationError::TimeoutExceedsInterval,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com").expected_status(99, 200),
+                BootManifestDeclarationError::InvalidStatusBounds,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com").expected_status(200, 600),
+                BootManifestDeclarationError::InvalidStatusBounds,
+            ),
+            (
+                HttpMonitor::new("x", "https://example.com").expected_status(300, 200),
+                BootManifestDeclarationError::ReversedStatusBounds,
+            ),
         ];
-        for monitor in variants {
-            assert!(build(&state(None, vec![monitor])).is_err());
+        for (monitor, expected) in variants {
+            assert_eq!(
+                build_from_state(&test_state(None, vec![monitor])),
+                Err(expected)
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn state_send_skips_hooks_when_unconfigured_and_validates_when_configured() {
+        let mut panicking = test_state(None, vec![]);
+        panicking.panic_on_monitor_hooks = true;
+        #[cfg(feature = "cron")]
+        let unconfigured = send_boot_manifest_from_state_inner::<Jobs, TestAppState>(
+            false, &panicking, None, None, None,
+        );
+        #[cfg(not(feature = "cron"))]
+        let unconfigured = send_boot_manifest_from_state_inner::<Jobs, TestAppState>(
+            false, &panicking, None, None,
+        );
+        assert_eq!(unconfigured, Ok(()));
+
+        let invalid = test_state(None, vec![HttpMonitor::new("", "/health")]);
+        #[cfg(feature = "cron")]
+        let configured = send_boot_manifest_from_state_inner::<Jobs, TestAppState>(
+            true, &invalid, None, None, None,
+        );
+        #[cfg(not(feature = "cron"))]
+        let configured =
+            send_boot_manifest_from_state_inner::<Jobs, TestAppState>(true, &invalid, None, None);
+        assert_eq!(configured, Err(BootManifestDeclarationError::EmptyId));
     }
     #[test]
     fn configuration_presence() {
