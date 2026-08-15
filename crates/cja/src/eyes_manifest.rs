@@ -43,7 +43,9 @@
 use crate::app_state::AppState;
 use crate::jobs::registry::JobRegistry;
 
-pub use eyes_subscriber::{AppManifest, CronEntry, ManifestError};
+pub use eyes_subscriber::{
+    AppManifest, CronEntry, ExpectedProcessRole, HttpMethod, HttpMonitor, ManifestError,
+};
 
 /// Build an [`AppManifest`] from a job registry and (optionally) a cron registry.
 ///
@@ -54,7 +56,9 @@ pub use eyes_subscriber::{AppManifest, CronEntry, ManifestError};
 /// expression schedules.
 ///
 /// Most apps should call [`send_boot_manifest`] instead; this is exposed for
-/// callers that want to inspect or customize the manifest before sending.
+/// callers that want to inspect or customize the manifest before sending it
+/// with [`send_manifest`] (e.g. attaching a `base_url` and [`HttpMonitor`]
+/// declarations).
 #[cfg(feature = "cron")]
 #[must_use]
 pub fn build_boot_manifest<J, S>(
@@ -66,23 +70,29 @@ where
     J: JobRegistry<S>,
     S: AppState,
 {
-    AppManifest {
-        app_version: app_version.map(ToString::to_string),
-        git_sha: git_sha.map(ToString::to_string),
-        jobs: J::job_names().iter().map(ToString::to_string).collect(),
-        crons: cron_registry
-            .map(|registry| {
-                registry
-                    .entries()
-                    .into_iter()
-                    .map(|(name, schedule)| CronEntry {
-                        name: name.to_string(),
-                        schedule,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+    let mut manifest = AppManifest::default()
+        .jobs(J::job_names().iter().map(ToString::to_string).collect())
+        .crons(
+            cron_registry
+                .map(|registry| {
+                    registry
+                        .entries()
+                        .into_iter()
+                        .map(|(name, schedule)| CronEntry {
+                            name: name.to_string(),
+                            schedule,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+    if let Some(app_version) = app_version {
+        manifest = manifest.app_version(app_version);
     }
+    if let Some(git_sha) = git_sha {
+        manifest = manifest.git_sha(git_sha);
+    }
+    manifest
 }
 
 /// Build an [`AppManifest`] from a job registry (no cron support compiled in).
@@ -93,12 +103,15 @@ where
     J: JobRegistry<S>,
     S: AppState,
 {
-    AppManifest {
-        app_version: app_version.map(ToString::to_string),
-        git_sha: git_sha.map(ToString::to_string),
-        jobs: J::job_names().iter().map(ToString::to_string).collect(),
-        crons: Vec::new(),
+    let mut manifest =
+        AppManifest::default().jobs(J::job_names().iter().map(ToString::to_string).collect());
+    if let Some(app_version) = app_version {
+        manifest = manifest.app_version(app_version);
     }
+    if let Some(git_sha) = git_sha {
+        manifest = manifest.git_sha(git_sha);
+    }
+    manifest
 }
 
 /// Send this app's boot manifest to Eyes, fire-and-forget.
@@ -141,6 +154,30 @@ where
     S: AppState,
 {
     spawn_send(build_boot_manifest::<J, S>(app_version, git_sha));
+}
+
+/// Send a caller-built manifest to Eyes, fire-and-forget.
+///
+/// Like [`send_boot_manifest`], but for apps that need declarations the
+/// registries can't express. Build the base manifest with
+/// [`build_boot_manifest`], attach the extra declarations with the
+/// [`AppManifest`] builder methods, then send:
+///
+/// ```rust,ignore
+/// let manifest = cja::eyes_manifest::build_boot_manifest::<Jobs, AppState>(
+///     Some(env!("CARGO_PKG_VERSION")),
+///     option_env!("VERGEN_GIT_SHA"),
+///     Some(&cron_registry),
+/// )
+/// .base_url("https://arena.battlesnake.com")
+/// .monitors(vec![HttpMonitor::new("health", "/health")]);
+/// cja::eyes_manifest::send_manifest(manifest);
+/// ```
+///
+/// Same guarantees as [`send_boot_manifest`]: never blocks or fails app boot,
+/// debug-logged no-op when `EYES_ORG_ID`/`EYES_APP_ID` are unset.
+pub fn send_manifest(manifest: AppManifest) {
+    spawn_send(manifest);
 }
 
 fn spawn_send(manifest: AppManifest) {
