@@ -44,7 +44,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features rustls,postgres
+        run: cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres
 
       - name: Migrate DB
         run: cd crates/cja && cargo sqlx database create && cargo sqlx migrate run
