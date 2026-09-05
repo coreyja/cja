@@ -23,6 +23,15 @@ pub const DEFAULT_MAX_RETRIES: i32 = 20;
 /// crashes or becomes unresponsive while processing a job.
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_hours(2);
 
+/// Initial backoff duration after a worker tick fails (e.g. the database was
+/// unreachable while trying to claim a job). Doubles on each consecutive
+/// failure, capped at [`TICK_ERROR_BACKOFF_MAX`], and resets after a
+/// successful tick.
+const TICK_ERROR_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Maximum backoff duration between retries after consecutive tick failures.
+const TICK_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
 #[derive(Debug)]
@@ -338,6 +347,17 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// - Any currently executing job is allowed to complete
 /// - Database locks are released immediately (instead of waiting for the lock timeout)
 ///
+/// # Transient Error Resilience
+///
+/// Errors from the worker loop itself (e.g. the database being unreachable while
+/// trying to claim the next job, such as a pool acquire timeout during a brief
+/// database stall) are NOT fatal. They are logged at ERROR level and the worker
+/// retries with exponential backoff (starting at 1 second, doubling up to a
+/// 30 second cap, resetting after the next successful tick). This keeps a
+/// transient database hiccup from killing the worker task — and with it, apps
+/// that join on all worker tasks. Job execution failures are unaffected by this:
+/// they continue to use the per-job retry machinery described above.
+///
 /// # Lock Timeout
 ///
 /// If a worker crashes or becomes unresponsive while processing a job, the job will remain
@@ -386,10 +406,39 @@ pub async fn job_worker<AppState: AS>(
         lock_timeout,
     );
 
+    let mut tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
+
     loop {
         tokio::select! {
             result = worker.tick() => {
-                result?;
+                match result {
+                    Ok(()) => {
+                        tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
+                    }
+                    Err(error) => {
+                        // A tick error here is a transient infrastructure failure
+                        // (e.g. couldn't reach the database to claim a job), not a
+                        // job failure — jobs have their own retry machinery. Log it
+                        // and retry with backoff instead of killing the worker,
+                        // which would take down apps that join on all worker tasks.
+                        tracing::error!(
+                            worker_id = %worker.id,
+                            error = %format!("{error:#}"),
+                            backoff_secs = tick_error_backoff.as_secs(),
+                            "Worker tick failed; backing off before retrying"
+                        );
+
+                        tokio::select! {
+                            () = tokio::time::sleep(tick_error_backoff) => {}
+                            () = shutdown_token.cancelled() => {
+                                tracing::info!(worker_id = %worker.id, "Job worker shutdown requested");
+                                break;
+                            }
+                        }
+
+                        tick_error_backoff = (tick_error_backoff * 2).min(TICK_ERROR_BACKOFF_MAX);
+                    }
+                }
             }
             () = shutdown_token.cancelled() => {
                 tracing::info!(worker_id = %worker.id, "Job worker shutdown requested");
@@ -650,5 +699,55 @@ mod tests {
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().job_id, newer_created_earlier_run_id);
+    }
+
+    /// Test that the worker loop survives transient database errors instead of
+    /// exiting. Before the tick-error backoff was added, a single failed
+    /// `fetch_next_job` (e.g. a pool acquire timeout during a database stall)
+    /// propagated out of `job_worker` and killed the worker task — and with it,
+    /// apps that join on all worker tasks.
+    #[sqlx::test]
+    async fn test_job_worker_survives_transient_db_errors(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+
+        // Close the pool so every query the worker makes fails, simulating the
+        // database being unreachable.
+        db.close().await;
+
+        let handle = tokio::spawn(async move {
+            job_worker(
+                app_state,
+                Jobs,
+                Duration::from_millis(10),
+                20,
+                worker_token,
+                DEFAULT_LOCK_TIMEOUT,
+            )
+            .await
+        });
+
+        // Give the worker time to hit at least one failing tick. Before the
+        // fix, job_worker returned Err almost immediately; with the fix it
+        // keeps looping (sleeping in error backoff).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !handle.is_finished(),
+            "worker exited after a transient DB error instead of retrying"
+        );
+
+        // The worker must still respond promptly to shutdown, even while
+        // sitting in an error-backoff sleep.
+        shutdown_token.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            joined.is_ok(),
+            "worker did not shut down promptly after cancellation"
+        );
     }
 }
