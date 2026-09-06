@@ -1,8 +1,11 @@
 [package]
 name = "cja"
 description = "Cron, Jobs and Axum a meta-framework for building web applications"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 default = ["cron", "jobs"]
