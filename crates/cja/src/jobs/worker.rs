@@ -405,7 +405,7 @@ pub async fn job_worker_with_shutdown_drain<AppState: AS>(
         let result = match fetched {
             Ok(Some(job)) => {
                 let mut running = std::pin::pin!(worker.run_next_job(job));
-                let result = tokio::select! {
+                let run_result = tokio::select! {
                     result = &mut running => result,
                     () = shutdown_token.cancelled() => {
                         if shutdown_drain_timeout.is_zero() {
@@ -416,16 +416,24 @@ pub async fn job_worker_with_shutdown_drain<AppState: AS>(
                             Err(_) => break,
                         }
                     }
-                }?;
-                match result {
-                    Ok(RunJobSuccess(job)) => {
+                };
+                // Fold the infrastructure error into `result` instead of
+                // `?`-ing out: a transient failure while running/finalizing a
+                // job (e.g. a DB blip during completion bookkeeping) must hit
+                // the same backoff-and-retry arm as a fetch failure — never
+                // kill the worker, which would take down apps that join on
+                // all worker tasks.
+                match run_result {
+                    Ok(Ok(RunJobSuccess(job))) => {
                         tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
+                        Ok(())
                     }
-                    Err(job_error) => {
+                    Ok(Err(job_error)) => {
                         tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+                        Ok(())
                     }
+                    Err(error) => Err(error),
                 }
-                Ok(())
             }
             Ok(None) => tokio::select! {
                 () = tokio::time::sleep(worker.sleep_duration) => Ok(()),
