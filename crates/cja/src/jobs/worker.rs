@@ -510,7 +510,240 @@ mod tests {
         }
     }
 
-    impl_job_registry!(TestAppState, TestJob);
+    /// A job that treats shutdown as work to finish: on cancellation it
+    /// performs a durable database write, THEN returns Ok. Used to prove the
+    /// bounded drain lets a cooperative job complete its cleanup instead of
+    /// being dropped mid-flight.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct DrainCooperativeJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for DrainCooperativeJob {
+        const NAME: &'static str = "DrainCooperativeJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            app_state: TestAppState,
+            cancellation_token: CancellationToken,
+        ) -> color_eyre::Result<()> {
+            // Park until shutdown is requested, then do the durable cleanup
+            // that a dropped future would never get to run.
+            cancellation_token.cancelled().await;
+            sqlx::query("UPDATE jobs SET context = 'cooperatively-drained' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+            Ok(())
+        }
+    }
+
+    /// A job that ignores cancellation entirely and sleeps far longer than any
+    /// drain. Used to prove the bounded drain expires and drops the future.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct DrainStubbornJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for DrainStubbornJob {
+        const NAME: &'static str = "DrainStubbornJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        }
+    }
+
+    impl_job_registry!(TestAppState, TestJob, DrainCooperativeJob, DrainStubbornJob);
+
+    async fn wait_until_locked(db: &sqlx::PgPool, name: &str) {
+        for _ in 0..200 {
+            let locked: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT locked_by FROM jobs WHERE name = $1")
+                    .bind(name)
+                    .fetch_optional(db)
+                    .await
+                    .unwrap();
+            if let Some((locked_by,)) = locked
+                && locked_by.is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("job {name} was never claimed by the worker");
+    }
+
+    /// A cancellation-aware job must be allowed to finish its durable cleanup
+    /// inside the bounded drain: the job observes cancellation, writes to the
+    /// database, returns Ok, and the worker's normal completion bookkeeping
+    /// (DELETE of the job row) runs — all before the worker exits. Without the
+    /// drain, the future is dropped at the job's first cancellation checkpoint
+    /// and the row survives (locked, then merely unlocked by cleanup).
+    #[sqlx::test]
+    async fn test_shutdown_drain_lets_a_cooperative_job_finish(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        DrainCooperativeJob
+            .clone()
+            .enqueue(app_state.clone(), "drain-cooperative-test".to_owned(), None)
+            .await
+            .unwrap();
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+        let handle = tokio::spawn(job_worker_with_shutdown_drain(
+            app_state,
+            Jobs,
+            Duration::from_millis(10),
+            20,
+            worker_token,
+            DEFAULT_LOCK_TIMEOUT,
+            Duration::from_secs(10),
+        ));
+
+        wait_until_locked(&db, DrainCooperativeJob::NAME).await;
+        shutdown_token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("worker must exit inside the drain window")
+            .unwrap()
+            .expect("worker must not error");
+
+        // The job completed INSIDE the drain, so the success path's durable
+        // bookkeeping (DELETE FROM jobs) ran. A row remaining here means the
+        // future was dropped before the job could finish.
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "cooperative job must complete (row deleted) inside the drain"
+        );
+    }
+
+    /// A cancellation-ignoring job must be dropped at the drain deadline, not
+    /// run to completion: the worker returns promptly after the drain expires
+    /// and `cleanup_worker_locks` has released the row, so another worker (or
+    /// a post-restart daemon) can take the job over instead of waiting out the
+    /// full lock timeout.
+    #[sqlx::test]
+    async fn test_shutdown_drain_drops_a_non_cooperative_job(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        DrainStubbornJob
+            .clone()
+            .enqueue(app_state.clone(), "drain-stubborn-test".to_owned(), None)
+            .await
+            .unwrap();
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+        let handle = tokio::spawn(job_worker_with_shutdown_drain(
+            app_state,
+            Jobs,
+            Duration::from_millis(10),
+            20,
+            worker_token,
+            DEFAULT_LOCK_TIMEOUT,
+            Duration::from_secs(2),
+        ));
+
+        wait_until_locked(&db, DrainStubbornJob::NAME).await;
+        let started = std::time::Instant::now();
+        shutdown_token.cancel();
+
+        // The job sleeps for 30 seconds ignoring cancellation; the worker must
+        // give up after its 2-second drain instead of waiting that out.
+        tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("worker must return after the drain expires, not after the job finishes")
+            .unwrap()
+            .expect("worker must not error");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "worker ran {:?}, longer than its 2s drain — the job future was not dropped",
+            started.elapsed()
+        );
+
+        // cleanup_worker_locks must have run after the drop: the row stays
+        // (unlike the cooperative case) but must be unlocked.
+        let (locked_by,): (Option<String>,) =
+            sqlx::query_as("SELECT locked_by FROM jobs WHERE name = $1")
+                .bind(DrainStubbornJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(
+            locked_by.is_none(),
+            "dropped job's lock must be released by cleanup_worker_locks"
+        );
+    }
+
+    /// The default `job_worker` entry point keeps its historical behavior:
+    /// zero drain — cancellation drops the in-flight job future immediately.
+    /// Existing consumers (and non-cooperative jobs) must not inherit the
+    /// bounded-drain wait just because the opt-in API exists.
+    #[sqlx::test]
+    async fn test_job_worker_default_cancels_immediately(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        DrainStubbornJob
+            .clone()
+            .enqueue(app_state.clone(), "zero-drain-test".to_owned(), None)
+            .await
+            .unwrap();
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+        let handle = tokio::spawn(job_worker(
+            app_state,
+            Jobs,
+            Duration::from_millis(10),
+            20,
+            worker_token,
+            DEFAULT_LOCK_TIMEOUT,
+        ));
+
+        wait_until_locked(&db, DrainStubbornJob::NAME).await;
+        let started = std::time::Instant::now();
+        shutdown_token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("zero-drain worker must return immediately on cancellation")
+            .unwrap()
+            .expect("worker must not error");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "zero-drain cancellation waited {:?} — it must not wait for the job",
+            started.elapsed()
+        );
+
+        let (locked_by,): (Option<String>,) =
+            sqlx::query_as("SELECT locked_by FROM jobs WHERE name = $1")
+                .bind(DrainStubbornJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(
+            locked_by.is_none(),
+            "lock must be released on immediate cancel"
+        );
+    }
 
     /// Test that `fetch_next_job` picks up a job with a stale lock (lock older than timeout)
     #[sqlx::test]
