@@ -246,46 +246,6 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 
         Ok(job)
     }
-
-    #[tracing::instrument(
-        name = "worker.tick",
-        level = "trace",
-        skip(self),
-        fields(
-            worker.id = %self.id,
-        ),
-    )]
-    async fn tick(&self) -> color_eyre::Result<()> {
-        let job = self.fetch_next_job().await?;
-
-        let Some(job) = job else {
-            let duration = self.sleep_duration;
-            tracing::debug!(worker.id =% self.id, ?duration, "No Job to Run, sleeping for requested duration");
-
-            tokio::time::sleep(duration).await;
-
-            return Ok(());
-        };
-
-        let result = self.run_next_job(job).await?;
-
-        match result {
-            Ok(RunJobSuccess(job)) => {
-                tracing::info!(worker.id =% self.id, job_id =% job.job_id, "Job Ran");
-            }
-            Err(job_error) => {
-                tracing::error!(
-                    worker.id =% self.id,
-                    job_id =% job_error.0.job_id,
-                    error_count =% job_error.0.error_count,
-                    error_msg =% job_error.1,
-                    "Job Errored"
-                );
-            }
-        }
-
-        Ok(())
-    }
 }
 
 /// Release database locks held by a worker.
@@ -397,6 +357,35 @@ pub async fn job_worker<AppState: AS>(
     shutdown_token: CancellationToken,
     lock_timeout: Duration,
 ) -> color_eyre::Result<()> {
+    job_worker_with_shutdown_drain(
+        app_state,
+        registry,
+        sleep_duration,
+        max_retries,
+        shutdown_token,
+        lock_timeout,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Start a worker which gives an in-flight job a bounded opportunity to
+/// observe cancellation and finish its durable cleanup.
+///
+/// Fetching and idle waits remain immediately cancellable. Once a job has
+/// been claimed, cancellation waits at most `shutdown_drain_timeout` for its
+/// future to finish. On expiry the future is dropped and this worker's locks
+/// are released. Use [`job_worker`] when immediate cancellation is desired.
+#[allow(clippy::too_many_arguments)]
+pub async fn job_worker_with_shutdown_drain<AppState: AS>(
+    app_state: AppState,
+    registry: impl JobRegistry<AppState>,
+    sleep_duration: Duration,
+    max_retries: i32,
+    shutdown_token: CancellationToken,
+    lock_timeout: Duration,
+    shutdown_drain_timeout: Duration,
+) -> color_eyre::Result<()> {
     let worker = Worker::new(
         app_state,
         registry,
@@ -409,40 +398,67 @@ pub async fn job_worker<AppState: AS>(
     let mut tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
 
     loop {
-        tokio::select! {
-            result = worker.tick() => {
-                match result {
-                    Ok(()) => {
-                        tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
-                    }
-                    Err(error) => {
-                        // A tick error here is a transient infrastructure failure
-                        // (e.g. couldn't reach the database to claim a job), not a
-                        // job failure — jobs have their own retry machinery. Log it
-                        // and retry with backoff instead of killing the worker,
-                        // which would take down apps that join on all worker tasks.
-                        tracing::error!(
-                            worker_id = %worker.id,
-                            error = %format!("{error:#}"),
-                            backoff_secs = tick_error_backoff.as_secs(),
-                            "Worker tick failed; backing off before retrying"
-                        );
-
-                        tokio::select! {
-                            () = tokio::time::sleep(tick_error_backoff) => {}
-                            () = shutdown_token.cancelled() => {
-                                tracing::info!(worker_id = %worker.id, "Job worker shutdown requested");
-                                break;
-                            }
+        let fetched = tokio::select! {
+            result = worker.fetch_next_job() => result,
+            () = shutdown_token.cancelled() => break,
+        };
+        let result = match fetched {
+            Ok(Some(job)) => {
+                let mut running = std::pin::pin!(worker.run_next_job(job));
+                let result = tokio::select! {
+                    result = &mut running => result,
+                    () = shutdown_token.cancelled() => {
+                        if shutdown_drain_timeout.is_zero() {
+                            break;
                         }
-
-                        tick_error_backoff = (tick_error_backoff * 2).min(TICK_ERROR_BACKOFF_MAX);
+                        match tokio::time::timeout(shutdown_drain_timeout, &mut running).await {
+                            Ok(result) => result,
+                            Err(_) => break,
+                        }
+                    }
+                }?;
+                match result {
+                    Ok(RunJobSuccess(job)) => {
+                        tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
+                    }
+                    Err(job_error) => {
+                        tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
                     }
                 }
+                Ok(())
             }
-            () = shutdown_token.cancelled() => {
-                tracing::info!(worker_id = %worker.id, "Job worker shutdown requested");
-                break;
+            Ok(None) => tokio::select! {
+                () = tokio::time::sleep(worker.sleep_duration) => Ok(()),
+                () = shutdown_token.cancelled() => break,
+            },
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
+            }
+            Err(error) => {
+                // A tick error here is a transient infrastructure failure
+                // (e.g. couldn't reach the database to claim a job), not a
+                // job failure — jobs have their own retry machinery. Log it
+                // and retry with backoff instead of killing the worker,
+                // which would take down apps that join on all worker tasks.
+                tracing::error!(
+                    worker_id = %worker.id,
+                    error = %format!("{error:#}"),
+                    backoff_secs = tick_error_backoff.as_secs(),
+                    "Worker tick failed; backing off before retrying"
+                );
+
+                tokio::select! {
+                    () = tokio::time::sleep(tick_error_backoff) => {}
+                    () = shutdown_token.cancelled() => {
+                        tracing::info!(worker_id = %worker.id, "Job worker shutdown requested");
+                        break;
+                    }
+                }
+
+                tick_error_backoff = (tick_error_backoff * 2).min(TICK_ERROR_BACKOFF_MAX);
             }
         }
     }
