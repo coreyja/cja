@@ -23,6 +23,15 @@ pub const DEFAULT_MAX_RETRIES: i32 = 20;
 /// crashes or becomes unresponsive while processing a job.
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_hours(2);
 
+/// Initial backoff duration after a worker tick fails (e.g. the database was
+/// unreachable while trying to claim a job). Doubles on each consecutive
+/// failure, capped at [`TICK_ERROR_BACKOFF_MAX`], and resets after a
+/// successful tick.
+const TICK_ERROR_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Maximum backoff duration between retries after consecutive tick failures.
+const TICK_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
 #[derive(Debug)]
@@ -237,46 +246,6 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 
         Ok(job)
     }
-
-    #[tracing::instrument(
-        name = "worker.tick",
-        level = "trace",
-        skip(self),
-        fields(
-            worker.id = %self.id,
-        ),
-    )]
-    async fn tick(&self) -> color_eyre::Result<()> {
-        let job = self.fetch_next_job().await?;
-
-        let Some(job) = job else {
-            let duration = self.sleep_duration;
-            tracing::debug!(worker.id =% self.id, ?duration, "No Job to Run, sleeping for requested duration");
-
-            tokio::time::sleep(duration).await;
-
-            return Ok(());
-        };
-
-        let result = self.run_next_job(job).await?;
-
-        match result {
-            Ok(RunJobSuccess(job)) => {
-                tracing::info!(worker.id =% self.id, job_id =% job.job_id, "Job Ran");
-            }
-            Err(job_error) => {
-                tracing::error!(
-                    worker.id =% self.id,
-                    job_id =% job_error.0.job_id,
-                    error_count =% job_error.0.error_count,
-                    error_msg =% job_error.1,
-                    "Job Errored"
-                );
-            }
-        }
-
-        Ok(())
-    }
 }
 
 /// Release database locks held by a worker.
@@ -338,6 +307,17 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// - Any currently executing job is allowed to complete
 /// - Database locks are released immediately (instead of waiting for the lock timeout)
 ///
+/// # Transient Error Resilience
+///
+/// Errors from the worker loop itself (e.g. the database being unreachable while
+/// trying to claim the next job, such as a pool acquire timeout during a brief
+/// database stall) are NOT fatal. They are logged at ERROR level and the worker
+/// retries with exponential backoff (starting at 1 second, doubling up to a
+/// 30 second cap, resetting after the next successful tick). This keeps a
+/// transient database hiccup from killing the worker task — and with it, apps
+/// that join on all worker tasks. Job execution failures are unaffected by this:
+/// they continue to use the per-job retry machinery described above.
+///
 /// # Lock Timeout
 ///
 /// If a worker crashes or becomes unresponsive while processing a job, the job will remain
@@ -377,6 +357,35 @@ pub async fn job_worker<AppState: AS>(
     shutdown_token: CancellationToken,
     lock_timeout: Duration,
 ) -> color_eyre::Result<()> {
+    job_worker_with_shutdown_drain(
+        app_state,
+        registry,
+        sleep_duration,
+        max_retries,
+        shutdown_token,
+        lock_timeout,
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Start a worker which gives an in-flight job a bounded opportunity to
+/// observe cancellation and finish its durable cleanup.
+///
+/// Fetching and idle waits remain immediately cancellable. Once a job has
+/// been claimed, cancellation waits at most `shutdown_drain_timeout` for its
+/// future to finish. On expiry the future is dropped and this worker's locks
+/// are released. Use [`job_worker`] when immediate cancellation is desired.
+#[allow(clippy::too_many_arguments)]
+pub async fn job_worker_with_shutdown_drain<AppState: AS>(
+    app_state: AppState,
+    registry: impl JobRegistry<AppState>,
+    sleep_duration: Duration,
+    max_retries: i32,
+    shutdown_token: CancellationToken,
+    lock_timeout: Duration,
+    shutdown_drain_timeout: Duration,
+) -> color_eyre::Result<()> {
     let worker = Worker::new(
         app_state,
         registry,
@@ -386,14 +395,78 @@ pub async fn job_worker<AppState: AS>(
         lock_timeout,
     );
 
+    let mut tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
+
     loop {
-        tokio::select! {
-            result = worker.tick() => {
-                result?;
+        let fetched = tokio::select! {
+            result = worker.fetch_next_job() => result,
+            () = shutdown_token.cancelled() => break,
+        };
+        let result = match fetched {
+            Ok(Some(job)) => {
+                let mut running = std::pin::pin!(worker.run_next_job(job));
+                let run_result = tokio::select! {
+                    result = &mut running => result,
+                    () = shutdown_token.cancelled() => {
+                        if shutdown_drain_timeout.is_zero() {
+                            break;
+                        }
+                        match tokio::time::timeout(shutdown_drain_timeout, &mut running).await {
+                            Ok(result) => result,
+                            Err(_) => break,
+                        }
+                    }
+                };
+                // Fold the infrastructure error into `result` instead of
+                // `?`-ing out: a transient failure while running/finalizing a
+                // job (e.g. a DB blip during completion bookkeeping) must hit
+                // the same backoff-and-retry arm as a fetch failure — never
+                // kill the worker, which would take down apps that join on
+                // all worker tasks.
+                match run_result {
+                    Ok(Ok(RunJobSuccess(job))) => {
+                        tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
+                        Ok(())
+                    }
+                    Ok(Err(job_error)) => {
+                        tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
-            () = shutdown_token.cancelled() => {
-                tracing::info!(worker_id = %worker.id, "Job worker shutdown requested");
-                break;
+            Ok(None) => tokio::select! {
+                () = tokio::time::sleep(worker.sleep_duration) => Ok(()),
+                () = shutdown_token.cancelled() => break,
+            },
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
+            }
+            Err(error) => {
+                // A tick error here is a transient infrastructure failure
+                // (e.g. couldn't reach the database to claim a job), not a
+                // job failure — jobs have their own retry machinery. Log it
+                // and retry with backoff instead of killing the worker,
+                // which would take down apps that join on all worker tasks.
+                tracing::error!(
+                    worker_id = %worker.id,
+                    error = %format!("{error:#}"),
+                    backoff_secs = tick_error_backoff.as_secs(),
+                    "Worker tick failed; backing off before retrying"
+                );
+
+                tokio::select! {
+                    () = tokio::time::sleep(tick_error_backoff) => {}
+                    () = shutdown_token.cancelled() => {
+                        tracing::info!(worker_id = %worker.id, "Job worker shutdown requested");
+                        break;
+                    }
+                }
+
+                tick_error_backoff = (tick_error_backoff * 2).min(TICK_ERROR_BACKOFF_MAX);
             }
         }
     }
@@ -445,7 +518,240 @@ mod tests {
         }
     }
 
-    impl_job_registry!(TestAppState, TestJob);
+    /// A job that treats shutdown as work to finish: on cancellation it
+    /// performs a durable database write, THEN returns Ok. Used to prove the
+    /// bounded drain lets a cooperative job complete its cleanup instead of
+    /// being dropped mid-flight.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct DrainCooperativeJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for DrainCooperativeJob {
+        const NAME: &'static str = "DrainCooperativeJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            app_state: TestAppState,
+            cancellation_token: CancellationToken,
+        ) -> color_eyre::Result<()> {
+            // Park until shutdown is requested, then do the durable cleanup
+            // that a dropped future would never get to run.
+            cancellation_token.cancelled().await;
+            sqlx::query("UPDATE jobs SET context = 'cooperatively-drained' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+            Ok(())
+        }
+    }
+
+    /// A job that ignores cancellation entirely and sleeps far longer than any
+    /// drain. Used to prove the bounded drain expires and drops the future.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct DrainStubbornJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for DrainStubbornJob {
+        const NAME: &'static str = "DrainStubbornJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        }
+    }
+
+    impl_job_registry!(TestAppState, TestJob, DrainCooperativeJob, DrainStubbornJob);
+
+    async fn wait_until_locked(db: &sqlx::PgPool, name: &str) {
+        for _ in 0..200 {
+            let locked: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT locked_by FROM jobs WHERE name = $1")
+                    .bind(name)
+                    .fetch_optional(db)
+                    .await
+                    .unwrap();
+            if let Some((locked_by,)) = locked
+                && locked_by.is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("job {name} was never claimed by the worker");
+    }
+
+    /// A cancellation-aware job must be allowed to finish its durable cleanup
+    /// inside the bounded drain: the job observes cancellation, writes to the
+    /// database, returns Ok, and the worker's normal completion bookkeeping
+    /// (DELETE of the job row) runs — all before the worker exits. Without the
+    /// drain, the future is dropped at the job's first cancellation checkpoint
+    /// and the row survives (locked, then merely unlocked by cleanup).
+    #[sqlx::test]
+    async fn test_shutdown_drain_lets_a_cooperative_job_finish(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        DrainCooperativeJob
+            .clone()
+            .enqueue(app_state.clone(), "drain-cooperative-test".to_owned(), None)
+            .await
+            .unwrap();
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+        let handle = tokio::spawn(job_worker_with_shutdown_drain(
+            app_state,
+            Jobs,
+            Duration::from_millis(10),
+            20,
+            worker_token,
+            DEFAULT_LOCK_TIMEOUT,
+            Duration::from_secs(10),
+        ));
+
+        wait_until_locked(&db, DrainCooperativeJob::NAME).await;
+        shutdown_token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("worker must exit inside the drain window")
+            .unwrap()
+            .expect("worker must not error");
+
+        // The job completed INSIDE the drain, so the success path's durable
+        // bookkeeping (DELETE FROM jobs) ran. A row remaining here means the
+        // future was dropped before the job could finish.
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "cooperative job must complete (row deleted) inside the drain"
+        );
+    }
+
+    /// A cancellation-ignoring job must be dropped at the drain deadline, not
+    /// run to completion: the worker returns promptly after the drain expires
+    /// and `cleanup_worker_locks` has released the row, so another worker (or
+    /// a post-restart daemon) can take the job over instead of waiting out the
+    /// full lock timeout.
+    #[sqlx::test]
+    async fn test_shutdown_drain_drops_a_non_cooperative_job(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        DrainStubbornJob
+            .clone()
+            .enqueue(app_state.clone(), "drain-stubborn-test".to_owned(), None)
+            .await
+            .unwrap();
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+        let handle = tokio::spawn(job_worker_with_shutdown_drain(
+            app_state,
+            Jobs,
+            Duration::from_millis(10),
+            20,
+            worker_token,
+            DEFAULT_LOCK_TIMEOUT,
+            Duration::from_secs(2),
+        ));
+
+        wait_until_locked(&db, DrainStubbornJob::NAME).await;
+        let started = std::time::Instant::now();
+        shutdown_token.cancel();
+
+        // The job sleeps for 30 seconds ignoring cancellation; the worker must
+        // give up after its 2-second drain instead of waiting that out.
+        tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("worker must return after the drain expires, not after the job finishes")
+            .unwrap()
+            .expect("worker must not error");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "worker ran {:?}, longer than its 2s drain — the job future was not dropped",
+            started.elapsed()
+        );
+
+        // cleanup_worker_locks must have run after the drop: the row stays
+        // (unlike the cooperative case) but must be unlocked.
+        let (locked_by,): (Option<String>,) =
+            sqlx::query_as("SELECT locked_by FROM jobs WHERE name = $1")
+                .bind(DrainStubbornJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(
+            locked_by.is_none(),
+            "dropped job's lock must be released by cleanup_worker_locks"
+        );
+    }
+
+    /// The default `job_worker` entry point keeps its historical behavior:
+    /// zero drain — cancellation drops the in-flight job future immediately.
+    /// Existing consumers (and non-cooperative jobs) must not inherit the
+    /// bounded-drain wait just because the opt-in API exists.
+    #[sqlx::test]
+    async fn test_job_worker_default_cancels_immediately(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        DrainStubbornJob
+            .clone()
+            .enqueue(app_state.clone(), "zero-drain-test".to_owned(), None)
+            .await
+            .unwrap();
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+        let handle = tokio::spawn(job_worker(
+            app_state,
+            Jobs,
+            Duration::from_millis(10),
+            20,
+            worker_token,
+            DEFAULT_LOCK_TIMEOUT,
+        ));
+
+        wait_until_locked(&db, DrainStubbornJob::NAME).await;
+        let started = std::time::Instant::now();
+        shutdown_token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("zero-drain worker must return immediately on cancellation")
+            .unwrap()
+            .expect("worker must not error");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "zero-drain cancellation waited {:?} — it must not wait for the job",
+            started.elapsed()
+        );
+
+        let (locked_by,): (Option<String>,) =
+            sqlx::query_as("SELECT locked_by FROM jobs WHERE name = $1")
+                .bind(DrainStubbornJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(
+            locked_by.is_none(),
+            "lock must be released on immediate cancel"
+        );
+    }
 
     /// Test that `fetch_next_job` picks up a job with a stale lock (lock older than timeout)
     #[sqlx::test]
@@ -650,5 +956,55 @@ mod tests {
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().job_id, newer_created_earlier_run_id);
+    }
+
+    /// Test that the worker loop survives transient database errors instead of
+    /// exiting. Before the tick-error backoff was added, a single failed
+    /// `fetch_next_job` (e.g. a pool acquire timeout during a database stall)
+    /// propagated out of `job_worker` and killed the worker task — and with it,
+    /// apps that join on all worker tasks.
+    #[sqlx::test]
+    async fn test_job_worker_survives_transient_db_errors(db: sqlx::PgPool) {
+        let app_state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+
+        // Close the pool so every query the worker makes fails, simulating the
+        // database being unreachable.
+        db.close().await;
+
+        let handle = tokio::spawn(async move {
+            job_worker(
+                app_state,
+                Jobs,
+                Duration::from_millis(10),
+                20,
+                worker_token,
+                DEFAULT_LOCK_TIMEOUT,
+            )
+            .await
+        });
+
+        // Give the worker time to hit at least one failing tick. Before the
+        // fix, job_worker returned Err almost immediately; with the fix it
+        // keeps looping (sleeping in error backoff).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !handle.is_finished(),
+            "worker exited after a transient DB error instead of retrying"
+        );
+
+        // The worker must still respond promptly to shutdown, even while
+        // sitting in an error-backoff sleep.
+        shutdown_token.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            joined.is_ok(),
+            "worker did not shut down promptly after cancellation"
+        );
     }
 }
