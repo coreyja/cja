@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cja::jobs::Job;
 use serde_json::{Map, Value, json};
-use tracing::{Subscriber, field::Visit, instrument::WithSubscriber};
+use tracing::{Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 
 #[derive(Debug, Clone)]
@@ -14,6 +14,22 @@ struct Record {
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<Record>>>);
+
+// Production has one subscriber for the process lifetime. Keep that same
+// model in this integration-test binary instead of installing and dropping
+// per-future subscribers while other tests use the same tracing callsites.
+// Tests select their own records by the committed job/unique context and span.
+fn capture() -> &'static Capture {
+    static CAPTURE: OnceLock<Capture> = OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture = Capture::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(capture.clone()),
+        )
+        .expect("integration tests install one tracing subscriber");
+        capture
+    })
+}
 
 #[derive(Default)]
 struct Fields(Map<String, Value>);
@@ -73,14 +89,12 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
 async fn enqueue_identity_is_present_at_span_creation_and_matches_the_committed_job() {
     let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
     let state = crate::common::app::TestAppState::new(pool.clone());
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let capture = capture();
     let job = super::jobs::TestJob {
         id: "game-123".into(),
         value: 42,
     };
     job.enqueue(state, "game game-123".into(), Some(-5))
-        .with_subscriber(subscriber)
         .await
         .unwrap();
 
@@ -90,7 +104,12 @@ async fn enqueue_identity_is_present_at_span_creation_and_matches_the_committed_
             .await
             .unwrap();
     let records = capture.0.lock().unwrap();
-    let span = records.iter().find(|record| record.is_span).unwrap();
+    let span = records
+        .iter()
+        .find(|record| {
+            record.is_span && record.fields.get("job.id") == Some(&json!(stored.0.to_string()))
+        })
+        .unwrap();
     assert_eq!(span.fields["job.id"], stored.0.to_string());
     assert_eq!(span.fields["job.name"], "TestJob");
     assert_eq!(span.fields["job.context"], stored.1);
@@ -103,10 +122,17 @@ async fn enqueue_identity_is_present_at_span_creation_and_matches_the_committed_
     let receipts: Vec<_> = records
         .iter()
         .filter(|record| {
-            !record.is_span && record.fields.get("event_type") == Some(&json!("job_enqueued"))
+            !record.is_span
+                && record.fields.get("job_id") == Some(&span.fields["job.id"])
+                && record.fields.get("event_type") == Some(&json!("job_enqueued"))
         })
         .collect();
-    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts.len(),
+        1,
+        "missing receipt for committed job {}",
+        stored.0
+    );
     assert_eq!(receipts[0].fields["job_id"], stored.0.to_string());
     assert_eq!(receipts[0].span_id, span.span_id);
 }
@@ -116,29 +142,28 @@ async fn a_failed_enqueue_has_an_identity_and_error_but_no_commit_receipt() {
     let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
     let state = crate::common::app::TestAppState::new(pool.clone());
     pool.close().await;
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let capture = capture();
     let job = super::jobs::TestJob {
         id: "game-456".into(),
         value: 42,
     };
-    assert!(
-        job.enqueue(state, "game game-456".into(), None)
-            .with_subscriber(subscriber)
-            .await
-            .is_err()
-    );
+    let context = format!("failed enqueue {}", uuid::Uuid::new_v4());
+    assert!(job.enqueue(state, context.clone(), None).await.is_err());
     let records = capture.0.lock().unwrap();
-    let span = records.iter().find(|record| record.is_span).unwrap();
+    let span = records
+        .iter()
+        .find(|record| record.is_span && record.fields.get("job.context") == Some(&json!(context)))
+        .unwrap();
     assert!(uuid::Uuid::parse_str(span.fields["job.id"].as_str().unwrap()).is_ok());
-    assert!(
-        !records
-            .iter()
-            .any(|record| record.fields.get("event_type") == Some(&json!("job_enqueued")))
-    );
+    assert!(!records.iter().any(|record| record.fields.get("job_id")
+        == Some(&span.fields["job.id"])
+        && record.fields.get("event_type") == Some(&json!("job_enqueued"))));
     let failure = records
         .iter()
-        .find(|record| record.fields.contains_key("error"))
+        .find(|record| {
+            record.fields.get("job_id") == Some(&span.fields["job.id"])
+                && record.fields.contains_key("error")
+        })
         .unwrap();
     assert_eq!(failure.fields["job_id"], span.fields["job.id"]);
     assert_eq!(failure.span_id, span.span_id);
