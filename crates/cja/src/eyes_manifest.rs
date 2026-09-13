@@ -44,7 +44,10 @@ use crate::app_state::AppState;
 use crate::jobs::registry::JobRegistry;
 
 pub use eyes_subscriber::{
-    AppManifest, CronEntry, ExpectedProcessRole, HttpMethod, HttpMonitor, ManifestError,
+    AppManifest, CronEntry, DashboardItem, DashboardLink, DashboardSection, ExpectedProcessRole,
+    HttpMethod, HttpMonitor, ManifestError, MetricThresholdBuilder, NamedDashboard, NamedMetric,
+    NamedMetricBuilder, ProcessHeartbeat, ProcessHeartbeatConfig, ProcessHeartbeatHandle,
+    ProcessIdentity, ThresholdComparison,
 };
 
 /// Build an [`AppManifest`] from a job registry and (optionally) a cron registry.
