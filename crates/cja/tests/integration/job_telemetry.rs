@@ -123,7 +123,7 @@ async fn enqueue_identity_is_present_at_span_creation_and_matches_the_committed_
         .iter()
         .filter(|record| {
             !record.is_span
-                && record.span_id == span.span_id
+                && record.fields.get("job_id") == Some(&span.fields["job.id"])
                 && record.fields.get("event_type") == Some(&json!("job_enqueued"))
         })
         .collect();
@@ -155,11 +155,15 @@ async fn a_failed_enqueue_has_an_identity_and_error_but_no_commit_receipt() {
         .find(|record| record.is_span && record.fields.get("job.context") == Some(&json!(context)))
         .unwrap();
     assert!(uuid::Uuid::parse_str(span.fields["job.id"].as_str().unwrap()).is_ok());
-    assert!(!records.iter().any(|record| record.span_id == span.span_id
+    assert!(!records.iter().any(|record| record.fields.get("job_id")
+        == Some(&span.fields["job.id"])
         && record.fields.get("event_type") == Some(&json!("job_enqueued"))));
     let failure = records
         .iter()
-        .find(|record| record.span_id == span.span_id && record.fields.contains_key("error"))
+        .find(|record| {
+            record.fields.get("job_id") == Some(&span.fields["job.id"])
+                && record.fields.contains_key("error")
+        })
         .unwrap();
     assert_eq!(failure.fields["job_id"], span.fields["job.id"]);
     assert_eq!(failure.span_id, span.span_id);
