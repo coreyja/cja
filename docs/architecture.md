@@ -197,6 +197,18 @@ The `sessions` table has an `update_updated_at_column()` trigger that automatica
 
 ## Graceful Shutdown
 
+HTTP callers can use `server::run_server_until(routes, shutdown_future)` to
+stop accepting connections and drain existing requests. It preserves the
+standard tracing/cookie middleware and `PORT`/systemfd listener setup.
+`server::serve_until(listener, routes, shutdown_future)` accepts a listener
+owned by the application. The original `run_server` remains available.
+
+Cron cancellation takes effect between ticks and during the polling sleep.
+An active tick finishes its callbacks and persists successful `last_run_at`
+updates before returning; callback errors still propagate during shutdown.
+Applications must await workers after cancellation and impose a drain deadline
+when a callback or HTTP response can run indefinitely.
+
 Shutdown flows through `tokio_util::sync::CancellationToken`:
 
 1. Signal handler (SIGINT/SIGTERM) calls `token.cancel()`
