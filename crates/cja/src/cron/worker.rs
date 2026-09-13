@@ -76,16 +76,11 @@ impl<AppState: AS> Worker<AppState> {
     /// ```
     pub async fn run(self, shutdown_token: CancellationToken) -> Result<(), TickError> {
         tracing::debug!(cron_worker_id = %self.id, "Starting Cron loop");
-        loop {
-            tokio::select! {
-                result = self.tick() => {
-                    result?;
-                }
-                () = shutdown_token.cancelled() => {
-                    tracing::info!(cron_worker_id = %self.id, "Cron worker shutdown requested");
-                    break;
-                }
-            }
+        while !shutdown_token.is_cancelled() {
+            // Dropping tick on cancellation can interrupt a direct callback
+            // after its side effect but before last_run_at is persisted.
+            // Finish the current tick, including its error or completion write.
+            self.tick().await?;
 
             tokio::select! {
                 () = tokio::time::sleep(self.sleep_duration) => {}
