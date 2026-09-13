@@ -6,9 +6,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct TestJob {
-    id: String,
-    value: i32,
+pub(super) struct TestJob {
+    pub(super) id: String,
+    pub(super) value: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
