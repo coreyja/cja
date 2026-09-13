@@ -133,7 +133,7 @@
 use crate::app_state::AppState as AS;
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 
 pub mod registry;
 
@@ -417,29 +417,61 @@ pub trait Job<AppState: AS>:
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(name = "jobs.enqueue", skip(app_state), fields(job.name = Self::NAME), err)]
     async fn enqueue(
         self,
         app_state: AppState,
         context: String,
         priority: Option<i32>,
     ) -> Result<(), EnqueueError> {
-        sqlx::query(
-            "
+        let job_id = uuid::Uuid::new_v4();
+        let created_at = chrono::Utc::now();
+        // Eyes captures fields at span creation. Recording the id after the
+        // insert would leave the enqueue disconnected from worker attempts.
+        let span = tracing::info_span!(
+            "jobs.enqueue",
+            job.id = %job_id,
+            job.name = Self::NAME,
+            job.context = %context,
+            job.priority = priority.unwrap_or(0),
+            job.created_at = %created_at,
+            job.run_at = %created_at,
+            "self" = ?self,
+            context = %context,
+            priority = ?priority,
+        );
+        async move {
+            let result = async {
+                sqlx::query(
+                    "
         INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(Self::NAME)
-        .bind(serde_json::to_value(self)?)
-        .bind(priority.unwrap_or(0))
-        .bind(chrono::Utc::now())
-        .bind(chrono::Utc::now())
-        .bind(context)
-        .execute(app_state.db())
-        .await?;
+                )
+                .bind(job_id)
+                .bind(Self::NAME)
+                .bind(serde_json::to_value(self)?)
+                .bind(priority.unwrap_or(0))
+                .bind(created_at)
+                .bind(created_at)
+                .bind(context)
+                .execute(app_state.db())
+                .await?;
 
-        Ok(())
+                Ok::<_, EnqueueError>(())
+            }
+            .await;
+            match &result {
+                Ok(()) => tracing::info!(
+                    event_type = "job_enqueued",
+                    job_id = %job_id,
+                    job.name = Self::NAME,
+                    "Job enqueued"
+                ),
+                Err(error) => tracing::error!(job_id = %job_id, %error, "Job enqueue failed"),
+            }
+            result
+        }
+        .instrument(span)
+        .await
     }
 }
 
