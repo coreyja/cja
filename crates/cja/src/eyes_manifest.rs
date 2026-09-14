@@ -106,17 +106,16 @@ where
 /// interval schedules (e.g. `"300s"`) and the original expression for cron
 /// expression schedules.
 ///
+/// This does not participate in HTTP monitor authority; prefer it when
+/// monitors are managed elsewhere. Use [`build_boot_manifest_from_state`] to
+/// declare monitors from application state.
+///
 /// Most apps should call [`send_boot_manifest`] instead; this is exposed for
 /// callers that want to inspect or customize the manifest before sending it
 /// with [`send_manifest`] (e.g. attaching a `base_url` and [`HttpMonitor`]
 /// declarations).
 #[cfg(feature = "cron")]
 #[must_use]
-/// Builds a legacy manifest from the job registry and optional cron registry.
-///
-/// Cron schedules come from [`crate::cron::CronRegistry::entries`]. This does
-/// not participate in HTTP monitor authority; prefer this API when monitors
-/// are managed elsewhere.
 pub fn build_boot_manifest<J, S>(
     app_version: Option<&str>,
     git_sha: Option<&str>,
@@ -141,11 +140,13 @@ where
     legacy_manifest::<J, S>(app_version, git_sha, crons)
 }
 
+/// Build an [`AppManifest`] from a job registry (without cron support).
+///
+/// This does not participate in HTTP monitor authority; prefer it when
+/// monitors are managed elsewhere. Use [`build_boot_manifest_from_state`] to
+/// declare monitors from application state.
 #[cfg(not(feature = "cron"))]
 #[must_use]
-/// Builds a legacy manifest from the job registry (without cron support).
-///
-/// The resulting manifest does not participate in HTTP monitor authority.
 pub fn build_boot_manifest<J, S>(app_version: Option<&str>, git_sha: Option<&str>) -> AppManifest
 where
     J: JobRegistry<S>,
