@@ -3,9 +3,9 @@ use cja::{
         self,
         eyre::{Context as _, eyre},
     },
-    server::{cookies::CookieKey, run_server},
+    server::{cookies::CookieKey, run_server_until},
     setup::{setup_sentry, setup_tracing},
-    tasks::NamedTask,
+    tasks::{ShutdownBudget, Supervisor},
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tracing::info;
@@ -93,37 +93,22 @@ async fn run_application() -> cja::Result<()> {
     let app_state = AppState::from_env().await?;
 
     info!("Spawning application tasks");
-    let mut tasks = vec![];
+    let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
 
     if is_feature_enabled("SERVER") {
         info!("Server Enabled");
-        tasks.push(NamedTask::spawn(
+        supervisor.spawn(
             "server",
-            run_server(routes::router(app_state.clone())),
-        ));
+            run_server_until(
+                routes::router(app_state.clone()),
+                supervisor.shutdown_token().cancelled_owned(),
+            ),
+        );
     } else {
         info!("Server Disabled");
     }
 
-    tasks.push(NamedTask::spawn("signal-handler", async move {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to create SIGTERM handler");
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("Failed to create SIGINT handler");
-
-        tokio::select! {
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, initiating graceful shutdown");
-            }
-            _ = sigint.recv() => {
-                info!("Received SIGINT, initiating graceful shutdown");
-            }
-        }
-
-        Ok(())
-    }));
-
-    cja::tasks::wait_for_first_error(tasks).await
+    supervisor.run().await
 }
 
 fn is_feature_enabled(feature: &str) -> bool {
