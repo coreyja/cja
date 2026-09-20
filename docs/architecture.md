@@ -209,14 +209,18 @@ updates before returning; callback errors still propagate during shutdown.
 Applications must await workers after cancellation and impose a drain deadline
 when a callback or HTTP response can run indefinitely.
 
-Shutdown flows through `tokio_util::sync::CancellationToken`:
+`tasks::Supervisor` owns the sequence so applications do not hand-roll it:
 
-1. Signal handler (SIGINT/SIGTERM) calls `token.cancel()`
-2. All subsystems (`job_worker`, cron `Worker::run`, etc.) check `token.cancelled()` in their `tokio::select!` loops
-3. Workers finish their current work item, then exit
-4. Job worker runs `cleanup_worker_locks()` to release any held locks
-5. `wait_for_first_error()` completes when the first task exits
-6. Application shuts down
+1. `Supervisor::new(budget)` registers SIGTERM and SIGINT (Fly sends SIGINT by default, Cloud Run and Kubernetes SIGTERM) and creates the shared `CancellationToken`
+2. The app spawns its server, job workers and cron through the supervisor, passing each `supervisor.shutdown_token()`
+3. `supervisor.run()` waits for a signal or for any task to exit on its own, then cancels the token
+4. Workers stop claiming jobs; an in-flight job gets `ShutdownBudget::job_drain` to finish, then is dropped and `cleanup_worker_locks()` releases its lock so another instance re-runs it immediately instead of after the lock timeout
+5. Tasks still running at `ShutdownBudget::deadline()` (`job_drain + exit_grace`) are aborted. Long-lived connections such as WebSockets make this routine, since they hold axum's graceful shutdown open
+6. `run()` returns `Ok` for a signal, `Err` when a task ended the process by itself
+
+The budget has to fit the platform's kill window: Cloud Run sends SIGKILL a fixed 10 seconds after SIGTERM, Fly after `kill_timeout` (5 seconds unless `fly.toml` raises it). The defaults are 2s + 2s; override with `CJA_SHUTDOWN_JOB_DRAIN_SECS` / `CJA_SHUTDOWN_EXIT_GRACE_SECS` or by constructing `ShutdownBudget` directly. Work still running when the platform kills the process keeps its job locks until the lock timeout (2 hours by default). On Cloud Run the supervisor warns at boot when the budget cannot fit.
+
+`NamedTask` and `wait_for_first_error` remain for apps that manage shutdown themselves. Note that a signal-handler task which simply returns ends `wait_for_first_error` without draining anything.
 
 ## Migration Locations
 
