@@ -538,6 +538,12 @@ mod tests {
             app_state: TestAppState,
             cancellation_token: CancellationToken,
         ) -> color_eyre::Result<()> {
+            // Announce that the job body is running. A locked row only proves
+            // the claim committed, not that the worker has the job yet.
+            sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
             // Park until shutdown is requested, then do the durable cleanup
             // that a dropped future would never get to run.
             cancellation_token.cancelled().await;
@@ -565,6 +571,26 @@ mod tests {
     }
 
     impl_job_registry!(TestAppState, TestJob, DrainCooperativeJob, DrainStubbornJob);
+
+    /// Wait until the job body is executing. Cancelling as soon as the row is
+    /// locked races the worker: the claim can be committed while the worker is
+    /// still awaiting the response, and a cancel in that window correctly
+    /// drops the fetch and releases the lock without ever running the job.
+    async fn wait_until_started(db: &sqlx::PgPool, name: &str) {
+        for _ in 0..200 {
+            let context: Option<String> =
+                sqlx::query_scalar("SELECT context FROM jobs WHERE name = $1")
+                    .bind(name)
+                    .fetch_optional(db)
+                    .await
+                    .unwrap();
+            if context.as_deref() == Some("started") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("job {name} never started running");
+    }
 
     async fn wait_until_locked(db: &sqlx::PgPool, name: &str) {
         for _ in 0..200 {
@@ -615,7 +641,7 @@ mod tests {
             Duration::from_secs(10),
         ));
 
-        wait_until_locked(&db, DrainCooperativeJob::NAME).await;
+        wait_until_started(&db, DrainCooperativeJob::NAME).await;
         shutdown_token.cancel();
 
         tokio::time::timeout(Duration::from_secs(15), handle)
