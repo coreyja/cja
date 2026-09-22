@@ -67,8 +67,7 @@
 //!
 //! ```rust,ignore
 //! use cja::setup::{setup_sentry, setup_tracing};
-//! use cja::tasks::NamedTask;
-//! use cja::jobs::CancellationToken;
+//! use cja::tasks::{ShutdownBudget, Supervisor};
 //!
 //! fn main() -> cja::Result<()> {
 //!     let _sentry_guard = setup_sentry();
@@ -83,36 +82,35 @@
 //!     let _eyes_handle = setup_tracing("my-app")?;
 //!
 //!     let app_state = MyAppState { /* ... */ };
-//!     let shutdown_token = CancellationToken::new();
 //!
-//!     let mut tasks = vec![];
+//!     // Registers SIGTERM/SIGINT and owns the shutdown sequence
+//!     let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
+//!     let shutdown = supervisor.shutdown_token();
 //!
-//!     // HTTP server
-//!     tasks.push(NamedTask::spawn("server",
-//!         cja::server::run_server(routes(app_state.clone()))
-//!     ));
+//!     // HTTP server: stops accepting connections when shutdown starts
+//!     supervisor.spawn("server",
+//!         cja::server::run_server_until(
+//!             routes(app_state.clone()),
+//!             shutdown.clone().cancelled_owned(),
+//!         )
+//!     );
 //!
-//!     // Job worker
-//!     tasks.push(NamedTask::spawn("jobs",
-//!         cja::jobs::worker::job_worker(
+//!     // Job worker: stops claiming jobs, drains the in-flight one, then
+//!     // releases its lock so another instance picks it up immediately
+//!     supervisor.spawn("jobs",
+//!         cja::jobs::worker::job_worker_with_shutdown_drain(
 //!             app_state.clone(),
 //!             Jobs,  // your job registry (see jobs module docs)
 //!             std::time::Duration::from_secs(60),
 //!             cja::jobs::DEFAULT_MAX_RETRIES,
-//!             shutdown_token.clone(),
+//!             shutdown.clone(),
 //!             cja::jobs::DEFAULT_LOCK_TIMEOUT,
+//!             supervisor.budget().job_drain,
 //!         )
-//!     ));
+//!     );
 //!
-//!     // Signal handler
-//!     let token = shutdown_token.clone();
-//!     tasks.push(NamedTask::spawn("signals", async move {
-//!         tokio::signal::ctrl_c().await?;
-//!         token.cancel();
-//!         Ok(())
-//!     }));
-//!
-//!     cja::tasks::wait_for_first_error(tasks).await
+//!     // Returns Ok after a signal, Err if a task died on its own
+//!     supervisor.run().await
 //! }
 //! ```
 //!
@@ -129,6 +127,8 @@
 //! | `JOBS_DISABLED` | No | `false` | Set to `"true"` to skip starting the job worker |
 //! | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |
 //! | `RUST_LOG` | No | `info` | Tracing filter directive |
+//! | `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `2` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked |
+//! | `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `2` | Extra time for tasks to exit after the job drain. Drain + grace must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default) |
 //! | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
 //! | `SENTRY_DSN` | No | — | Enables Sentry error tracking |
 //! | `HONEYCOMB_API_KEY` | No | — | Enables OpenTelemetry export to Honeycomb |
