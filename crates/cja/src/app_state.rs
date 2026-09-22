@@ -91,4 +91,31 @@ pub trait AppState: Clone + Send + Sync + 'static {
     /// This key should be consistent across application restarts
     /// to maintain session continuity.
     fn cookie_key(&self) -> &CookieKey;
+
+    /// Returns the application's public HTTP(S) origin or base URL for Eyes monitors.
+    ///
+    /// Root-relative monitor targets use URL join semantics and therefore discard
+    /// any path component here (`https://example.com/app` plus `/health` becomes
+    /// `https://example.com/health`). Path-prefixed apps should declare absolute
+    /// monitor targets instead.
+    fn eyes_base_url(&self) -> Option<&str> {
+        None
+    }
+
+    /// Returns the app-level HTTP monitors reported to Eyes.
+    ///
+    /// Monitor IDs must be stable identifiers. Applications can use the cja
+    /// re-export without depending on `eyes-subscriber` directly:
+    ///
+    /// ```
+    /// use cja::eyes_subscriber::{HttpMethod, HttpMonitor};
+    /// let monitors = vec![
+    ///     HttpMonitor::new("health", "/health"),
+    ///     HttpMonitor::new("headers", "https://example.com/").method(HttpMethod::Head),
+    /// ];
+    /// assert_eq!(monitors.len(), 2);
+    /// ```
+    fn eyes_http_monitors(&self) -> Vec<crate::eyes_subscriber::HttpMonitor> {
+        Vec::new()
+    }
 }
