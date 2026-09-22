@@ -248,6 +248,53 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
     }
 }
 
+/// Confirm the database has the schema this worker's SQL relies on.
+///
+/// The worker's queries are not checked at compile time against the app's
+/// database, so an app that is missing cja migrations builds and boots
+/// normally, then fails every `fetch_next_job` forever while cron keeps
+/// enqueueing. Catching that here turns a silently dead worker into a failed
+/// start.
+///
+/// Only a definite schema mismatch is an error. Anything else (database
+/// unreachable, pool timeout) is left to the worker loop, which already
+/// retries transient failures with backoff.
+async fn verify_jobs_schema(db: &sqlx::PgPool) -> color_eyre::Result<()> {
+    const UNDEFINED_COLUMN: &str = "42703";
+    const UNDEFINED_TABLE: &str = "42P01";
+
+    let checks = [
+        "SELECT job_id, name, payload, priority, run_at, created_at, context, locked_by, \
+         locked_at, error_count, last_error_message, last_failed_at FROM jobs LIMIT 0",
+        "SELECT original_job_id, name, payload, context, priority, error_count, \
+         last_error_message, created_at FROM dead_letter_jobs LIMIT 0",
+    ];
+
+    for check in checks {
+        let Err(error) = sqlx::query(check).execute(db).await else {
+            continue;
+        };
+        let schema_mismatch = error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .is_some_and(|code| code == UNDEFINED_COLUMN || code == UNDEFINED_TABLE);
+        if schema_mismatch {
+            return Err(color_eyre::eyre::eyre!(
+                "The jobs schema is missing cja migrations ({error}). The job worker cannot \
+                 claim jobs until they are applied: copy the missing files from cja's \
+                 `migrations/` directory (`cja sync-migrations`) and run them."
+            ));
+        }
+        tracing::warn!(
+            %error,
+            "Could not verify the jobs schema at startup; continuing, the worker loop will retry"
+        );
+        return Ok(());
+    }
+
+    Ok(())
+}
+
 /// Release database locks held by a worker.
 ///
 /// This should be called during graceful shutdown to immediately release any job locks
@@ -317,6 +364,15 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// transient database hiccup from killing the worker task — and with it, apps
 /// that join on all worker tasks. Job execution failures are unaffected by this:
 /// they continue to use the per-job retry machinery described above.
+///
+/// # Schema Check
+///
+/// Before polling, the worker confirms the `jobs` and `dead_letter_jobs`
+/// tables have the columns its queries use, and returns an error if the
+/// database is missing cja migrations. Without this an out-of-date schema
+/// boots fine and then fails every claim silently. A database that is merely
+/// unreachable at startup is not an error; see transient error resilience
+/// above.
 ///
 /// # Lock Timeout
 ///
@@ -394,6 +450,8 @@ pub async fn job_worker_with_shutdown_drain<AppState: AS>(
         shutdown_token.clone(),
         lock_timeout,
     );
+
+    verify_jobs_schema(worker.state.db()).await?;
 
     let mut tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
 
@@ -538,6 +596,12 @@ mod tests {
             app_state: TestAppState,
             cancellation_token: CancellationToken,
         ) -> color_eyre::Result<()> {
+            // Announce that the job body is running. A locked row only proves
+            // the claim committed, not that the worker has the job yet.
+            sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
             // Park until shutdown is requested, then do the durable cleanup
             // that a dropped future would never get to run.
             cancellation_token.cancelled().await;
@@ -566,6 +630,26 @@ mod tests {
 
     impl_job_registry!(TestAppState, TestJob, DrainCooperativeJob, DrainStubbornJob);
 
+    /// Wait until the job body is executing. Cancelling as soon as the row is
+    /// locked races the worker: the claim can be committed while the worker is
+    /// still awaiting the response, and a cancel in that window correctly
+    /// drops the fetch and releases the lock without ever running the job.
+    async fn wait_until_started(db: &sqlx::PgPool, name: &str) {
+        for _ in 0..200 {
+            let context: Option<String> =
+                sqlx::query_scalar("SELECT context FROM jobs WHERE name = $1")
+                    .bind(name)
+                    .fetch_optional(db)
+                    .await
+                    .unwrap();
+            if context.as_deref() == Some("started") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("job {name} never started running");
+    }
+
     async fn wait_until_locked(db: &sqlx::PgPool, name: &str) {
         for _ in 0..200 {
             let locked: Option<(Option<String>,)> =
@@ -590,6 +674,71 @@ mod tests {
     /// (DELETE of the job row) runs — all before the worker exits. Without the
     /// drain, the future is dropped at the job's first cancellation checkpoint
     /// and the row survives (locked, then merely unlocked by cleanup).
+    async fn run_worker_briefly(db: sqlx::PgPool) -> color_eyre::Result<()> {
+        let app_state = TestAppState {
+            db,
+            cookie_key: CookieKey::generate(),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            job_worker(
+                app_state,
+                Jobs,
+                Duration::from_millis(50),
+                DEFAULT_MAX_RETRIES,
+                CancellationToken::new(),
+                DEFAULT_LOCK_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("a schema mismatch must end the worker at startup, not leave it polling")
+    }
+
+    /// The eyes incident: `AddJobErrorTracking` was never applied.
+    #[sqlx::test]
+    async fn test_worker_refuses_to_start_without_error_tracking_columns(db: sqlx::PgPool) {
+        sqlx::query("ALTER TABLE jobs DROP COLUMN error_count")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let error = run_worker_briefly(db).await.unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("error_count"), "{message}");
+        assert!(message.contains("missing cja migrations"), "{message}");
+    }
+
+    #[sqlx::test]
+    async fn test_worker_refuses_to_start_without_dead_letter_table(db: sqlx::PgPool) {
+        sqlx::query("DROP TABLE dead_letter_jobs")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let error = run_worker_briefly(db).await.unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("dead_letter_jobs"), "{message}");
+        assert!(message.contains("missing cja migrations"), "{message}");
+    }
+
+    /// An unreachable database is the worker loop's problem, not a reason to
+    /// refuse to start.
+    #[sqlx::test]
+    async fn test_schema_check_ignores_transient_database_errors(db: sqlx::PgPool) {
+        db.close().await;
+
+        verify_jobs_schema(&db)
+            .await
+            .expect("a closed pool is not a schema mismatch");
+    }
+
+    #[sqlx::test]
+    async fn test_schema_check_passes_on_current_migrations(db: sqlx::PgPool) {
+        verify_jobs_schema(&db).await.unwrap();
+    }
+
     #[sqlx::test]
     async fn test_shutdown_drain_lets_a_cooperative_job_finish(db: sqlx::PgPool) {
         let app_state = TestAppState {
@@ -615,7 +764,7 @@ mod tests {
             Duration::from_secs(10),
         ));
 
-        wait_until_locked(&db, DrainCooperativeJob::NAME).await;
+        wait_until_started(&db, DrainCooperativeJob::NAME).await;
         shutdown_token.cancel();
 
         tokio::time::timeout(Duration::from_secs(15), handle)

@@ -40,7 +40,7 @@
 use axum::{extract::Request, response::Response};
 use color_eyre::eyre::WrapErr;
 use listenfd::ListenFd;
-use std::{convert::Infallible, error::Error, net::SocketAddr};
+use std::{convert::Infallible, error::Error, future::Future, net::SocketAddr};
 use tokio::net::TcpListener;
 use tower_cookies::CookieManagerLayer;
 use tower_service::Service;
@@ -79,13 +79,48 @@ where
         IntoFuture<Output = Result<(), E>>,
     E: Error + Send + Sync + 'static,
 {
+    let app = prepare_routes(routes);
+    let listener = bind_listener().await?;
+    axum::serve(listener, app)
+        .await
+        .wrap_err("Failed to run server")
+}
+
+/// Run the standard cja HTTP server until `shutdown` resolves, then stop
+/// accepting connections and finish in-flight requests. Preserves `PORT`,
+/// systemfd listeners, request tracing and cookie middleware.
+///
+/// The caller should bound the drain if a request can run indefinitely.
+pub async fn run_server_until(
+    routes: axum::Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> color_eyre::Result<()> {
+    serve_until(bind_listener().await?, routes, shutdown).await
+}
+
+/// Serve an already-bound listener with cja middleware and graceful shutdown.
+/// This is useful when the application owns its bind address or port.
+pub async fn serve_until(
+    listener: TcpListener,
+    routes: axum::Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> color_eyre::Result<()> {
+    axum::serve(listener, prepare_routes(routes))
+        .with_graceful_shutdown(shutdown)
+        .await
+        .wrap_err("Failed to run server")
+}
+
+fn prepare_routes<AS: Clone + Send + Sync + 'static>(routes: axum::Router<AS>) -> axum::Router<AS> {
     let tracer = trace::Tracer;
     let trace_layer = tower_http::trace::TraceLayer::new_for_http()
         .make_span_with(tracer)
         .on_response(tracer);
 
-    let app = routes.layer(trace_layer).layer(CookieManagerLayer::new());
+    routes.layer(trace_layer).layer(CookieManagerLayer::new())
+}
 
+async fn bind_listener() -> color_eyre::Result<TcpListener> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let port: u16 = port.parse()?;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -114,7 +149,5 @@ where
     let addr = listener.local_addr()?;
     tracing::info!("Listening on {}", addr);
 
-    axum::serve(listener, app)
-        .await
-        .wrap_err("Failed to run server")
+    Ok(listener)
 }

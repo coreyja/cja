@@ -70,6 +70,40 @@ pub fn setup_sentry() -> Option<ClientInitGuard> {
 /// - `EYES_APP_ID`: Eyes application ID (UUID)
 /// - `EYES_URL`: Eyes server URL (defaults to `https://eyes.coreyja.com`)
 pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<Option<EyesShutdownHandle>> {
+    TracingConfig::new(crate_name).init()
+}
+
+/// Tracing setup with an optional boot-stable Eyes process identity.
+/// Use the same identity in the boot manifest and heartbeat configuration.
+pub struct TracingConfig<'a> {
+    crate_name: &'a str,
+    process: Option<eyes_subscriber::ProcessIdentity>,
+}
+
+impl<'a> TracingConfig<'a> {
+    #[must_use]
+    pub fn new(crate_name: &'a str) -> Self {
+        Self {
+            crate_name,
+            process: None,
+        }
+    }
+
+    #[must_use]
+    pub fn process(mut self, identity: eyes_subscriber::ProcessIdentity) -> Self {
+        self.process = Some(identity);
+        self
+    }
+
+    pub fn init(self) -> color_eyre::Result<Option<EyesShutdownHandle>> {
+        initialize_tracing(self.crate_name, self.process.as_ref())
+    }
+}
+
+fn initialize_tracing(
+    crate_name: &str,
+    process: Option<&eyes_subscriber::ProcessIdentity>,
+) -> color_eyre::Result<Option<EyesShutdownHandle>> {
     let rust_log = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| format!("info,{crate_name}=trace,tower_http=debug,serenity=error"));
 
@@ -104,7 +138,7 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<Option<EyesShutdown
     };
 
     // Setup Eyes layer if configured
-    let (eyes_layer, eyes_shutdown_handle) = setup_eyes_layer()?;
+    let (eyes_layer, eyes_shutdown_handle) = setup_eyes_layer(process)?;
 
     let stdout_layer = if std::env::var("JSON_LOGS").is_ok() {
         println!("Logging to STDOUT as JSON");
@@ -140,7 +174,9 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<Option<EyesShutdown
 }
 
 /// Sets up the Eyes tracing layer if `EYES_ORG_ID` and `EYES_APP_ID` are configured.
-fn setup_eyes_layer() -> color_eyre::Result<(Option<EyesLayer>, Option<EyesShutdownHandle>)> {
+fn setup_eyes_layer(
+    process: Option<&eyes_subscriber::ProcessIdentity>,
+) -> color_eyre::Result<(Option<EyesLayer>, Option<EyesShutdownHandle>)> {
     let org_id = std::env::var("EYES_ORG_ID").ok();
     let app_id = std::env::var("EYES_APP_ID").ok();
 
@@ -151,8 +187,13 @@ fn setup_eyes_layer() -> color_eyre::Result<(Option<EyesLayer>, Option<EyesShutd
             let app_id = Uuid::parse_str(&app_id_str)
                 .wrap_err_with(|| format!("Invalid EYES_APP_ID: {app_id_str}"))?;
 
-            let (layer, shutdown_handle) = EyesSubscriberBuilder::build_from_env(org_id, app_id)
-                .wrap_err("Failed to build Eyes subscriber")?;
+            let (mut builder, transport) =
+                EyesSubscriberBuilder::from_env_with_transport(org_id, app_id)
+                    .wrap_err("Failed to build Eyes subscriber")?;
+            if let Some(process) = process {
+                builder = builder.with_process_instance_id(process.instance_id());
+            }
+            let (layer, shutdown_handle) = builder.build_with_transport(transport);
 
             let eyes_url = std::env::var("EYES_URL")
                 .unwrap_or_else(|_| "https://eyes.coreyja.com".to_string());

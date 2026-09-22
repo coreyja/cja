@@ -112,3 +112,12 @@ cargo fmt --check
 - Maud (HTML templating)
 - color-eyre (error handling)
 - OpenTelemetry (distributed tracing)
+
+### Eyes process identity
+
+For process-aware telemetry, initialize tracing with
+`cja::setup::TracingConfig::new("my_app").process(identity.clone()).init()` and
+attach the same `ProcessIdentity` to the boot manifest and heartbeat config.
+Existing `setup_tracing("my_app")` callers retain their behavior. The
+`eyes_manifest` module re-exports the subscriber's metric, threshold, dashboard,
+and process-lifecycle builders. These APIs require eyes-subscriber 0.8.
