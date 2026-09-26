@@ -2,14 +2,11 @@ use cja::db::run_migrations;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-pub async fn setup_test_db() -> cja::Result<(PgPool, super::TestDbGuard)> {
-    let db_name = format!("cja_test_{}", Uuid::new_v4().to_string().replace('-', ""));
-    let pool = super::ensure_test_db(&db_name).await?;
+pub async fn setup_test_db() -> cja::Result<(PgPool, cja::testing::test_db::TestDatabaseGuard)> {
+    let (pool, guard) = cja::testing::test_db::create_test_database("cja_test_").await?;
 
     // Run migrations
     run_migrations(&pool).await?;
-
-    let guard = super::cleanup_on_drop(db_name);
 
     Ok((pool, guard))
 }

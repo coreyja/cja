@@ -60,6 +60,7 @@ reqwest = { workspace = true, features = ["cookies"] }
 # Paused-clock tests for the shutdown supervisor.
 tokio = { workspace = true, features = ["test-util"] }
 once_cell = "1.19"
+tempfile = "3"
 
 [lints]
 workspace = true
