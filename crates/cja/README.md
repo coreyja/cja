@@ -143,10 +143,12 @@ See `crates/cja.app/` in the repository for a complete working example.
 default = ["cron", "jobs"]
 cron = ["jobs"]           # cron depends on jobs
 jobs = []
-testing = []              # enables mock OAuth for tests
+testing = []              # enables testing::mock_oauth
 ```
 
 Disabling `jobs` at compile time also disables `cron`.
+The destructive `testing::test_db` helper is always exported so integration
+test harnesses also compile without default features.
 
 ## Job System
 

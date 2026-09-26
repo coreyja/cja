@@ -49,17 +49,30 @@ cargo test --package cja --lib --test lib
 
 ### Lima VM / Unix Socket Setup
 
-If your PostgreSQL uses Unix sockets (common on Linux/Lima VMs), you need two different `DATABASE_URL` formats:
+If your PostgreSQL uses Unix sockets (common on Linux/Lima VMs), use a URL such as:
 
 ```bash
-# For compile-time query! macro validation (cargo build / cargo test --no-run):
-DATABASE_URL="postgres:///cja_dev?host=/var/run/postgresql" cargo test --package cja --no-run
-
-# For runtime test execution:
-DATABASE_URL="postgres://%2Fvar%2Frun%2Fpostgresql/postgres" cargo test --package cja --lib --test lib -- --test-threads=1
+DATABASE_URL="postgres:///cja_dev?host=/var/run/postgresql" cargo test --package cja --lib --test lib
 ```
 
-The two formats are needed because the test infrastructure's URL parser (`rfind('/')`) breaks on `?host=` query parameters at runtime. Use `--test-threads=1` to avoid database conflicts.
+The harness parses `DATABASE_URL` as `PgConnectOptions`, so the same URL works at
+compile time and runtime. Test databases have unique names and parallel execution
+is supported.
+
+Each test database is named `<prefix><unix_seconds>_<uuid-simple>`. On the first
+creation for each prefix in a process, the harness reaps disconnected databases
+older than one hour. `CJA_TEST_DB_MAX_AGE_SECS` overrides that age. A retained idle
+pool connection protects live tests across concurrent processes; normal guard drop
+still cleans up immediately. Reaping is fail-open and is only a backstop when a
+later test process starts.
+
+Prefixes must be lowercase ASCII identifiers ending in `_`, and must leave 43
+bytes within PostgreSQL's 63-byte identifier limit. All producers using a prefix
+must converge on the timestamped format for global growth to remain bounded.
+
+Legacy UUID-only `cja_test_*` and `cja_passkey_test_*` names have no safe encoded
+age and are never automatically reaped. During rollout, list only exact legacy
+patterns, verify they have no `pg_stat_activity` rows, and drop them manually.
 
 See `crates/cja/TESTING.md` for the full testing philosophy and test infrastructure details.
 

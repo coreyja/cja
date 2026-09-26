@@ -39,8 +39,9 @@ server/
   page/factory.rs  — Factory Axum extractor
   trace.rs         — Tracer (MakeSpan + OnResponse for tower-http)
 testing/
-  mod.rs           — Feature-gated test utilities
-  mock_oauth/      — Mock OAuth server for integration tests
+  mod.rs           — Test-support exports
+  test_db.rs       — Isolated PostgreSQL database lifecycle and stale reaping
+  mock_oauth/      — Feature-gated mock OAuth server for integration tests
 ```
 
 ## Key Traits
