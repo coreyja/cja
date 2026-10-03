@@ -1110,7 +1110,18 @@ mod test {
 
     #[sqlx::test]
     async fn atomic_statement_timeout_is_recoverable(db: sqlx::PgPool) {
-        let mut tx = db.begin().await.unwrap();
+        let state = TestAppState {
+            db,
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job_atomic(TestJob, None, Duration::from_mins(1));
+        let cron = registry.get(TestJob::NAME).unwrap();
+        let (mut tx, _) = cron
+            .claim_due(&state, Utc::now(), chrono_tz::UTC)
+            .await
+            .unwrap()
+            .unwrap();
         sqlx::query("SET LOCAL statement_timeout = '10ms'")
             .execute(&mut *tx)
             .await
