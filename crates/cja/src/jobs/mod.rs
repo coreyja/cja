@@ -65,14 +65,15 @@
 //!
 //! | Retry # | Delay |
 //! |---------|-------|
-//! | 1 | 4 seconds |
-//! | 2 | 8 seconds |
-//! | 5 | ~1 minute |
+//! | 1 | 2 seconds |
+//! | 2 | 4 seconds |
+//! | 5 | 32 seconds |
 //! | 10 | ~17 minutes |
 //! | 20 | ~12 days |
 //!
-//! After [`DEFAULT_MAX_RETRIES`] (20) attempts,
-//! jobs are moved to the `dead_letter_jobs` table.
+//! With `max_retries = N`, a job can execute N+1 times. Returned errors,
+//! caught handler panics, and expired leases each count as a failed attempt.
+//! The final incremented count is stored in `dead_letter_jobs`.
 //!
 //! # Idempotency
 //!
@@ -106,8 +107,8 @@
 //! | `priority` | INT | Higher = runs first (`ORDER BY priority DESC`) |
 //! | `run_at` | TIMESTAMPTZ | When job can next be executed |
 //! | `created_at` | TIMESTAMPTZ | When job was enqueued |
-//! | `locked_at` | TIMESTAMPTZ | When a worker locked this job |
-//! | `locked_by` | TEXT | Worker UUID that holds the lock |
+//! | `locked_at` | TIMESTAMPTZ | Last lease refresh (claim time for legacy workers) |
+//! | `locked_by` | TEXT | Exact worker ownership token (`lease:<UUID>` for new workers) |
 //! | `context` | TEXT | Debug info (e.g., "user-signup") |
 //! | `error_count` | INT | Number of failures |
 //! | `last_error_message` | TEXT | Most recent error |
@@ -138,7 +139,9 @@ use tracing::{Instrument, instrument};
 pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
-pub use worker::{DEFAULT_LOCK_TIMEOUT, DEFAULT_MAX_RETRIES};
+pub use worker::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LOCK_TIMEOUT, DEFAULT_MAX_RETRIES, JobLeaseConfig,
+};
 
 #[derive(Debug, Error)]
 pub enum EnqueueError {
@@ -166,8 +169,9 @@ pub enum EnqueueError {
 /// Jobs are locked while being processed to prevent multiple workers from running the same
 /// job. If a worker crashes or becomes unresponsive, the lock remains but the job is never
 /// completed. The lock timeout mechanism handles this:
-/// - Jobs locked longer than the timeout (default: 2 hours) are considered abandoned
-/// - Any worker can pick up abandoned jobs and retry them
+/// - New workers heartbeat active jobs every 30 seconds by default
+/// - A missing heartbeat makes the job claimable after 120 seconds by default
+/// - Expired leases count as failed attempts; old unprefixed locks retain a two-hour minimum
 /// - This ensures jobs are eventually processed even after worker failures
 ///
 /// # Example

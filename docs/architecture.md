@@ -117,17 +117,18 @@ Incoming request
 ```
 enqueue() → INSERT INTO jobs (with priority, payload, context)
   → Worker poll loop (every sleep_duration)
-    → SELECT ... FOR UPDATE SKIP LOCKED (locks one row)
+    → SELECT ... FOR UPDATE SKIP LOCKED (claims one row and charges an expired lease)
       → Deserialize payload → JobRegistry::run_job() → Job::run()
+        → Heartbeat `locked_at` while the handler runs
         → On success: DELETE FROM jobs
-        → On failure (error_count < max_retries):
+        → On returned error or caught panic (error_count < max_retries):
             UPDATE jobs SET error_count += 1,
               run_at = NOW() + 2^(error_count+1) seconds
-        → On failure (error_count >= max_retries):
-            INSERT INTO dead_letter_jobs + DELETE FROM jobs
+        → On terminal failure or terminal expired lease:
+            INSERT INTO dead_letter_jobs with final count + DELETE FROM jobs
 ```
 
-The `FOR UPDATE SKIP LOCKED` clause is what makes multiple concurrent workers safe — each worker atomically claims a different row. Priority ordering is `ORDER BY priority DESC, created_at ASC` (higher priority value = runs first).
+The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. New owners use `lease:<UUID>`; old unprefixed owners retain a two-hour minimum expiry. The default heartbeat is 30 seconds and the default reclaim window is 120 seconds from the last refresh. Missing heartbeats count as failed attempts, while completion and graceful drain do not. When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent.
 
 ### Cron Flow
 
@@ -153,8 +154,8 @@ Cron jobs are regular `Job` implementations — the cron system just handles sch
 | `priority` | `INT NOT NULL` | Higher value = runs first (default 0) |
 | `run_at` | `TIMESTAMPTZ NOT NULL` | When the job becomes eligible to run |
 | `created_at` | `TIMESTAMPTZ NOT NULL` | When the job was enqueued |
-| `locked_at` | `TIMESTAMPTZ` | When a worker claimed this job |
-| `locked_by` | `TEXT` | Worker ID holding the lock |
+| `locked_at` | `TIMESTAMPTZ` | Last lease refresh (claim time for legacy workers) |
+| `locked_by` | `TEXT` | Exact ownership token (`lease:<UUID>` for new workers) |
 | `context` | `TEXT NOT NULL` | Human-readable enqueue context |
 | `error_count` | `INTEGER NOT NULL DEFAULT 0` | Number of failed attempts |
 | `last_error_message` | `TEXT` | Most recent error |
@@ -218,7 +219,7 @@ when a callback or HTTP response can run indefinitely.
 5. Tasks still running at `ShutdownBudget::deadline()` (`job_drain + exit_grace`) are aborted. Long-lived connections such as WebSockets make this routine, since they hold axum's graceful shutdown open
 6. `run()` returns `Ok` for a signal, `Err` when a task ended the process by itself
 
-The budget has to fit the platform's kill window: Cloud Run sends SIGKILL a fixed 10 seconds after SIGTERM, Fly after `kill_timeout` (5 seconds unless `fly.toml` raises it). The defaults are 2s + 2s; override with `CJA_SHUTDOWN_JOB_DRAIN_SECS` / `CJA_SHUTDOWN_EXIT_GRACE_SECS` or by constructing `ShutdownBudget` directly. Work still running when the platform kills the process keeps its job locks until the lock timeout (2 hours by default). On Cloud Run the supervisor warns at boot when the budget cannot fit.
+The budget has to fit the platform's kill window: Cloud Run sends SIGKILL a fixed 10 seconds after SIGTERM, Fly after `kill_timeout` (5 seconds unless `fly.toml` raises it). The defaults are 2s + 2s; override with `CJA_SHUTDOWN_JOB_DRAIN_SECS` / `CJA_SHUTDOWN_EXIT_GRACE_SECS` or by constructing `ShutdownBudget` directly. Work still running when the platform kills the process keeps its job locks until the reclaim window (120 seconds after the last refresh by default for new workers). On Cloud Run the supervisor warns at boot when the budget cannot fit.
 
 `NamedTask` and `wait_for_first_error` remain for apps that manage shutdown themselves. Note that a signal-handler task which simply returns ends `wait_for_first_error` without draining anything.
 
