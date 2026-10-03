@@ -61,7 +61,8 @@ async fn check_active_cron_shutdown(pool: sqlx::PgPool, fail: bool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(recorded, i64::from(!fail));
+    // The claim commits before the callback starts, including a failing callback.
+    assert_eq!(recorded, 1);
 }
 
 #[sqlx::test]

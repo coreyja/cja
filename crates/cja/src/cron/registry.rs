@@ -171,6 +171,8 @@ pub struct CronJob<AppState: AS> {
     pub schedule: Schedule,
     #[cfg(all(test, feature = "jobs"))]
     pause_after_claim: Option<std::sync::Arc<ClaimPause>>,
+    #[cfg(all(test, feature = "jobs"))]
+    pause_after_commit: Option<std::sync::Arc<CallbackPause>>,
 }
 
 #[cfg(all(test, feature = "jobs"))]
@@ -179,15 +181,21 @@ struct ClaimPause {
     release: tokio::sync::Notify,
 }
 
+#[cfg(all(test, feature = "jobs"))]
+struct CallbackPause {
+    committed: tokio::sync::mpsc::Sender<chrono::DateTime<Utc>>,
+    release: tokio::sync::Notify,
+}
+
 enum CronAction<AppState: AS> {
     Callback(Box<dyn CronFn<AppState> + Send + Sync + 'static>),
     #[cfg(feature = "jobs")]
-    Atomic(Box<dyn AtomicCronJob<AppState> + Send + Sync + 'static>),
+    Job(Box<dyn CronEnqueueJob<AppState> + Send + Sync + 'static>),
 }
 
 #[cfg(feature = "jobs")]
 #[async_trait::async_trait]
-trait AtomicCronJob<AppState: AS>: Send + Sync {
+trait CronEnqueueJob<AppState: AS>: Send + Sync {
     async fn insert(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -202,7 +210,7 @@ trait AtomicCronJob<AppState: AS>: Send + Sync {
 
 #[cfg(feature = "jobs")]
 #[async_trait::async_trait]
-impl<AppState: AS, J: Job<AppState>> AtomicCronJob<AppState> for J {
+impl<AppState: AS, J: Job<AppState>> CronEnqueueJob<AppState> for J {
     async fn insert(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -250,7 +258,7 @@ fn recoverable(error: &sqlx::Error) -> bool {
 #[cfg(feature = "jobs")]
 fn skip_recoverable(name: &str, operation: &str, error: &sqlx::Error) -> bool {
     if recoverable(error) {
-        tracing::warn!(cron.name = name, operation, sqlstate = ?error.as_database_error().and_then(sqlx::error::DatabaseError::code), cause = %error, "Atomic cron claim skipped");
+        tracing::warn!(cron.name = name, operation, sqlstate = ?error.as_database_error().and_then(sqlx::error::DatabaseError::code), cause = %error, "Cron claim skipped");
         true
     } else {
         false
@@ -283,44 +291,9 @@ impl<AppState: AS> CronJob<AppState> {
             .should_run(last_enqueue, now, worker_started_at, timezone);
 
         if should_run {
-            #[cfg(feature = "jobs")]
-            if let CronAction::Atomic(job) = &self.action {
-                return self
-                    .tick_atomic(
-                        &app_state,
-                        job.as_ref(),
-                        &context,
-                        worker_started_at,
-                        timezone,
-                    )
-                    .await;
-            }
-            tracing::info!(
-                task_name = self.name,
-                last_run = ?last_enqueue,
-                "Enqueuing Task"
-            );
-            if let CronAction::Callback(func) = &self.action {
-                func.run(app_state.clone(), context)
-                    .await
-                    .map_err(TickError::JobError)?;
-            }
-
-            sqlx::query!(
-                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (name)
-                DO UPDATE SET
-                last_run_at = $3",
-                uuid::Uuid::new_v4(),
-                self.name,
-                now,
-                now,
-                now
-            )
-            .execute(app_state.db())
-            .await
-            .map_err(TickError::SqlxError)?;
+            return self
+                .tick_claimed(&app_state, &context, worker_started_at, timezone)
+                .await;
         }
 
         Ok(())
@@ -330,18 +303,7 @@ impl<AppState: AS> CronJob<AppState> {
         match &self.action {
             CronAction::Callback(func) => func.run(app_state, context).await,
             #[cfg(feature = "jobs")]
-            CronAction::Atomic(job) => job.enqueue_direct(app_state, context).await,
-        }
-    }
-
-    pub fn is_atomic(&self) -> bool {
-        #[cfg(feature = "jobs")]
-        {
-            matches!(self.action, CronAction::Atomic(_))
-        }
-        #[cfg(not(feature = "jobs"))]
-        {
-            false
+            CronAction::Job(job) => job.enqueue_direct(app_state, context).await,
         }
     }
 
@@ -432,10 +394,9 @@ impl<AppState: AS> CronJob<AppState> {
     }
 
     #[cfg(feature = "jobs")]
-    async fn tick_atomic(
+    async fn tick_claimed(
         &self,
         app_state: &AppState,
-        job: &dyn AtomicCronJob<AppState>,
         context: &str,
         worker_started_at: chrono::DateTime<Utc>,
         timezone: Tz,
@@ -457,7 +418,54 @@ impl<AppState: AS> CronJob<AppState> {
             pause.claimed.send(pid).await.expect("claim test receiver");
             pause.release.notified().await;
         }
-        self.fire(tx, claim_time, job, context).await
+        match &self.action {
+            CronAction::Job(job) => self.fire(tx, claim_time, job.as_ref(), context).await,
+            CronAction::Callback(callback) => {
+                if !self.commit_claim(tx, claim_time).await? {
+                    return Ok(());
+                }
+                #[cfg(test)]
+                if let Some(pause) = &self.pause_after_commit {
+                    pause
+                        .committed
+                        .send(claim_time)
+                        .await
+                        .expect("callback test receiver");
+                    pause.release.notified().await;
+                }
+                callback
+                    .run(app_state.clone(), context.to_owned())
+                    .await
+                    .map_err(TickError::JobError)
+            }
+        }
+    }
+
+    #[cfg(feature = "jobs")]
+    async fn commit_claim(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        claim_time: chrono::DateTime<Utc>,
+    ) -> Result<bool, TickError> {
+        if let Err(err) =
+            sqlx::query("UPDATE crons SET last_run_at = $1, updated_at = $1 WHERE name = $2")
+                .bind(claim_time)
+                .bind(self.name)
+                .execute(&mut *tx)
+                .await
+        {
+            if skip_recoverable(self.name, "cron update", &err) {
+                return Ok(false);
+            }
+            return Err(TickError::SqlxError(err));
+        }
+        if let Err(err) = tx.commit().await {
+            if skip_recoverable(self.name, "commit", &err) {
+                return Ok(false);
+            }
+            return Err(TickError::SqlxError(err));
+        }
+        Ok(true)
     }
 
     #[cfg(feature = "jobs")]
@@ -465,7 +473,7 @@ impl<AppState: AS> CronJob<AppState> {
         &self,
         mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
         claim_time: chrono::DateTime<Utc>,
-        job: &dyn AtomicCronJob<AppState>,
+        job: &dyn CronEnqueueJob<AppState>,
         context: &str,
     ) -> Result<(), TickError> {
         let id = uuid::Uuid::new_v4();
@@ -487,25 +495,9 @@ impl<AppState: AS> CronJob<AppState> {
                     }
                 }
             }
-            if let Err(err) =
-                sqlx::query("UPDATE crons SET last_run_at = $1, updated_at = $1 WHERE name = $2")
-                    .bind(claim_time)
-                    .bind(self.name)
-                    .execute(&mut *tx)
-                    .await
-            {
-                if skip_recoverable(self.name, "cron update", &err) {
-                    return Ok(());
-                }
-                return Err(TickError::SqlxError(err));
+            if self.commit_claim(tx, claim_time).await? {
+                enqueue_receipt(id, job.name());
             }
-            if let Err(err) = tx.commit().await {
-                if skip_recoverable(self.name, "commit", &err) {
-                    return Ok(());
-                }
-                return Err(TickError::SqlxError(err));
-            }
-            enqueue_receipt(id, job.name());
             Ok(())
         }
         .instrument(span)
@@ -541,6 +533,8 @@ impl<AppState: AS> CronRegistry<AppState> {
             schedule: Schedule::Interval(IntervalSchedule(interval)),
             #[cfg(all(test, feature = "jobs"))]
             pause_after_claim: None,
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_commit: None,
         };
         self.jobs.insert(name, cron_job);
     }
@@ -567,6 +561,8 @@ impl<AppState: AS> CronRegistry<AppState> {
             schedule: Schedule::Cron(CronSchedule(Box::new(cron_schedule))),
             #[cfg(all(test, feature = "jobs"))]
             pause_after_claim: None,
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_commit: None,
         };
         self.jobs.insert(name, cron_job);
         Ok(())
@@ -580,28 +576,17 @@ impl<AppState: AS> CronRegistry<AppState> {
         description: Option<&'static str>,
         interval: Duration,
     ) {
-        self.register(J::NAME, description, interval, move |app_state, context| {
-            J::enqueue(job.clone(), app_state, context, None)
-        });
-    }
-
-    #[cfg(feature = "jobs")]
-    #[tracing::instrument(name = "cron.register_job_atomic", skip_all, fields(cron_job.name = J::NAME, cron_job.interval = ?interval))]
-    pub fn register_job_atomic<J: Job<AppState>>(
-        &mut self,
-        job: J,
-        description: Option<&'static str>,
-        interval: Duration,
-    ) {
         self.jobs.insert(
             J::NAME,
             CronJob {
                 name: J::NAME,
                 description,
-                action: CronAction::Atomic(Box::new(job)),
+                action: CronAction::Job(Box::new(job)),
                 schedule: Schedule::Interval(IntervalSchedule(interval)),
                 #[cfg(all(test, feature = "jobs"))]
                 pause_after_claim: None,
+                #[cfg(all(test, feature = "jobs"))]
+                pause_after_commit: None,
             },
         );
     }
@@ -614,12 +599,21 @@ impl<AppState: AS> CronRegistry<AppState> {
         description: Option<&'static str>,
         cron_expr: &str,
     ) -> Result<(), cron::error::Error> {
-        self.register_with_cron(
+        let schedule = cron_expr.parse::<cron::Schedule>()?;
+        self.jobs.insert(
             J::NAME,
-            description,
-            cron_expr,
-            move |app_state, context| J::enqueue(job.clone(), app_state, context, None),
-        )
+            CronJob {
+                name: J::NAME,
+                description,
+                action: CronAction::Job(Box::new(job)),
+                schedule: Schedule::Cron(CronSchedule(Box::new(schedule))),
+                #[cfg(all(test, feature = "jobs"))]
+                pause_after_claim: None,
+                #[cfg(all(test, feature = "jobs"))]
+                pause_after_commit: None,
+            },
+        );
+        Ok(())
     }
 
     #[cfg(feature = "jobs")]
@@ -798,23 +792,23 @@ mod test {
         }
     }
 
-    fn atomic_worker(db: sqlx::PgPool) -> crate::cron::Worker<TestAppState> {
+    fn job_worker(db: sqlx::PgPool) -> crate::cron::Worker<TestAppState> {
         let state = TestAppState {
             db,
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job_atomic(TestJob, None, Duration::from_millis(100));
+        registry.register_job(TestJob, None, Duration::from_millis(100));
         crate::cron::Worker::new(state, registry)
     }
 
     #[sqlx::test]
-    async fn atomic_two_pools_commit_one_enqueue_per_interval(db: sqlx::PgPool) {
+    async fn two_pools_commit_one_enqueue_per_interval(db: sqlx::PgPool) {
         let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
             .await
             .unwrap();
-        let first = atomic_worker(db.clone());
-        let second = atomic_worker(other);
+        let first = job_worker(db.clone());
+        let second = job_worker(other);
         let count = || async {
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
                 .bind(TestJob::NAME)
@@ -855,19 +849,180 @@ mod test {
                 .bind(TestJob::NAME).execute(&db).await.unwrap();
             pair().await;
             assert_eq!(count().await, expected);
+            println!("job interval {expected}: {} enqueue(s)", count().await);
             pair().await;
             assert_eq!(count().await, expected);
         }
     }
 
     #[sqlx::test]
-    async fn atomic_dropped_claim_rolls_back_and_next_tick_fires(db: sqlx::PgPool) {
+    async fn two_pools_commit_one_enqueue_per_cron_slot(db: sqlx::PgPool) {
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let make_worker = |pool| {
+            let mut registry = CronRegistry::new();
+            registry
+                .register_job_with_cron(TestJob, None, "* * * * * * *")
+                .unwrap();
+            crate::cron::Worker::new(
+                TestAppState {
+                    db: pool,
+                    cookie_key: CookieKey::generate(),
+                },
+                registry,
+            )
+        };
+        let first = make_worker(db.clone());
+        let second = make_worker(other);
+        for expected in 1..=4 {
+            // Start each pair just after a database-clock slot boundary. A pair
+            // straddling a boundary is entitled to two enqueues.
+            let db_now = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(
+                1100 - u64::from(db_now.timestamp_subsec_millis()),
+            ))
+            .await;
+            if expected > 1 {
+                sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 seconds' WHERE name = $1")
+                    .bind(TestJob::NAME).execute(&db).await.unwrap();
+            }
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let (a, b, _) = tokio::join!(
+                async {
+                    barrier.wait().await;
+                    first.tick().await
+                },
+                async {
+                    barrier.wait().await;
+                    second.tick().await
+                },
+                barrier.wait(),
+            );
+            a.unwrap();
+            b.unwrap();
+            let actual = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            println!("cron expression slot {expected}: {actual} enqueue(s)");
+        }
+    }
+
+    #[sqlx::test]
+    async fn two_pools_claim_callback_once_per_interval(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let make_worker = |pool, calls: Arc<AtomicUsize>| {
+            let mut registry = CronRegistry::new();
+            registry.register("callback", None, Duration::from_millis(100), move |_, _| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), std::io::Error>(())
+                })
+            });
+            crate::cron::Worker::new(
+                TestAppState {
+                    db: pool,
+                    cookie_key: CookieKey::generate(),
+                },
+                registry,
+            )
+        };
+        let first = make_worker(db.clone(), calls.clone());
+        let second = make_worker(other, calls.clone());
+        for expected in 1..=4 {
+            if expected > 1 {
+                sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 seconds' WHERE name = 'callback'")
+                    .execute(&db).await.unwrap();
+            }
+            let (a, b) = tokio::join!(first.tick(), second.tick());
+            a.unwrap();
+            b.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), expected);
+            println!(
+                "callback interval {expected}: {} invocation(s)",
+                calls.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn callback_aborted_after_commit_waits_for_next_interval(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = CronRegistry::new();
+        let observed = calls.clone();
+        registry.register("callback", None, Duration::from_secs(30), move |_, _| {
+            let observed = observed.clone();
+            Box::pin(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), std::io::Error>(())
+            })
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let pause = Arc::new(CallbackPause {
+            committed: sender,
+            release: tokio::sync::Notify::new(),
+        });
+        registry
+            .jobs
+            .get_mut("callback")
+            .unwrap()
+            .pause_after_commit = Some(pause.clone());
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let worker = crate::cron::Worker::new(state.clone(), registry);
+        let task = tokio::spawn(async move { worker.tick().await });
+        let claim_time = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stored = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "SELECT last_run_at FROM crons WHERE name = 'callback'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(stored, claim_time);
+        sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '31 seconds' WHERE name = 'callback'")
+            .execute(&db).await.unwrap();
+        let remaining = calls.clone();
+        let mut retry = CronRegistry::new();
+        retry.register("callback", None, Duration::from_secs(30), move |_, _| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), std::io::Error>(())
+            })
+        });
+        crate::cron::Worker::new(state, retry).tick().await.unwrap();
+        assert_eq!(remaining.load(Ordering::SeqCst), 1);
+        println!("aborted callback: first interval skipped; next interval invoked once");
+    }
+
+    #[sqlx::test]
+    async fn dropped_claim_rolls_back_and_next_tick_fires(db: sqlx::PgPool) {
         let state = TestAppState {
             db: db.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job_atomic(TestJob, None, Duration::from_secs(864));
+        registry.register_job(TestJob, None, Duration::from_secs(864));
         let cron = registry.get(TestJob::NAME).unwrap();
         let (claim, _) = cron
             .claim_due(&state, Utc::now(), chrono_tz::UTC)
@@ -894,7 +1049,7 @@ mod test {
         sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '866 seconds' WHERE name = $1")
             .bind(TestJob::NAME).execute(&db).await.unwrap();
         let mut registry = CronRegistry::new();
-        registry.register_job_atomic(TestJob, None, Duration::from_secs(864));
+        registry.register_job(TestJob, None, Duration::from_secs(864));
         let cron = registry.get(TestJob::NAME).unwrap();
         let (claim, _) = cron
             .claim_due(&state, Utc::now(), chrono_tz::UTC)
@@ -916,13 +1071,13 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn atomic_864_second_cadence_and_database_stamp(db: sqlx::PgPool) {
+    async fn cadence_864_seconds_and_database_stamp(db: sqlx::PgPool) {
         let state = TestAppState {
             db: db.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job_atomic(TestJob, None, Duration::from_secs(864));
+        registry.register_job(TestJob, None, Duration::from_secs(864));
         let worker = crate::cron::Worker::new(state, registry);
         worker.tick().await.unwrap();
         sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '862 seconds' WHERE name = $1")
@@ -964,14 +1119,14 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn atomic_locked_cron_does_not_block_other_crons(db: sqlx::PgPool) {
+    async fn locked_cron_does_not_block_other_crons(db: sqlx::PgPool) {
         let state = TestAppState {
             db: db.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job_atomic(TestJob, None, Duration::from_secs(30));
-        registry.register_job_atomic(SecondTestJob, None, Duration::from_secs(30));
+        registry.register_job(TestJob, None, Duration::from_secs(30));
+        registry.register_job(SecondTestJob, None, Duration::from_secs(30));
         let worker = crate::cron::Worker::new(state, registry);
         sqlx::query("INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at) VALUES ($1, $2, clock_timestamp() - interval '60 seconds', clock_timestamp(), clock_timestamp())")
             .bind(uuid::Uuid::new_v4()).bind(TestJob::NAME).execute(&db).await.unwrap();
@@ -1014,11 +1169,11 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn atomic_uncommitted_first_row_is_bounded_and_retried(db: sqlx::PgPool) {
+    async fn uncommitted_first_row_is_bounded_and_retried(db: sqlx::PgPool) {
         let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
             .await
             .unwrap();
-        let worker = atomic_worker(other);
+        let worker = job_worker(other);
         let mut blocker = db.begin().await.unwrap();
         sqlx::query("INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at) VALUES ($1, $2, clock_timestamp(), clock_timestamp(), clock_timestamp())")
             .bind(uuid::Uuid::new_v4()).bind(TestJob::NAME).execute(&mut *blocker).await.unwrap();
@@ -1045,7 +1200,7 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn atomic_terminated_claimer_rolls_back_and_retries(db: sqlx::PgPool) {
+    async fn terminated_claimer_rolls_back_and_retries(db: sqlx::PgPool) {
         let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
             .await
             .unwrap();
@@ -1054,7 +1209,7 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job_atomic(TestJob, None, Duration::from_mins(1));
+        registry.register_job(TestJob, None, Duration::from_mins(1));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let pause = std::sync::Arc::new(ClaimPause {
             claimed: sender,
@@ -1099,7 +1254,7 @@ mod test {
             0
         );
         let mut retry_registry = CronRegistry::new();
-        retry_registry.register_job_atomic(TestJob, None, Duration::from_mins(1));
+        retry_registry.register_job(TestJob, None, Duration::from_mins(1));
         crate::cron::Worker::new(state, retry_registry)
             .tick()
             .await
@@ -1114,13 +1269,13 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn atomic_statement_timeout_is_recoverable(db: sqlx::PgPool) {
+    async fn statement_timeout_is_recoverable(db: sqlx::PgPool) {
         let state = TestAppState {
             db,
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job_atomic(TestJob, None, Duration::from_mins(1));
+        registry.register_job(TestJob, None, Duration::from_mins(1));
         let cron = registry.get(TestJob::NAME).unwrap();
         let (mut tx, _) = cron
             .claim_due(&state, Utc::now(), chrono_tz::UTC)
@@ -1143,7 +1298,7 @@ mod test {
     }
 
     #[test]
-    fn atomic_termination_sqlstates_are_recoverable() {
+    fn termination_sqlstates_are_recoverable() {
         for code in ["55P03", "57014", "25P03", "57P01", "08006", "08003"] {
             assert!(recoverable_sqlstate(code), "{code}");
         }
@@ -1153,14 +1308,14 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn atomic_enqueue_receipt_follows_commit_and_has_parent_span(db: sqlx::PgPool) {
+    async fn enqueue_receipt_follows_commit_and_has_parent_span(db: sqlx::PgPool) {
         let lines = trace_capture();
         let state = TestAppState {
             db: db.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job_atomic(TelemetryJob, None, Duration::from_mins(1));
+        registry.register_job(TelemetryJob, None, Duration::from_mins(1));
         let worker = crate::cron::Worker::new(state.clone(), registry);
         worker.tick().await.unwrap();
         let captured = lines.lock().unwrap().clone();
@@ -1448,7 +1603,7 @@ mod test {
         .fetch_one(&app_state.db)
         .await
         .unwrap();
-        assert_eq!(cron_count.count.unwrap(), 0);
+        assert_eq!(cron_count.count.unwrap(), 1);
     }
 
     #[sqlx::test]
