@@ -522,7 +522,7 @@ async fn test_max_retries_exceeded_moves_to_dead_letter_queue() {
     .bind(&payload)
     .bind("test-context")
     .bind(0)
-    .bind(max_retries)
+    .bind(max_retries + 1)
     .bind(error_message)
     .execute(&mut *tx)
     .await
@@ -561,7 +561,7 @@ async fn test_max_retries_exceeded_moves_to_dead_letter_queue() {
     assert_eq!(dlq_row.get::<String, _>("name"), "TestJob");
     assert_eq!(dlq_row.get::<String, _>("context"), "test-context");
     assert_eq!(dlq_row.get::<i32, _>("priority"), 0);
-    assert_eq!(dlq_row.get::<i32, _>("error_count"), max_retries);
+    assert_eq!(dlq_row.get::<i32, _>("error_count"), max_retries + 1);
     assert_eq!(
         dlq_row.get::<Option<String>, _>("last_error_message"),
         Some(error_message.to_string())

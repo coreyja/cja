@@ -1,5 +1,6 @@
-use std::time::Duration;
+use std::{any::Any, time::Duration};
 
+use futures::FutureExt;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::Span;
@@ -16,12 +17,67 @@ use super::registry::JobRegistry;
 /// - Total retry window of ~12 days
 pub const DEFAULT_MAX_RETRIES: i32 = 20;
 
-/// Default lock timeout duration (2 hours).
-///
-/// Jobs locked for longer than this duration will be considered abandoned and
-/// made available for other workers to pick up. This handles cases where a worker
-/// crashes or becomes unresponsive while processing a job.
-pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_hours(2);
+/// Default heartbeat interval for an active job.
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Default reclaim window after the last successful heartbeat.
+pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_mins(2);
+const DEFAULT_LEGACY_LOCK_TIMEOUT: Duration = Duration::from_hours(2);
+
+/// Timing for active job leases. The reclaim window must be at least three
+/// heartbeat intervals; a larger window allows more transient DB failures.
+#[derive(Clone, Copy, Debug)]
+pub struct JobLeaseConfig {
+    pub heartbeat_interval: Duration,
+    pub reclaim_window: Duration,
+}
+
+impl Default for JobLeaseConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            reclaim_window: DEFAULT_LOCK_TIMEOUT,
+        }
+    }
+}
+
+impl JobLeaseConfig {
+    fn from_lock_timeout(lock_timeout: Duration) -> Self {
+        let reclaim_window = lock_timeout.max(Duration::from_millis(4));
+        let heartbeat_interval = (reclaim_window / 4)
+            .min(DEFAULT_HEARTBEAT_INTERVAL)
+            .max(Duration::from_millis(1));
+        Self {
+            heartbeat_interval,
+            reclaim_window,
+        }
+    }
+
+    fn validate(self) -> color_eyre::Result<(i64, i64)> {
+        use color_eyre::eyre::eyre;
+        if self.heartbeat_interval.is_zero() {
+            return Err(eyre!("heartbeat interval must be positive"));
+        }
+        if self
+            .heartbeat_interval
+            .checked_mul(3)
+            .is_none_or(|minimum| self.reclaim_window < minimum)
+        {
+            return Err(eyre!(
+                "reclaim window must be at least three heartbeat intervals"
+            ));
+        }
+        let heartbeat = i64::try_from(self.heartbeat_interval.as_micros())
+            .map_err(|_| eyre!("heartbeat interval exceeds PostgreSQL microsecond range"))?;
+        let window = i64::try_from(self.reclaim_window.as_micros())
+            .map_err(|_| eyre!("reclaim window exceeds PostgreSQL microsecond range"))?;
+        if heartbeat == 0 || window == 0 || self.heartbeat_interval / 3 == Duration::ZERO {
+            return Err(eyre!(
+                "heartbeat interval must allow a positive query timeout"
+            ));
+        }
+        Ok((heartbeat, window))
+    }
+}
 
 /// Initial backoff duration after a worker tick fails (e.g. the database was
 /// unreachable while trying to claim a job). Doubles on each consecutive
@@ -36,6 +92,29 @@ pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
 #[derive(Debug)]
 pub(super) struct RunJobSuccess(JobFromDB);
+
+enum RunJobOutcome {
+    Completed(RunJobResult),
+    LeaseLost(uuid::Uuid),
+}
+
+struct ClaimedJob {
+    job: JobFromDB,
+    claim_sent_at: tokio::time::Instant,
+    previous_locked_by: Option<String>,
+    previous_error_count: i32,
+}
+
+struct LeaseTracker {
+    last_refresh_sent: tokio::time::Instant,
+    lease: JobLeaseConfig,
+}
+
+impl LeaseTracker {
+    fn deadline(&self) -> tokio::time::Instant {
+        self.last_refresh_sent + self.lease.reclaim_window - self.lease.heartbeat_interval / 2
+    }
+}
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct JobFromDB {
@@ -57,12 +136,15 @@ pub(crate) struct JobError(JobFromDB, color_eyre::Report);
 
 struct Worker<AppState: AS, R: JobRegistry<AppState>> {
     id: uuid::Uuid,
+    owner_token: String,
     state: AppState,
     registry: R,
     sleep_duration: Duration,
     max_retries: i32,
     cancellation_token: CancellationToken,
-    lock_timeout: Duration,
+    lease: JobLeaseConfig,
+    #[cfg(test)]
+    fail_heartbeats: std::sync::atomic::AtomicU32,
 }
 
 impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
@@ -72,179 +154,272 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         sleep_duration: Duration,
         max_retries: i32,
         cancellation_token: CancellationToken,
-        lock_timeout: Duration,
+        lease: JobLeaseConfig,
     ) -> Self {
+        let id = uuid::Uuid::new_v4();
         Self {
-            id: uuid::Uuid::new_v4(),
+            id,
+            owner_token: format!("lease:{id}"),
             state,
             registry,
             sleep_duration,
             max_retries,
             cancellation_token,
-            lock_timeout,
+            lease,
+            #[cfg(test)]
+            fail_heartbeats: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
     #[tracing::instrument(
         name = "worker.run_job",
         skip(self, job),
-        fields(
-            job.id = %job.job_id,
-            job.name = job.name,
-            job.priority = job.priority,
-            job.run_at = %job.run_at,
-            job.created_at = %job.created_at,
-            job.context = job.context,
-            job.error_count = job.error_count,
-            worker.id = %self.id,
-        )
+        fields(job.id = %job.job_id, job.name = job.name, worker.id = %self.id),
         err,
     )]
     async fn run_job(&self, job: &JobFromDB) -> color_eyre::Result<()> {
-        self.registry
-            .run_job(job, self.state.clone(), self.cancellation_token.clone())
-            .await
+        let result = std::panic::AssertUnwindSafe(self.registry.run_job(
+            job,
+            self.state.clone(),
+            self.cancellation_token.clone(),
+        ))
+        .catch_unwind()
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(payload) => Err(color_eyre::eyre::eyre!(
+                "Job panicked: {}",
+                panic_message(payload.as_ref())
+            )),
+        }
     }
 
-    pub(crate) async fn run_next_job(&self, job: JobFromDB) -> color_eyre::Result<RunJobResult> {
-        let job_result = self.run_job(&job).await;
+    async fn run_next_job(&self, claimed: ClaimedJob) -> color_eyre::Result<RunJobOutcome> {
+        let job = claimed.job;
+        let mut tracker = LeaseTracker {
+            last_refresh_sent: claimed.claim_sent_at,
+            lease: self.lease,
+        };
+        if tokio::time::Instant::now() >= tracker.deadline() {
+            tracing::warn!(job_id = %job.job_id, "Claim response exceeded lease deadline");
+            return Ok(RunJobOutcome::LeaseLost(job.job_id));
+        }
 
-        if let Err(e) = job_result {
-            // Extract error message from color_eyre::Report
-            let error_message = format!("{e}");
-
-            // Check if job has exceeded max retries
+        let job_result = {
+            let mut body = std::pin::pin!(self.run_job(&job));
+            let mut next_tick = claimed.claim_sent_at + self.lease.heartbeat_interval;
+            loop {
+                let deadline = tracker.deadline();
+                tokio::select! {
+                    biased;
+                    result = &mut body => break result,
+                    () = tokio::time::sleep_until(deadline) => {
+                        tracing::warn!(job_id = %job.job_id, "Job lease watchdog expired");
+                        return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                    }
+                    () = tokio::time::sleep_until(next_tick) => {
+                        let sent_at = tokio::time::Instant::now();
+                        next_tick = sent_at + self.lease.heartbeat_interval;
+                        #[cfg(test)]
+                        if self.fail_heartbeats.fetch_update(
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                            |n| n.checked_sub(1),
+                        ).is_ok() {
+                            tracing::warn!(job_id = %job.job_id, "Synthetic heartbeat failure");
+                            continue;
+                        }
+                        let update = sqlx::query(
+                            "UPDATE jobs SET locked_at = NOW() WHERE job_id = $1 AND locked_by = $2"
+                        )
+                        .bind(job.job_id)
+                        .bind(&self.owner_token)
+                        .execute(self.state.db());
+                        match tokio::time::timeout(self.lease.heartbeat_interval / 3, update).await {
+                            Ok(Ok(result)) if result.rows_affected() == 1 => {
+                                tracker.last_refresh_sent = sent_at;
+                            }
+                            Ok(Ok(_)) => {
+                                tracing::warn!(job_id = %job.job_id, owner = %self.owner_token, "Job lease ownership lost");
+                                return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                            }
+                            Ok(Err(error)) => tracing::warn!(job_id = %job.job_id, %error, "Job heartbeat failed"),
+                            Err(_) => tracing::warn!(job_id = %job.job_id, "Job heartbeat timed out"),
+                        }
+                    }
+                }
+            }
+        };
+        // The body and all heartbeat futures have ended before finalization.
+        if let Err(error) = job_result {
+            let error_message = format!("{error:#}");
             if job.error_count >= self.max_retries {
-                // Move job to dead letter queue
-                tracing::error!(
-                    worker.id = %self.id,
-                    job_id = %job.job_id,
-                    error_count = job.error_count,
-                    max_retries = self.max_retries,
-                    "Job permanently failed - moved to dead letter queue"
-                );
-
-                let mut tx = self.state.db().begin().await?;
-
-                sqlx::query(
-                    "INSERT INTO dead_letter_jobs (original_job_id, name, payload, context, priority, error_count, last_error_message, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                let count = job
+                    .error_count
+                    .checked_add(1)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("job error_count overflow"))?;
+                if !self.dead_letter_owned(&job, count, &error_message).await? {
+                    return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                }
+            } else {
+                let result = sqlx::query(
+                    "UPDATE jobs SET locked_by = NULL, locked_at = NULL,
+                     error_count = error_count + 1, last_error_message = $3,
+                     last_failed_at = NOW(),
+                     run_at = NOW() + POWER(2, error_count + 1) * interval '1 second'
+                     WHERE job_id = $1 AND locked_by = $2 AND error_count < 2147483647",
                 )
                 .bind(job.job_id)
-                .bind(&job.name)
-                .bind(&job.payload)
-                .bind(&job.context)
-                .bind(job.priority)
-                .bind(job.error_count)
+                .bind(&self.owner_token)
                 .bind(&error_message)
-                .bind(job.created_at)
-                .execute(&mut *tx)
+                .execute(self.state.db())
                 .await?;
-
-                sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
-                    .bind(job.job_id)
-                    .bind(self.id.to_string())
-                    .execute(&mut *tx)
-                    .await?;
-
-                tx.commit().await?;
-
-                return Ok(Err(JobError(job, e)));
+                if result.rows_affected() != 1 {
+                    tracing::warn!(job_id = %job.job_id, "Job failure finalization lost ownership");
+                    return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                }
             }
+            return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
+        }
 
-            // Job is under max retries - requeue with exponential backoff
-            tracing::warn!(
-                worker.id = %self.id,
-                job_id = %job.job_id,
-                error_count = job.error_count,
-                retry_attempt = job.error_count + 1,
-                "Job failed, retry #{}",
-                job.error_count + 1
-            );
-
-            sqlx::query(
-                "
-                UPDATE jobs
-                SET locked_by = NULL,
-                    locked_at = NULL,
-                    error_count = error_count + 1,
-                    last_error_message = $3,
-                    last_failed_at = NOW(),
-                    run_at = NOW() + (POWER(2, error_count + 1)) * interval '1 second'
-                WHERE job_id = $1 AND locked_by = $2
-                ",
-            )
+        let result = sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
             .bind(job.job_id)
-            .bind(self.id.to_string())
-            .bind(error_message)
+            .bind(&self.owner_token)
             .execute(self.state.db())
             .await?;
-
-            return Ok(Err(JobError(job, e)));
+        if result.rows_affected() != 1 {
+            tracing::warn!(job_id = %job.job_id, "Job completion lost ownership");
+            return Ok(RunJobOutcome::LeaseLost(job.job_id));
         }
-
-        sqlx::query(
-            "
-                DELETE FROM jobs
-                WHERE job_id = $1 AND locked_by = $2
-                ",
-        )
-        .bind(job.job_id)
-        .bind(self.id.to_string())
-        .execute(self.state.db())
-        .await?;
-
-        Ok(Ok(RunJobSuccess(job)))
+        Ok(RunJobOutcome::Completed(Ok(RunJobSuccess(job))))
     }
 
-    #[tracing::instrument(
-        name = "worker.fetch_next_job",
-        level = "trace",
-        skip(self),
-        fields(
-            worker.id = %self.id,
-            job.id,
-            job.name,
-            lock_timeout_secs = self.lock_timeout.as_secs(),
-        ),
-        err,
-    )]
-    #[allow(clippy::cast_possible_wrap)]
-    async fn fetch_next_job(&self) -> color_eyre::Result<Option<JobFromDB>> {
-        // Cast is safe: lock timeouts are typically hours, not approaching i64::MAX seconds
-        let lock_timeout_secs = self.lock_timeout.as_secs() as i64;
+    async fn dead_letter_owned(
+        &self,
+        job: &JobFromDB,
+        count: i32,
+        message: &str,
+    ) -> color_eyre::Result<bool> {
+        let mut tx = self.state.db().begin().await?;
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = $1 AND locked_by = $2 FOR UPDATE)",
+        )
+        .bind(job.job_id)
+        .bind(&self.owner_token)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !owned {
+            tracing::warn!(job_id = %job.job_id, "Dead-letter finalization lost ownership");
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO dead_letter_jobs (original_job_id, name, payload, context, priority,
+              error_count, last_error_message, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(job.job_id)
+        .bind(&job.name)
+        .bind(&job.payload)
+        .bind(&job.context)
+        .bind(job.priority)
+        .bind(count)
+        .bind(message)
+        .bind(job.created_at)
+        .execute(&mut *tx)
+        .await?;
+        let deleted = sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
+            .bind(job.job_id)
+            .bind(&self.owner_token)
+            .execute(&mut *tx)
+            .await?;
+        if deleted.rows_affected() != 1 {
+            return Err(color_eyre::eyre::eyre!(
+                "owned dead-letter delete affected no rows"
+            ));
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
 
-        let job = sqlx::query_as::<_, JobFromDB>(
-            "
-            UPDATE jobs
-            SET LOCKED_BY = $1, LOCKED_AT = NOW()
-            WHERE job_id = (
-                SELECT job_id
+    #[tracing::instrument(name = "worker.fetch_next_job", level = "trace", skip(self), err)]
+    async fn fetch_next_job(&self) -> color_eyre::Result<Option<ClaimedJob>> {
+        use sqlx::Row;
+        let (_, window) = self.lease.validate()?;
+        let legacy_window = window.max(i64::try_from(DEFAULT_LEGACY_LOCK_TIMEOUT.as_micros())?);
+        let claim_sent_at = tokio::time::Instant::now();
+        let row = sqlx::query(
+            "WITH candidate AS MATERIALIZED (
+                SELECT job_id, locked_by AS previous_locked_by,
+                       error_count AS previous_error_count
                 FROM jobs
                 WHERE run_at <= NOW()
-                  AND (
-                    locked_by IS NULL
-                    OR locked_at < NOW() - ($2 || ' seconds')::interval
-                  )
+                  AND (locked_by IS NULL
+                    OR (locked_by LIKE 'lease:%' AND locked_at < NOW() - $2::bigint * interval '1 microsecond')
+                    OR (locked_by NOT LIKE 'lease:%' AND locked_at < NOW() - $3::bigint * interval '1 microsecond'))
+                  AND (locked_by IS NULL OR error_count < 2147483647)
                 ORDER BY priority DESC, run_at ASC, created_at ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING job_id, name, payload, priority, run_at, created_at, context, error_count, last_error_message, last_failed_at
-            ",
+                LIMIT 1 FOR UPDATE SKIP LOCKED
+             ), updated AS (
+                UPDATE jobs AS j
+                SET locked_by = $1, locked_at = NOW(),
+                    error_count = j.error_count + CASE WHEN c.previous_locked_by IS NULL THEN 0 ELSE 1 END,
+                    last_error_message = CASE WHEN c.previous_locked_by IS NULL THEN j.last_error_message
+                      ELSE 'Job lease expired (previous worker: ' || c.previous_locked_by || ')' END,
+                    last_failed_at = CASE WHEN c.previous_locked_by IS NULL THEN j.last_failed_at ELSE NOW() END
+                FROM candidate AS c WHERE j.job_id = c.job_id
+                RETURNING j.job_id, j.name, j.payload, j.priority, j.run_at, j.created_at,
+                          j.context, j.error_count, j.last_error_message, j.last_failed_at
+             )
+             SELECT u.*, c.previous_locked_by, c.previous_error_count FROM updated u
+             JOIN candidate c ON u.job_id = c.job_id"
         )
-        .bind(self.id.to_string())
-        .bind(lock_timeout_secs.to_string())
+        .bind(&self.owner_token)
+        .bind(window)
+        .bind(legacy_window)
         .fetch_optional(self.state.db())
         .await?;
-
-        if let Some(job) = &job {
-            let span = Span::current();
-            span.record("job.id", job.job_id.to_string());
-            span.record("job.name", &job.name);
+        let Some(row) = row else { return Ok(None) };
+        let claimed = ClaimedJob {
+            job: JobFromDB {
+                job_id: row.try_get("job_id")?,
+                name: row.try_get("name")?,
+                payload: row.try_get("payload")?,
+                priority: row.try_get("priority")?,
+                run_at: row.try_get("run_at")?,
+                created_at: row.try_get("created_at")?,
+                context: row.try_get("context")?,
+                error_count: row.try_get("error_count")?,
+                last_error_message: row.try_get("last_error_message")?,
+                last_failed_at: row.try_get("last_failed_at")?,
+            },
+            claim_sent_at,
+            previous_locked_by: row.try_get("previous_locked_by")?,
+            previous_error_count: row.try_get("previous_error_count")?,
+        };
+        let span = Span::current();
+        span.record("job.id", claimed.job.job_id.to_string());
+        if claimed.previous_locked_by.is_some() && claimed.previous_error_count >= self.max_retries
+        {
+            let message = claimed
+                .job
+                .last_error_message
+                .as_deref()
+                .unwrap_or("Job lease expired");
+            self.dead_letter_owned(&claimed.job, claimed.job.error_count, message)
+                .await?;
+            return Ok(None);
         }
+        Ok(Some(claimed))
+    }
+}
 
-        Ok(job)
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else {
+        "non-string payload"
     }
 }
 
@@ -298,7 +473,7 @@ async fn verify_jobs_schema(db: &sqlx::PgPool) -> color_eyre::Result<()> {
 /// Release database locks held by a worker.
 ///
 /// This should be called during graceful shutdown to immediately release any job locks
-/// held by this worker, rather than waiting for the 2-hour lock timeout.
+/// held by this worker, rather than waiting for lease expiry.
 async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
     worker: &Worker<AppState, R>,
 ) -> color_eyre::Result<()> {
@@ -309,7 +484,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
          SET locked_by = NULL, locked_at = NULL
          WHERE locked_by = $1",
     )
-    .bind(worker.id.to_string())
+    .bind(&worker.owner_token)
     .execute(worker.state.db())
     .await?;
 
@@ -336,7 +511,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// * `shutdown_token` - Cancellation token for graceful shutdown. When cancelled, the worker
 ///   will stop accepting new jobs and release database locks before exiting.
 /// * `lock_timeout` - How long a job can be locked before it's considered abandoned and
-///   becomes available for other workers (default: 2 hours)
+///   becomes available for other workers (default: 120 seconds)
 ///
 /// # Retry Behavior
 ///
@@ -390,7 +565,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// let shutdown_token = CancellationToken::new();
 /// let worker_token = shutdown_token.clone();
 ///
-/// // Start worker with graceful shutdown support and lock timeout
+/// // Start worker with graceful shutdown support and a reclaim window
 /// tokio::spawn(async move {
 ///     cja::jobs::worker::job_worker(
 ///         app_state,
@@ -398,7 +573,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 ///         Duration::from_secs(60),      // poll every 60s when idle
 ///         20,                            // max 20 retries
 ///         worker_token,                  // for graceful shutdown
-///         Duration::from_secs(2 * 3600), // 2 hour lock timeout
+///         cja::jobs::DEFAULT_LOCK_TIMEOUT, // 120 second reclaim window
 ///     ).await.unwrap();
 /// });
 ///
@@ -442,13 +617,40 @@ pub async fn job_worker_with_shutdown_drain<AppState: AS>(
     lock_timeout: Duration,
     shutdown_drain_timeout: Duration,
 ) -> color_eyre::Result<()> {
+    job_worker_configured(
+        app_state,
+        registry,
+        sleep_duration,
+        max_retries,
+        shutdown_token,
+        JobLeaseConfig::from_lock_timeout(lock_timeout),
+        shutdown_drain_timeout,
+    )
+    .await
+}
+
+/// Run a job worker with explicit heartbeat and reclaim timings.
+#[allow(clippy::too_many_arguments)]
+pub async fn job_worker_configured<AppState: AS>(
+    app_state: AppState,
+    registry: impl JobRegistry<AppState>,
+    sleep_duration: Duration,
+    max_retries: i32,
+    shutdown_token: CancellationToken,
+    lease: JobLeaseConfig,
+    shutdown_drain_timeout: Duration,
+) -> color_eyre::Result<()> {
+    lease.validate()?;
+    if max_retries < 0 {
+        return Err(color_eyre::eyre::eyre!("max_retries must be nonnegative"));
+    }
     let worker = Worker::new(
         app_state,
         registry,
         sleep_duration,
         max_retries,
         shutdown_token.clone(),
-        lock_timeout,
+        lease,
     );
 
     verify_jobs_schema(worker.state.db()).await?;
@@ -482,12 +684,16 @@ pub async fn job_worker_with_shutdown_drain<AppState: AS>(
                 // kill the worker, which would take down apps that join on
                 // all worker tasks.
                 match run_result {
-                    Ok(Ok(RunJobSuccess(job))) => {
+                    Ok(RunJobOutcome::Completed(Ok(RunJobSuccess(job)))) => {
                         tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
                         Ok(())
                     }
-                    Ok(Err(job_error)) => {
+                    Ok(RunJobOutcome::Completed(Err(job_error))) => {
                         tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+                        Ok(())
+                    }
+                    Ok(RunJobOutcome::LeaseLost(job_id)) => {
+                        tracing::warn!(worker.id = %worker.id, %job_id, "Job lease lost; body stopped");
                         Ok(())
                     }
                     Err(error) => Err(error),
@@ -576,6 +782,54 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct PanicJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for PanicJob {
+        const NAME: &'static str = "PanicJob";
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+            panic!("fixture panic payload");
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct NormalProbeJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for NormalProbeJob {
+        const NAME: &'static str = "NormalProbeJob";
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            sqlx::query("INSERT INTO job_probe (marker) VALUES ('ran')")
+                .execute(app_state.db())
+                .await?;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct LongJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for LongJob {
+        const NAME: &'static str = "LongJob";
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        }
+    }
+
     /// A job that treats shutdown as work to finish: on cancellation it
     /// performs a durable database write, THEN returns Ok. Used to prove the
     /// bounded drain lets a cooperative job complete its cleanup instead of
@@ -628,7 +882,39 @@ mod tests {
         }
     }
 
-    impl_job_registry!(TestAppState, TestJob, DrainCooperativeJob, DrainStubbornJob);
+    impl_job_registry!(
+        TestAppState,
+        TestJob,
+        PanicJob,
+        NormalProbeJob,
+        LongJob,
+        DrainCooperativeJob,
+        DrainStubbornJob
+    );
+
+    fn test_state(db: sqlx::PgPool) -> TestAppState {
+        TestAppState {
+            db,
+            cookie_key: CookieKey::generate(),
+        }
+    }
+
+    async fn wait_for<T, F, Fut>(mut check: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(value) = check().await {
+                    return value;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("expected durable job state within 10 seconds")
+    }
 
     /// Wait until the job body is executing. Cancelling as soon as the row is
     /// locked races the worker: the claim can be committed while the worker is
@@ -666,6 +952,106 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("job {name} was never claimed by the worker");
+    }
+
+    #[sqlx::test]
+    async fn test_panicking_job_is_charged_and_worker_continues(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        PanicJob
+            .enqueue(state.clone(), "panic".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker_configured(
+            state.clone(),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobLeaseConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+            },
+            Duration::ZERO,
+        ));
+        wait_for(|| async {
+            let row: Option<(i32, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT error_count, locked_by, last_error_message FROM jobs WHERE name = 'PanicJob'"
+            ).fetch_optional(&db).await.unwrap();
+            row.filter(|(count, owner, message)| *count == 1 && owner.is_none() && message.as_deref().is_some_and(|m| m.contains("fixture panic payload")))
+        }).await;
+        assert!(
+            !handle.is_finished(),
+            "handler panic must not stop the worker"
+        );
+        NormalProbeJob
+            .enqueue(state, "normal".into(), None)
+            .await
+            .unwrap();
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_probe")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[sqlx::test]
+    async fn test_panics_dead_letter_with_final_count(db: sqlx::PgPool) {
+        for max_retries in [0, 1] {
+            let state = test_state(db.clone());
+            PanicJob
+                .enqueue(state.clone(), "terminal panic".into(), None)
+                .await
+                .unwrap();
+            let id: uuid::Uuid =
+                sqlx::query_scalar("SELECT job_id FROM jobs WHERE name = 'PanicJob'")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            let token = CancellationToken::new();
+            let handle = tokio::spawn(job_worker_configured(
+                state,
+                Jobs,
+                Duration::from_millis(20),
+                max_retries,
+                token.clone(),
+                JobLeaseConfig {
+                    heartbeat_interval: Duration::from_millis(300),
+                    reclaim_window: Duration::from_millis(1200),
+                },
+                Duration::ZERO,
+            ));
+            let count: i32 = wait_for(|| async {
+                sqlx::query_scalar::<_, i32>(
+                    "SELECT error_count FROM dead_letter_jobs WHERE original_job_id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&db)
+                .await
+                .unwrap()
+            })
+            .await;
+            assert_eq!(count, max_retries + 1);
+            let message: String = sqlx::query_scalar(
+                "SELECT last_error_message FROM dead_letter_jobs WHERE original_job_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert!(message.contains("fixture panic payload"));
+            token.cancel();
+            handle.await.unwrap().unwrap();
+        }
     }
 
     /// A cancellation-aware job must be allowed to finish its durable cleanup
@@ -845,6 +1231,17 @@ mod tests {
             locked_by.is_none(),
             "dropped job's lock must be released by cleanup_worker_locks"
         );
+        let count: i32 = sqlx::query_scalar("SELECT error_count FROM jobs WHERE name = $1")
+            .bind(DrainStubbornJob::NAME)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "graceful drain does not charge a failed attempt");
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0);
     }
 
     /// The default `job_worker` entry point keeps its historical behavior:
@@ -900,6 +1297,17 @@ mod tests {
             locked_by.is_none(),
             "lock must be released on immediate cancel"
         );
+        let count: i32 = sqlx::query_scalar("SELECT error_count FROM jobs WHERE name = $1")
+            .bind(DrainStubbornJob::NAME)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0);
     }
 
     /// Test that `fetch_next_job` picks up a job with a stale lock (lock older than timeout)
@@ -911,7 +1319,7 @@ mod tests {
         };
 
         let job_id = uuid::Uuid::new_v4();
-        let stale_worker_id = "crashed-worker";
+        let stale_worker_id = "lease:crashed-worker";
 
         // Insert a job locked 120 seconds ago
         sqlx::query(
@@ -936,13 +1344,287 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_mins(1), // 60 second timeout
+            JobLeaseConfig::from_lock_timeout(Duration::from_mins(1)), // 60 second timeout
         );
 
         // fetch_next_job should pick up the stale locked job
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_some());
-        assert_eq!(fetched.unwrap().job_id, job_id);
+        let claimed = fetched.unwrap();
+        assert_eq!(claimed.job.job_id, job_id);
+        assert_eq!(claimed.job.error_count, 1);
+        assert!(
+            claimed
+                .job
+                .last_error_message
+                .unwrap()
+                .contains(stale_worker_id)
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_terminal_expired_lease_dead_letters_without_dispatch(db: sqlx::PgPool) {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context,
+               error_count, locked_by, locked_at)
+             VALUES ($1, 'PanicJob', '{}', 0, NOW(), NOW(), 'never-dispatched', 1,
+               'lease:dead-worker', NOW() - interval '5 seconds')",
+        )
+        .bind(job_id)
+        .execute(&db)
+        .await
+        .unwrap();
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            1,
+            CancellationToken::new(),
+            JobLeaseConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+            },
+        );
+        assert!(worker.fetch_next_job().await.unwrap().is_none());
+        let row: (i32, String) = sqlx::query_as(
+            "SELECT error_count, last_error_message FROM dead_letter_jobs WHERE original_job_id = $1"
+        ).bind(job_id).fetch_one(&db).await.unwrap();
+        assert_eq!(row.0, 2);
+        assert!(row.1.contains("lease:dead-worker"));
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_legacy_and_fresh_leases_are_not_reclaimed_early(db: sqlx::PgPool) {
+        for (owner, age) in [("lease:alive", "1 second"), ("old-worker", "10 minutes")] {
+            sqlx::query(
+                "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context,
+                   locked_by, locked_at) VALUES ($1, 'TestJob', '{}', 0, NOW(), NOW(), 'locked',
+                   $2, NOW() - $3::interval)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(owner)
+            .bind(age)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobLeaseConfig::default(),
+        );
+        assert!(worker.fetch_next_job().await.unwrap().is_none());
+        sqlx::query(
+            "UPDATE jobs SET locked_at = NOW() - interval '3 hours' WHERE locked_by = 'old-worker'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        assert_eq!(claimed.previous_locked_by.as_deref(), Some("old-worker"));
+        assert_eq!(claimed.job.error_count, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_live_job_heartbeat_survives_two_failed_ticks(db: sqlx::PgPool) {
+        use std::sync::{Arc, atomic::Ordering};
+        let state = test_state(db.clone());
+        LongJob
+            .enqueue(state.clone(), "long".into(), None)
+            .await
+            .unwrap();
+        let lease = JobLeaseConfig {
+            heartbeat_interval: Duration::from_millis(300),
+            reclaim_window: Duration::from_millis(1200),
+        };
+        let worker = Arc::new(Worker::new(
+            state.clone(),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            lease,
+        ));
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        let initial: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT locked_at FROM jobs WHERE job_id = $1")
+                .bind(claimed.job.job_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        worker.fail_heartbeats.store(2, Ordering::SeqCst);
+        let runner = tokio::spawn({
+            let worker = Arc::clone(&worker);
+            async move { worker.run_next_job(claimed).await }
+        });
+        wait_until_started(&db, LongJob::NAME).await;
+        let advanced = wait_for(|| async {
+            let current: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT locked_at FROM jobs WHERE name = 'LongJob'")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            (current > initial && worker.fail_heartbeats.load(Ordering::SeqCst) == 0)
+                .then_some(current)
+        })
+        .await;
+        let competitor = Worker::new(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            lease,
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < deadline {
+            assert!(competitor.fetch_next_job().await.unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let row: (i32, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as("SELECT error_count, locked_at FROM jobs WHERE name = 'LongJob'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 0);
+        assert!(row.1 > advanced);
+        assert!(!runner.is_finished());
+        runner.abort();
+        let _ = runner.await;
+        cleanup_worker_locks(&worker).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn test_watchdog_stops_body_before_expiry_and_reclaim_charges_once(db: sqlx::PgPool) {
+        use std::sync::{Arc, atomic::Ordering};
+        let state = test_state(db.clone());
+        LongJob
+            .enqueue(state.clone(), "watchdog".into(), None)
+            .await
+            .unwrap();
+        let lease = JobLeaseConfig {
+            heartbeat_interval: Duration::from_millis(300),
+            reclaim_window: Duration::from_millis(1200),
+        };
+        let worker = Arc::new(Worker::new(
+            state.clone(),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            lease,
+        ));
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        let id = claimed.job.job_id;
+        worker.fail_heartbeats.store(3, Ordering::SeqCst);
+        let runner = tokio::spawn({
+            let worker = Arc::clone(&worker);
+            async move { worker.run_next_job(claimed).await }
+        });
+        wait_until_started(&db, LongJob::NAME).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, RunJobOutcome::LeaseLost(found) if found == id));
+        assert_eq!(worker.fail_heartbeats.load(Ordering::SeqCst), 0);
+        let row: (i32, Option<String>) =
+            sqlx::query_as("SELECT error_count, locked_by FROM jobs WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(row.0, 0);
+        assert_eq!(row.1.as_deref(), Some(worker.owner_token.as_str()));
+        let competitor = Worker::new(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            lease,
+        );
+        let reclaimed = wait_for(|| async { competitor.fetch_next_job().await.unwrap() }).await;
+        assert_eq!(reclaimed.job.job_id, id);
+        assert_eq!(reclaimed.job.error_count, 1);
+        assert!(
+            reclaimed
+                .job
+                .last_error_message
+                .unwrap()
+                .contains(&worker.owner_token)
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_lost_ownership_stops_body_without_touching_new_owner(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        LongJob
+            .enqueue(state.clone(), "lost".into(), None)
+            .await
+            .unwrap();
+        let lease = JobLeaseConfig {
+            heartbeat_interval: Duration::from_millis(300),
+            reclaim_window: Duration::from_millis(1200),
+        };
+        let worker = Worker::new(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            lease,
+        );
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        let id = claimed.job.job_id;
+        let runner = tokio::spawn(async move { worker.run_next_job(claimed).await });
+        wait_until_started(&db, LongJob::NAME).await;
+        sqlx::query("UPDATE jobs SET locked_by = 'lease:new-owner' WHERE job_id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, RunJobOutcome::LeaseLost(found) if found == id));
+        let row: (String, i32) =
+            sqlx::query_as("SELECT locked_by, error_count FROM jobs WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(row, ("lease:new-owner".into(), 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_lease_tracker_uses_conservative_deadline() {
+        let sent = tokio::time::Instant::now();
+        let tracker = LeaseTracker {
+            last_refresh_sent: sent,
+            lease: JobLeaseConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+            },
+        };
+        assert_eq!(tracker.deadline(), sent + Duration::from_millis(1050));
+        tokio::time::advance(Duration::from_millis(1049)).await;
+        assert!(tokio::time::Instant::now() < tracker.deadline());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(tokio::time::Instant::now() >= tracker.deadline());
     }
 
     /// Test that `fetch_next_job` does NOT pick up a job with a fresh lock
@@ -979,7 +1661,7 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_hours(1), // 1 hour timeout
+            JobLeaseConfig::from_lock_timeout(Duration::from_hours(1)), // 1 hour timeout
         );
 
         // fetch_next_job should NOT pick up the recently locked job
@@ -1036,13 +1718,15 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_mins(1),
+            JobLeaseConfig::from_lock_timeout(Duration::from_mins(1)),
         );
 
         // Should pick the higher priority unlocked job first
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_some());
-        assert_eq!(fetched.unwrap().job_id, unlocked_job_id);
+        let claimed = fetched.unwrap();
+        assert_eq!(claimed.job.job_id, unlocked_job_id);
+        assert_eq!(claimed.job.error_count, 0);
     }
 
     /// Test that among same-priority jobs, the one that became eligible earliest
@@ -1097,14 +1781,14 @@ mod tests {
             Duration::from_secs(1),
             20,
             CancellationToken::new(),
-            Duration::from_mins(1),
+            JobLeaseConfig::from_lock_timeout(Duration::from_mins(1)),
         );
 
         // Both jobs share a priority; the one due longest (smaller run_at) wins,
         // regardless of which was created first.
         let fetched = worker.fetch_next_job().await.unwrap();
         assert!(fetched.is_some());
-        assert_eq!(fetched.unwrap().job_id, newer_created_earlier_run_id);
+        assert_eq!(fetched.unwrap().job.job_id, newer_created_earlier_run_id);
     }
 
     /// Test that the worker loop survives transient database errors instead of

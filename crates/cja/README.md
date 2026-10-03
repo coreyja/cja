@@ -200,8 +200,20 @@ my_job.enqueue(app_state, "urgent".into(), Some(10)).await?;
 
 - Failed jobs retry with exponential backoff: delay = `2^(error_count + 1)` seconds
 - Default max retries: 20 (`DEFAULT_MAX_RETRIES`)
-- Default lock timeout: 2 hours (`DEFAULT_LOCK_TIMEOUT`)
-- After max retries, jobs move to the `dead_letter_jobs` table
+- Default heartbeat interval: 30 seconds (`DEFAULT_HEARTBEAT_INTERVAL`)
+- Default new-worker reclaim window: 120 seconds (`DEFAULT_LOCK_TIMEOUT`)
+- Handler panics are caught and recorded like returned errors. An expired lease also increments `error_count` and records its previous worker.
+- With `max_retries = N`, a job may execute N+1 times. A terminal failure moves it to `dead_letter_jobs` with the final incremented count. Success and graceful shutdown do not count as failures.
+
+Use `job_worker_configured` with `JobLeaseConfig { heartbeat_interval, reclaim_window }` for explicit timing. The window must be at least three heartbeat intervals. The existing `job_worker` APIs take their `lock_timeout` as the reclaim window and derive an interval. An explicit window over five minutes opts into slower recovery. A missing heartbeat makes a new-worker row eligible after the window; actual pickup also depends on idle poll cadence. A still-running body stops if its worker detects lost ownership or its watchdog expires. Job side effects must remain idempotent.
+
+Heartbeats share the app `PgPool`; size it for heartbeat and job queries. With W busy workers and H-second intervals, heartbeat load averages at most W/H row UPDATEs per second (ticks may cluster); idle workers issue none. At 30 seconds, 3–11 busy arena workers use about 0.1–0.37 UPDATEs/s, 20 use 0.67/s, and 100 use 3.3/s.
+
+### Upgrading job workers
+
+`DEFAULT_LOCK_TIMEOUT` changes from two hours to 120 seconds; explicit larger timeouts remain effective. New owners use a `lease:` prefix and refresh `locked_at`; old unprefixed locks retain at least a two-hour expiry during rollout. Terminal dead-letter rows now store the final incremented count. If old instances used a custom timeout above two hours, or new jobs may run longer than an old instance's timeout while old claimers remain, drain old instances before starting new claimers: the old timeout is not stored in job rows. A `panic = "abort"` build or hard kill cannot catch a handler panic, so its abandoned lease is charged on expiry.
+
+Panics outside the caught handler future (worker loop, SQL, heartbeat/watchdog setup, or job-body `Drop`) still unwind the worker. `Supervisor::run_until` logs `Task ended the process`, cancels shared shutdown, lets peers perform bounded drain and uncharged lock release, then returns an error for platform restart. The panicking worker's abandoned row is charged when its lease expires.
 
 ### Idempotency
 
