@@ -1189,7 +1189,7 @@ mod test {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|line| line.contains("job_enqueued"))
+                .any(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons")
@@ -1211,9 +1211,15 @@ mod test {
         assert!(
             ordinary
                 .iter()
-                .any(|line| line.starts_with("span:jobs.enqueue") && line.contains("job.context"))
+                .any(|line| line.starts_with("span:jobs.enqueue")
+                    && line.contains("job.context")
+                    && line.contains(TelemetryJob::NAME))
         );
-        assert!(ordinary.iter().any(|line| line.contains("job_enqueued")));
+        assert!(
+            ordinary
+                .iter()
+                .any(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
+        );
     }
 
     #[sqlx::test]
