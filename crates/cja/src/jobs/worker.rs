@@ -1915,7 +1915,7 @@ mod tests {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(5000)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
             tx.rollback().await.unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
 
