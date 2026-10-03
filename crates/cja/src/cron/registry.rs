@@ -798,7 +798,7 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, None, Duration::from_millis(100));
+        registry.register_job(TestJob, None, Duration::from_mins(1));
         crate::cron::Worker::new(state, registry)
     }
 
@@ -845,7 +845,7 @@ mod test {
         pair().await;
         assert_eq!(count().await, 1);
         for expected in 2..=4 {
-            sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 seconds' WHERE name = $1")
+            sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 minutes' WHERE name = $1")
                 .bind(TestJob::NAME).execute(&db).await.unwrap();
             pair().await;
             assert_eq!(count().await, expected);
@@ -923,7 +923,7 @@ mod test {
         let calls = Arc::new(AtomicUsize::new(0));
         let make_worker = |pool, calls: Arc<AtomicUsize>| {
             let mut registry = CronRegistry::new();
-            registry.register("callback", None, Duration::from_millis(100), move |_, _| {
+            registry.register("callback", None, Duration::from_mins(1), move |_, _| {
                 let calls = calls.clone();
                 Box::pin(async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -942,7 +942,7 @@ mod test {
         let second = make_worker(other, calls.clone());
         for expected in 1..=4 {
             if expected > 1 {
-                sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 seconds' WHERE name = 'callback'")
+                sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 minutes' WHERE name = 'callback'")
                     .execute(&db).await.unwrap();
             }
             let (a, b) = tokio::join!(first.tick(), second.tick());
