@@ -6,6 +6,12 @@ use chrono_tz::Tz;
 use crate::app_state::AppState as AS;
 #[cfg(feature = "jobs")]
 use crate::jobs::Job;
+#[cfg(feature = "jobs")]
+use crate::jobs::{
+    EnqueueError, enqueue_failure, enqueue_on_connection, enqueue_receipt, enqueue_span,
+};
+#[cfg(feature = "jobs")]
+use tracing::Instrument;
 
 pub struct CronRegistry<AppState: AS> {
     pub(super) jobs: HashMap<&'static str, CronJob<AppState>>,
@@ -161,8 +167,71 @@ impl Schedule {
 pub struct CronJob<AppState: AS> {
     pub name: &'static str,
     pub description: Option<&'static str>,
-    func: Box<dyn CronFn<AppState> + Send + Sync + 'static>,
+    action: CronAction<AppState>,
     pub schedule: Schedule,
+    #[cfg(all(test, feature = "jobs"))]
+    pause_after_claim: Option<std::sync::Arc<ClaimPause>>,
+    #[cfg(all(test, feature = "jobs"))]
+    pause_after_commit: Option<std::sync::Arc<CallbackPause>>,
+}
+
+#[cfg(all(test, feature = "jobs"))]
+struct ClaimPause {
+    claimed: tokio::sync::mpsc::Sender<i32>,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "jobs"))]
+struct CallbackPause {
+    committed: tokio::sync::mpsc::Sender<chrono::DateTime<Utc>>,
+    release: tokio::sync::Notify,
+}
+
+enum CronAction<AppState: AS> {
+    Callback(Box<dyn CronFn<AppState> + Send + Sync + 'static>),
+    #[cfg(feature = "jobs")]
+    Job(Box<dyn CronEnqueueJob<AppState> + Send + Sync + 'static>),
+}
+
+#[cfg(feature = "jobs")]
+#[async_trait::async_trait]
+trait CronEnqueueJob<AppState: AS>: Send + Sync {
+    async fn insert(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        context: &str,
+        at: chrono::DateTime<Utc>,
+        id: uuid::Uuid,
+    ) -> Result<uuid::Uuid, EnqueueError>;
+    fn span(&self, context: &str, at: chrono::DateTime<Utc>, id: uuid::Uuid) -> tracing::Span;
+    fn name(&self) -> &'static str;
+    async fn enqueue_direct(&self, app_state: AppState, context: String) -> Result<(), String>;
+}
+
+#[cfg(feature = "jobs")]
+#[async_trait::async_trait]
+impl<AppState: AS, J: Job<AppState>> CronEnqueueJob<AppState> for J {
+    async fn insert(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        context: &str,
+        at: chrono::DateTime<Utc>,
+        id: uuid::Uuid,
+    ) -> Result<uuid::Uuid, EnqueueError> {
+        enqueue_on_connection::<AppState, J>(conn, self.clone(), context, None, at, id).await
+    }
+    fn span(&self, context: &str, at: chrono::DateTime<Utc>, id: uuid::Uuid) -> tracing::Span {
+        enqueue_span::<AppState, J>(self, context, None, at, id)
+    }
+    fn name(&self) -> &'static str {
+        J::NAME
+    }
+    async fn enqueue_direct(&self, app_state: AppState, context: String) -> Result<(), String> {
+        self.clone()
+            .enqueue(app_state, context, None)
+            .await
+            .map_err(|err| err.to_string())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,6 +239,30 @@ pub struct CronJob<AppState: AS> {
 pub enum TickError {
     JobError(String),
     SqlxError(sqlx::Error),
+}
+
+#[cfg(feature = "jobs")]
+fn recoverable_sqlstate(code: &str) -> bool {
+    matches!(code, "55P03" | "57014" | "25P03" | "57P01") || code.starts_with("08")
+}
+
+#[cfg(feature = "jobs")]
+fn recoverable(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(db) => db.code().is_some_and(|code| recoverable_sqlstate(&code)),
+        sqlx::Error::Io(_) | sqlx::Error::PoolClosed => true,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "jobs")]
+fn skip_recoverable(name: &str, operation: &str, error: &sqlx::Error) -> bool {
+    if recoverable(error) {
+        tracing::warn!(cron.name = name, operation, sqlstate = ?error.as_database_error().and_then(sqlx::error::DatabaseError::code), cause = %error, "Cron claim skipped");
+        true
+    } else {
+        false
+    }
 }
 
 impl<AppState: AS> CronJob<AppState> {
@@ -198,38 +291,217 @@ impl<AppState: AS> CronJob<AppState> {
             .should_run(last_enqueue, now, worker_started_at, timezone);
 
         if should_run {
-            tracing::info!(
-                task_name = self.name,
-                last_run = ?last_enqueue,
-                "Enqueuing Task"
-            );
-            (self.func)
-                .run(app_state.clone(), context)
-                .await
-                .map_err(TickError::JobError)?;
-
-            sqlx::query!(
-                "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (name)
-                DO UPDATE SET
-                last_run_at = $3",
-                uuid::Uuid::new_v4(),
-                self.name,
-                now,
-                now,
-                now
-            )
-            .execute(app_state.db())
-            .await
-            .map_err(TickError::SqlxError)?;
+            return self
+                .tick_claimed(&app_state, &context, worker_started_at, timezone)
+                .await;
         }
 
         Ok(())
     }
 
     pub async fn run(&self, app_state: AppState, context: String) -> Result<(), String> {
-        (self.func).run(app_state, context).await
+        match &self.action {
+            CronAction::Callback(func) => func.run(app_state, context).await,
+            #[cfg(feature = "jobs")]
+            CronAction::Job(job) => job.enqueue_direct(app_state, context).await,
+        }
+    }
+
+    #[cfg(feature = "jobs")]
+    async fn claim_due(
+        &self,
+        app_state: &AppState,
+        worker_started_at: chrono::DateTime<Utc>,
+        timezone: Tz,
+    ) -> Result<Option<(sqlx::Transaction<'_, sqlx::Postgres>, chrono::DateTime<Utc>)>, TickError>
+    {
+        let mut tx = match app_state.db().begin().await {
+            Ok(tx) => tx,
+            Err(err) if skip_recoverable(self.name, "begin", &err) => return Ok(None),
+            Err(err) => return Err(TickError::SqlxError(err)),
+        };
+        for (setting, value) in [
+            ("lock_timeout", "1s"),
+            ("statement_timeout", "5s"),
+            ("idle_in_transaction_session_timeout", "15s"),
+        ] {
+            let sql = format!("SET LOCAL {setting} = '{value}'");
+            if let Err(err) = sqlx::query(&sql).execute(&mut *tx).await {
+                if skip_recoverable(self.name, "timeout setup", &err) {
+                    return Ok(None);
+                }
+                return Err(TickError::SqlxError(err));
+            }
+        }
+        let existing = sqlx::query_as::<_, (chrono::DateTime<Utc>,)>(
+            "SELECT last_run_at FROM crons WHERE name = $1 FOR UPDATE NOWAIT",
+        )
+        .bind(self.name)
+        .fetch_optional(&mut *tx)
+        .await;
+        let last_run = match existing {
+            Ok(Some((at,))) => Some(at),
+            Ok(None) => {
+                let inserted = sqlx::query(
+                    "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+                     VALUES ($1, $2, clock_timestamp(), clock_timestamp(), clock_timestamp())
+                     ON CONFLICT (name) DO NOTHING RETURNING cron_id",
+                )
+                .bind(uuid::Uuid::new_v4())
+                .bind(self.name)
+                .fetch_optional(&mut *tx)
+                .await;
+                match inserted {
+                    Ok(Some(_)) => None,
+                    Ok(None) => match sqlx::query_as::<_, (chrono::DateTime<Utc>,)>(
+                        "SELECT last_run_at FROM crons WHERE name = $1 FOR UPDATE NOWAIT",
+                    )
+                    .bind(self.name)
+                    .fetch_one(&mut *tx)
+                    .await
+                    {
+                        Ok((at,)) => Some(at),
+                        Err(err) if skip_recoverable(self.name, "reselect", &err) => {
+                            return Ok(None);
+                        }
+                        Err(err) => return Err(TickError::SqlxError(err)),
+                    },
+                    Err(err) if skip_recoverable(self.name, "first-row insert", &err) => {
+                        return Ok(None);
+                    }
+                    Err(err) => return Err(TickError::SqlxError(err)),
+                }
+            }
+            Err(err) if skip_recoverable(self.name, "row claim", &err) => return Ok(None),
+            Err(err) => return Err(TickError::SqlxError(err)),
+        };
+        let claim_time =
+            match sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+                .fetch_one(&mut *tx)
+                .await
+            {
+                Ok(at) => at,
+                Err(err) if skip_recoverable(self.name, "database time", &err) => return Ok(None),
+                Err(err) => return Err(TickError::SqlxError(err)),
+            };
+        if !self
+            .schedule
+            .should_run(last_run.as_ref(), claim_time, worker_started_at, timezone)
+        {
+            return Ok(None);
+        }
+        Ok(Some((tx, claim_time)))
+    }
+
+    #[cfg(feature = "jobs")]
+    async fn tick_claimed(
+        &self,
+        app_state: &AppState,
+        context: &str,
+        worker_started_at: chrono::DateTime<Utc>,
+        timezone: Tz,
+    ) -> Result<(), TickError> {
+        let Some((tx, claim_time)) = self
+            .claim_due(app_state, worker_started_at, timezone)
+            .await?
+        else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        let mut tx = tx;
+        #[cfg(test)]
+        if let Some(pause) = &self.pause_after_claim {
+            let pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(TickError::SqlxError)?;
+            pause.claimed.send(pid).await.expect("claim test receiver");
+            pause.release.notified().await;
+        }
+        match &self.action {
+            CronAction::Job(job) => self.fire(tx, claim_time, job.as_ref(), context).await,
+            CronAction::Callback(callback) => {
+                if !self.commit_claim(tx, claim_time).await? {
+                    return Ok(());
+                }
+                #[cfg(test)]
+                if let Some(pause) = &self.pause_after_commit {
+                    pause
+                        .committed
+                        .send(claim_time)
+                        .await
+                        .expect("callback test receiver");
+                    pause.release.notified().await;
+                }
+                callback
+                    .run(app_state.clone(), context.to_owned())
+                    .await
+                    .map_err(TickError::JobError)
+            }
+        }
+    }
+
+    #[cfg(feature = "jobs")]
+    async fn commit_claim(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        claim_time: chrono::DateTime<Utc>,
+    ) -> Result<bool, TickError> {
+        if let Err(err) =
+            sqlx::query("UPDATE crons SET last_run_at = $1, updated_at = $1 WHERE name = $2")
+                .bind(claim_time)
+                .bind(self.name)
+                .execute(&mut *tx)
+                .await
+        {
+            if skip_recoverable(self.name, "cron update", &err) {
+                return Ok(false);
+            }
+            return Err(TickError::SqlxError(err));
+        }
+        if let Err(err) = tx.commit().await {
+            if skip_recoverable(self.name, "commit", &err) {
+                return Ok(false);
+            }
+            return Err(TickError::SqlxError(err));
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "jobs")]
+    async fn fire(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        claim_time: chrono::DateTime<Utc>,
+        job: &dyn CronEnqueueJob<AppState>,
+        context: &str,
+    ) -> Result<(), TickError> {
+        let id = uuid::Uuid::new_v4();
+        let span = job.span(context, claim_time, id);
+        async {
+            if let Err(err) = job.insert(&mut tx, context, claim_time, id).await {
+                enqueue_failure(id, &err);
+                match err {
+                    EnqueueError::SqlxError(sqlx_err)
+                        if skip_recoverable(self.name, "queue insert", &sqlx_err) =>
+                    {
+                        return Ok(());
+                    }
+                    EnqueueError::SqlxError(sqlx_err) => {
+                        return Err(TickError::SqlxError(sqlx_err));
+                    }
+                    EnqueueError::SerdeJsonError(serde_err) => {
+                        return Err(TickError::JobError(serde_err.to_string()));
+                    }
+                }
+            }
+            if self.commit_claim(tx, claim_time).await? {
+                enqueue_receipt(id, job.name());
+            }
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -254,11 +526,15 @@ impl<AppState: AS> CronRegistry<AppState> {
         let cron_job = CronJob {
             name,
             description,
-            func: Box::new(CronFnClosure {
+            action: CronAction::Callback(Box::new(CronFnClosure {
                 func: job,
                 _marker: std::marker::PhantomData,
-            }),
+            })),
             schedule: Schedule::Interval(IntervalSchedule(interval)),
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_claim: None,
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_commit: None,
         };
         self.jobs.insert(name, cron_job);
     }
@@ -278,11 +554,15 @@ impl<AppState: AS> CronRegistry<AppState> {
         let cron_job = CronJob {
             name,
             description,
-            func: Box::new(CronFnClosure {
+            action: CronAction::Callback(Box::new(CronFnClosure {
                 func: job,
                 _marker: std::marker::PhantomData,
-            }),
+            })),
             schedule: Schedule::Cron(CronSchedule(Box::new(cron_schedule))),
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_claim: None,
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_commit: None,
         };
         self.jobs.insert(name, cron_job);
         Ok(())
@@ -296,9 +576,19 @@ impl<AppState: AS> CronRegistry<AppState> {
         description: Option<&'static str>,
         interval: Duration,
     ) {
-        self.register(J::NAME, description, interval, move |app_state, context| {
-            J::enqueue(job.clone(), app_state, context, None)
-        });
+        self.jobs.insert(
+            J::NAME,
+            CronJob {
+                name: J::NAME,
+                description,
+                action: CronAction::Job(Box::new(job)),
+                schedule: Schedule::Interval(IntervalSchedule(interval)),
+                #[cfg(all(test, feature = "jobs"))]
+                pause_after_claim: None,
+                #[cfg(all(test, feature = "jobs"))]
+                pause_after_commit: None,
+            },
+        );
     }
 
     #[cfg(feature = "jobs")]
@@ -309,12 +599,21 @@ impl<AppState: AS> CronRegistry<AppState> {
         description: Option<&'static str>,
         cron_expr: &str,
     ) -> Result<(), cron::error::Error> {
-        self.register_with_cron(
+        let schedule = cron_expr.parse::<cron::Schedule>()?;
+        self.jobs.insert(
             J::NAME,
-            description,
-            cron_expr,
-            move |app_state, context| J::enqueue(job.clone(), app_state, context, None),
-        )
+            CronJob {
+                name: J::NAME,
+                description,
+                action: CronAction::Job(Box::new(job)),
+                schedule: Schedule::Cron(CronSchedule(Box::new(schedule))),
+                #[cfg(all(test, feature = "jobs"))]
+                pause_after_claim: None,
+                #[cfg(all(test, feature = "jobs"))]
+                pause_after_commit: None,
+            },
+        );
+        Ok(())
     }
 
     #[cfg(feature = "jobs")]
@@ -361,8 +660,69 @@ impl<AppState: AS> Default for CronRegistry<AppState> {
 mod test {
     use crate::app_state::AppState;
     use crate::server::cookies::CookieKey;
+    use std::fmt::Write;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tracing::{
+        Event, Id, Subscriber,
+        field::{Field, Visit},
+        span::Attributes,
+    };
+    use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 
     use super::*;
+
+    #[derive(Default)]
+    struct Fields(String);
+
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    struct TraceCapture(Arc<Mutex<Vec<String>>>);
+
+    fn trace_capture() -> &'static Arc<Mutex<Vec<String>>> {
+        static CAPTURE: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    .with(TraceCapture(lines.clone()))
+                    .with(tracing_subscriber::filter::LevelFilter::TRACE),
+            )
+            .expect("install one test tracing subscriber");
+            lines
+        })
+    }
+
+    impl<S> Layer<S> for TraceCapture
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            let mut fields = Fields::default();
+            attrs.record(&mut fields);
+            let parent = ctx
+                .span(id)
+                .and_then(|span| span.parent().map(|parent| parent.name().to_owned()));
+            self.0.lock().unwrap().push(format!(
+                "span:{} parent:{parent:?}{}",
+                attrs.metadata().name(),
+                fields.0
+            ));
+        }
+
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            let parent = ctx.event_span(event).map(|span| span.name().to_owned());
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("event parent:{parent:?}{}", fields.0));
+        }
+    }
 
     #[derive(Clone)]
     struct TestAppState {
@@ -418,6 +778,619 @@ mod test {
         async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
             Ok(())
         }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct TelemetryJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for TelemetryJob {
+        const NAME: &'static str = "atomic_telemetry_job";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn job_worker(db: sqlx::PgPool) -> crate::cron::Worker<TestAppState> {
+        let state = TestAppState {
+            db,
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        crate::cron::Worker::new(state, registry)
+    }
+
+    #[sqlx::test]
+    async fn two_pools_commit_one_enqueue_per_interval(db: sqlx::PgPool) {
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let first = job_worker(db.clone());
+        let second = job_worker(other);
+        let count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+        };
+        let pair = || async {
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let (a, b, _) = tokio::join!(
+                async {
+                    barrier.wait().await;
+                    first.tick().await
+                },
+                async {
+                    barrier.wait().await;
+                    second.tick().await
+                },
+                barrier.wait(),
+            );
+            a.unwrap();
+            b.unwrap();
+        };
+        pair().await;
+        assert_eq!(count().await, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        pair().await;
+        assert_eq!(count().await, 1);
+        for expected in 2..=4 {
+            sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 minutes' WHERE name = $1")
+                .bind(TestJob::NAME).execute(&db).await.unwrap();
+            pair().await;
+            assert_eq!(count().await, expected);
+            println!("job interval {expected}: {} enqueue(s)", count().await);
+            pair().await;
+            assert_eq!(count().await, expected);
+        }
+    }
+
+    #[sqlx::test]
+    async fn two_pools_commit_one_enqueue_per_cron_slot(db: sqlx::PgPool) {
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let make_worker = |pool| {
+            let mut registry = CronRegistry::new();
+            registry
+                .register_job_with_cron(TestJob, None, "* * * * * * *")
+                .unwrap();
+            crate::cron::Worker::new(
+                TestAppState {
+                    db: pool,
+                    cookie_key: CookieKey::generate(),
+                },
+                registry,
+            )
+        };
+        let first = make_worker(db.clone());
+        let second = make_worker(other);
+        for expected in 1..=4 {
+            // Start each pair just after a database-clock slot boundary. A pair
+            // straddling a boundary is entitled to two enqueues.
+            let db_now = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(
+                1100 - u64::from(db_now.timestamp_subsec_millis()),
+            ))
+            .await;
+            if expected > 1 {
+                sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 seconds' WHERE name = $1")
+                    .bind(TestJob::NAME).execute(&db).await.unwrap();
+            }
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let (a, b, _) = tokio::join!(
+                async {
+                    barrier.wait().await;
+                    first.tick().await
+                },
+                async {
+                    barrier.wait().await;
+                    second.tick().await
+                },
+                barrier.wait(),
+            );
+            a.unwrap();
+            b.unwrap();
+            let actual = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            println!("cron expression slot {expected}: {actual} enqueue(s)");
+        }
+    }
+
+    #[sqlx::test]
+    async fn two_pools_claim_callback_once_per_interval(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let make_worker = |pool, calls: Arc<AtomicUsize>| {
+            let mut registry = CronRegistry::new();
+            registry.register("callback", None, Duration::from_mins(1), move |_, _| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), std::io::Error>(())
+                })
+            });
+            crate::cron::Worker::new(
+                TestAppState {
+                    db: pool,
+                    cookie_key: CookieKey::generate(),
+                },
+                registry,
+            )
+        };
+        let first = make_worker(db.clone(), calls.clone());
+        let second = make_worker(other, calls.clone());
+        for expected in 1..=4 {
+            if expected > 1 {
+                sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '2 minutes' WHERE name = 'callback'")
+                    .execute(&db).await.unwrap();
+            }
+            let (a, b) = tokio::join!(first.tick(), second.tick());
+            a.unwrap();
+            b.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), expected);
+            println!(
+                "callback interval {expected}: {} invocation(s)",
+                calls.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn callback_aborted_after_commit_waits_for_next_interval(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = CronRegistry::new();
+        let observed = calls.clone();
+        registry.register("callback", None, Duration::from_secs(30), move |_, _| {
+            let observed = observed.clone();
+            Box::pin(async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), std::io::Error>(())
+            })
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let pause = Arc::new(CallbackPause {
+            committed: sender,
+            release: tokio::sync::Notify::new(),
+        });
+        registry
+            .jobs
+            .get_mut("callback")
+            .unwrap()
+            .pause_after_commit = Some(pause.clone());
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let worker = crate::cron::Worker::new(state.clone(), registry);
+        let task = tokio::spawn(async move { worker.tick().await });
+        let claim_time = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stored = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "SELECT last_run_at FROM crons WHERE name = 'callback'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(stored, claim_time);
+        sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '31 seconds' WHERE name = 'callback'")
+            .execute(&db).await.unwrap();
+        let remaining = calls.clone();
+        let mut retry = CronRegistry::new();
+        retry.register("callback", None, Duration::from_secs(30), move |_, _| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), std::io::Error>(())
+            })
+        });
+        crate::cron::Worker::new(state, retry).tick().await.unwrap();
+        assert_eq!(remaining.load(Ordering::SeqCst), 1);
+        println!("aborted callback: first interval skipped; next interval invoked once");
+    }
+
+    #[sqlx::test]
+    async fn dropped_claim_rolls_back_and_next_tick_fires(db: sqlx::PgPool) {
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_secs(864));
+        let cron = registry.get(TestJob::NAME).unwrap();
+        let (claim, _) = cron
+            .claim_due(&state, Utc::now(), chrono_tz::UTC)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(claim);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        let worker = crate::cron::Worker::new(state.clone(), registry);
+        worker.tick().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '866 seconds' WHERE name = $1")
+            .bind(TestJob::NAME).execute(&db).await.unwrap();
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_secs(864));
+        let cron = registry.get(TestJob::NAME).unwrap();
+        let (claim, _) = cron
+            .claim_due(&state, Utc::now(), chrono_tz::UTC)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(claim);
+        crate::cron::Worker::new(state, registry)
+            .tick()
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[sqlx::test]
+    async fn cadence_864_seconds_and_database_stamp(db: sqlx::PgPool) {
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_secs(864));
+        let worker = crate::cron::Worker::new(state, registry);
+        worker.tick().await.unwrap();
+        sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '862 seconds' WHERE name = $1")
+            .bind(TestJob::NAME).execute(&db).await.unwrap();
+        worker.tick().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '866 seconds' WHERE name = $1")
+            .bind(TestJob::NAME).execute(&db).await.unwrap();
+        let before = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        worker.tick().await.unwrap();
+        let after = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let stamp = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "SELECT last_run_at FROM crons WHERE name = $1",
+        )
+        .bind(TestJob::NAME)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(stamp >= before && stamp <= after);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[sqlx::test]
+    async fn locked_cron_does_not_block_other_crons(db: sqlx::PgPool) {
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_secs(30));
+        registry.register_job(SecondTestJob, None, Duration::from_secs(30));
+        let worker = crate::cron::Worker::new(state, registry);
+        sqlx::query("INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at) VALUES ($1, $2, clock_timestamp() - interval '60 seconds', clock_timestamp(), clock_timestamp())")
+            .bind(uuid::Uuid::new_v4()).bind(TestJob::NAME).execute(&db).await.unwrap();
+        let mut blocker = db.begin().await.unwrap();
+        sqlx::query("SELECT last_run_at FROM crons WHERE name = $1 FOR UPDATE")
+            .bind(TestJob::NAME)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker.tick())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(SecondTestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        blocker.rollback().await.unwrap();
+        worker.tick().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test]
+    async fn uncommitted_first_row_is_bounded_and_retried(db: sqlx::PgPool) {
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let worker = job_worker(other);
+        let mut blocker = db.begin().await.unwrap();
+        sqlx::query("INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at) VALUES ($1, $2, clock_timestamp(), clock_timestamp(), clock_timestamp())")
+            .bind(uuid::Uuid::new_v4()).bind(TestJob::NAME).execute(&mut *blocker).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker.tick())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        blocker.rollback().await.unwrap();
+        worker.tick().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test]
+    async fn terminated_claimer_rolls_back_and_retries(db: sqlx::PgPool) {
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let pause = std::sync::Arc::new(ClaimPause {
+            claimed: sender,
+            release: tokio::sync::Notify::new(),
+        });
+        registry
+            .jobs
+            .get_mut(TestJob::NAME)
+            .unwrap()
+            .pause_after_claim = Some(pause.clone());
+        let worker = crate::cron::Worker::new(state.clone(), registry);
+        let task = tokio::spawn(async move { worker.tick().await });
+        let pid = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+                .bind(pid)
+                .fetch_one(&other)
+                .await
+                .unwrap()
+        );
+        pause.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut retry_registry = CronRegistry::new();
+        retry_registry.register_job(TestJob, None, Duration::from_mins(1));
+        crate::cron::Worker::new(state, retry_registry)
+            .tick()
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test]
+    async fn statement_timeout_is_recoverable(db: sqlx::PgPool) {
+        let state = TestAppState {
+            db,
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let cron = registry.get(TestJob::NAME).unwrap();
+        let (mut tx, _) = cron
+            .claim_due(&state, Utc::now(), chrono_tz::UTC)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("SET LOCAL statement_timeout = '10ms'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let error = sqlx::query("SELECT pg_sleep(0.1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("57014")
+        );
+        assert!(recoverable(&error));
+    }
+
+    #[test]
+    fn termination_sqlstates_are_recoverable() {
+        for code in ["55P03", "57014", "25P03", "57P01", "08006", "08003"] {
+            assert!(recoverable_sqlstate(code), "{code}");
+        }
+        for code in ["23505", "42P01", "25P02"] {
+            assert!(!recoverable_sqlstate(code), "{code}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn enqueue_receipt_follows_commit_and_has_parent_span(db: sqlx::PgPool) {
+        let lines = trace_capture();
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TelemetryJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(state.clone(), registry);
+        worker.tick().await.unwrap();
+        let captured = lines.lock().unwrap().clone();
+        let span = captured
+            .iter()
+            .find(|line| line.starts_with("span:jobs.enqueue") && line.contains(TelemetryJob::NAME))
+            .expect("enqueue span");
+        assert!(span.contains("parent:Some(\"cron_job.tick\")"), "{span}");
+        for field in [
+            "job.id",
+            "job.name",
+            "job.context",
+            "job.priority",
+            "job.created_at",
+            "job.run_at",
+        ] {
+            assert!(span.contains(field), "missing {field}: {span}");
+        }
+        let receipt = captured
+            .iter()
+            .find(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
+            .expect("enqueue receipt");
+        assert!(receipt.contains("jobs.enqueue"), "{receipt}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+
+        sqlx::query("DELETE FROM jobs").execute(&db).await.unwrap();
+        sqlx::query("DELETE FROM crons").execute(&db).await.unwrap();
+        sqlx::query("ALTER TABLE jobs ADD CONSTRAINT test_reject_job CHECK (name <> 'atomic_telemetry_job')")
+            .execute(&db)
+            .await
+            .unwrap();
+        lines.lock().unwrap().clear();
+        assert!(worker.tick().await.is_err());
+        assert!(
+            !lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        sqlx::query("ALTER TABLE jobs DROP CONSTRAINT test_reject_job")
+            .execute(&db)
+            .await
+            .unwrap();
+        lines.lock().unwrap().clear();
+        TelemetryJob
+            .enqueue(state, "ordinary".into(), None)
+            .await
+            .unwrap();
+        let ordinary = lines.lock().unwrap();
+        assert!(
+            ordinary
+                .iter()
+                .any(|line| line.starts_with("span:jobs.enqueue")
+                    && line.contains("job.context")
+                    && line.contains(TelemetryJob::NAME))
+        );
+        assert!(
+            ordinary
+                .iter()
+                .any(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
+        );
     }
 
     #[sqlx::test]
@@ -630,7 +1603,7 @@ mod test {
         .fetch_one(&app_state.db)
         .await
         .unwrap();
-        assert_eq!(cron_count.count.unwrap(), 0);
+        assert_eq!(cron_count.count.unwrap(), 1);
     }
 
     #[sqlx::test]

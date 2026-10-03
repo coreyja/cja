@@ -77,7 +77,8 @@ emitted only after the insert succeeds. The span alone proves an enqueue was
 attempted; the receipt proves it was persisted. Serialization and database
 failures emit an error carrying the attempted job ID and never emit a receipt.
 Tracing remains synchronous enqueue-only instrumentation; no telemetry I/O is
-awaited by job insertion.
+awaited by job insertion. A cron enqueue emits its receipt only after the cron
+claim transaction commits.
 
 ### `JobRegistry<AS>` (`jobs/registry.rs`)
 
@@ -133,14 +134,29 @@ The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting ato
 ### Cron Flow
 
 ```
-CronRegistry (job name → Schedule + enqueue function)
-  → Worker tick loop (every sleep_duration, default 60s)
-    → For each registered job:
-      → Check Schedule::should_run() against last_run in crons table
-        → If due: enqueue the job, update last_run
+CronRegistry (name → schedule + job or callback)
+  → Worker tick loop
+    → Cheap schedule pre-filter
+    → Lock crons row; re-check due against database time
+      → Job: insert queue row + stamp cron in one transaction
+      → Callback: commit cron stamp, then invoke callback
 ```
 
 Cron jobs are regular `Job` implementations — the cron system just handles scheduling the enqueue.
+
+Every cron claim uses the unique index on `crons.name` and a bounded row lock.
+`register_job` and `register_job_with_cron` check due time against database time,
+then commit the queue insert and `last_run_at` update in one transaction. This
+commits exactly one enqueue per due interval or cron slot across schedulers.
+A crash before commit rolls back both writes and the next tick retries. Job
+execution remains at-least-once under worker lease and retry semantics.
+
+`register` and `register_with_cron` commit the timestamp claim before running
+the callback. They invoke a callback at most once per interval; callback error
+or process death skips the interval, and the next one fires normally. Lock,
+statement, and idle-transaction timeouts are fixed inside the scheduler.
+During a rollout, an older scheduler overlapping an upgraded one can still
+double-fire.
 
 ## Database Schema
 

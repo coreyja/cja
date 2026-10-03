@@ -240,6 +240,17 @@ registry.register_job(MyJob, Some("description"), Duration::from_secs(60));
 registry.register_job_with_cron(MyJob, Some("description"), "0 */5 * * * *".parse()?);
 ```
 
+Job registrations (`register_job` and `register_job_with_cron`) commit exactly
+one enqueue per due interval or cron slot across schedulers sharing a database.
+The row lock, queue insert, and `last_run_at` update share one transaction. A
+crash before commit rolls everything back, so the next tick retries. Job
+execution remains at-least-once under worker lease and retry semantics.
+
+Callback registrations (`register` and `register_with_cron`) claim at most once
+per interval: the timestamp commits before invocation. A callback error or
+process death skips that interval; the next interval fires normally. During a
+rollout, an older scheduler overlapping an upgraded one can still double-fire.
+
 ### Running the Cron Worker
 
 ```rust
