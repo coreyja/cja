@@ -1842,4 +1842,91 @@ mod tests {
             "worker did not shut down promptly after cancellation"
         );
     }
+
+    /// PR review pin (DEV-1537 round 1): the heartbeat must run alongside the
+    /// job body, not instead of it. A slow heartbeat UPDATE (row lock held,
+    /// pool contention, DB stall) must not freeze the running job for up to
+    /// `heartbeat_interval / 3`.
+    mod heartbeat_does_not_stall_body {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static MAX_GAP_MS: AtomicU64 = AtomicU64::new(0);
+
+        #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+        struct TickingJob;
+
+        #[async_trait::async_trait]
+        impl Job<TestAppState> for TickingJob {
+            const NAME: &'static str = "TickingJob";
+
+            async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+                sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                    .bind(Self::NAME)
+                    .execute(app_state.db())
+                    .await?;
+                let mut last = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let now = std::time::Instant::now();
+                    let gap = u64::try_from((now - last).as_millis()).unwrap();
+                    MAX_GAP_MS.fetch_max(gap, Ordering::SeqCst);
+                    last = now;
+                }
+            }
+        }
+
+        impl_job_registry!(TestAppState, TickingJob);
+
+        #[sqlx::test]
+        async fn test_slow_heartbeat_does_not_stall_job_body(db: sqlx::PgPool) {
+            let state = test_state(db.clone());
+            TickingJob
+                .enqueue(state.clone(), "ticking".into(), None)
+                .await
+                .unwrap();
+            // Per-attempt heartbeat budget is interval / 3 = 1s.
+            let lease = JobLeaseConfig {
+                heartbeat_interval: Duration::from_secs(3),
+                reclaim_window: Duration::from_secs(12),
+            };
+            let worker = std::sync::Arc::new(Worker::new(
+                state,
+                Jobs,
+                Duration::from_millis(20),
+                20,
+                CancellationToken::new(),
+                lease,
+            ));
+            let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+            let id = claimed.job.job_id;
+            let runner = tokio::spawn({
+                let worker = std::sync::Arc::clone(&worker);
+                async move { worker.run_next_job(claimed).await }
+            });
+            wait_until_started(&db, TickingJob::NAME).await;
+            MAX_GAP_MS.store(0, Ordering::SeqCst);
+
+            // Hold the row lock across the first heartbeat tick (~3s after
+            // claim) so that heartbeat UPDATE blocks for its full 1s budget.
+            let mut tx = db.begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM jobs WHERE job_id = $1 FOR UPDATE")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(5000)).await;
+            tx.rollback().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let max_gap = MAX_GAP_MS.load(Ordering::SeqCst);
+            runner.abort();
+            let _ = runner.await;
+            cleanup_worker_locks(&worker).await.unwrap();
+            assert!(
+                max_gap < 400,
+                "job body was not polled for {max_gap}ms while a heartbeat UPDATE was in flight"
+            );
+        }
+    }
 }
