@@ -231,8 +231,6 @@ impl<AppState: AS, J: Job<AppState>> AtomicCronJob<AppState> for J {
 pub enum TickError {
     JobError(String),
     SqlxError(sqlx::Error),
-    #[cfg(feature = "jobs")]
-    Enqueue(EnqueueError),
 }
 
 #[cfg(feature = "jobs")]
@@ -475,12 +473,19 @@ impl<AppState: AS> CronJob<AppState> {
         async {
             if let Err(err) = job.insert(&mut tx, context, claim_time, id).await {
                 enqueue_failure(id, &err);
-                if let EnqueueError::SqlxError(sqlx_err) = &err
-                    && skip_recoverable(self.name, "queue insert", sqlx_err)
-                {
-                    return Ok(());
+                match err {
+                    EnqueueError::SqlxError(sqlx_err)
+                        if skip_recoverable(self.name, "queue insert", &sqlx_err) =>
+                    {
+                        return Ok(());
+                    }
+                    EnqueueError::SqlxError(sqlx_err) => {
+                        return Err(TickError::SqlxError(sqlx_err));
+                    }
+                    EnqueueError::SerdeJsonError(serde_err) => {
+                        return Err(TickError::JobError(serde_err.to_string()));
+                    }
                 }
-                return Err(TickError::Enqueue(err));
             }
             if let Err(err) =
                 sqlx::query("UPDATE crons SET last_run_at = $1, updated_at = $1 WHERE name = $2")
@@ -1433,7 +1438,7 @@ mod test {
             TickError::JobError(err) => {
                 assert!(err.contains("CustomError"));
             }
-            TickError::SqlxError(_) | TickError::Enqueue(_) => panic!("Expected JobError"),
+            TickError::SqlxError(_) => panic!("Expected JobError"),
         }
 
         let cron_count = sqlx::query!(
