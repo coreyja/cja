@@ -1443,9 +1443,11 @@ mod tests {
             .enqueue(state.clone(), "long".into(), None)
             .await
             .unwrap();
+        // CI runs ten feature lanes against separate PostgreSQL containers at
+        // once. Give this sustained-heartbeat test enough scheduling margin.
         let lease = JobLeaseConfig {
-            heartbeat_interval: Duration::from_millis(300),
-            reclaim_window: Duration::from_millis(1200),
+            heartbeat_interval: Duration::from_millis(800),
+            reclaim_window: Duration::from_secs(4),
         };
         let worker = Arc::new(Worker::new(
             state.clone(),
@@ -1486,7 +1488,7 @@ mod tests {
             CancellationToken::new(),
             lease,
         );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(13);
         while tokio::time::Instant::now() < deadline {
             assert!(competitor.fetch_next_job().await.unwrap().is_none());
             tokio::time::sleep(Duration::from_millis(100)).await;
