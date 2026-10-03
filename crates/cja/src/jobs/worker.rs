@@ -1,4 +1,4 @@
-use std::{any::Any, time::Duration};
+use std::{any::Any, collections::HashSet, future::Future, pin::Pin, sync::Mutex, time::Duration};
 
 use futures::FutureExt;
 use thiserror::Error;
@@ -143,6 +143,9 @@ struct Worker<AppState: AS, R: JobRegistry<AppState>> {
     max_retries: i32,
     cancellation_token: CancellationToken,
     lease: JobLeaseConfig,
+    // A watchdog-abandoned row must expire and be charged, even if this worker
+    // subsequently shuts down gracefully.
+    abandoned_jobs: Mutex<HashSet<uuid::Uuid>>,
     #[cfg(test)]
     fail_heartbeats: std::sync::atomic::AtomicU32,
 }
@@ -166,6 +169,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             max_retries,
             cancellation_token,
             lease,
+            abandoned_jobs: Mutex::new(HashSet::new()),
             #[cfg(test)]
             fail_heartbeats: std::sync::atomic::AtomicU32::new(0),
         }
@@ -194,6 +198,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // scoped heartbeat race and ownership-safe finalization belong together
     async fn run_next_job(&self, claimed: ClaimedJob) -> color_eyre::Result<RunJobOutcome> {
         let job = claimed.job;
         let mut tracker = LeaseTracker {
@@ -202,12 +207,20 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         };
         if tokio::time::Instant::now() >= tracker.deadline() {
             tracing::warn!(job_id = %job.job_id, "Claim response exceeded lease deadline");
+            self.abandoned_jobs.lock().unwrap().insert(job.job_id);
             return Ok(RunJobOutcome::LeaseLost(job.job_id));
         }
 
         let job_result = {
             let mut body = std::pin::pin!(self.run_job(&job));
             let mut next_tick = claimed.claim_sent_at + self.lease.heartbeat_interval;
+            type HeartbeatResult = Result<
+                Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+                tokio::time::error::Elapsed,
+            >;
+            let mut heartbeat: Option<Pin<Box<dyn Future<Output = HeartbeatResult> + Send + '_>>> =
+                None;
+            let mut heartbeat_sent_at = claimed.claim_sent_at;
             loop {
                 let deadline = tracker.deadline();
                 tokio::select! {
@@ -215,9 +228,24 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     result = &mut body => break result,
                     () = tokio::time::sleep_until(deadline) => {
                         tracing::warn!(job_id = %job.job_id, "Job lease watchdog expired");
+                        self.abandoned_jobs.lock().unwrap().insert(job.job_id);
                         return Ok(RunJobOutcome::LeaseLost(job.job_id));
                     }
-                    () = tokio::time::sleep_until(next_tick) => {
+                    result = async { heartbeat.as_mut().expect("guarded heartbeat").await }, if heartbeat.is_some() => {
+                        heartbeat = None;
+                        match result {
+                            Ok(Ok(result)) if result.rows_affected() == 1 => {
+                                tracker.last_refresh_sent = heartbeat_sent_at;
+                            }
+                            Ok(Ok(_)) => {
+                                tracing::warn!(job_id = %job.job_id, owner = %self.owner_token, "Job lease ownership lost");
+                                return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                            }
+                            Ok(Err(error)) => tracing::warn!(job_id = %job.job_id, %error, "Job heartbeat failed"),
+                            Err(_) => tracing::warn!(job_id = %job.job_id, "Job heartbeat timed out"),
+                        }
+                    }
+                    () = tokio::time::sleep_until(next_tick), if heartbeat.is_none() => {
                         let sent_at = tokio::time::Instant::now();
                         next_tick = sent_at + self.lease.heartbeat_interval;
                         #[cfg(test)]
@@ -235,17 +263,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                         .bind(job.job_id)
                         .bind(&self.owner_token)
                         .execute(self.state.db());
-                        match tokio::time::timeout(self.lease.heartbeat_interval / 3, update).await {
-                            Ok(Ok(result)) if result.rows_affected() == 1 => {
-                                tracker.last_refresh_sent = sent_at;
-                            }
-                            Ok(Ok(_)) => {
-                                tracing::warn!(job_id = %job.job_id, owner = %self.owner_token, "Job lease ownership lost");
-                                return Ok(RunJobOutcome::LeaseLost(job.job_id));
-                            }
-                            Ok(Err(error)) => tracing::warn!(job_id = %job.job_id, %error, "Job heartbeat failed"),
-                            Err(_) => tracing::warn!(job_id = %job.job_id, "Job heartbeat timed out"),
-                        }
+                        heartbeat_sent_at = sent_at;
+                        heartbeat = Some(Box::pin(tokio::time::timeout(self.lease.heartbeat_interval / 3, update)));
                     }
                 }
             }
@@ -261,6 +280,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 if !self.dead_letter_owned(&job, count, &error_message).await? {
                     return Ok(RunJobOutcome::LeaseLost(job.job_id));
                 }
+                tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
+                    "Job permanently failed - moved to dead letter queue");
             } else {
                 let result = sqlx::query(
                     "UPDATE jobs SET locked_by = NULL, locked_at = NULL,
@@ -278,6 +299,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     tracing::warn!(job_id = %job.job_id, "Job failure finalization lost ownership");
                     return Ok(RunJobOutcome::LeaseLost(job.job_id));
                 }
+                tracing::warn!(job_id = %job.job_id, retry = job.error_count + 1, error = %error_message,
+                    "Job failed, retry scheduled");
             }
             return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
         }
@@ -341,7 +364,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         Ok(true)
     }
 
-    #[tracing::instrument(name = "worker.fetch_next_job", level = "trace", skip(self), err)]
+    #[tracing::instrument(name = "worker.fetch_next_job", level = "trace", skip(self),
+        fields(worker.id = %self.id, job.id = tracing::field::Empty,
+            job.name = tracing::field::Empty, lock_timeout_secs = self.lease.reclaim_window.as_secs()), err)]
     async fn fetch_next_job(&self) -> color_eyre::Result<Option<ClaimedJob>> {
         use sqlx::Row;
         let (_, window) = self.lease.validate()?;
@@ -398,6 +423,11 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         };
         let span = Span::current();
         span.record("job.id", claimed.job.job_id.to_string());
+        span.record("job.name", &claimed.job.name);
+        self.abandoned_jobs
+            .lock()
+            .unwrap()
+            .remove(&claimed.job.job_id);
         if claimed.previous_locked_by.is_some() && claimed.previous_error_count >= self.max_retries
         {
             let message = claimed
@@ -405,8 +435,15 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 .last_error_message
                 .as_deref()
                 .unwrap_or("Job lease expired");
-            self.dead_letter_owned(&claimed.job, claimed.job.error_count, message)
-                .await?;
+            if self
+                .dead_letter_owned(&claimed.job, claimed.job.error_count, message)
+                .await?
+            {
+                tracing::error!(job_id = %claimed.job.job_id,
+                    previous_owner = ?claimed.previous_locked_by,
+                    error_count = claimed.job.error_count,
+                    "Job lease expired - moved to dead letter queue");
+            }
             return Ok(None);
         }
         Ok(Some(claimed))
@@ -473,18 +510,27 @@ async fn verify_jobs_schema(db: &sqlx::PgPool) -> color_eyre::Result<()> {
 /// Release database locks held by a worker.
 ///
 /// This should be called during graceful shutdown to immediately release any job locks
-/// held by this worker, rather than waiting for lease expiry.
+/// held by this worker, rather than waiting for lease expiry. Watchdog-abandoned
+/// rows stay locked so a later claim records their failed attempt.
 async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
     worker: &Worker<AppState, R>,
 ) -> color_eyre::Result<()> {
     tracing::info!(worker_id = %worker.id, "Releasing database locks");
+    let abandoned: Vec<_> = worker
+        .abandoned_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect();
 
     let result = sqlx::query(
         "UPDATE jobs
          SET locked_by = NULL, locked_at = NULL
-         WHERE locked_by = $1",
+         WHERE locked_by = $1 AND NOT (job_id = ANY($2::uuid[]))",
     )
     .bind(&worker.owner_token)
+    .bind(&abandoned)
     .execute(worker.state.db())
     .await?;
 
@@ -1436,7 +1482,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_live_job_heartbeat_survives_two_failed_ticks(db: sqlx::PgPool) {
+    async fn test_live_job_heartbeat_survives_boundary_failed_ticks(db: sqlx::PgPool) {
         use std::sync::{Arc, atomic::Ordering};
         let state = test_state(db.clone());
         LongJob
@@ -1464,7 +1510,8 @@ mod tests {
                 .fetch_one(&db)
                 .await
                 .unwrap();
-        worker.fail_heartbeats.store(2, Ordering::SeqCst);
+        // 4s / 800ms = 5 intervals: k-2 failures are the tolerated boundary.
+        worker.fail_heartbeats.store(3, Ordering::SeqCst);
         let runner = tokio::spawn({
             let worker = Arc::clone(&worker);
             async move { worker.run_next_job(claimed).await }
@@ -1549,6 +1596,14 @@ mod tests {
                 .unwrap();
         assert_eq!(row.0, 0);
         assert_eq!(row.1.as_deref(), Some(worker.owner_token.as_str()));
+        cleanup_worker_locks(&worker).await.unwrap();
+        let still_owned: Option<String> =
+            sqlx::query_scalar("SELECT locked_by FROM jobs WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(still_owned.as_deref(), Some(worker.owner_token.as_str()));
         let competitor = Worker::new(
             state,
             Jobs,
