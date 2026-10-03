@@ -59,11 +59,16 @@ impl AppState for App {
 
 async fn run() -> Result<()> {
     let app = App::from_env().await?;
-    let tasks = vec![
-        NamedTask::spawn("server", run_server(routes(app.clone()))),
-        NamedTask::spawn("jobs", job_worker(app, Jobs)),
-    ];
-    wait_for_first_error(tasks).await
+    let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
+    let shutdown = supervisor.shutdown_token();
+    supervisor.spawn("server", run_server_until(
+        routes(app.clone()), shutdown.clone().cancelled_owned(),
+    ));
+    supervisor.spawn("jobs", job_worker(
+        app, Jobs, Duration::from_secs(60), DEFAULT_MAX_RETRIES,
+        shutdown.clone(), Default::default(),
+    ));
+    supervisor.run().await
 }"#, "rust"))
                     }
                     div class="hero-cta" {

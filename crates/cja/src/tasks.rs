@@ -87,7 +87,7 @@ pub async fn wait_for_first_error(tasks: Vec<NamedTask>) -> crate::Result<()> {
 pub struct ShutdownBudget {
     /// How long an in-flight job may keep running after shutdown starts
     /// before it is dropped and its lock released. Hand this to
-    /// [`crate::jobs::worker::job_worker_with_shutdown_drain`].
+    /// [`crate::jobs::worker::job_worker`] via [`crate::jobs::JobWorkerConfig::shutdown_drain_timeout`].
     pub job_drain: Duration,
     /// Extra time for every task to exit once the job drain is over: workers
     /// release their locks, the HTTP server closes connections.
@@ -177,14 +177,13 @@ fn env_secs(name: &str) -> Option<Duration> {
 /// );
 /// supervisor.spawn(
 ///     "jobs",
-///     cja::jobs::worker::job_worker_with_shutdown_drain(
+///     cja::jobs::worker::job_worker(
 ///         app_state.clone(),
 ///         Jobs,
 ///         Duration::from_secs(60),
 ///         cja::jobs::DEFAULT_MAX_RETRIES,
 ///         shutdown.clone(),
-///         cja::jobs::DEFAULT_LOCK_TIMEOUT,
-///         supervisor.budget().job_drain,
+///         Default::default(),
 ///     ),
 /// );
 ///
