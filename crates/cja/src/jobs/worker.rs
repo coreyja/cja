@@ -32,7 +32,9 @@ pub struct JobWorkerConfig {
     /// reclaim and charge the attempt (120 seconds by default).
     pub reclaim_window: Duration,
     /// Time allowed for the running job body after cancellation. Defaults to
-    /// `ShutdownBudget::from_env().job_drain` (2 seconds when unset).
+    /// `ShutdownBudget::from_env().job_drain` (2 seconds when unset). This should
+    /// match the `job_drain` of the `ShutdownBudget` given to the `Supervisor`;
+    /// apps constructing a custom budget must set this field to the same value.
     pub shutdown_drain_timeout: Duration,
 }
 
@@ -1370,10 +1372,12 @@ mod tests {
     /// Default worker config gives a running body a bounded, nonzero drain.
     #[sqlx::test]
     async fn test_job_worker_default_drains_for_bounded_time(db: sqlx::PgPool) {
-        let elapsed = assert_stubborn_drain(db, JobWorkerConfig::default()).await;
+        let config = JobWorkerConfig::default();
+        let drain = config.shutdown_drain_timeout;
+        let elapsed = assert_stubborn_drain(db, config).await;
         assert!(
-            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(10),
-            "{elapsed:?}"
+            elapsed >= drain && elapsed < drain + Duration::from_secs(8),
+            "elapsed {elapsed:?}, configured drain {drain:?}"
         );
     }
 
