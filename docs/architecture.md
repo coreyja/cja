@@ -67,6 +67,13 @@ Defines a background job type. Key members:
 
 ### Job enqueue evidence
 
+Atomic interval cron claims use the existing unique index on `crons.name`.
+The scheduler locks that row, checks its timestamp against database time, and
+inserts the queue row and updates `last_run_at` in one transaction. A lost
+connection or process death before commit rolls both changes back; a retry
+rechecks the committed timestamp. Lock and statement timeouts bound contention.
+Legacy callback and cron-expression registrations retain their prior behavior.
+
 The `jobs.enqueue` span contains `job.id`, `job.name`, `job.context`,
 `job.priority`, `job.created_at`, and `job.run_at` when it is created. The UUID
 is the same value inserted into `jobs` and later emitted as `job.id` by

@@ -47,6 +47,15 @@
 //! The default poll interval is 60 seconds. To change it, use
 //! [`Worker::new_with_timezone`] — there is no `new_with_interval` method.
 //!
+//! # Atomic interval jobs
+//!
+//! `register_job_atomic` is validated for interval schedules only. Its row-locked
+//! transaction commits the queue insert and cron timestamp together, so upgraded
+//! schedulers sharing a database commit one enqueue per due interval. It does not
+//! make job execution once-only or protect arbitrary callback side effects.
+//! During a rollout, a legacy scheduler overlapping an upgraded one can still
+//! enqueue twice.
+//!
 //! # Queue Pileup Warning
 //!
 //! If a cron job takes longer to run than its scheduling interval, the queue
