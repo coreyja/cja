@@ -136,6 +136,59 @@ use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tracing::{Instrument, instrument};
 
+pub(crate) fn enqueue_span<AppState: AS, J: Job<AppState>>(
+    job: &J,
+    context: &str,
+    priority: Option<i32>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    job_id: uuid::Uuid,
+) -> tracing::Span {
+    tracing::info_span!(
+        "jobs.enqueue",
+        job.id = %job_id,
+        job.name = J::NAME,
+        job.context = %context,
+        job.priority = priority.unwrap_or(0),
+        job.created_at = %created_at,
+        job.run_at = %created_at,
+        "self" = ?job,
+        context = %context,
+        priority = ?priority,
+    )
+}
+
+pub(crate) async fn enqueue_on_connection<AppState: AS, J: Job<AppState>>(
+    conn: &mut sqlx::PgConnection,
+    job: J,
+    context: &str,
+    priority: Option<i32>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    job_id: uuid::Uuid,
+) -> Result<uuid::Uuid, EnqueueError> {
+    sqlx::query(
+        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(job_id)
+    .bind(J::NAME)
+    .bind(serde_json::to_value(job)?)
+    .bind(priority.unwrap_or(0))
+    .bind(created_at)
+    .bind(created_at)
+    .bind(context)
+    .execute(conn)
+    .await?;
+    Ok(job_id)
+}
+
+pub(crate) fn enqueue_receipt<JName: AsRef<str>>(job_id: uuid::Uuid, name: JName) {
+    tracing::info!(event_type = "job_enqueued", job_id = %job_id, job.name = name.as_ref(), "Job enqueued");
+}
+
+pub(crate) fn enqueue_failure(job_id: uuid::Uuid, error: &EnqueueError) {
+    tracing::error!(job_id = %job_id, %error, "Job enqueue failed");
+}
+
 pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
@@ -431,46 +484,20 @@ pub trait Job<AppState: AS>:
         let created_at = chrono::Utc::now();
         // Eyes captures fields at span creation. Recording the id after the
         // insert would leave the enqueue disconnected from worker attempts.
-        let span = tracing::info_span!(
-            "jobs.enqueue",
-            job.id = %job_id,
-            job.name = Self::NAME,
-            job.context = %context,
-            job.priority = priority.unwrap_or(0),
-            job.created_at = %created_at,
-            job.run_at = %created_at,
-            "self" = ?self,
-            context = %context,
-            priority = ?priority,
-        );
+        let span = enqueue_span::<AppState, Self>(&self, &context, priority, created_at, job_id);
         async move {
             let result = async {
-                sqlx::query(
-                    "
-        INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                let mut conn = app_state.db().acquire().await?;
+                enqueue_on_connection::<AppState, Self>(
+                    &mut conn, self, &context, priority, created_at, job_id,
                 )
-                .bind(job_id)
-                .bind(Self::NAME)
-                .bind(serde_json::to_value(self)?)
-                .bind(priority.unwrap_or(0))
-                .bind(created_at)
-                .bind(created_at)
-                .bind(context)
-                .execute(app_state.db())
                 .await?;
-
                 Ok::<_, EnqueueError>(())
             }
             .await;
             match &result {
-                Ok(()) => tracing::info!(
-                    event_type = "job_enqueued",
-                    job_id = %job_id,
-                    job.name = Self::NAME,
-                    "Job enqueued"
-                ),
-                Err(error) => tracing::error!(job_id = %job_id, %error, "Job enqueue failed"),
+                Ok(()) => enqueue_receipt(job_id, Self::NAME),
+                Err(error) => enqueue_failure(job_id, error),
             }
             result
         }

@@ -8,6 +8,7 @@ A Rust web framework for full-stack development that combines background job pro
 
 - **Background Jobs** — PostgreSQL-backed queue with automatic retries, exponential backoff, priority scheduling, dead letter queue, and graceful shutdown
 - **Cron Scheduling** — Interval-based and cron expression scheduling with timezone support
+  - Job crons commit exactly one enqueue per due interval or slot across schedulers sharing a database; callbacks are at-most-once after a committed claim. Job execution remains at-least-once. During rollout, an older scheduler overlapping an upgraded one can double-fire.
 - **HTTP Server** — Axum with encrypted cookies, database-backed sessions, and zero-downtime reload
 - **Integrated Observability** — Structured tracing with Sentry, Honeycomb, and Eyes support
 - **Type Safety** — Pedantic Clippy lints, no unsafe code, compile-time SQL checking via SQLx
