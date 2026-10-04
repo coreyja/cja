@@ -98,14 +98,13 @@
 //!     // Job worker: stops claiming jobs, drains the in-flight one, then
 //!     // releases its lock so another instance picks it up immediately
 //!     supervisor.spawn("jobs",
-//!         cja::jobs::worker::job_worker_with_shutdown_drain(
+//!         cja::jobs::worker::job_worker(
 //!             app_state.clone(),
 //!             Jobs,  // your job registry (see jobs module docs)
 //!             std::time::Duration::from_secs(60),
 //!             cja::jobs::DEFAULT_MAX_RETRIES,
 //!             shutdown.clone(),
-//!             cja::jobs::DEFAULT_LOCK_TIMEOUT,
-//!             supervisor.budget().job_drain,
+//!             Default::default(),
 //!         )
 //!     );
 //!

@@ -47,6 +47,20 @@
 //! The default poll interval is 60 seconds. To change it, use
 //! [`Worker::new_with_timezone`] — there is no `new_with_interval` method.
 //!
+//! # Database-backed cron claims
+//!
+//! `register_job` and `register_job_with_cron` enqueue exactly once per due
+//! interval or cron slot across schedulers sharing a database. The row lock,
+//! queue insert, and `last_run_at` update commit in one transaction. A crash
+//! before commit rolls them all back, so the next tick retries. Job execution
+//! remains at-least-once because worker leases and retries are unchanged.
+//!
+//! `register` and `register_with_cron` callbacks are at-most-once per interval:
+//! the claim commits before the callback runs. If it errors or the process dies,
+//! that interval is skipped and the next interval fires normally.
+//! During a rollout, an older scheduler overlapping an upgraded one can still
+//! double-fire.
+//!
 //! # Queue Pileup Warning
 //!
 //! If a cron job takes longer to run than its scheduling interval, the queue

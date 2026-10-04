@@ -67,8 +67,7 @@ cja::db::run_migrations(&pool).await?;
 
 ```rust
 use cja::setup::{setup_sentry, setup_tracing};
-use cja::tasks::NamedTask;
-use cja::jobs::CancellationToken;
+use cja::tasks::{ShutdownBudget, Supervisor};
 
 fn main() -> cja::Result<()> {
     let _sentry_guard = setup_sentry();
@@ -83,36 +82,26 @@ async fn run() -> cja::Result<()> {
     let _eyes_handle = setup_tracing("my-app")?;
 
     let app_state = MyApp { /* ... */ };
-    let shutdown_token = CancellationToken::new();
+    let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
+    let shutdown = supervisor.shutdown_token();
 
-    let mut tasks = vec![];
-
-    // HTTP server
-    tasks.push(NamedTask::spawn("server",
-        cja::server::run_server(routes(app_state.clone()))
-    ));
-
-    // Job worker
-    tasks.push(NamedTask::spawn("jobs",
+    supervisor.spawn("server",
+        cja::server::run_server_until(
+            routes(app_state.clone()), shutdown.clone().cancelled_owned(),
+        )
+    );
+    supervisor.spawn("jobs",
         cja::jobs::worker::job_worker(
             app_state.clone(),
-            Jobs,  // your job registry
+            Jobs, // your job registry
             std::time::Duration::from_secs(60),
             cja::jobs::DEFAULT_MAX_RETRIES,
-            shutdown_token.clone(),
-            cja::jobs::DEFAULT_LOCK_TIMEOUT,
+            shutdown.clone(),
+            Default::default(),
         )
-    ));
+    );
 
-    // Signal handler
-    let token = shutdown_token.clone();
-    tasks.push(NamedTask::spawn("signals", async move {
-        tokio::signal::ctrl_c().await?;
-        token.cancel();
-        Ok(())
-    }));
-
-    cja::tasks::wait_for_first_error(tasks).await
+    supervisor.run().await
 }
 ```
 
@@ -202,8 +191,20 @@ my_job.enqueue(app_state, "urgent".into(), Some(10)).await?;
 
 - Failed jobs retry with exponential backoff: delay = `2^(error_count + 1)` seconds
 - Default max retries: 20 (`DEFAULT_MAX_RETRIES`)
-- Default lock timeout: 2 hours (`DEFAULT_LOCK_TIMEOUT`)
-- After max retries, jobs move to the `dead_letter_jobs` table
+- Default heartbeat interval: 30 seconds (`DEFAULT_HEARTBEAT_INTERVAL`)
+- Default reclaim window: 120 seconds (`DEFAULT_RECLAIM_WINDOW`)
+- Handler panics are caught and recorded like returned errors. An expired lease also increments `error_count` and records its previous worker.
+- With `max_retries = N`, a job may execute N+1 times. A terminal failure moves it to `dead_letter_jobs` with the final incremented count. Success and graceful shutdown do not count as failures.
+
+The single `job_worker` accepts `JobWorkerConfig { heartbeat_interval, reclaim_window, shutdown_drain_timeout }`; pass `Default::default()` unless the application needs custom timings. Defaults are 30 seconds between heartbeats, 120 seconds from the last successful heartbeat before reclaim, and the `ShutdownBudget::from_env().job_drain` value (2 seconds when unset). `CJA_SHUTDOWN_JOB_DRAIN_SECS` controls both the default worker drain and a default Supervisor budget. The reclaim window must be at least three heartbeat intervals. A missing heartbeat makes any owned row eligible after the window; actual pickup also depends on the unchanged idle poll cadence. A still-running body stops if its worker detects lost ownership or its watchdog expires. Job side effects must remain idempotent.
+
+The worker's `shutdown_drain_timeout` should match the `job_drain` of the `ShutdownBudget` given to its Supervisor. If the Supervisor uses a programmatically constructed budget, pass `JobWorkerConfig { shutdown_drain_timeout: supervisor.budget().job_drain, ..Default::default() }`. `ShutdownBudget` owns the process deadline (`job_drain + exit_grace`); the worker config bounds its local body drain. Keep `exit_grace` positive so lock-release SQL can finish, and fit the full deadline inside the hosting platform's kill window.
+
+Heartbeats share the app `PgPool`; size it for heartbeat and job queries. With W busy workers and H-second intervals, heartbeat load averages at most W/H row UPDATEs per second (ticks may cluster); idle workers issue none. At 30 seconds, 3–11 busy arena workers use about 0.1–0.37 UPDATEs/s, 20 use 0.67/s, and 100 use 3.3/s.
+
+A `panic = "abort"` build or hard kill cannot catch a handler panic, so its abandoned lease is charged on expiry.
+
+Panics outside the caught handler future (worker loop, SQL, heartbeat/watchdog setup, or job-body `Drop`) still unwind the worker. `Supervisor::run_until` logs `Task ended the process`, cancels shared shutdown, lets peers perform bounded drain and uncharged lock release, then returns an error for platform restart. The panicking worker's abandoned row is charged when its lease expires.
 
 ### Idempotency
 
@@ -229,6 +230,17 @@ registry.register_job(MyJob, Some("description"), Duration::from_secs(60));
 // Cron expression
 registry.register_job_with_cron(MyJob, Some("description"), "0 */5 * * * *".parse()?);
 ```
+
+Job registrations (`register_job` and `register_job_with_cron`) commit exactly
+one enqueue per due interval or cron slot across schedulers sharing a database.
+The row lock, queue insert, and `last_run_at` update share one transaction. A
+crash before commit rolls everything back, so the next tick retries. Job
+execution remains at-least-once under worker lease and retry semantics.
+
+Callback registrations (`register` and `register_with_cron`) claim at most once
+per interval: the timestamp commits before invocation. A callback error or
+process death skips that interval; the next interval fires normally. During a
+rollout, an older scheduler overlapping an upgraded one can still double-fire.
 
 ### Running the Cron Worker
 
