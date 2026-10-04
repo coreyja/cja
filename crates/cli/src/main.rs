@@ -1278,6 +1278,9 @@ fn spawn_application_tasks(
             jobs::Jobs,
             Duration::from_secs(60),
             cja::jobs::DEFAULT_MAX_RETRIES,
+            // TODO: wire to a shutdown signal (see cja::tasks::Supervisor)
+            cja::jobs::CancellationToken::new(),
+            Default::default(),
         )));
     } else {
         info!("Jobs Disabled");
@@ -1726,4 +1729,22 @@ DROP FUNCTION IF EXISTS update_updated_at_column ();
     .context("Failed to write session down migration")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_spawn_tasks;
+
+    #[test]
+    fn generated_job_worker_has_shutdown_token_and_config() {
+        let generated = generate_spawn_tasks(false, true);
+        assert!(
+            generated.contains("// TODO: wire to a shutdown signal (see cja::tasks::Supervisor)")
+        );
+        assert!(
+            generated
+                .contains("cja::jobs::CancellationToken::new(),\n            Default::default(),")
+        );
+        assert!(generated.contains("cja::jobs::worker::job_worker("));
+    }
 }

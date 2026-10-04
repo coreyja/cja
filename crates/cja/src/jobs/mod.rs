@@ -107,8 +107,8 @@
 //! | `priority` | INT | Higher = runs first (`ORDER BY priority DESC`) |
 //! | `run_at` | TIMESTAMPTZ | When job can next be executed |
 //! | `created_at` | TIMESTAMPTZ | When job was enqueued |
-//! | `locked_at` | TIMESTAMPTZ | Last lease refresh (claim time for legacy workers) |
-//! | `locked_by` | TEXT | Exact worker ownership token (`lease:<UUID>` for new workers) |
+//! | `locked_at` | TIMESTAMPTZ | Last successful heartbeat (claim time initially) |
+//! | `locked_by` | TEXT | Worker UUID string used as the exact ownership key |
 //! | `context` | TEXT | Debug info (e.g., "user-signup") |
 //! | `error_count` | INT | Number of failures |
 //! | `last_error_message` | TEXT | Most recent error |
@@ -193,7 +193,7 @@ pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
 pub use worker::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LOCK_TIMEOUT, DEFAULT_MAX_RETRIES, JobLeaseConfig,
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MAX_RETRIES, DEFAULT_RECLAIM_WINDOW, JobWorkerConfig,
 };
 
 #[derive(Debug, Error)]
@@ -221,10 +221,10 @@ pub enum EnqueueError {
 ///
 /// Jobs are locked while being processed to prevent multiple workers from running the same
 /// job. If a worker crashes or becomes unresponsive, the lock remains but the job is never
-/// completed. The lock timeout mechanism handles this:
+/// completed. The lease reclaim window handles this:
 /// - New workers heartbeat active jobs every 30 seconds by default
 /// - A missing heartbeat makes the job claimable after 120 seconds by default
-/// - Expired leases count as failed attempts; old unprefixed locks retain a two-hour minimum
+/// - Every expired lease counts as a failed attempt
 /// - This ensures jobs are eventually processed even after worker failures
 ///
 /// # Example
