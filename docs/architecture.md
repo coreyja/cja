@@ -20,10 +20,10 @@ lib.rs             — Re-exports (sqlx, uuid, color_eyre, maud, chrono, chrono_
 app_state.rs       — AppState trait
 setup.rs           — Sentry + tracing initialization
 db.rs              — run_migrations() via sqlx::migrate!("./migrations")
-tasks.rs           — NamedTask, wait_for_first_error
+tasks.rs           — Supervisor, ShutdownBudget, NamedTask, wait_for_first_error
 jobs/
-  mod.rs           — Job trait, enqueue logic, constants (DEFAULT_MAX_RETRIES, DEFAULT_LOCK_TIMEOUT)
-  worker.rs        — job_worker() polling loop, retry/dead-letter logic, FOR UPDATE SKIP LOCKED
+  mod.rs           — Job trait, enqueue logic, constants (DEFAULT_MAX_RETRIES, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_RECLAIM_WINDOW)
+  worker.rs        — job_worker(), JobWorkerConfig, polling loop, retry/dead-letter logic, FOR UPDATE SKIP LOCKED
   registry.rs      — JobRegistry trait, impl_job_registry! macro
 cron/
   mod.rs           — Re-exports
@@ -77,7 +77,8 @@ emitted only after the insert succeeds. The span alone proves an enqueue was
 attempted; the receipt proves it was persisted. Serialization and database
 failures emit an error carrying the attempted job ID and never emit a receipt.
 Tracing remains synchronous enqueue-only instrumentation; no telemetry I/O is
-awaited by job insertion.
+awaited by job insertion. A cron enqueue emits its receipt only after the cron
+claim transaction commits.
 
 ### `JobRegistry<AS>` (`jobs/registry.rs`)
 
@@ -117,29 +118,45 @@ Incoming request
 ```
 enqueue() → INSERT INTO jobs (with priority, payload, context)
   → Worker poll loop (every sleep_duration)
-    → SELECT ... FOR UPDATE SKIP LOCKED (locks one row)
+    → SELECT ... FOR UPDATE SKIP LOCKED (claims one row and charges an expired lease)
       → Deserialize payload → JobRegistry::run_job() → Job::run()
+        → Heartbeat `locked_at` while the handler runs
         → On success: DELETE FROM jobs
-        → On failure (error_count < max_retries):
+        → On returned error or caught panic (error_count < max_retries):
             UPDATE jobs SET error_count += 1,
               run_at = NOW() + 2^(error_count+1) seconds
-        → On failure (error_count >= max_retries):
-            INSERT INTO dead_letter_jobs + DELETE FROM jobs
+        → On terminal failure or terminal expired lease:
+            INSERT INTO dead_letter_jobs with final count + DELETE FROM jobs
 ```
 
-The `FOR UPDATE SKIP LOCKED` clause is what makes multiple concurrent workers safe — each worker atomically claims a different row. Priority ordering is `ORDER BY priority DESC, created_at ASC` (higher priority value = runs first).
+The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not. When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent.
 
 ### Cron Flow
 
 ```
-CronRegistry (job name → Schedule + enqueue function)
-  → Worker tick loop (every sleep_duration, default 60s)
-    → For each registered job:
-      → Check Schedule::should_run() against last_run in crons table
-        → If due: enqueue the job, update last_run
+CronRegistry (name → schedule + job or callback)
+  → Worker tick loop
+    → Cheap schedule pre-filter
+    → Lock crons row; re-check due against database time
+      → Job: insert queue row + stamp cron in one transaction
+      → Callback: commit cron stamp, then invoke callback
 ```
 
 Cron jobs are regular `Job` implementations — the cron system just handles scheduling the enqueue.
+
+Every cron claim uses the unique index on `crons.name` and a bounded row lock.
+`register_job` and `register_job_with_cron` check due time against database time,
+then commit the queue insert and `last_run_at` update in one transaction. This
+commits exactly one enqueue per due interval or cron slot across schedulers.
+A crash before commit rolls back both writes and the next tick retries. Job
+execution remains at-least-once under worker lease and retry semantics.
+
+`register` and `register_with_cron` commit the timestamp claim before running
+the callback. They invoke a callback at most once per interval; callback error
+or process death skips the interval, and the next one fires normally. Lock,
+statement, and idle-transaction timeouts are fixed inside the scheduler.
+During a rollout, an older scheduler overlapping an upgraded one can still
+double-fire.
 
 ## Database Schema
 
@@ -153,8 +170,8 @@ Cron jobs are regular `Job` implementations — the cron system just handles sch
 | `priority` | `INT NOT NULL` | Higher value = runs first (default 0) |
 | `run_at` | `TIMESTAMPTZ NOT NULL` | When the job becomes eligible to run |
 | `created_at` | `TIMESTAMPTZ NOT NULL` | When the job was enqueued |
-| `locked_at` | `TIMESTAMPTZ` | When a worker claimed this job |
-| `locked_by` | `TEXT` | Worker ID holding the lock |
+| `locked_at` | `TIMESTAMPTZ` | Last successful heartbeat (claim time initially) |
+| `locked_by` | `TEXT` | Worker UUID string used as the exact ownership key |
 | `context` | `TEXT NOT NULL` | Human-readable enqueue context |
 | `error_count` | `INTEGER NOT NULL DEFAULT 0` | Number of failed attempts |
 | `last_error_message` | `TEXT` | Most recent error |
@@ -214,11 +231,11 @@ when a callback or HTTP response can run indefinitely.
 1. `Supervisor::new(budget)` registers SIGTERM and SIGINT (Fly sends SIGINT by default, Cloud Run and Kubernetes SIGTERM) and creates the shared `CancellationToken`
 2. The app spawns its server, job workers and cron through the supervisor, passing each `supervisor.shutdown_token()`
 3. `supervisor.run()` waits for a signal or for any task to exit on its own, then cancels the token
-4. Workers stop claiming jobs; an in-flight job gets `ShutdownBudget::job_drain` to finish, then is dropped and `cleanup_worker_locks()` releases its lock so another instance re-runs it immediately instead of after the lock timeout
+4. Workers stop claiming jobs; an in-flight job gets `ShutdownBudget::job_drain` to finish, then is dropped and `cleanup_worker_locks()` releases its lock so another instance re-runs it immediately instead of after the reclaim window
 5. Tasks still running at `ShutdownBudget::deadline()` (`job_drain + exit_grace`) are aborted. Long-lived connections such as WebSockets make this routine, since they hold axum's graceful shutdown open
 6. `run()` returns `Ok` for a signal, `Err` when a task ended the process by itself
 
-The budget has to fit the platform's kill window: Cloud Run sends SIGKILL a fixed 10 seconds after SIGTERM, Fly after `kill_timeout` (5 seconds unless `fly.toml` raises it). The defaults are 2s + 2s; override with `CJA_SHUTDOWN_JOB_DRAIN_SECS` / `CJA_SHUTDOWN_EXIT_GRACE_SECS` or by constructing `ShutdownBudget` directly. Work still running when the platform kills the process keeps its job locks until the lock timeout (2 hours by default). On Cloud Run the supervisor warns at boot when the budget cannot fit.
+The budget has to fit the platform's kill window: Cloud Run sends SIGKILL a fixed 10 seconds after SIGTERM, Fly after `kill_timeout` (5 seconds unless `fly.toml` raises it). The default `JobWorkerConfig.shutdown_drain_timeout` equals `ShutdownBudget::from_env().job_drain` (2s). The Supervisor process deadline adds the positive `exit_grace` (2s by default) for release SQL; override with `CJA_SHUTDOWN_JOB_DRAIN_SECS` / `CJA_SHUTDOWN_EXIT_GRACE_SECS` or by constructing `ShutdownBudget` directly. Work still running when the platform kills the process keeps its job locks until the reclaim window (120 seconds after the last refresh by default). When constructing a custom Supervisor budget in code, pass `JobWorkerConfig { shutdown_drain_timeout: supervisor.budget().job_drain, ..Default::default() }` to `job_worker`. On Cloud Run the supervisor warns at boot when the budget cannot fit.
 
 `NamedTask` and `wait_for_first_error` remain for apps that manage shutdown themselves. Note that a signal-handler task which simply returns ends `wait_for_first_error` without draining anything.
 

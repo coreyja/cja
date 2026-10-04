@@ -65,14 +65,15 @@
 //!
 //! | Retry # | Delay |
 //! |---------|-------|
-//! | 1 | 4 seconds |
-//! | 2 | 8 seconds |
-//! | 5 | ~1 minute |
+//! | 1 | 2 seconds |
+//! | 2 | 4 seconds |
+//! | 5 | 32 seconds |
 //! | 10 | ~17 minutes |
 //! | 20 | ~12 days |
 //!
-//! After [`DEFAULT_MAX_RETRIES`] (20) attempts,
-//! jobs are moved to the `dead_letter_jobs` table.
+//! With `max_retries = N`, a job can execute N+1 times. Returned errors,
+//! caught handler panics, and expired leases each count as a failed attempt.
+//! The final incremented count is stored in `dead_letter_jobs`.
 //!
 //! # Idempotency
 //!
@@ -106,8 +107,8 @@
 //! | `priority` | INT | Higher = runs first (`ORDER BY priority DESC`) |
 //! | `run_at` | TIMESTAMPTZ | When job can next be executed |
 //! | `created_at` | TIMESTAMPTZ | When job was enqueued |
-//! | `locked_at` | TIMESTAMPTZ | When a worker locked this job |
-//! | `locked_by` | TEXT | Worker UUID that holds the lock |
+//! | `locked_at` | TIMESTAMPTZ | Last successful heartbeat (claim time initially) |
+//! | `locked_by` | TEXT | Worker UUID string used as the exact ownership key |
 //! | `context` | TEXT | Debug info (e.g., "user-signup") |
 //! | `error_count` | INT | Number of failures |
 //! | `last_error_message` | TEXT | Most recent error |
@@ -135,10 +136,65 @@ use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tracing::{Instrument, instrument};
 
+pub(crate) fn enqueue_span<AppState: AS, J: Job<AppState>>(
+    job: &J,
+    context: &str,
+    priority: Option<i32>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    job_id: uuid::Uuid,
+) -> tracing::Span {
+    tracing::info_span!(
+        "jobs.enqueue",
+        job.id = %job_id,
+        job.name = J::NAME,
+        job.context = %context,
+        job.priority = priority.unwrap_or(0),
+        job.created_at = %created_at,
+        job.run_at = %created_at,
+        "self" = ?job,
+        context = %context,
+        priority = ?priority,
+    )
+}
+
+pub(crate) async fn enqueue_on_connection<AppState: AS, J: Job<AppState>>(
+    conn: &mut sqlx::PgConnection,
+    job: J,
+    context: &str,
+    priority: Option<i32>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    job_id: uuid::Uuid,
+) -> Result<uuid::Uuid, EnqueueError> {
+    sqlx::query(
+        "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(job_id)
+    .bind(J::NAME)
+    .bind(serde_json::to_value(job)?)
+    .bind(priority.unwrap_or(0))
+    .bind(created_at)
+    .bind(created_at)
+    .bind(context)
+    .execute(conn)
+    .await?;
+    Ok(job_id)
+}
+
+pub(crate) fn enqueue_receipt<JName: AsRef<str>>(job_id: uuid::Uuid, name: JName) {
+    tracing::info!(event_type = "job_enqueued", job_id = %job_id, job.name = name.as_ref(), "Job enqueued");
+}
+
+pub(crate) fn enqueue_failure(job_id: uuid::Uuid, error: &EnqueueError) {
+    tracing::error!(job_id = %job_id, %error, "Job enqueue failed");
+}
+
 pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
-pub use worker::{DEFAULT_LOCK_TIMEOUT, DEFAULT_MAX_RETRIES};
+pub use worker::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MAX_RETRIES, DEFAULT_RECLAIM_WINDOW, JobWorkerConfig,
+};
 
 #[derive(Debug, Error)]
 pub enum EnqueueError {
@@ -165,9 +221,10 @@ pub enum EnqueueError {
 ///
 /// Jobs are locked while being processed to prevent multiple workers from running the same
 /// job. If a worker crashes or becomes unresponsive, the lock remains but the job is never
-/// completed. The lock timeout mechanism handles this:
-/// - Jobs locked longer than the timeout (default: 2 hours) are considered abandoned
-/// - Any worker can pick up abandoned jobs and retry them
+/// completed. The lease reclaim window handles this:
+/// - New workers heartbeat active jobs every 30 seconds by default
+/// - A missing heartbeat makes the job claimable after 120 seconds by default
+/// - Every expired lease counts as a failed attempt
 /// - This ensures jobs are eventually processed even after worker failures
 ///
 /// # Example
@@ -427,46 +484,20 @@ pub trait Job<AppState: AS>:
         let created_at = chrono::Utc::now();
         // Eyes captures fields at span creation. Recording the id after the
         // insert would leave the enqueue disconnected from worker attempts.
-        let span = tracing::info_span!(
-            "jobs.enqueue",
-            job.id = %job_id,
-            job.name = Self::NAME,
-            job.context = %context,
-            job.priority = priority.unwrap_or(0),
-            job.created_at = %created_at,
-            job.run_at = %created_at,
-            "self" = ?self,
-            context = %context,
-            priority = ?priority,
-        );
+        let span = enqueue_span::<AppState, Self>(&self, &context, priority, created_at, job_id);
         async move {
             let result = async {
-                sqlx::query(
-                    "
-        INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                let mut conn = app_state.db().acquire().await?;
+                enqueue_on_connection::<AppState, Self>(
+                    &mut conn, self, &context, priority, created_at, job_id,
                 )
-                .bind(job_id)
-                .bind(Self::NAME)
-                .bind(serde_json::to_value(self)?)
-                .bind(priority.unwrap_or(0))
-                .bind(created_at)
-                .bind(created_at)
-                .bind(context)
-                .execute(app_state.db())
                 .await?;
-
                 Ok::<_, EnqueueError>(())
             }
             .await;
             match &result {
-                Ok(()) => tracing::info!(
-                    event_type = "job_enqueued",
-                    job_id = %job_id,
-                    job.name = Self::NAME,
-                    "Job enqueued"
-                ),
-                Err(error) => tracing::error!(job_id = %job_id, %error, "Job enqueue failed"),
+                Ok(()) => enqueue_receipt(job_id, Self::NAME),
+                Err(error) => enqueue_failure(job_id, error),
             }
             result
         }
