@@ -6,6 +6,8 @@ resolver = "3"
 version = "0.0.0"
 edition = "2024"
 authors = ["Corey Alexander"]
+license = "MIT"
+repository = "https://github.com/coreyja/cja"
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
