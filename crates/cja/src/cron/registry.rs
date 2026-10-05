@@ -1481,6 +1481,88 @@ mod test {
         }
     }
 
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct CronContextJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for CronContextJob {
+        const NAME: &'static str = "cron_context_job";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    mod cron_context_jobs {
+        use super::{CronContextJob, TestAppState};
+        crate::impl_job_registry!(TestAppState, CronContextJob);
+    }
+
+    #[sqlx::test]
+    async fn cron_triggered_run_span_carries_cron_context(db: sqlx::PgPool) {
+        // Eyes contract: `cron_job_failed` monitors only count a job outcome
+        // whose `worker.run_job` span has `job.context` starting `Cron@`.
+        let lines = trace_capture();
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(CronContextJob, None, Duration::from_mins(1));
+        crate::cron::Worker::new(state.clone(), registry)
+            .tick()
+            .await
+            .unwrap();
+        let job_id: uuid::Uuid = sqlx::query_scalar("SELECT job_id FROM jobs WHERE name = $1")
+            .bind(CronContextJob::NAME)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        let token = crate::jobs::CancellationToken::new();
+        let worker = tokio::spawn(crate::jobs::worker::job_worker(
+            state,
+            cron_context_jobs::Jobs,
+            Duration::from_millis(20),
+            3,
+            token.clone(),
+            crate::jobs::JobWorkerConfig::default(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+                > 0
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cron-enqueued job runs");
+        token.cancel();
+        worker.await.unwrap().unwrap();
+
+        let captured = lines.lock().unwrap().clone();
+        let span = captured
+            .iter()
+            .find(|line| {
+                line.starts_with("span:worker.run_job") && line.contains(&job_id.to_string())
+            })
+            .expect("run span for the cron-enqueued job");
+        assert!(span.contains("job.context=\"Cron@test\""), "{span}");
+        for field in [
+            "job.name",
+            "job.priority",
+            "job.run_at",
+            "job.created_at",
+            "job.error_count",
+        ] {
+            assert!(span.contains(field), "missing {field}: {span}");
+        }
+    }
+
     #[sqlx::test]
     async fn enqueue_receipt_follows_commit_and_has_parent_span(db: sqlx::PgPool) {
         let lines = trace_capture();
@@ -1534,16 +1616,17 @@ mod test {
             .execute(&db)
             .await
             .unwrap();
-        lines.lock().unwrap().clear();
+        // The capture is shared by concurrently running tests, so look only at
+        // what was recorded from here on instead of clearing it under them.
+        let start = lines.lock().unwrap().len();
         assert!(worker.tick().await.is_err());
+        let rejected = lines.lock().unwrap()[start..].to_vec();
         assert!(
-            !lines
-                .lock()
-                .unwrap()
+            !rejected
                 .iter()
                 .any(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
         );
-        assert!(!lines.lock().unwrap().iter().any(|line| fire(&line)));
+        assert!(!rejected.iter().any(|line| fire(&line)));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons")
                 .fetch_one(&db)
@@ -1555,12 +1638,12 @@ mod test {
             .execute(&db)
             .await
             .unwrap();
-        lines.lock().unwrap().clear();
+        let start = lines.lock().unwrap().len();
         TelemetryJob
             .enqueue(state, "ordinary".into(), None)
             .await
             .unwrap();
-        let ordinary = lines.lock().unwrap();
+        let ordinary = lines.lock().unwrap()[start..].to_vec();
         assert!(
             ordinary
                 .iter()
