@@ -255,6 +255,17 @@ fn recoverable(error: &sqlx::Error) -> bool {
     }
 }
 
+/// A due interval whose `crons` row this process holds locked. Committing the
+/// transaction is what makes the interval this process's fire.
+#[cfg(feature = "jobs")]
+struct Claim<'c> {
+    tx: sqlx::Transaction<'c, sqlx::Postgres>,
+    /// Database time of the claim; becomes the row's new `last_run_at`.
+    at: chrono::DateTime<Utc>,
+    /// The row's `last_run_at` before this claim; `None` on a cron's first fire.
+    last_run: Option<chrono::DateTime<Utc>>,
+}
+
 #[cfg(feature = "jobs")]
 fn skip_recoverable(name: &str, operation: &str, error: &sqlx::Error) -> bool {
     if recoverable(error) {
@@ -307,14 +318,31 @@ impl<AppState: AS> CronJob<AppState> {
         }
     }
 
+    /// The cron fire receipt: one INFO event per interval this process claimed
+    /// and committed, for job and callback crons alike.
+    ///
+    /// **This event is an Eyes contract — do not remove, reword, or move it
+    /// without coordinating Eyes.** Eyes classifies `cron.fire` as
+    /// `level = INFO AND target = 'cja::cron::registry' AND message LIKE
+    /// 'Enqueuing Task%'`, keyed by the `task_name` field; every `cron_missed`
+    /// monitor and the crons dashboard depend on it. `last_run` is the `Debug`
+    /// form of the claimed row's previous `last_run_at` (`None` on the first
+    /// fire), which humans use to prove a run happened when telemetry was
+    /// dropped. The target comes from `module_path!()`, so this must stay in
+    /// `cja::cron::registry`. cja#53 dropped this event once and blinded every
+    /// cron monitor in apps that picked it up.
+    #[cfg(feature = "jobs")]
+    fn fire_receipt(&self, last_run: Option<chrono::DateTime<Utc>>) {
+        tracing::info!(task_name = self.name, last_run = ?last_run, "Enqueuing Task");
+    }
+
     #[cfg(feature = "jobs")]
     async fn claim_due(
         &self,
         app_state: &AppState,
         worker_started_at: chrono::DateTime<Utc>,
         timezone: Tz,
-    ) -> Result<Option<(sqlx::Transaction<'_, sqlx::Postgres>, chrono::DateTime<Utc>)>, TickError>
-    {
+    ) -> Result<Option<Claim<'_>>, TickError> {
         let mut tx = match app_state.db().begin().await {
             Ok(tx) => tx,
             Err(err) if skip_recoverable(self.name, "begin", &err) => return Ok(None),
@@ -390,7 +418,11 @@ impl<AppState: AS> CronJob<AppState> {
         {
             return Ok(None);
         }
-        Ok(Some((tx, claim_time)))
+        Ok(Some(Claim {
+            tx,
+            at: claim_time,
+            last_run,
+        }))
     }
 
     #[cfg(feature = "jobs")]
@@ -401,7 +433,11 @@ impl<AppState: AS> CronJob<AppState> {
         worker_started_at: chrono::DateTime<Utc>,
         timezone: Tz,
     ) -> Result<(), TickError> {
-        let Some((tx, claim_time)) = self
+        let Some(Claim {
+            tx,
+            at: claim_time,
+            last_run,
+        }) = self
             .claim_due(app_state, worker_started_at, timezone)
             .await?
         else {
@@ -419,11 +455,15 @@ impl<AppState: AS> CronJob<AppState> {
             pause.release.notified().await;
         }
         match &self.action {
-            CronAction::Job(job) => self.fire(tx, claim_time, job.as_ref(), context).await,
+            CronAction::Job(job) => {
+                self.fire(tx, claim_time, last_run, job.as_ref(), context)
+                    .await
+            }
             CronAction::Callback(callback) => {
                 if !self.commit_claim(tx, claim_time).await? {
                     return Ok(());
                 }
+                self.fire_receipt(last_run);
                 #[cfg(test)]
                 if let Some(pause) = &self.pause_after_commit {
                     pause
@@ -473,6 +513,7 @@ impl<AppState: AS> CronJob<AppState> {
         &self,
         mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
         claim_time: chrono::DateTime<Utc>,
+        last_run: Option<chrono::DateTime<Utc>>,
         job: &dyn CronEnqueueJob<AppState>,
         context: &str,
     ) -> Result<(), TickError> {
@@ -496,6 +537,8 @@ impl<AppState: AS> CronJob<AppState> {
                 }
             }
             if self.commit_claim(tx, claim_time).await? {
+                // Inside the `jobs.enqueue` span so the fire shares its trace.
+                self.fire_receipt(last_run);
                 enqueue_receipt(id, job.name());
             }
             Ok(())
@@ -665,6 +708,7 @@ mod test {
     use tracing::{
         Event, Id, Subscriber,
         field::{Field, Visit},
+        instrument::WithSubscriber,
         span::Attributes,
     };
     use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
@@ -722,6 +766,136 @@ mod test {
                 .unwrap()
                 .push(format!("event parent:{parent:?}{}", fields.0));
         }
+    }
+
+    /// One structured event, for asserting the Eyes `cron.fire` contract.
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        level: tracing::Level,
+        parent: Option<String>,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldMap(std::collections::BTreeMap<String, String>);
+
+    impl Visit for FieldMap {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    /// Per-test capture, attached to the future under test with
+    /// `with_subscriber`. Unlike the global [`TraceCapture`], concurrent tests
+    /// can neither clear it nor write into it.
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let mut fields = FieldMap::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_owned(),
+                level: *event.metadata().level(),
+                parent: ctx.event_span(event).map(|span| span.name().to_owned()),
+                fields: fields.0,
+            });
+        }
+    }
+
+    impl EventCapture {
+        fn dispatch(&self) -> tracing::Dispatch {
+            // While at most one dispatcher is registered, tracing-core caches a
+            // callsite's interest from whichever dispatcher is current on the
+            // thread that first hits it. An uncaptured test thread would then
+            // cache `never` for spans and events this capture needs. The
+            // always-on global subscriber makes every thread's default enable
+            // everything, so no callsite can be cached as disabled.
+            trace_capture();
+            tracing::Dispatch::new(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn messages(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| event.fields.get("message").cloned())
+                .collect()
+        }
+
+        /// Every event claiming to be a fire of cron `name`. Matched loosely so
+        /// a wrong target, level, or field fails [`assert_fire_receipt`] rather
+        /// than reading as a missing receipt.
+        fn fire_receipts(&self, name: &str) -> Vec<CapturedEvent> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event
+                        .fields
+                        .get("message")
+                        .is_some_and(|message| message.starts_with("Enqueuing Task"))
+                        && event.fields.get("task_name").map(String::as_str) == Some(name)
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// The exact event shape Eyes classifies as `cron.fire`.
+    fn assert_fire_receipt(
+        receipt: &CapturedEvent,
+        name: &str,
+        last_run: Option<chrono::DateTime<Utc>>,
+    ) {
+        assert_eq!(receipt.target, "cja::cron::registry", "{receipt:?}");
+        assert_eq!(receipt.level, tracing::Level::INFO, "{receipt:?}");
+        let field = |key: &str| receipt.fields.get(key).map(String::as_str);
+        assert_eq!(field("message"), Some("Enqueuing Task"), "{receipt:?}");
+        assert_eq!(field("task_name"), Some(name), "{receipt:?}");
+        let last_run = format!("{last_run:?}");
+        assert_eq!(field("last_run"), Some(last_run.as_str()), "{receipt:?}");
+    }
+
+    /// Moves cron `name` back by `by` so it is due, returning the
+    /// `last_run_at` its next fire must report.
+    async fn backdate(db: &sqlx::PgPool, name: &str, by: &str) -> chrono::DateTime<Utc> {
+        sqlx::query_scalar(
+            "UPDATE crons SET last_run_at = clock_timestamp() - $2::text::interval
+             WHERE name = $1 RETURNING last_run_at",
+        )
+        .bind(name)
+        .bind(by)
+        .fetch_one(db)
+        .await
+        .unwrap()
+    }
+
+    const RECEIPT_CALLBACK: &str = "receipt_callback";
+
+    /// A 1-minute `TestJob` cron plus a 1-minute callback cron that logs
+    /// `"callback body ran"`.
+    fn receipt_registry() -> CronRegistry<TestAppState> {
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        registry.register(RECEIPT_CALLBACK, None, Duration::from_mins(1), |_, _| {
+            Box::pin(async {
+                tracing::info!("callback body ran");
+                Ok::<(), std::io::Error>(())
+            })
+        });
+        registry
     }
 
     #[derive(Clone)]
@@ -1024,7 +1198,7 @@ mod test {
         let mut registry = CronRegistry::new();
         registry.register_job(TestJob, None, Duration::from_secs(864));
         let cron = registry.get(TestJob::NAME).unwrap();
-        let (claim, _) = cron
+        let claim = cron
             .claim_due(&state, Utc::now(), chrono_tz::UTC)
             .await
             .unwrap()
@@ -1051,7 +1225,7 @@ mod test {
         let mut registry = CronRegistry::new();
         registry.register_job(TestJob, None, Duration::from_secs(864));
         let cron = registry.get(TestJob::NAME).unwrap();
-        let (claim, _) = cron
+        let claim = cron
             .claim_due(&state, Utc::now(), chrono_tz::UTC)
             .await
             .unwrap()
@@ -1277,7 +1451,7 @@ mod test {
         let mut registry = CronRegistry::new();
         registry.register_job(TestJob, None, Duration::from_mins(1));
         let cron = registry.get(TestJob::NAME).unwrap();
-        let (mut tx, _) = cron
+        let Claim { mut tx, .. } = cron
             .claim_due(&state, Utc::now(), chrono_tz::UTC)
             .await
             .unwrap()
@@ -1304,6 +1478,88 @@ mod test {
         }
         for code in ["23505", "42P01", "25P02"] {
             assert!(!recoverable_sqlstate(code), "{code}");
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct CronContextJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for CronContextJob {
+        const NAME: &'static str = "cron_context_job";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    mod cron_context_jobs {
+        use super::{CronContextJob, TestAppState};
+        crate::impl_job_registry!(TestAppState, CronContextJob);
+    }
+
+    #[sqlx::test]
+    async fn cron_triggered_run_span_carries_cron_context(db: sqlx::PgPool) {
+        // Eyes contract: `cron_job_failed` monitors only count a job outcome
+        // whose `worker.run_job` span has `job.context` starting `Cron@`.
+        let lines = trace_capture();
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(CronContextJob, None, Duration::from_mins(1));
+        crate::cron::Worker::new(state.clone(), registry)
+            .tick()
+            .await
+            .unwrap();
+        let job_id: uuid::Uuid = sqlx::query_scalar("SELECT job_id FROM jobs WHERE name = $1")
+            .bind(CronContextJob::NAME)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        let token = crate::jobs::CancellationToken::new();
+        let worker = tokio::spawn(crate::jobs::worker::job_worker(
+            state,
+            cron_context_jobs::Jobs,
+            Duration::from_millis(20),
+            3,
+            token.clone(),
+            crate::jobs::JobWorkerConfig::default(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&db)
+                .await
+                .unwrap()
+                > 0
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cron-enqueued job runs");
+        token.cancel();
+        worker.await.unwrap().unwrap();
+
+        let captured = lines.lock().unwrap().clone();
+        let span = captured
+            .iter()
+            .find(|line| {
+                line.starts_with("span:worker.run_job") && line.contains(&job_id.to_string())
+            })
+            .expect("run span for the cron-enqueued job");
+        assert!(span.contains("job.context=\"Cron@test\""), "{span}");
+        for field in [
+            "job.name",
+            "job.priority",
+            "job.run_at",
+            "job.created_at",
+            "job.error_count",
+        ] {
+            assert!(span.contains(field), "missing {field}: {span}");
         }
     }
 
@@ -1339,6 +1595,13 @@ mod test {
             .find(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
             .expect("enqueue receipt");
         assert!(receipt.contains("jobs.enqueue"), "{receipt}");
+        let fire =
+            |line: &&String| line.contains("Enqueuing Task") && line.contains(TelemetryJob::NAME);
+        let fire_receipt = captured.iter().find(fire).expect("cron fire receipt");
+        assert!(
+            fire_receipt.contains("parent:Some(\"jobs.enqueue\")"),
+            "{fire_receipt}"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
                 .fetch_one(&db)
@@ -1353,15 +1616,17 @@ mod test {
             .execute(&db)
             .await
             .unwrap();
-        lines.lock().unwrap().clear();
+        // The capture is shared by concurrently running tests, so look only at
+        // what was recorded from here on instead of clearing it under them.
+        let start = lines.lock().unwrap().len();
         assert!(worker.tick().await.is_err());
+        let rejected = lines.lock().unwrap()[start..].to_vec();
         assert!(
-            !lines
-                .lock()
-                .unwrap()
+            !rejected
                 .iter()
                 .any(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
         );
+        assert!(!rejected.iter().any(|line| fire(&line)));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons")
                 .fetch_one(&db)
@@ -1373,12 +1638,12 @@ mod test {
             .execute(&db)
             .await
             .unwrap();
-        lines.lock().unwrap().clear();
+        let start = lines.lock().unwrap().len();
         TelemetryJob
             .enqueue(state, "ordinary".into(), None)
             .await
             .unwrap();
-        let ordinary = lines.lock().unwrap();
+        let ordinary = lines.lock().unwrap()[start..].to_vec();
         assert!(
             ordinary
                 .iter()
@@ -1391,6 +1656,254 @@ mod test {
                 .iter()
                 .any(|line| line.contains("job_enqueued") && line.contains(TelemetryJob::NAME))
         );
+    }
+
+    #[sqlx::test]
+    async fn job_cron_fire_receipt_once_per_committed_interval(db: sqlx::PgPool) {
+        let capture = EventCapture::default();
+        let dispatch = capture.dispatch();
+        let worker = job_worker(db.clone());
+        worker
+            .tick()
+            .with_subscriber(dispatch.clone())
+            .await
+            .unwrap();
+        let receipts = capture.fire_receipts(TestJob::NAME);
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert_fire_receipt(&receipts[0], TestJob::NAME, None);
+        // Emitted inside the enqueue span, so the fire shares its trace.
+        assert_eq!(receipts[0].parent.as_deref(), Some("jobs.enqueue"));
+
+        // Same interval: nothing is due, so nothing is claimed or reported.
+        worker
+            .tick()
+            .with_subscriber(dispatch.clone())
+            .await
+            .unwrap();
+        assert_eq!(capture.fire_receipts(TestJob::NAME).len(), 1);
+
+        let previous = backdate(&db, TestJob::NAME, "2 minutes").await;
+        worker.tick().with_subscriber(dispatch).await.unwrap();
+        let receipts = capture.fire_receipts(TestJob::NAME);
+        assert_eq!(receipts.len(), 2, "{receipts:?}");
+        assert_fire_receipt(&receipts[1], TestJob::NAME, Some(previous));
+        assert_eq!(receipts[1].parent.as_deref(), Some("jobs.enqueue"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[sqlx::test]
+    async fn callback_cron_fire_receipt_precedes_callback(db: sqlx::PgPool) {
+        let capture = EventCapture::default();
+        let dispatch = capture.dispatch();
+        let mut registry = receipt_registry();
+        registry.jobs.retain(|name, _| *name == RECEIPT_CALLBACK);
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let worker = crate::cron::Worker::new(state, registry);
+        worker
+            .tick()
+            .with_subscriber(dispatch.clone())
+            .await
+            .unwrap();
+        let receipts = capture.fire_receipts(RECEIPT_CALLBACK);
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert_fire_receipt(&receipts[0], RECEIPT_CALLBACK, None);
+        assert_eq!(receipts[0].parent.as_deref(), Some("cron_job.tick"));
+
+        worker
+            .tick()
+            .with_subscriber(dispatch.clone())
+            .await
+            .unwrap();
+        assert_eq!(capture.fire_receipts(RECEIPT_CALLBACK).len(), 1);
+
+        let previous = backdate(&db, RECEIPT_CALLBACK, "2 minutes").await;
+        worker.tick().with_subscriber(dispatch).await.unwrap();
+        let receipts = capture.fire_receipts(RECEIPT_CALLBACK);
+        assert_eq!(receipts.len(), 2, "{receipts:?}");
+        assert_fire_receipt(&receipts[1], RECEIPT_CALLBACK, Some(previous));
+        // The claim commits, then the receipt, then the callback runs.
+        let order: Vec<String> = capture
+            .messages()
+            .into_iter()
+            .filter(|message| message == "Enqueuing Task" || message == "callback body ran")
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "Enqueuing Task",
+                "callback body ran",
+                "Enqueuing Task",
+                "callback body ran"
+            ]
+        );
+    }
+
+    #[sqlx::test]
+    async fn contended_claims_emit_no_fire_receipt(db: sqlx::PgPool) {
+        let capture = EventCapture::default();
+        let dispatch = capture.dispatch();
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let worker = crate::cron::Worker::new(state, receipt_registry());
+        let mut previous = HashMap::new();
+        for name in [TestJob::NAME, RECEIPT_CALLBACK] {
+            let at = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at) VALUES ($1, $2, clock_timestamp() - interval '2 minutes', clock_timestamp(), clock_timestamp()) RETURNING last_run_at")
+                .bind(uuid::Uuid::new_v4()).bind(name).fetch_one(&db).await.unwrap();
+            previous.insert(name, at);
+        }
+        // Both crons are due, but another scheduler holds their rows.
+        let mut blocker = db.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM crons FOR UPDATE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            worker.tick().with_subscriber(dispatch.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let skipped = capture
+            .messages()
+            .iter()
+            .filter(|message| *message == "Cron claim skipped")
+            .count();
+        assert_eq!(skipped, 2, "{:?}", capture.messages());
+        for name in [TestJob::NAME, RECEIPT_CALLBACK] {
+            assert!(capture.fire_receipts(name).is_empty(), "{name}");
+        }
+
+        blocker.rollback().await.unwrap();
+        worker.tick().with_subscriber(dispatch).await.unwrap();
+        for name in [TestJob::NAME, RECEIPT_CALLBACK] {
+            let receipts = capture.fire_receipts(name);
+            assert_eq!(receipts.len(), 1, "{name}: {receipts:?}");
+            assert_fire_receipt(&receipts[0], name, Some(previous[name]));
+        }
+    }
+
+    #[sqlx::test]
+    async fn uncommitted_claims_emit_no_fire_receipt(db: sqlx::PgPool) {
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let capture = EventCapture::default();
+        let dispatch = capture.dispatch();
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        for name in [TestJob::NAME, RECEIPT_CALLBACK] {
+            let mut registry = receipt_registry();
+            registry.jobs.retain(|registered, _| *registered == name);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let pause = Arc::new(ClaimPause {
+                claimed: sender,
+                release: tokio::sync::Notify::new(),
+            });
+            registry.jobs.get_mut(name).unwrap().pause_after_claim = Some(pause.clone());
+            let worker = crate::cron::Worker::new(state.clone(), registry);
+            let task =
+                tokio::spawn(async move { worker.tick().await }.with_subscriber(dispatch.clone()));
+            let pid = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            // The claim is held but dies before it can commit.
+            assert!(
+                sqlx::query_scalar::<_, bool>("SELECT pg_terminate_backend($1)")
+                    .bind(pid)
+                    .fetch_one(&other)
+                    .await
+                    .unwrap()
+            );
+            pause.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(capture.fire_receipts(name).is_empty(), "{name}");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+
+        crate::cron::Worker::new(state, receipt_registry())
+            .tick()
+            .with_subscriber(dispatch)
+            .await
+            .unwrap();
+        for name in [TestJob::NAME, RECEIPT_CALLBACK] {
+            let receipts = capture.fire_receipts(name);
+            assert_eq!(receipts.len(), 1, "{name}: {receipts:?}");
+            assert_fire_receipt(&receipts[0], name, None);
+        }
+    }
+
+    #[sqlx::test]
+    async fn two_pools_emit_one_fire_receipt_per_interval(db: sqlx::PgPool) {
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let capture = EventCapture::default();
+        let dispatch = capture.dispatch();
+        let make_worker = |pool| {
+            let state = TestAppState {
+                db: pool,
+                cookie_key: CookieKey::generate(),
+            };
+            crate::cron::Worker::new(state, receipt_registry())
+        };
+        let first = make_worker(db.clone());
+        let second = make_worker(other);
+        let mut previous = HashMap::new();
+        for interval in 1..=3 {
+            if interval > 1 {
+                for name in [TestJob::NAME, RECEIPT_CALLBACK] {
+                    previous.insert(name, backdate(&db, name, "2 minutes").await);
+                }
+            }
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let (a, b, _) = async {
+                tokio::join!(
+                    async {
+                        barrier.wait().await;
+                        first.tick().await
+                    },
+                    async {
+                        barrier.wait().await;
+                        second.tick().await
+                    },
+                    barrier.wait(),
+                )
+            }
+            .with_subscriber(dispatch.clone())
+            .await;
+            a.unwrap();
+            b.unwrap();
+            for name in [TestJob::NAME, RECEIPT_CALLBACK] {
+                let receipts = capture.fire_receipts(name);
+                assert_eq!(receipts.len(), interval, "{name}: {receipts:?}");
+                assert_fire_receipt(receipts.last().unwrap(), name, previous.get(name).copied());
+            }
+        }
     }
 
     #[sqlx::test]
