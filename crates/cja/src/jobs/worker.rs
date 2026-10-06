@@ -181,10 +181,23 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         })
     }
 
+    // Eyes contract: these fields must exist when the span is created. Eyes
+    // treats a run as cron-triggered when `job.context` starts with `Cron@`
+    // (its `cron_job_failed` monitors) and reads the timing fields for queue
+    // delay. Don't drop or rename them without coordinating Eyes.
     #[tracing::instrument(
         name = "worker.run_job",
         skip(self, job),
-        fields(job.id = %job.job_id, job.name = job.name, worker.id = %self.id),
+        fields(
+            job.id = %job.job_id,
+            job.name = job.name,
+            job.priority = job.priority,
+            job.run_at = %job.run_at,
+            job.created_at = %job.created_at,
+            job.context = job.context,
+            job.error_count = job.error_count,
+            worker.id = %self.id,
+        ),
         err,
     )]
     async fn run_job(&self, job: &JobFromDB) -> color_eyre::Result<()> {
