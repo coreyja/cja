@@ -23,6 +23,10 @@ pub enum ChallengeState {
         auth_state: webauthn_rs::prelude::PasskeyAuthentication,
         user_id: uuid::Uuid,
     },
+    #[serde(rename = "discoverable_authentication")]
+    DiscoverableAuthentication {
+        auth_state: webauthn_rs::prelude::DiscoverableAuthentication,
+    },
 }
 
 #[async_trait::async_trait]

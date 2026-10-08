@@ -211,6 +211,14 @@ async fn register_start_returns_valid_challenge() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("publicKey").is_some(), "missing publicKey: {json}");
+    assert_eq!(
+        json["publicKey"]["authenticatorSelection"]["residentKey"],
+        "preferred"
+    );
+    assert_eq!(
+        json["publicKey"]["authenticatorSelection"]["requireResidentKey"],
+        false
+    );
 
     // No user yet
     let row = sqlx::query("SELECT count(*) AS n FROM passkey_users")
@@ -260,6 +268,157 @@ async fn auth_start_unknown_username_returns_404() {
         .await
         .unwrap();
     assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+async fn discoverable_start_is_anonymous_and_has_no_allowed_credentials() {
+    let (pool, _guard) = setup_test_db().await;
+    let app = make_router(make_state(pool.clone()));
+    let response = app
+        .oneshot(json_request(
+            "/auth/discoverable/start",
+            &serde_json::json!({}),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let challenge: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        challenge["publicKey"]["allowCredentials"],
+        serde_json::json!([])
+    );
+    assert_eq!(challenge["mediation"], "conditional");
+
+    let row = sqlx::query("SELECT user_id, challenge_state FROM sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<Option<Uuid>, _>("user_id").unwrap(), None);
+    let state: serde_json::Value = row.try_get("challenge_state").unwrap();
+    assert_eq!(state["type"], "discoverable_authentication");
+    assert!(serde_json::from_value::<ChallengeState>(state).is_ok());
+}
+
+fn dummy_assertion() -> serde_json::Value {
+    serde_json::json!({
+        "id": "AQ", "rawId": "AQ", "type": "public-key",
+        "response": {
+            "authenticatorData": "AQ", "clientDataJSON": "AQ", "signature": "AQ",
+            "userHandle": null
+        },
+        "extensions": {}
+    })
+}
+
+#[tokio::test]
+async fn discoverable_finish_rejects_missing_malformed_and_wrong_challenge() {
+    let (pool, _guard) = setup_test_db().await;
+    let session_id = create_anonymous_session(&pool).await;
+    let state = make_state(pool.clone());
+    let cookie = make_session_cookie(session_id, &state.cookie_key);
+    for challenge in [
+        None,
+        Some(serde_json::json!({"type": "discoverable_authentication"})),
+        Some(serde_json::json!({"type": "authentication"})),
+    ] {
+        sqlx::query("UPDATE sessions SET challenge_state = $1 WHERE session_id = $2")
+            .bind(challenge)
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = make_router(state.clone())
+            .oneshot(json_request(
+                "/auth/discoverable/finish",
+                &dummy_assertion(),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+    }
+
+    let register_start = make_router(state.clone())
+        .oneshot(json_request(
+            "/register/start",
+            &serde_json::json!({ "username": "alice" }),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(register_start.status(), 200);
+    let response = make_router(state)
+        .oneshot(json_request(
+            "/auth/discoverable/finish",
+            &dummy_assertion(),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+}
+
+#[tokio::test]
+async fn discoverable_finish_rejects_missing_user_handle() {
+    let (pool, _guard) = setup_test_db().await;
+    let session_id = create_anonymous_session(&pool).await;
+    let state = make_state(pool.clone());
+    let (_, auth_state) = state
+        .passkey_config
+        .webauthn
+        .start_discoverable_authentication()
+        .unwrap();
+    PasskeySession::set_challenge_state(
+        &pool,
+        session_id,
+        serde_json::to_value(ChallengeState::DiscoverableAuthentication { auth_state }).unwrap(),
+    )
+    .await
+    .unwrap();
+    let cookie = make_session_cookie(session_id, &state.cookie_key);
+    let response = make_router(state)
+        .oneshot(json_request(
+            "/auth/discoverable/finish",
+            &dummy_assertion(),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    let row = sqlx::query("SELECT user_id FROM sessions WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<Option<Uuid>, _>("user_id").unwrap(), None);
+}
+
+#[tokio::test]
+async fn named_finish_rejects_discoverable_challenge() {
+    let (pool, _guard) = setup_test_db().await;
+    let session_id = create_anonymous_session(&pool).await;
+    let state = make_state(pool);
+    let cookie = make_session_cookie(session_id, &state.cookie_key);
+    let start = make_router(state.clone())
+        .oneshot(json_request(
+            "/auth/discoverable/start",
+            &serde_json::json!({}),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 200);
+    let finish = make_router(state)
+        .oneshot(json_request(
+            "/auth/finish",
+            &dummy_assertion(),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 400);
 }
 
 #[tokio::test]
@@ -725,6 +884,9 @@ async fn challenge_state_registration_round_trip_via_json_text() {
     let back: ChallengeState = serde_json::from_value(v).unwrap();
     match back {
         ChallengeState::Registration { username, .. } => assert_eq!(username, "alice"),
-        ChallengeState::Authentication { .. } => panic!("wrong variant"),
+        ChallengeState::Authentication { .. }
+        | ChallengeState::DiscoverableAuthentication { .. } => {
+            panic!("wrong variant")
+        }
     }
 }

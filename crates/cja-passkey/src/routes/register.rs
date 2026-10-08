@@ -45,12 +45,22 @@ where
     let display_for_webauthn = display_name.as_deref().unwrap_or(&username);
 
     let webauthn = state.passkey_config().webauthn.clone();
-    let (challenge, registration_state) = webauthn
+    let (mut challenge, registration_state) = webauthn
         .start_passkey_registration(temp_uuid, &username, display_for_webauthn, None)
         .map_err(|err| {
             tracing::error!("start_passkey_registration failed: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    let selection = challenge
+        .public_key
+        .authenticator_selection
+        .as_mut()
+        .ok_or_else(|| {
+            tracing::error!("registration challenge has no authenticator_selection");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    selection.resident_key = Some(webauthn_rs_proto::ResidentKeyRequirement::Preferred);
 
     let challenge_state = ChallengeState::Registration {
         registration_state,
