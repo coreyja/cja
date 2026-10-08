@@ -14,6 +14,14 @@ where
         .route("/auth/start", axum::routing::post(auth::start::<S>))
         .route("/auth/finish", axum::routing::post(auth::finish::<S>))
         .route(
+            "/auth/discoverable/start",
+            axum::routing::post(auth::start_discoverable::<S>),
+        )
+        .route(
+            "/auth/discoverable/finish",
+            axum::routing::post(auth::finish_discoverable::<S>),
+        )
+        .route(
             "/passkey-client.js",
             axum::routing::get(crate::js::passkey_js_handler),
         )

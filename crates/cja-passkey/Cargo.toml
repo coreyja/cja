@@ -11,7 +11,9 @@ workspace = true
 cja = { path = "../cja", default-features = false }
 webauthn-rs = { version = "0.5", features = [
     "danger-allow-state-serialisation",
+    "conditional-ui",
 ] }
+webauthn-rs-proto = "=0.5.3"
 axum = { workspace = true, features = ["macros"] }
 sqlx.workspace = true
 serde.workspace = true
