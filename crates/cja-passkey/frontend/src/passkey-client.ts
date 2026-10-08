@@ -135,6 +135,31 @@ interface LoginArgs {
 }
 
 function createPasskeyClient(basePath: string = "") {
+  async function assertCredential(
+    startPath: string,
+    startBody: unknown,
+    finishPath: string,
+  ): Promise<unknown> {
+    const startResp = await postJson(`${basePath}${startPath}`, startBody);
+    if (!startResp.ok) {
+      throw new Error(`${startPath} failed: ${startResp.status}`);
+    }
+    const startJson = (await startResp.json()) as RequestOptionsJson;
+    const options = prepareAssertionOptions(startJson);
+    const credential = (await navigator.credentials.get({
+      publicKey: options,
+    })) as PublicKeyCredential | null;
+    if (!credential) throw new Error("navigator.credentials.get returned null");
+    const finishResp = await postJson(
+      `${basePath}${finishPath}`,
+      prepareAssertionResponse(credential),
+    );
+    if (!finishResp.ok) {
+      throw new Error(`${finishPath} failed: ${finishResp.status}`);
+    }
+    return finishResp.json().catch(() => ({}));
+  }
+
   return {
     async register({ username, displayName }: RegisterArgs): Promise<unknown> {
       const startResp = await postJson(`${basePath}/register/start`, {
@@ -158,23 +183,12 @@ function createPasskeyClient(basePath: string = "") {
       return finishResp.json().catch(() => ({}));
     },
 
-    async login({ username }: LoginArgs): Promise<unknown> {
-      const startResp = await postJson(`${basePath}/auth/start`, { username });
-      if (!startResp.ok) {
-        throw new Error(`auth/start failed: ${startResp.status}`);
-      }
-      const startJson = (await startResp.json()) as RequestOptionsJson;
-      const options = prepareAssertionOptions(startJson);
-      const credential = (await navigator.credentials.get({
-        publicKey: options,
-      })) as PublicKeyCredential | null;
-      if (!credential) throw new Error("navigator.credentials.get returned null");
-      const finishBody = prepareAssertionResponse(credential);
-      const finishResp = await postJson(`${basePath}/auth/finish`, finishBody);
-      if (!finishResp.ok) {
-        throw new Error(`auth/finish failed: ${finishResp.status}`);
-      }
-      return finishResp.json().catch(() => ({}));
+    login(): Promise<unknown> {
+      return assertCredential("/auth/discoverable/start", {}, "/auth/discoverable/finish");
+    },
+
+    loginWithUsername({ username }: LoginArgs): Promise<unknown> {
+      return assertCredential("/auth/start", { username }, "/auth/finish");
     },
   };
 }

@@ -1,0 +1,14 @@
+{
+  "name": "cja-passkey-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "playwright test discoverable.spec.ts --reporter=line",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.0",
+    "@types/node": "22.19.17",
+    "typescript": "5.9.3"
+  }
+}

@@ -40,6 +40,57 @@ jobs:
       - name: Run cargo deny
         run: cargo deny check bans
 
+  passkey-browser:
+    name: Passkey browser
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+      CJA_PASSKEY_STRICT_FRONTEND_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" --component rustfmt --component clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.0
+      - name: Install frontend dependencies
+        working-directory: crates/cja-passkey/frontend
+        run: pnpm install --frozen-lockfile
+      - name: Check and build frontend
+        working-directory: crates/cja-passkey/frontend
+        run: |
+          pnpm check
+          pnpm build
+          grep -q 'loginWithUsername' dist/passkey-client.js
+          grep -q 'discoverable/start' dist/passkey-client.js
+      - name: Install browser test dependencies
+        working-directory: crates/cja-passkey/e2e
+        run: pnpm install --frozen-lockfile
+      - name: Check browser test types and install Chromium
+        working-directory: crates/cja-passkey/e2e
+        run: |
+          pnpm check
+          pnpm exec playwright install --with-deps chromium
+      - name: Run real WebAuthn browser fixture
+        run: cargo test -p cja-passkey --test browser_fixture -- --ignored --nocapture
+
   deploy:
     # Serialize production deploys. Two merges close together each build their
     # own image and run `flyctl deploy` concurrently; whichever finishes last
