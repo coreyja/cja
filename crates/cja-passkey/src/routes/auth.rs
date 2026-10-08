@@ -197,7 +197,10 @@ where
     let webauthn = &state.passkey_config().webauthn;
     let (user_id, credential_id) = webauthn
         .identify_discoverable_authentication(&credential_payload)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        .map_err(|err| {
+            tracing::warn!("identify_discoverable_authentication failed: {err}");
+            StatusCode::UNAUTHORIZED
+        })?;
     let row = credential::find_by_credential_id(state.db(), credential_id)
         .await
         .map_err(|err| {
