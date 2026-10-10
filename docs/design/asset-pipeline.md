@@ -29,14 +29,15 @@ The experiment is a standalone edition-2024 crate outside the cja workspace. `sr
 
 The lockfile was generated before timing (`cargo generate-lockfile`, 281 packages; crates.io index updated). “Cold” means an absent `/tmp/mull-scratch/cja-DEV-1652-build`, a generated lockfile, and the host's warm Cargo registry/index cache. The first compiling command was `cargo build`. Every Cargo invocation set `CARGO_BUILD_BUILD_DIR=/tmp/mull-scratch/cja-DEV-1652-build`; final executable was in the scratch crate's `target/debug/`. A `systemd-run --user --scope -p MemoryAccounting=yes` dry run successfully read its own cgroup `memory.peak` before the measured build. No other Cargo/rustc process was running at start. The build was not retried or reconfigured.
 
-Reproduction from the retained scratch sources:
+Reproduction from the retained scratch sources and `Cargo.lock`:
 
 ```sh
 cd /tmp/mull-scratch/cja-DEV-1652
-CARGO_BUILD_BUILD_DIR=/tmp/mull-scratch/cja-DEV-1652-build cargo generate-lockfile
+# Keep the retained Cargo.lock. Regenerating it may select a different dependency graph.
 # Ensure the dedicated build dir is absent; this was checked before the measured run.
 systemd-run --user --scope -p MemoryAccounting=yes -- ./logs/cold-run.sh
-# cold-run.sh runs /usr/bin/time -v -o logs/cold.time cargo build,
+# For a new reproduction, add --locked to the cargo build in cold-run.sh.
+# cold-run.sh originally ran /usr/bin/time -v -o logs/cold.time cargo build,
 # saves Cargo output/status, then reads its scope's memory.peak before exit.
 du -sb /tmp/mull-scratch/cja-DEV-1652-build
 du -sB1 /tmp/mull-scratch/cja-DEV-1652-build
@@ -45,13 +46,15 @@ touch src/util.ts
 CARGO_BUILD_BUILD_DIR=/tmp/mull-scratch/cja-DEV-1652-build /usr/bin/time -v cargo build
 ```
 
+The timed cold run used the earlier `[name].[hash:8].js` `build.rs` variant, not the final fixed-name post-processing code printed below. The retained `cold-run.sh` records the original invocation; adding `--locked` is the reproducible way to hold its dependency graph. The cold timing excludes the approximately 119 MB of TypeScript and Tailwind downloads, which were performed separately from the shell.
+
 VM: Ubuntu 24.04.3, Linux 6.8.0-106-generic, aarch64 glibc, 8 vCPU, 15 GiB RAM, 8 GiB swap (3.2 GiB already used), 32 GiB available on `/` before the run. Rust/Cargo 1.99.0. `~/.cargo/config.toml` sets `jobs = 4`, `build-dir = "/home/coreyja.linux/.cache/cargo-builds"` (overridden for this experiment), and aarch64 linker `clang` with `-fuse-ld=mold`. No `RUSTFLAGS` or `CARGO_INCREMENTAL` environment override. The default dev profile is unoptimized with debuginfo and default incremental compilation. These figures are VM- and profile-specific.
 
 **Toolchain compatibility:** This scratch crate is outside the cja workspace and used the host default Rust 1.99.0. cja pins Rust 1.96.0 in `rust-toolchain.toml`, which the CI stable lane selects. The pinned `rolldown = "=1.2.13"` dependency graph includes `oxc` 0.153.0 crates with `rust-version = "1.97.0"`. `cargo +1.96.0 check --offline --locked` in the scratch crate fails before compilation with the MSRV error reproduced in the appendix. Therefore the measured build does **not** demonstrate that the proposed crate builds with cja's current pinned toolchain. DEV-1653 must first bump `rust-toolchain.toml` to at least 1.97.0 (and run CI on the chosen pin); consuming apps pinned below 1.97.0 need the same prerequisite. The automatic toolchain bump is currently blocked by open [cja#51](https://github.com/coreyja/cja/pull/51). A cold measurement on the eventual pin remains unverified.
 
 ## Working build.rs code
 
-This is the compiling final scratch implementation, built once after the earlier rolldown `[name].[hash:8].js` variant. Rolldown's fixed `app.js` and `app.js.map` outputs are selected from the **current `BundleOutput.assets`**, then SHA-256 is truncated to eight lowercase hex characters for both final files. The spike removes the source map's optional `file` property so it cannot name a hashed JS file; a fixed logical `file: "app.js"` would not itself create a hash cycle. The exact string replacement below relies on the observed rolldown serialization and can silently do nothing if that shape changes. **DEV-1653 must parse the map as JSON and set or remove `file` structurally**, then serialize before hashing. Its `sources` and mappings must remain intact. The build fails on any rolldown warning, including failed-clean warnings. `clean_dir` applies only to `OUT_DIR/assets`.
+This is the compiling final **single-entry** scratch implementation, built once after the earlier rolldown `[name].[hash:8].js` variant. Rolldown's fixed `app.js` and `app.js.map` outputs are selected from the **current `BundleOutput.assets`**, then SHA-256 is truncated to eight lowercase hex characters for both final files. The spike removes the source map's optional `file` property so it cannot name a hashed JS file; a fixed logical `file: "app.js"` would not itself create a hash cycle. The exact string replacement below relies on the observed rolldown serialization and can silently do nothing if that shape changes. **DEV-1653 must parse the map as JSON, set or remove `file` structurally, and normalize `sources` relative to `CARGO_MANIFEST_DIR` or the frontend root before hashing.** The source entries must still resolve, and mappings must remain intact. Rolldown otherwise writes source paths relative to its output directory; those paths leak the build/worktree layout and make map and JS hashes location-dependent. The build fails on any rolldown warning, including failed-clean warnings. In this one-entry spike only, `clean_dir` applies to `OUT_DIR/assets`; production directory ownership is specified below.
 
 ```rust
 use rolldown::plugin::{HookResolveIdArgs, HookResolveIdReturn, HookUsage, Plugin, PluginContext};
@@ -207,26 +210,36 @@ fn main() {
 | GNU time maximum RSS | **985,100 KiB** = **1,008,742,400 bytes** = **1.008742 GB** = **0.939465 GiB**; largest single process, not aggregate concurrency |
 | Scoped cgroup memory peak | **1,882,210,304 bytes** = 1.882210 GB = 1.752945 GiB; aggregate scope context, not the RSS gate |
 | Cold build dir immediately after build | Apparent **1,106,248,791 bytes** (1.106249 GB, 1.030274 GiB); allocated **1,115,881,472 bytes** (1.115881 GB, 1.039246 GiB); `du -sh` **1.1G**. Gate uses the larger allocated count. |
-| Touch-only warm rebuild (earlier rolldown hash variant) | **0.32 s**; Cargo recompiled `cja-asset-spike`; output remained 209-byte JS and 768-byte map under the same `app.17571f0d` rolldown names and identical SHA-256 bytes. |
+| Touch-only warm rebuild (earlier rolldown hash variant) | **0.32 s**; Cargo recompiled `cja-asset-spike`; output remained 209-byte JS and 768-byte map under the same `app.17571f0d` rolldown names. Warm output SHA-256 values are retained in `logs/warm.output-sha256`; the cold hash capture is empty, so no cold-to-warm hash comparison is claimed. |
 | Visible `util.ts` edit and restore (earlier rolldown hash variant) | Changed string yielded `app.91e3dc39.js` (217 bytes), its map, and a 217-byte embedded binary output. Restore yielded only the original two files and 209-byte embedded output. `clean_dir` removed stale files for this variant; edit/restore cleanup was **not** rerun on the final post-process variant. |
 | IIFE / external map / embedding | Pass: minified `(function(){...})();`, imported `asset-spike:` behavior, no TS syntax/import left. Rolldown output was `app.17571f0d.js` (209 bytes) and `app.17571f0d.js.map` (768 bytes), with a resolving `sourceMappingURL`; binary printed `len=209`. |
 | Final content hashes (final post-process variant) | Pass in one build after post-process: `app.f0a80ffc.js` (209 bytes, SHA-256 starts `f0a80ffc`) and `app.js.69e14a70.map` (743 bytes, SHA-256 starts `69e14a70`); source-map URL resolves. The map is valid JSON with two sources and no optional `file` field. |
 | cja pinned toolchain / MSRV | **Blocked for integration:** Rust 1.96.0 rejects the pinned rolldown dependency graph before compilation; oxc 0.153.0 requires Rust 1.97.0. The 1.99.0 measurements do not apply to a 1.97.0 build without a new run. |
-| Bare imports | Pass: the `resolve_id` plugin fails both absent and fake-resolvable `left-pad` before ordinary resolution, with specifier and importing `src/main.ts` path in the diagnostic. Both builds exited 101; restored source built cleanly. |
-| TypeScript 7.0.2 | Pass: verified 8,900,516-byte archive; extracted whole `package/lib/` tree to shared cache. Clean `--noEmit -p tsconfig.json` exited 0 in **0.18 s** with no `node_modules`; `document` and `HTMLElement` resolved. Injected `string` to `number` mismatch exited 1 with TS2322 and file/line; restored source passed. |
-| Tailwind CLI v4.3.3 | Pass: verified 109,881,488-byte binary; `--minify` exited 0 in **0.42 s**; CSS **69,175 bytes**; `.bg-red-500{` and escaped `.md\\:flex{` selectors both present; first CSS line is `/*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */`. No `node_modules`. |
+| Bare imports (earlier `build.rs` variant) | Pass: the `resolve_id` plugin fails both absent and fake-resolvable `left-pad` before ordinary resolution, with specifier and importing `src/main.ts` path in the diagnostic. Both builds exited 101; restored source built cleanly. These logs precede the final post-process variant. |
+| TypeScript 7.0.2 standalone CLI check | Pass: verified 8,900,516-byte archive; extracted whole `package/lib/` tree to shared cache. Clean `--noEmit -p tsconfig.json` exited 0 in **0.18 s** with no `node_modules`; `document` and `HTMLElement` resolved. Injected `string` to `number` mismatch exited 1 with TS2322 and file/line on **stdout**; restored source passed. `build.rs` did not invoke tsc. |
+| Tailwind CLI v4.3.3 standalone CLI check | Pass: verified 109,881,488-byte binary; `--minify` exited 0 in **0.42 s**; CSS **69,175 bytes**; `.bg-red-500{` and escaped `.md\\:flex{` selectors both present; first CSS line is `/*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */`. No `node_modules`. `build.rs` did not invoke Tailwind. |
 
-The cold build used the earlier rolldown `[name].[hash:8].js` variant. Its artifact capture files are empty, so the output-content checks above use the later warm and variant runs; only the cold compilation and resource measurements are attributed to that first invocation. The final post-process variant was built once and checked for on-disk hash correctness, but its edit/restore cleanup behavior remains unverified.
+The cold build used the earlier rolldown `[name].[hash:8].js` variant. Its artifact capture files are empty, so the output-content checks above use the later warm and variant runs; only the cold compilation and resource measurements are attributed to that first invocation. The final post-process variant was built once and checked for on-disk hash correctness. `logs/final.outputs` lists only its two final files after a preceding post-process build, so single-entry stale cleanup was observed; a content edit/restore sequence on that variant and multi-entry assembly remain untested. TypeScript and Tailwind were downloaded, verified, and run manually from the shell. The settled environment-override → cache → download precedence, offline error, concurrent cache installation, and propagation of CLI failures through `cargo build` were **not exercised**. DEV-1653 must capture tsc stdout as well as stderr so TS2322 reaches Cargo's diagnostics.
 
 ### Bare-import mechanism
 
-Rolldown's native `UNRESOLVED_IMPORT` is only a warning/externalization and cannot enforce relative imports when a package resolves. The `resolve_id` hook with `HookUsage::ResolveId` rejects every non-entry specifier not beginning `./` or `../`. Both the absent and fake-resolvable package produced the plugin error shown verbatim in the appendix. The fixture was removed, and the clean source rebuilt. Production code should retain the plugin gate; no package manager or install is involved.
+Rolldown's native `UNRESOLVED_IMPORT` is only a warning/externalization and cannot enforce relative imports when a package resolves. The `resolve_id` hook with `HookUsage::ResolveId` rejects every non-entry specifier not beginning `./` or `../`. Both the absent and fake-resolvable package produced the plugin error shown verbatim in the appendix. These 15:54:39 logs tested an earlier `build.rs` variant; the final post-process build ran at 15:55:43. The fixture was removed, and the clean source rebuilt. Production code should retain the plugin gate, but change the diagnostic to **“non-relative import”**: the current “bare import” wording also describes absolute paths and URL specifiers. A relative `../../node_modules/pkg/index.js` still passes the lexical gate. DEV-1653 must reject any resolved id with a `node_modules` path component in the resolve hook, naming the original import and importer. Whether to restrict every resolved id to an allowed root such as the crate directory is an open design question for the DEV-1653 plan, not a settled requirement here.
+
+### Multi-entry and directory ownership
+
+This spike bundled one entry only. Rolldown 1.2.13 rejects IIFE/UMD output when the plan contains more than one chunk, so one IIFE per entry requires separate `Bundler` runs. Its `clean_dir` empties the entire selected output directory before **each** `write()`. If several entries write into a shared `OUT_DIR/assets`, a later run deletes earlier bundles, maps, Tailwind CSS, and static files.
+
+DEV-1653 must give each entry its own rolldown scratch output directory and scope that run's `clean_dir` there. `cja-build` owns the final assets directory, clears it exactly once per build before assembling outputs, then moves or copies hashed bundles, maps, Tailwind CSS, and static files into it. The scratch `OUT_DIR/assets` layout above demonstrates one entry only and is not the production directory layout.
+
+The scratch `cargo:rerun-if-changed=src` also misses allowed `../` imports outside `src`. After each write, DEV-1653 must emit `cargo:rerun-if-changed=<path>` for every file in `Bundler::watch_files()`, plus the TypeScript config and selected external tool binary/version. This makes imported files outside `src` trigger a rebuild rather than silently embedding stale JS.
 
 ### Hash and source-map behavior
 
 Rolldown's `[hash:8]` is its chunk hash (xxh3_128 with hex characters), **not** SHA-256 of either final emitted file. The native `app.17571f0d.js` had SHA-256 `bf2ff44a...`; its `app.17571f0d.js.map` had SHA-256 `e88dd585...`. Thus the map's name does not hash its own bytes. The JS name also does not hash the final bytes containing its `sourceMappingURL` comment. For the settled every-file content-hash rule, the working post-process emits fixed names from rolldown, removes the map's optional `file` field, hashes/renames the map, rewrites the JS comment to that returned map name, then hashes/renames the final JS. A final on-disk SHA-256 recomputation verified both names. `app.js.<hash>.map` treats `app.js` as the logical name and `.map` as the extension.
 
-**Recommendation for DEV-1653:** emit fixed rolldown names and post-process with truncated SHA-256, map first and JS second, using the same hash function for static files. Parse the map JSON structurally. Repeat the edit/restore cleanup test on that implementation; this spike only checked that sequence on the earlier rolldown hash variant.
+**Recommendation for DEV-1653, scoped to single-chunk IIFE output:** emit fixed rolldown names and post-process with truncated SHA-256, map first and JS second, using the same hash function for static files. Parse the map JSON structurally; normalize `sources` relative to the crate or frontend root in that same pass before hashing so maps do not leak local build paths and names remain reproducible across worktrees. Repeat the edit/restore cleanup test on that implementation; this spike only checked that sequence on the earlier rolldown hash variant.
+
+Optional ESM output may contain dynamic imports or several chunks with imports by filename. Renaming those chunks after write without rewriting their import specifiers causes runtime 404s. Before ESM ships, DEV-1653 needs import-specifier rewriting in dependency order or another naming strategy that preserves every reference and content hash. It must fail the build on any multi-chunk output it cannot hash and link correctly; it must never emit broken references.
 
 ### Native tool provenance and cache
 
@@ -236,6 +249,8 @@ Rolldown's `[hash:8]` is its chunk hash (xxh3_128 with hex characters), **not** 
 | Tailwind CLI 4.3.3 | [linux-arm64 binary](https://github.com/tailwindlabs/tailwindcss/releases/download/v4.3.3/tailwindcss-linux-arm64); SHA-256 `55fd0b241214eff3de1e8ee4f22796662f2d2e7a49bcfca7477cfd0bac398195` matches the exact line in publisher [sha256sums.txt](https://github.com/tailwindlabs/tailwindcss/releases/download/v4.3.3/sha256sums.txt) and the [release API asset digest](https://api.github.com/repos/tailwindlabs/tailwindcss/releases/tags/v4.3.3). | `$XDG_CACHE_HOME/cja/tailwindcss-4.3.3-linux-arm64` (default `~/.cache/cja/...`). |
 
 Only this VM's linux-arm64 glibc assets were executed. linux x64, linux musl, and macOS x64/arm64 remain unverified on this VM. Tailwind publishes a distinct `tailwindcss-linux-arm64-musl` asset; its key and digest must differ. TypeScript-go 7.0.2 musl compatibility is unverified. These are later platform checks, not failures of this VM spike.
+
+DEV-1653 must install verified downloads atomically across worktrees. For tsc, extract into a temporary directory in the cache's parent, write a marker containing the verified archive SHA-256, then atomically rename the completed tree to the versioned cache key. On a cache hit, require that marker to match the hardcoded digest; the retained extracted tree alone cannot be rehashed against the original tarball digest. For Tailwind, download to a temporary file in the same parent, verify its bytes, then atomically rename it to the single-file cache key; rehash the binary on a hit. Coordinate concurrent installers so no reader can accept a partial entry.
 
 ### Surprises
 
@@ -255,7 +270,8 @@ Only this VM's linux-arm64 glibc assets were executed. linux x64, linux musl, an
 | Cold build ≤ 180 s | Pass: **29.12 s** on Rust 1.99.0 |
 | Largest-process RSS ≤ 6,000,000,000 bytes | Pass: **1,008,742,400 bytes** |
 | Build dir ≤ 5,000,000,000 bytes | Pass: **1,115,881,472 bytes**, larger of apparent and allocated |
-| Bundle, map, embedding, import policy, tsc, Tailwind, checksums, final content hashes | Pass in the variant-specific checks described above |
+| Bundle, map, embedding, import policy, final content hashes | Pass in the single-entry variant-specific checks described above; multi-entry and ESM were untested |
+| tsc, Tailwind, checksums | Pass as **standalone CLI checks**; build-script invocation, tool downloads and cache precedence, offline failure, and Cargo diagnostic propagation were untested and are required in DEV-1653 |
 | cja Rust 1.96.0 compatibility | **Fail:** oxc 0.153.0 needs Rust ≥ 1.97.0 |
 | Linux musl and macOS | Unverified on this VM |
 
@@ -263,9 +279,9 @@ If a supported toolchain or later platform misses a gate, the considered fallbac
 
 ## Appendix: raw evidence
 
-### Pinned toolchain compatibility (verbatim command output)
+### Pinned toolchain compatibility (transcribed command output)
 
-`CARGO_BUILD_BUILD_DIR=/tmp/mull-scratch/cja-DEV-1652-build cargo +1.96.0 check --offline --locked` exited 101 before compilation. Selected output lines, verbatim (all listed `oxc` 0.153.0 packages carry the same requirement):
+`CARGO_BUILD_BUILD_DIR=/tmp/mull-scratch/cja-DEV-1652-build cargo +1.96.0 check --offline --locked` exited 101 before compilation. Selected output lines were transcribed from that run; no raw MSRV log was retained in `logs/` (all listed `oxc` 0.153.0 packages carry the same requirement):
 
 ```text
 error: rustc 1.96.0 is not supported by the following packages:
