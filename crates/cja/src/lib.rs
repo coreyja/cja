@@ -146,6 +146,8 @@
 //! ```
 //!
 //! Disabling `jobs` at compile time also disables `cron`.
+//! [`testing::test_db`] is always available; `testing` enables only
+//! [`testing::mock_oauth`].
 //!
 //! ## Re-exports
 //!
@@ -172,7 +174,6 @@ pub mod eyes_manifest;
 #[cfg(feature = "jobs")]
 pub mod jobs;
 pub mod server;
-#[cfg(feature = "testing")]
 pub mod testing;
 
 pub mod app_state;

@@ -17,10 +17,12 @@
 
 ## Feature Flags
 
-- **Compile-time:** `#[cfg(feature = "...")]` for optional modules (`cron`, `jobs`, `testing`)
+- **Compile-time:** `#[cfg(feature = "...")]` for optional modules (`cron`, `jobs`) and optional helpers such as `testing::mock_oauth`
 - **Runtime:** `{FEATURE}_DISABLED` env vars (e.g., `SERVER_DISABLED`, `JOBS_DISABLED`, `CRON_DISABLED`)
 
 The `cron` feature depends on `jobs` — enabling `cron` automatically enables `jobs`, and disabling `jobs` at compile time also disables `cron`.
+The destructive `testing::test_db` lifecycle helper is always available; the
+`testing` feature enables only `testing::mock_oauth`.
 
 ## Unsafe Code
 

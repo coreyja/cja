@@ -481,6 +481,7 @@ dependencies = [
  "serde_urlencoded",
  "socket2",
  "sqlx",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",

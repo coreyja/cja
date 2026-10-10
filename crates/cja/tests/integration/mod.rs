@@ -6,3 +6,4 @@ mod job_telemetry;
 mod jobs;
 mod server_shutdown;
 mod sessions;
+mod test_db;
