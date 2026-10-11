@@ -21,8 +21,4 @@ where
             "/auth/discoverable/finish",
             axum::routing::post(auth::finish_discoverable::<S>),
         )
-        .route(
-            "/passkey-client.js",
-            axum::routing::get(crate::js::passkey_js_handler),
-        )
 }

@@ -1,4 +1,4 @@
-#![doc(html_favicon_url = "https://cja.app/favicon.svg")]
+#![doc(html_favicon_url = "https://cja.app/docs/favicon.svg")]
 //! # CJA — Cron, Jobs and Axum
 //!
 //! > **ALPHA**: CJA is under active development. APIs may change between releases.
@@ -164,6 +164,7 @@
 //! ```
 
 pub use eyes_subscriber;
+pub mod assets;
 pub use sqlx;
 pub use uuid;
 

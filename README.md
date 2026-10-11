@@ -1,5 +1,7 @@
 # CJA — Cron, Jobs and Axum
 
+For embedded static files, see the [asset guide](crates/cja/README.md#embedded-static-assets).
+
 > **ALPHA** — APIs may change between releases. Use in production at your own risk.
 
 A Rust web framework for full-stack development that combines background job processing, cron scheduling, and an HTTP server built on [Axum](https://github.com/tokio-rs/axum).

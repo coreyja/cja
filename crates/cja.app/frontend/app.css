@@ -1,3 +1,6 @@
+@import "tailwindcss" source(none);
+@source "../src";
+
 :root {
     --dark: #121131;
     --dark-surface: #181845;
@@ -36,7 +39,7 @@ body {
     -moz-osx-font-smoothing: grayscale;
 }
 
-.container {
+.site-container {
     max-width: var(--container-max);
     margin: 0 auto;
     padding: 0 24px;

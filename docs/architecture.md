@@ -1,5 +1,38 @@
 # Architecture
 
+## Embedded frontend assets
+
+An app's `build.rs` calls `cja-build` with optional `assets/` static files and
+TypeScript/JavaScript entries from `frontend/`. Native tsc checks the
+`tsconfig.json` once and Rolldown bundles each entry into a minified IIFE (or
+single-chunk ESM) with an external source map. The builder hashes final bytes
+with SHA-256, writes hashed copies under its owned
+`OUT_DIR/cja-assets/`, and generates `OUT_DIR/cja_assets.rs` last. The
+`cja::include_assets!` macro embeds those bytes and exposes a manifest plus
+scoped logical-name lookup. At startup, `cja::assets::router` validates all
+manifest URLs and registers concrete Axum routes. A source change reruns the
+build script; serving never reads an asset from disk. Cargo watches the static
+root, frontend root, tsconfig chain, tsc-listed app files and ambient
+declarations, and Rolldown's resolved files. Source map labels are relative to
+the frontend root and contain `sourcesContent`. `AssetsBuilder::tailwind`
+takes a manifest-relative CSS input and a logical `.css` name. The root CSS
+uses `@import "tailwindcss" source(none);` and explicit directory `@source`
+paths relative to that CSS file. Local `./` and `../` `.css` imports are
+validated recursively, and all CSS files and scan roots stay inside the app's
+manifest directory. Cargo watches the CSS graph and every explicit scan root,
+including Rust Maud templates. Tailwind's minified output uses the same hashed,
+embedded manifest path as static files; ordinary CSS may still use `static_dir`.
+The scanner accepts only the [documented at-rule allow-list](../crates/cja/README.md#tailwind-css-inputs),
+depth-zero root directives, ASCII outside strings/comments, and literal source
+directories without globs.
+`cja-build` watches existing ancestor `.gitignore`, `.ignore`, and
+`.git/info/exclude` files, including the common Git directory's exclude in a
+worktree or a submodule Git directory's exclude. Watching those files can cause
+an extra rebuild even when Tailwind does not use a particular exclude file.
+A newly created ancestor
+ignore file is noticed on the next rerun, not immediately. Docker builds omit
+`.git/info/exclude` because `.dockerignore` removes `.git`.
+
 CJA is organized as three subsystems — Cron, Jobs, and Axum (HTTP server) — plus supporting modules for sessions, tracing, and database management. Everything coordinates through a shared `AppState` trait and `CancellationToken` for graceful shutdown.
 
 ## Crate Structure
@@ -8,6 +41,7 @@ CJA is organized as three subsystems — Cron, Jobs, and Axum (HTTP server) — 
 Cargo.toml          — Workspace root, clippy/lint config
 crates/
   cja/              — Core framework library
+  cja-build/        — Compile-time static hashing, type checking, and bundling
   cja.app/          — Example application (canonical usage reference)
   cli/              — `cja` CLI tool (project scaffolding)
 migrations/         — Copy of crates/cja/migrations/ for sqlx CLI
@@ -131,6 +165,8 @@ enqueue() → INSERT INTO jobs (with priority, payload, context)
 ```
 
 The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not. When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent.
+
+`JobWorkerConfig.idle_poll_gate` optionally shares a process-local `IdlePollGate` among workers. Its permits limit periodic idle claims; a worker keeps a permit across empty sleeps and releases it before running a job or its heartbeat. A successful autocommit `Job::enqueue` calls `AppState::job_enqueued`, which an app may override to wake one parked worker for one extra claim. Direct SQL, other processes, transactional enqueue, due retries, and expired leases do not provide this local wake; the periodic claimers discover them. Notifications may coalesce or be lost, so SQL remains authoritative with the same priority order.
 
 ### Cron Flow
 

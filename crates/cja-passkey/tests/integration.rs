@@ -752,10 +752,84 @@ async fn challenge_state_type_mismatch_register_finish_rejected() {
 }
 
 #[tokio::test]
-async fn js_asset_is_served() {
+async fn client_manifest_serves_hashed_js_and_map() {
+    use cja_passkey::passkey_assets;
+    use http::header::{CACHE_CONTROL, CONTENT_TYPE};
+
+    let manifest = &passkey_assets::MANIFEST;
+    assert_eq!(manifest.owner, "cja-passkey");
+    assert!(
+        manifest
+            .entries
+            .iter()
+            .any(|asset| asset.logical_name == "passkey-client.js")
+    );
+    assert!(
+        manifest
+            .entries
+            .iter()
+            .any(|asset| asset.logical_name == "passkey-client.js.map")
+    );
+    let js_url = passkey_assets::asset_url("passkey-client.js");
+    let stem = js_url.strip_prefix("/assets/passkey-client.").unwrap();
+    let hash = stem.strip_suffix(".js").unwrap();
+    assert_eq!(hash.len(), 8);
+    assert!(
+        hash.bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
+
+    let app = cja::assets::router::<()>(&[manifest]).unwrap();
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&js_url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/javascript");
+    assert_eq!(
+        response.headers()[CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let js = std::str::from_utf8(&body).unwrap();
+    assert!(js.contains("cjaPasskey") && js.contains("createPasskeyClient"));
+    let map_basename = js
+        .lines()
+        .find_map(|line| line.strip_prefix("//# sourceMappingURL="))
+        .expect("external source map reference");
+    let map_url = format!("/assets/{map_basename}");
+    assert_eq!(map_url, passkey_assets::asset_url("passkey-client.js.map"));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&map_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    assert_eq!(
+        response.headers()[CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
+    for path in ["/passkey-client.js", "/assets/passkey-client.js"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn auth_router_does_not_serve_unhashed_client() {
     let (pool, _guard) = setup_test_db().await;
     let app = make_router(make_state(pool));
-
     let response = app
         .oneshot(
             Request::builder()
@@ -765,24 +839,7 @@ async fn js_asset_is_served() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(
-        response
-            .headers()
-            .get(http::header::CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "application/javascript; charset=utf-8"
-    );
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let text = String::from_utf8_lossy(&body);
-    assert!(body.len() > 100, "body too short: {} bytes", body.len());
-    assert!(
-        text.contains("cjaPasskey") && text.contains("createPasskeyClient"),
-        "expected cjaPasskey/createPasskeyClient in JS output, got: {}",
-        &text[..text.len().min(200)]
-    );
+    assert_eq!(response.status(), 404);
 }
 
 // Ensure ChallengeState enum tag is `type` and roundtrips for the registration variant.

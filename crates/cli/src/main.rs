@@ -484,7 +484,7 @@ fn create_project(
 
     // Check if directory already exists
     if project_path.exists() {
-        anyhow::bail!("Directory '{}' already exists", project_name);
+        anyhow::bail!("Directory '{project_name}' already exists");
     }
 
     // Create project directory structure
@@ -598,7 +598,7 @@ fn init_project(
             if let Some(name) = bin.get("name").and_then(|n| n.as_str())
                 && name == bin_name
             {
-                anyhow::bail!("A binary named '{}' already exists in Cargo.toml", bin_name);
+                anyhow::bail!("A binary named '{bin_name}' already exists in Cargo.toml");
             }
         }
     }
@@ -684,7 +684,7 @@ fn add_dependencies(github_repo: Option<&String>, branch: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("cargo add failed: {}", stderr);
+        anyhow::bail!("cargo add failed: {stderr}");
     }
 
     // Add other required dependencies

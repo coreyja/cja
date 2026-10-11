@@ -5,6 +5,109 @@
 A Rust web framework that combines background job processing, cron scheduling,
 and an HTTP server built on [Axum](https://docs.rs/axum).
 
+## Embedded frontend assets
+
+Add `cja-build = { git = "https://github.com/coreyja/cja", rev = "<same rev as cja>" }` under `[build-dependencies]` and
+put files in `assets/`. Pin `cja-build` and `cja` to the same revision. The build script is:
+
+```rust
+fn main() -> Result<(), cja_build::BuildError> {
+    cja_build::AssetsBuilder::new()
+        .static_dir("assets")
+        .entry(cja_build::Entry::new("src/studio.ts", "studio.js"))
+        .build()
+}
+```
+
+Entries are relative to `frontend/` by default; `.frontend_dir(path)` changes
+that root. A TypeScript entry requires `frontend/tsconfig.json`. Start with
+`{"compilerOptions":{"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true,"allowImportingTsExtensions":true,"lib":["ES2022","DOM"],"types":[]},"include":["src/**/*.ts"]}`.
+Every entry must belong to the tsconfig program. Include each TypeScript entry
+through `include` or `files`; for JavaScript entries, also enable `allowJs`.
+`cja-build` runs native TypeScript 7.0.2 for type checking, then Rolldown for
+minified IIFE bundles and external source maps. No Node installation is needed.
+Imports must be relative and stay inside the frontend directory; `node_modules`, CSS, and
+dynamic imports are rejected. Each ESM entry (`.format(EntryFormat::Esm)`) must
+remain one self-contained chunk. For an IIFE export, set
+`.format(EntryFormat::Iife { global_name: Some("cjaPasskey".into()) })`.
+
+The native tsc resolves through `TSC`, the shared `$XDG_CACHE_HOME/cja` cache
+(or `~/.cache/cja`), then a pinned HTTPS download verified by SHA-256. Set
+`CARGO_NET_OFFLINE=true` only with a verified cache or `TSC` override. Type or
+bundle errors fail `cargo build`. Cargo reruns the build for config, source,
+declaration, and static changes. Source map `sources` are frontend-relative
+labels with embedded `sourcesContent`, not served source URLs.
+
+### Tailwind CSS inputs
+
+Add `.tailwind(cja_build::Tailwind::new("assets/input.css", "app.css"))` to
+the build script. A root stylesheet starts with explicit, top-level inputs:
+
+```css
+@import "tailwindcss" source(none);
+@source "../src";
+@import "./portfolio.css";
+```
+
+Add a separate top-level `@source "../...";` for every template directory
+under the app manifest, relative to `assets/input.css`. The root stylesheet
+needs exactly one Tailwind import and at least one source. Imported CSS may
+contain local `./` or `../` `.css` imports, but no Tailwind import or source.
+The scanner accepts a strict subset of Tailwind CSS: one leading UTF-8 BOM,
+ASCII bytes outside strings and comments, and ASCII whitespace around at-rule
+arguments. `source(` outside strings and comments is reserved for the exact
+root Tailwind import, even when comments split the token. Source paths are
+literal directories beginning `./` or `../`, with no glob metacharacters.
+Parentheses must balance and cannot contain braces.
+`@import` and `@source` must start a statement (at the start of the file or
+after `;`, `{` or `}`, outside parentheses) and be followed by a space, tab
+or newline. Neutral whitespace before these rules is only space, tab, LF or
+CRLF; a lone CR or form feed can make Tailwind drop a rule. Custom-property
+values cannot contain at-rules and must balance `()`, `[]` and `{}`.
+All inputs must remain inside the manifest directory, outside `target/`, and
+free of symlinks. Unsupported at-rules fail the build, including `@plugin`,
+`@config`, `@reference`, and `@tailwind`.
+
+| Allowed at-rule | Consumer or reason allowed |
+| --- | --- |
+| `import` | cja.app and eyes; exact Tailwind root import or confined local `.css` imports |
+| `source` | cja.app and future-form eyes; explicit depth-zero directories |
+| `media` | cja.app and eyes; no file/path input or `source(...)` |
+| `supports` | No file/path input or `source(...)` |
+| `layer` | No file/path input or `source(...)` |
+| `keyframes` | cja.app; no file/path input or `source(...)` |
+| `font-face` | No file/path input or `source(...)` |
+| `theme` | No file/path input or `source(...)` |
+| `utility` | No file/path input or `source(...)` |
+| `variant` | No file/path input or `source(...)` |
+| `custom-variant` | No file/path input or `source(...)` |
+| `apply` | No file/path input or `source(...)` |
+| `container` | No file/path input or `source(...)` |
+| `property` | No file/path input or `source(...)` |
+| `starting-style` | No file/path input or `source(...)` |
+| `page` | No file/path input or `source(...)` |
+| `charset` | No file/path input or `source(...)` |
+
+Arena does not use Tailwind.
+
+At module scope, call `cja::include_assets!(site_assets)`. Use
+`site_assets::asset_url("img/logo.svg")` for a scoped logical-name lookup; an
+unknown name panics. Merge
+`cja::assets::router::<AppState>(&[&site_assets::MANIFEST])?` into the root
+Axum router before `.with_state(state)`. The router accepts multiple manifests
+and rejects duplicate served URLs at startup. The macro records the invoking
+crate via `CARGO_PKG_NAME`; collision errors name both owning crates and logical
+names. Call `router()` once with every
+manifest: calling it twice, or defining another `/assets` wildcard, conflicts
+at startup. Unknown `/assets` URLs return 404 even with an app fallback.
+
+Names may contain ASCII letters, digits, `.`, `_`, `~`, `@`, `+`, `-`, and `/`.
+Dot-prefixed files and directories at any depth are skipped. Files are embedded at `/assets/name.<sha256-8>.ext` with immutable cache headers.
+Root-level `favicon.ico` and `robots.txt` also have one-hour stable aliases.
+Missing directories, unreadable files, invalid names, and collisions fail the
+Cargo build. No asset is read from disk at runtime.
+
+
 ## Overview
 
 CJA provides three integrated subsystems:
@@ -196,7 +299,9 @@ my_job.enqueue(app_state, "urgent".into(), Some(10)).await?;
 - Handler panics are caught and recorded like returned errors. An expired lease also increments `error_count` and records its previous worker.
 - With `max_retries = N`, a job may execute N+1 times. A terminal failure moves it to `dead_letter_jobs` with the final incremented count. Success and graceful shutdown do not count as failures.
 
-The single `job_worker` accepts `JobWorkerConfig { heartbeat_interval, reclaim_window, shutdown_drain_timeout }`; pass `Default::default()` unless the application needs custom timings. Defaults are 30 seconds between heartbeats, 120 seconds from the last successful heartbeat before reclaim, and the `ShutdownBudget::from_env().job_drain` value (2 seconds when unset). `CJA_SHUTDOWN_JOB_DRAIN_SECS` controls both the default worker drain and a default Supervisor budget. The reclaim window must be at least three heartbeat intervals. A missing heartbeat makes any owned row eligible after the window; actual pickup also depends on the unchanged idle poll cadence. A still-running body stops if its worker detects lost ownership or its watchdog expires. Job side effects must remain idempotent.
+The single `job_worker` accepts `JobWorkerConfig { heartbeat_interval, reclaim_window, shutdown_drain_timeout, idle_poll_gate }`; pass `Default::default()` unless the application needs custom timings. `idle_poll_gate` defaults to `None`, preserving independent polling. Defaults are 30 seconds between heartbeats, 120 seconds from the last successful heartbeat before reclaim, and the `ShutdownBudget::from_env().job_drain` value (2 seconds when unset). `CJA_SHUTDOWN_JOB_DRAIN_SECS` controls both the default worker drain and a default Supervisor budget. The reclaim window must be at least three heartbeat intervals. A missing heartbeat makes any owned row eligible after the window; actual pickup also depends on the idle poll cadence. A still-running body stops if its worker detects lost ownership or its watchdog expires. Job side effects must remain idempotent.
+
+To limit idle claims, create one `IdlePollGate::new(NonZeroUsize::new(2).unwrap())`, clone it into each worker's `JobWorkerConfig { idle_poll_gate: Some(gate.clone()), ..Default::default() }`, and keep a clone in application state. Override `AppState::job_enqueued` to call `gate.wake_one()`. This local wake follows successful autocommit enqueue only. Direct SQL, other processes, transactional enqueue, due retries, and expired leases still need periodic claims; permits never cover job bodies or heartbeats.
 
 The worker's `shutdown_drain_timeout` should match the `job_drain` of the `ShutdownBudget` given to its Supervisor. If the Supervisor uses a programmatically constructed budget, pass `JobWorkerConfig { shutdown_drain_timeout: supervisor.budget().job_drain, ..Default::default() }`. `ShutdownBudget` owns the process deadline (`job_drain + exit_grace`); the worker config bounds its local body drain. Keep `exit_grace` positive so lock-release SQL can finish, and fit the full deadline inside the hosting platform's kill window.
 

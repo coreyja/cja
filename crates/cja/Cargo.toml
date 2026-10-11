@@ -61,6 +61,7 @@ reqwest = { workspace = true, features = ["cookies"] }
 tokio = { workspace = true, features = ["test-util"] }
 once_cell = "1.19"
 tempfile = "3"
+tower = { version = "0.5.2", features = ["util"] }
 
 [lints]
 workspace = true

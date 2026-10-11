@@ -40,6 +40,65 @@ jobs:
       - name: Run cargo deny
         run: cargo deny check bans
 
+  native-tsc:
+    name: Native TypeScript and warm rerun
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set isolated build paths
+        run: |
+          {
+            echo "XDG_CACHE_HOME=$RUNNER_TEMP/cja-cold-cache"
+            echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/cja-native-build"
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cja-native-target"
+          } >> "$GITHUB_ENV"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - name: Run real TypeScript tests from a cold cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$XDG_CACHE_HOME/cja"
+          cargo test -p cja-build --lib real_tsc_ -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/tsc-tests.log"
+          grep -q 'test tool_cache::tests::real_tsc_valid_fixture ... ok' "$RUNNER_TEMP/tsc-tests.log"
+          grep -q 'test tool_cache::tests::real_tsc_type_error ... ok' "$RUNNER_TEMP/tsc-tests.log"
+          grep -Eq '^test result: ok\. 2 passed; 0 failed;' "$RUNNER_TEMP/tsc-tests.log"
+          test -f "$XDG_CACHE_HOME/cja/tsc-7.0.2-linux-x64/.sha256"
+      - name: Verify warm rerun on a new ambient declaration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p cja-build --test rerun warm_add_ambient_declaration -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/rerun-tests.log"
+          grep -q 'test warm_add_ambient_declaration ... ok' "$RUNNER_TEMP/rerun-tests.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/rerun-tests.log"
+
+      - name: Run real Tailwind from a cold cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$XDG_CACHE_HOME/cja/tailwindcss-4.3.3-linux-x64"
+          CJA_REAL_TAILWIND_CACHE_HOME="$XDG_CACHE_HOME" cargo test -p cja-build --lib tests::real_tailwind_cold_cache -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/tailwind-real.log"
+          grep -q 'test tests::real_tailwind_cold_cache ... ok' "$RUNNER_TEMP/tailwind-real.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/tailwind-real.log"
+          test -x "$XDG_CACHE_HOME/cja/tailwindcss-4.3.3-linux-x64"
+      - name: Check Tailwind scanner against pinned binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          CJA_REAL_TAILWIND_CACHE_HOME="$XDG_CACHE_HOME" cargo test -p cja-build --lib tests::real_tailwind_adversarial_corpus -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/tailwind-corpus.log"
+          grep -q 'test tests::real_tailwind_adversarial_corpus ... ok' "$RUNNER_TEMP/tailwind-corpus.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/tailwind-corpus.log"
+      - name: Verify warm Tailwind Rust source rerun
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p cja-build --test rerun warm_tailwind_rust_source -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/tailwind-rerun.log"
+          grep -q 'test warm_tailwind_rust_source ... ok' "$RUNNER_TEMP/tailwind-rerun.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/tailwind-rerun.log"
+
   passkey-browser:
     name: Passkey browser
     runs-on: ubuntu-latest
@@ -59,27 +118,21 @@ jobs:
           - 5432:5432
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
-      CJA_PASSKEY_STRICT_FRONTEND_BUILD: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" --component rustfmt --component clippy
+      - name: Cache native cja tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cja
+          key: cja-tools-${{ runner.os }}-${{ runner.arch }}-tsc-7.0.2-tailwindcss-4.3.3
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - uses: pnpm/action-setup@v4
         with:
           version: 10.6.0
-      - name: Install frontend dependencies
-        working-directory: crates/cja-passkey/frontend
-        run: pnpm install --frozen-lockfile
-      - name: Check and build frontend
-        working-directory: crates/cja-passkey/frontend
-        run: |
-          pnpm check
-          pnpm build
-          grep -q 'loginWithUsername' dist/passkey-client.js
-          grep -q 'discoverable/start' dist/passkey-client.js
       - name: Install browser test dependencies
         working-directory: crates/cja-passkey/e2e
         run: pnpm install --frozen-lockfile
