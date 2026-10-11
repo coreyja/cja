@@ -1,6 +1,7 @@
 //! Build static and bundled frontend files into a content-hashed cja manifest.
 
 mod bundler;
+mod tailwind;
 mod tool_cache;
 
 #[cfg(test)]
@@ -68,6 +69,7 @@ pub struct AssetsBuilder {
     assets_dir: Option<PathBuf>,
     frontend_dir: PathBuf,
     entries: Vec<Entry>,
+    tailwinds: Vec<Tailwind>,
     outputs: Vec<AssetRecord>,
 }
 
@@ -79,6 +81,22 @@ pub struct Entry {
     format: EntryFormat,
 }
 
+/// One Tailwind input, relative to `CARGO_MANIFEST_DIR`, and its logical CSS name.
+#[derive(Clone)]
+pub struct Tailwind {
+    input: PathBuf,
+    logical_name: String,
+}
+
+impl Tailwind {
+    pub fn new(input: impl Into<PathBuf>, logical_name: impl Into<String>) -> Self {
+        Self {
+            input: input.into(),
+            logical_name: logical_name.into(),
+        }
+    }
+}
+
 /// The output format for one entry. ESM must remain a single self-contained chunk.
 #[derive(Clone)]
 pub enum EntryFormat {
@@ -87,6 +105,7 @@ pub enum EntryFormat {
 }
 
 impl Entry {
+    /// `source` is relative to the builder's `frontend_dir`.
     pub fn new(source: impl Into<PathBuf>, logical_name: impl Into<String>) -> Self {
         Self {
             source: source.into(),
@@ -108,6 +127,7 @@ impl AssetsBuilder {
             assets_dir: None,
             frontend_dir: PathBuf::from("frontend"),
             entries: Vec::new(),
+            tailwinds: Vec::new(),
             outputs: Vec::new(),
         }
     }
@@ -127,6 +147,12 @@ impl AssetsBuilder {
     #[must_use]
     pub fn entry(mut self, entry: Entry) -> Self {
         self.entries.push(entry);
+        self
+    }
+
+    #[must_use]
+    pub fn tailwind(mut self, input: Tailwind) -> Self {
+        self.tailwinds.push(input);
         self
     }
 
@@ -214,6 +240,9 @@ impl AssetsBuilder {
         if !self.entries.is_empty() {
             self.build_entries(manifest_dir, out_dir, tool_env)?;
         }
+        if !self.tailwinds.is_empty() {
+            self.build_tailwinds(manifest_dir, out_dir, tool_env)?;
+        }
 
         let mut manifest = String::from("[\n");
         for record in &self.outputs {
@@ -251,7 +280,13 @@ impl AssetsBuilder {
     }
 
     fn emit_env_watches(&self, tool_env: &tool_cache::ToolEnv) {
-        for name in [
+        for name in self.env_watch_keys(tool_env) {
+            println!("cargo::rerun-if-env-changed={name}");
+        }
+    }
+
+    fn env_watch_keys(&self, tool_env: &tool_cache::ToolEnv) -> Vec<&'static str> {
+        let mut keys = vec![
             "TSC",
             "TAILWIND_CLI",
             "XDG_CACHE_HOME",
@@ -264,20 +299,26 @@ impl AssetsBuilder {
             "http_proxy",
             "all_proxy",
             "no_proxy",
-        ] {
-            println!("cargo::rerun-if-env-changed={name}");
+        ];
+        let tools = [
+            (!self.entries.is_empty(), tool_cache::Tool::Tsc),
+            (!self.tailwinds.is_empty(), tool_cache::Tool::Tailwind),
+        ];
+        if tools.iter().any(|(active, tool)| {
+            *active
+                && tool_env
+                    .override_for(*tool)
+                    .is_some_and(|path| Path::new(path).components().count() == 1)
+        }) {
+            keys.push("PATH");
         }
-        if !self.entries.is_empty() {
-            if tool_env
-                .override_for(tool_cache::Tool::Tsc)
-                .is_some_and(|path| Path::new(path).components().count() == 1)
-            {
-                println!("cargo::rerun-if-env-changed=PATH");
-            }
-            if tool_env.uses_home_cache(tool_cache::Tool::Tsc) {
-                println!("cargo::rerun-if-env-changed=HOME");
-            }
+        if tools
+            .iter()
+            .any(|(active, tool)| *active && tool_env.uses_home_cache(*tool))
+        {
+            keys.push("HOME");
         }
+        keys
     }
 
     fn add_output(
@@ -568,6 +609,92 @@ impl AssetsBuilder {
                 js.into_bytes(),
                 &frontend.join(&entry.source),
             )?;
+        }
+        Ok(())
+    }
+
+    fn build_tailwinds(
+        &mut self,
+        manifest_dir: &Path,
+        out_dir: &Path,
+        tool_env: &tool_cache::ToolEnv,
+    ) -> Result<(), BuildError> {
+        for input in &self.tailwinds {
+            validate_name(&input.logical_name, &input.input)?;
+            if Path::new(&input.logical_name)
+                .extension()
+                .is_none_or(|ext| ext != "css")
+            {
+                return Err(BuildError::Frontend(format!(
+                    "Tailwind logical name must end in .css: {}",
+                    input.logical_name
+                )));
+            }
+            if input.input.is_absolute() {
+                return Err(BuildError::Frontend(format!(
+                    "Tailwind input must be manifest-relative: {}",
+                    input.input.display()
+                )));
+            }
+            let css = manifest_dir.join(&input.input);
+            if css.extension().is_none_or(|ext| ext != "css") {
+                return Err(BuildError::Frontend(format!(
+                    "Tailwind input must end in .css: {}",
+                    css.display()
+                )));
+            }
+            tailwind::validate_css(&css, manifest_dir, out_dir)?;
+        }
+        let executable = tool_cache::resolve_tailwind(tool_env, tool_cache::fetch_https)
+            .map_err(BuildError::Frontend)?;
+        watch_dir(&executable, out_dir)?;
+        for input in self.tailwinds.clone() {
+            let css = manifest_dir
+                .join(&input.input)
+                .canonicalize()
+                .map_err(|e| BuildError::Frontend(e.to_string()))?;
+            let scratch = tempfile::Builder::new()
+                .prefix("cja-tailwind-")
+                .tempdir_in(out_dir)
+                .map_err(|e| BuildError::Frontend(format!("create Tailwind scratch: {e}")))?;
+            let output_path = scratch.path().join("app.css");
+            let output = std::process::Command::new(&executable)
+                .current_dir(css.parent().expect("CSS file has parent"))
+                .arg("-i")
+                .arg(&css)
+                .arg("-o")
+                .arg(&output_path)
+                .arg("--minify")
+                .output()
+                .map_err(|e| {
+                    BuildError::Frontend(format!("run Tailwind {}: {e}", executable.display()))
+                })?;
+            let streams = format!(
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !output.status.success() {
+                return Err(BuildError::Frontend(format!(
+                    "Tailwind failed for {} ({}):\n{streams}",
+                    css.display(),
+                    output.status
+                )));
+            }
+            let bytes = fs::read(&output_path).map_err(|e| {
+                BuildError::Frontend(format!(
+                    "Tailwind produced no output for {}: {e}\n{streams}",
+                    css.display()
+                ))
+            })?;
+            let banner = format!("/*! tailwindcss v{} |", tool_cache::TAILWIND_VERSION);
+            if bytes.is_empty() || !bytes.starts_with(banner.as_bytes()) {
+                return Err(BuildError::Frontend(format!(
+                    "Tailwind output for {} is empty or lacks pinned {banner} banner:\n{streams}",
+                    css.display()
+                )));
+            }
+            self.add_output(&input.logical_name, bytes, &css)?;
         }
         Ok(())
     }
@@ -1382,5 +1509,218 @@ mod tests {
         assert!(matches!(err, BuildError::Io { .. }));
         assert!(err.to_string().contains("secret.css"));
         assert!(format!("{err:?}").contains(&direct.to_string()));
+    }
+
+    fn css_fixture(root: &Path, extra: &str) {
+        fs::create_dir_all(root.join("frontend")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/page.rs"),
+            "html! { div class=\"bg-red-500 md:flex\" {} }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("frontend/app.css"),
+            format!("@import \"tailwindcss\" source(none);\n@source \"../src\";\n{extra}\n"),
+        )
+        .unwrap();
+    }
+
+    fn fake_tailwind_env(root: &Path) -> tool_cache::ToolEnv {
+        let mut env = fake_env(root);
+        env.tailwind_override = Some(
+            fixture_path("bin/fake-tailwindcss")
+                .as_os_str()
+                .to_os_string(),
+        );
+        env.offline = true;
+        env
+    }
+
+    #[test]
+    fn fake_tailwind_success_and_failures() {
+        let _guard = crate::SPAWN.lock().unwrap();
+        let root = fixture();
+        css_fixture(root.path(), "");
+        let out = root.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let build = || {
+            AssetsBuilder::new()
+                .tailwind(Tailwind::new("frontend/app.css", "app.css"))
+                .build_in(root.path(), &out, &fake_tailwind_env(root.path()))
+        };
+        build().unwrap();
+        let manifest = fs::read_to_string(out.join("cja_assets.rs")).unwrap();
+        assert!(manifest.contains("app.") && manifest.contains("text/css"));
+        for (mode, expected) in [
+            ("fail", "fake stderr"),
+            ("empty", "empty"),
+            ("missing", "no output"),
+            ("wrong", "banner"),
+        ] {
+            css_fixture(root.path(), &format!("/* FAKE_MODE={mode} */"));
+            let error = build().unwrap_err().to_string();
+            assert!(error.contains(expected), "{mode}: {error}");
+            if mode == "fail" {
+                assert!(error.contains("fake stdout"));
+            }
+            assert!(!out.join("cja_assets.rs").exists());
+        }
+    }
+
+    #[test]
+    fn tailwind_rejects_invalid_inputs_before_spawn() {
+        let root = fixture();
+        css_fixture(root.path(), "");
+        let out = root.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let check = |input: &str, name: &str| {
+            AssetsBuilder::new()
+                .tailwind(Tailwind::new(input, name))
+                .build_in(root.path(), &out, &fake_tailwind_env(root.path()))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(check("frontend/app.css", "app.js").contains("must end in .css"));
+        assert!(check("../app.css", "app.css").contains("manifest directory"));
+        assert!(check("frontend/app.txt", "app.css").contains("must end in .css"));
+        assert!(check("frontend/missing.css", "app.css").contains("CSS path"));
+        assert!(check("frontend/app.css", "bad name.css").contains("invalid asset path"));
+        fs::write(root.path().join("frontend/tailwind.config.js"), "{}").unwrap();
+        assert!(check("frontend/app.css", "app.css").contains("CSS-first"));
+        fs::remove_file(root.path().join("frontend/tailwind.config.js")).unwrap();
+        fs::write(
+            root.path().join("frontend/app.css"),
+            "@import \"tailwindcss\"; @source \"../src\";",
+        )
+        .unwrap();
+        assert!(check("frontend/app.css", "app.css").contains("unsupported @import"));
+        assert!(!out.join("cja_assets.rs").exists());
+    }
+
+    #[test]
+    #[ignore = "downloads pinned Tailwind binary"]
+    fn real_tailwind_cold_cache() {
+        let _guard = crate::SPAWN.lock().unwrap();
+        let root = fixture();
+        css_fixture(root.path(), "@import \"./extra.css\";");
+        fs::write(
+            root.path().join("frontend/extra.css"),
+            ".imported-selector { color: red; }",
+        )
+        .unwrap();
+        let out = root.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let mut env = fake_tailwind_env(root.path());
+        env.tailwind_override = None;
+        env.xdg_cache_home = Some(root.path().join("cold-cache"));
+        env.offline = false;
+        AssetsBuilder::new()
+            .tailwind(Tailwind::new("frontend/app.css", "app.css"))
+            .build_in(root.path(), &out, &env)
+            .unwrap();
+        let manifest = fs::read_to_string(out.join("cja_assets.rs")).unwrap();
+        assert!(manifest.contains("app.") && manifest.contains("text/css"));
+        let css = fs::read_to_string(
+            fs::read_dir(out.join("cja-assets"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        assert!(
+            css.starts_with("/*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */")
+        );
+        assert!(css.contains(".bg-red-500{"), "{css}");
+        assert!(css.contains(".md\\:flex{"), "{css}");
+        assert!(css.contains(".imported-selector{"), "{css}");
+        assert!(
+            env.xdg_cache_home
+                .unwrap()
+                .join("cja")
+                .join(format!("tailwindcss-4.3.3-{}", env.host))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn env_watches_cover_tailwind_only_and_deduplicate_tools() {
+        let root = fixture();
+        let mut env = fake_tailwind_env(root.path());
+        env.xdg_cache_home = None;
+        env.tailwind_override = Some("tailwindcss".into());
+        let only = AssetsBuilder::new().tailwind(Tailwind::new("frontend/app.css", "app.css"));
+        let keys = only.env_watch_keys(&env);
+        assert_eq!(keys.iter().filter(|key| **key == "TAILWIND_CLI").count(), 1);
+        assert_eq!(keys.iter().filter(|key| **key == "PATH").count(), 1);
+        assert!(!keys.contains(&"HOME"));
+        env.tailwind_override = None;
+        assert_eq!(
+            only.env_watch_keys(&env)
+                .iter()
+                .filter(|key| **key == "HOME")
+                .count(),
+            1
+        );
+        env.tailwind_override = Some("tailwindcss".into());
+        env.tsc_override = Some("tsc".into());
+        let both = only.entry(Entry::new("src/main.ts", "app.js"));
+        let keys = both.env_watch_keys(&env);
+        assert_eq!(keys.iter().filter(|key| **key == "PATH").count(), 1);
+        env.tsc_override = None;
+        env.tailwind_override = None;
+        let keys = both.env_watch_keys(&env);
+        assert_eq!(keys.iter().filter(|key| **key == "HOME").count(), 1);
+    }
+
+    #[test]
+    fn static_css_and_generated_collision() {
+        let _guard = crate::SPAWN.lock().unwrap();
+        let root = fixture();
+        css_fixture(root.path(), "");
+        fs::create_dir(root.path().join("assets")).unwrap();
+        fs::write(root.path().join("assets/plain.css"), "body { color: red; }").unwrap();
+        let out = root.path().join("out");
+        fs::create_dir(&out).unwrap();
+        AssetsBuilder::new()
+            .static_dir("assets")
+            .tailwind(Tailwind::new("frontend/app.css", "app.css"))
+            .build_in(root.path(), &out, &fake_tailwind_env(root.path()))
+            .unwrap();
+        let manifest = fs::read_to_string(out.join("cja_assets.rs")).unwrap();
+        assert!(manifest.contains("plain.css") && manifest.contains("app.css"));
+        fs::write(root.path().join("assets/app.css"), "ordinary CSS").unwrap();
+        let error = AssetsBuilder::new()
+            .static_dir("assets")
+            .tailwind(Tailwind::new("frontend/app.css", "app.css"))
+            .build_in(root.path(), &out, &fake_tailwind_env(root.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("collision"), "{error}");
+        assert!(!out.join("cja_assets.rs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tailwind_source_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let root = fixture();
+        css_fixture(root.path(), "");
+        symlink("src", root.path().join("linked-src")).unwrap();
+        fs::write(
+            root.path().join("frontend/app.css"),
+            "@import \"tailwindcss\" source(none); @source \"../linked-src\";",
+        )
+        .unwrap();
+        let out = root.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let error = AssetsBuilder::new()
+            .tailwind(Tailwind::new("frontend/app.css", "app.css"))
+            .build_in(root.path(), &out, &fake_tailwind_env(root.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "{error}");
     }
 }

@@ -12,15 +12,15 @@ use std::{
 };
 
 const TSC_VERSION: &str = "7.0.2";
+pub(crate) const TAILWIND_VERSION: &str = "4.3.3";
 const TSC_MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
+const TAILWIND_MAX_DOWNLOAD: u64 = 160 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Tool {
     Tsc,
-    #[allow(dead_code)] // The shared resolver's Tailwind caller lands in DEV-1654.
     Tailwind,
 }
 
@@ -108,6 +108,48 @@ pub(crate) struct ToolSpec {
 }
 
 impl ToolSpec {
+    pub fn tailwind(host: &str) -> Result<Self, String> {
+        let (asset, digest) = match host {
+            "linux-x64" => (
+                "tailwindcss-linux-x64",
+                "dc61b3ac6b8c9ca874c0cc4c57b2409791a64c5540404ca5f5367360babc313a",
+            ),
+            "linux-arm64" => (
+                "tailwindcss-linux-arm64",
+                "55fd0b241214eff3de1e8ee4f22796662f2d2e7a49bcfca7477cfd0bac398195",
+            ),
+            "linux-x64-musl" => (
+                "tailwindcss-linux-x64-musl",
+                "a04d34ceacc8f52cbe8920ad846cdeb61d3d0021dba32db0d1f77c9d9fad7a6c",
+            ),
+            "linux-arm64-musl" => (
+                "tailwindcss-linux-arm64-musl",
+                "71ea4be79c9de9827545682df3e040053fb535d37c71ed2cfdedf9385a0868e0",
+            ),
+            "darwin-x64" => (
+                "tailwindcss-macos-x64",
+                "7922e0953f2110c05976e3bf58f14e643d90427575e766b7d433f5f80cbee7e1",
+            ),
+            "darwin-arm64" => (
+                "tailwindcss-macos-arm64",
+                "cdf646702987a743464dff4d9c60fd4480d1c1e73dd819a9a67f1078815dce9d",
+            ),
+            _ => return Err(format!("unsupported native tailwindcss build host: {host}")),
+        };
+        Ok(Self {
+            name: "tailwindcss",
+            version: TAILWIND_VERSION,
+            platform: host.to_owned(),
+            url: format!(
+                "https://github.com/tailwindlabs/tailwindcss/releases/download/v{TAILWIND_VERSION}/{asset}"
+            ),
+            digest,
+            archive_executable: None,
+            tool: Tool::Tailwind,
+            max_bytes: TAILWIND_MAX_DOWNLOAD,
+        })
+    }
+
     pub fn tsc(host: &str) -> Result<Self, String> {
         let archive_platform = host.strip_suffix("-musl").unwrap_or(host);
         let digest = match archive_platform {
@@ -152,6 +194,16 @@ pub(crate) fn resolve_tsc(
     }
     let spec = ToolSpec::tsc(&env.host)?;
     resolve(&spec, env, fetch)
+}
+
+pub(crate) fn resolve_tailwind(
+    env: &ToolEnv,
+    fetch: impl Fn(&ToolSpec) -> Result<Vec<u8>, String>,
+) -> Result<PathBuf, String> {
+    if let Some(value) = env.override_for(Tool::Tailwind) {
+        return resolve_override(value, env, Tool::Tailwind.override_env());
+    }
+    resolve(&ToolSpec::tailwind(&env.host)?, env, fetch)
 }
 
 pub(crate) fn resolve(
@@ -338,12 +390,6 @@ fn install(
             root.display()
         )
     })?;
-    if bytes.len() as u64 > spec.max_bytes {
-        return Err(format!(
-            "{} download from {} exceeds {} bytes",
-            spec.name, spec.url, spec.max_bytes
-        ));
-    }
     let actual = format!("{:x}", Sha256::digest(&bytes));
     if actual != spec.digest {
         return Err(format!(
@@ -422,7 +468,8 @@ pub(crate) fn fetch_https(spec: &ToolSpec) -> Result<Vec<u8>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(READ_TIMEOUT)
-        .timeout(OVERALL_TIMEOUT)
+        // ureq 2.12.1's overall deadline replaces timeout_read on each read. A
+        // progressing large binary must not fail after an arbitrary wall time.
         .build();
     let response = agent
         .get(url)
@@ -434,26 +481,32 @@ pub(crate) fn fetch_https(spec: &ToolSpec) -> Result<Vec<u8>, String> {
             response.get_url()
         ));
     }
-    if response
+    let content_length = response
         .header("Content-Length")
-        .and_then(|s| s.parse::<u64>().ok())
-        .is_some_and(|n| n > spec.max_bytes)
-    {
+        .and_then(|s| s.parse().ok());
+    read_capped(response.into_reader(), content_length, spec)
+}
+
+fn read_capped(
+    reader: impl io::Read,
+    content_length: Option<u64>,
+    spec: &ToolSpec,
+) -> Result<Vec<u8>, String> {
+    if content_length.is_some_and(|n| n > spec.max_bytes) {
         return Err(format!(
             "{} download from {} exceeds {} bytes",
-            spec.name, url, spec.max_bytes
+            spec.name, spec.url, spec.max_bytes
         ));
     }
     let mut bytes = Vec::new();
-    response
-        .into_reader()
+    reader
         .take(spec.max_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > spec.max_bytes {
         return Err(format!(
             "{} download from {} exceeds {} bytes",
-            spec.name, url, spec.max_bytes
+            spec.name, spec.url, spec.max_bytes
         ));
     }
     Ok(bytes)
@@ -525,6 +578,109 @@ mod tests {
             tool: Tool::Tailwind,
             max_bytes: 128 * 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn tailwind_platform_specs_and_unsupported_host() {
+        for (host, asset, digest) in [
+            (
+                "linux-x64",
+                "tailwindcss-linux-x64",
+                "dc61b3ac6b8c9ca874c0cc4c57b2409791a64c5540404ca5f5367360babc313a",
+            ),
+            (
+                "linux-arm64",
+                "tailwindcss-linux-arm64",
+                "55fd0b241214eff3de1e8ee4f22796662f2d2e7a49bcfca7477cfd0bac398195",
+            ),
+            (
+                "linux-x64-musl",
+                "tailwindcss-linux-x64-musl",
+                "a04d34ceacc8f52cbe8920ad846cdeb61d3d0021dba32db0d1f77c9d9fad7a6c",
+            ),
+            (
+                "linux-arm64-musl",
+                "tailwindcss-linux-arm64-musl",
+                "71ea4be79c9de9827545682df3e040053fb535d37c71ed2cfdedf9385a0868e0",
+            ),
+            (
+                "darwin-x64",
+                "tailwindcss-macos-x64",
+                "7922e0953f2110c05976e3bf58f14e643d90427575e766b7d433f5f80cbee7e1",
+            ),
+            (
+                "darwin-arm64",
+                "tailwindcss-macos-arm64",
+                "cdf646702987a743464dff4d9c60fd4480d1c1e73dd819a9a67f1078815dce9d",
+            ),
+        ] {
+            let spec = ToolSpec::tailwind(host).unwrap();
+            assert!(spec.url.ends_with(asset));
+            assert_eq!(spec.digest, digest);
+            assert_eq!(spec.key(), format!("tailwindcss-4.3.3-{host}"));
+            assert_eq!(spec.max_bytes, TAILWIND_MAX_DOWNLOAD);
+            assert!(spec.archive_executable.is_none());
+        }
+        assert!(
+            ToolSpec::tailwind("windows-x64")
+                .unwrap_err()
+                .contains("unsupported")
+        );
+    }
+
+    #[test]
+    fn capped_download_rejects_headers_and_streams() {
+        let mut spec = file_spec(b"1234");
+        spec.max_bytes = 4;
+        for (reader, length) in [(b"1234".as_slice(), Some(5)), (b"12345".as_slice(), None)] {
+            let error = read_capped(reader, length, &spec).unwrap_err();
+            assert!(
+                error.contains("tailwindcss")
+                    && error.contains(&spec.url)
+                    && error.contains("4 bytes"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            read_capped(b"1234".as_slice(), Some(4), &spec).unwrap(),
+            b"1234"
+        );
+    }
+
+    #[test]
+    fn tailwind_override_and_cache_rehash() {
+        let _guard = crate::SPAWN.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-tailwind");
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut env = env(dir.path());
+        env.host = "unsupported".to_owned();
+        env.tailwind_override = Some(path.as_os_str().to_os_string());
+        env.offline = true;
+        assert_eq!(
+            resolve_tailwind(&env, |_| panic!("download")).unwrap(),
+            path
+        );
+        env.tailwind_override = None;
+        env.host = "linux-arm64".to_owned();
+        let spec = file_spec(b"good");
+        let error = resolve(&spec, &env, |_| panic!("offline")).unwrap_err();
+        assert!(error.contains("TAILWIND_CLI"));
+        env.offline = false;
+        let cached = resolve(&spec, &env, |_| Ok(b"good".to_vec())).unwrap();
+        env.offline = true;
+        assert_eq!(
+            resolve(&spec, &env, |_| panic!("cache hit")).unwrap(),
+            cached
+        );
+        fs::write(&cached, b"bad").unwrap();
+        let error = resolve(&spec, &env, |_| panic!("offline")).unwrap_err();
+        assert!(error.contains("invalid cache entry"));
     }
 
     fn tar_bytes(link: bool) -> Vec<u8> {
@@ -706,10 +862,9 @@ mod tests {
 
     #[test]
     fn download_cap_is_per_tool_and_names_tool_and_url() {
-        let dir = tempfile::tempdir().unwrap();
         let mut spec = file_spec(b"oversized");
         spec.max_bytes = 2;
-        let error = resolve(&spec, &env(dir.path()), |_| Ok(b"oversized".to_vec())).unwrap_err();
+        let error = read_capped(b"oversized".as_slice(), None, &spec).unwrap_err();
         assert!(
             error.contains("tailwindcss") && error.contains("2 bytes") && error.contains(&spec.url),
             "{error}"

@@ -14,7 +14,14 @@ manifest URLs and registers concrete Axum routes. A source change reruns the
 build script; serving never reads an asset from disk. Cargo watches the static
 root, frontend root, tsconfig chain, tsc-listed app files and ambient
 declarations, and Rolldown's resolved files. Source map labels are relative to
-the frontend root and contain `sourcesContent`.
+the frontend root and contain `sourcesContent`. `AssetsBuilder::tailwind`
+takes a manifest-relative CSS input and a logical `.css` name. The root CSS
+uses `@import "tailwindcss" source(none);` and explicit directory `@source`
+paths relative to that CSS file. Local `./` and `../` `.css` imports are
+validated recursively, and all CSS files and scan roots stay inside the app's
+manifest directory. Cargo watches the CSS graph and every explicit scan root,
+including Rust Maud templates. Tailwind's minified output uses the same hashed,
+embedded manifest path as static files; ordinary CSS may still use `static_dir`.
 
 CJA is organized as three subsystems — Cron, Jobs, and Axum (HTTP server) — plus supporting modules for sessions, tracing, and database management. Everything coordinates through a shared `AppState` trait and `CancellationToken` for graceful shutdown.
 
