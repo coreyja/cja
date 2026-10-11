@@ -12,15 +12,15 @@ use std::{
 };
 
 const TSC_VERSION: &str = "7.0.2";
+pub(crate) const TAILWIND_VERSION: &str = "4.3.3";
 const TSC_MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
+const TAILWIND_MAX_DOWNLOAD: u64 = 160 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Tool {
     Tsc,
-    #[allow(dead_code)] // The shared resolver's Tailwind caller lands in DEV-1654.
     Tailwind,
 }
 
@@ -108,6 +108,52 @@ pub(crate) struct ToolSpec {
 }
 
 impl ToolSpec {
+    pub fn tailwind(host: &str) -> Result<Self, String> {
+        let (asset, digest) = match host {
+            "linux-x64" => (
+                "tailwindcss-linux-x64",
+                "dc61b3ac6b8c9ca874c0cc4c57b2409791a64c5540404ca5f5367360babc313a",
+            ),
+            "linux-arm64" => (
+                "tailwindcss-linux-arm64",
+                "55fd0b241214eff3de1e8ee4f22796662f2d2e7a49bcfca7477cfd0bac398195",
+            ),
+            "linux-x64-musl" => (
+                "tailwindcss-linux-x64-musl",
+                "a04d34ceacc8f52cbe8920ad846cdeb61d3d0021dba32db0d1f77c9d9fad7a6c",
+            ),
+            "linux-arm64-musl" => (
+                "tailwindcss-linux-arm64-musl",
+                "71ea4be79c9de9827545682df3e040053fb535d37c71ed2cfdedf9385a0868e0",
+            ),
+            "darwin-x64" => (
+                "tailwindcss-macos-x64",
+                "7922e0953f2110c05976e3bf58f14e643d90427575e766b7d433f5f80cbee7e1",
+            ),
+            "darwin-arm64" => (
+                "tailwindcss-macos-arm64",
+                "cdf646702987a743464dff4d9c60fd4480d1c1e73dd819a9a67f1078815dce9d",
+            ),
+            _ => {
+                return Err(format!(
+                    "unsupported native tailwindcss build host: {host}; set TAILWIND_CLI to an installed executable"
+                ));
+            }
+        };
+        Ok(Self {
+            name: "tailwindcss",
+            version: TAILWIND_VERSION,
+            platform: host.to_owned(),
+            url: format!(
+                "https://github.com/tailwindlabs/tailwindcss/releases/download/v{TAILWIND_VERSION}/{asset}"
+            ),
+            digest,
+            archive_executable: None,
+            tool: Tool::Tailwind,
+            max_bytes: TAILWIND_MAX_DOWNLOAD,
+        })
+    }
+
     pub fn tsc(host: &str) -> Result<Self, String> {
         let archive_platform = host.strip_suffix("-musl").unwrap_or(host);
         let digest = match archive_platform {
@@ -152,6 +198,16 @@ pub(crate) fn resolve_tsc(
     }
     let spec = ToolSpec::tsc(&env.host)?;
     resolve(&spec, env, fetch)
+}
+
+pub(crate) fn resolve_tailwind(
+    env: &ToolEnv,
+    fetch: impl Fn(&ToolSpec) -> Result<Vec<u8>, String>,
+) -> Result<PathBuf, String> {
+    if let Some(value) = env.override_for(Tool::Tailwind) {
+        return resolve_override(value, env, Tool::Tailwind.override_env());
+    }
+    resolve(&ToolSpec::tailwind(&env.host)?, env, fetch)
 }
 
 pub(crate) fn resolve(
@@ -223,7 +279,12 @@ fn resolve_override(
     {
         use std::os::unix::fs::PermissionsExt as _;
         if fs::metadata(&candidate)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| {
+                format!(
+                    "inspect {override_env} override {}: {e}",
+                    candidate.display()
+                )
+            })?
             .permissions()
             .mode()
             & 0o111
@@ -269,14 +330,26 @@ fn resolve_locked(
     if root.exists() {
         let path = root
             .parent()
-            .ok_or("cache entry has no parent")?
+            .ok_or_else(|| {
+                format!(
+                    "{} cache entry {} for {} has no parent",
+                    spec.name,
+                    root.display(),
+                    spec.url
+                )
+            })?
             .join(format!(
                 "{}.stale-{}-{}",
                 spec.key(),
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!(
+                        "timestamp {} cache {} from {}: {e}",
+                        spec.name,
+                        root.display(),
+                        spec.url
+                    ))?
                     .as_nanos()
             ));
         fs::rename(root, &path).map_err(|e| {
@@ -318,12 +391,54 @@ fn valid_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
                 && spec.executable(root).is_file()
                 && root.join("package/lib/lib.d.ts").is_file())
         }
-        None => Ok(root.is_file()
-            && format!(
-                "{:x}",
-                Sha256::digest(fs::read(root).map_err(|e| e.to_string())?)
-            ) == spec.digest),
+        None => valid_file_cache(spec, root),
     }
+}
+
+fn valid_file_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
+    if !root.is_file() {
+        return Ok(false);
+    }
+    let metadata = fs::metadata(root)
+        .map_err(|e| format!("inspect {} cache {}: {e}", spec.name, root.display()))?;
+    let modified = metadata
+        .modified()
+        .map_err(|e| format!("inspect {} cache mtime {}: {e}", spec.name, root.display()))?;
+    let stamp = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| format!("{} {} {}", metadata.len(), elapsed.as_nanos(), spec.digest));
+    let marker = root.with_file_name(format!("{}.verified", spec.key()));
+    if stamp
+        .as_ref()
+        .is_some_and(|stamp| fs::read_to_string(&marker).is_ok_and(|value| value == *stamp))
+    {
+        return Ok(true);
+    }
+    let mut file = fs::File::open(root)
+        .map_err(|e| format!("open {} cache {}: {e}", spec.name, root.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| format!("read {} cache {}: {e}", spec.name, root.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let valid = format!("{:x}", hasher.finalize()) == spec.digest;
+    if let (true, Some(stamp)) = (valid, stamp) {
+        fs::write(&marker, stamp).map_err(|e| {
+            format!(
+                "write {} verified marker {}: {e}",
+                spec.name,
+                marker.display()
+            )
+        })?;
+    }
+    Ok(valid)
 }
 
 fn install(
@@ -338,52 +453,47 @@ fn install(
             root.display()
         )
     })?;
-    if bytes.len() as u64 > spec.max_bytes {
-        return Err(format!(
-            "{} download from {} exceeds {} bytes",
-            spec.name, spec.url, spec.max_bytes
-        ));
-    }
     let actual = format!("{:x}", Sha256::digest(&bytes));
     if actual != spec.digest {
         return Err(format!(
-            "{} SHA-256 mismatch: expected {}, got {actual}",
-            spec.name, spec.digest
+            "{} download from {} for cache {} SHA-256 mismatch: expected {}, got {actual}",
+            spec.name,
+            spec.url,
+            root.display(),
+            spec.digest
         ));
     }
-    let parent = root.parent().ok_or("cache entry has no parent")?;
+    let parent = root.parent().ok_or_else(|| {
+        format!(
+            "{} cache entry {} for {} has no parent",
+            spec.name,
+            root.display(),
+            spec.url
+        )
+    })?;
     let stage = tempfile::Builder::new()
         .prefix(".cja-tool-")
         .tempdir_in(parent)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            format!(
+                "stage {} download from {} in {}: {e}",
+                spec.name,
+                spec.url,
+                parent.display()
+            )
+        })?;
     if let Some(executable) = spec.archive_executable {
-        let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
-        let mut archive = tar::Archive::new(decoder);
-        for entry in archive.entries().map_err(|e| e.to_string())? {
-            let mut entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path().map_err(|e| e.to_string())?;
-            if path.is_absolute()
-                || path
-                    .components()
-                    .any(|c| !matches!(c, Component::Normal(_)))
-            {
-                return Err(format!("unsafe tar path: {}", path.display()));
-            }
-            let kind = entry.header().entry_type();
-            if !kind.is_file() && !kind.is_dir() {
-                return Err(format!("unsafe tar entry: {}", path.display()));
-            }
-            entry.unpack_in(stage.path()).map_err(|e| e.to_string())?;
-        }
-        if !stage.path().join(executable).is_file()
-            || !stage.path().join("package/lib/lib.d.ts").is_file()
-        {
-            return Err("tsc archive lacks executable or declaration libraries".to_owned());
-        }
-        fs::write(stage.path().join(".sha256"), spec.digest).map_err(|e| e.to_string())?;
+        unpack_archive(spec, &bytes, stage.path(), executable)?;
         let staged = stage.into_path();
         if let Err(e) = fs::rename(&staged, root) {
-            fs::remove_dir_all(&staged).map_err(|cleanup| cleanup.to_string())?;
+            fs::remove_dir_all(&staged).map_err(|cleanup| {
+                format!(
+                    "clean staged {} archive {} from {}: {cleanup}",
+                    spec.name,
+                    staged.display(),
+                    spec.url
+                )
+            })?;
             if matches!(
                 e.kind(),
                 io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty
@@ -399,18 +509,130 @@ fn install(
             return Err(format!("install {}: {e}", root.display()));
         }
     } else {
-        let staged = stage.path().join("binary");
-        let mut file = fs::File::create(&staged).map_err(|e| e.to_string())?;
-        file.write_all(&bytes).map_err(|e| e.to_string())?;
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
-                .map_err(|e| e.to_string())?;
-        }
-        fs::rename(staged, root).map_err(|e| format!("install {}: {e}", root.display()))?;
+        install_single_file(spec, root, stage.path(), &bytes)?;
     }
+    Ok(())
+}
+
+fn unpack_archive(
+    spec: &ToolSpec,
+    bytes: &[u8],
+    stage: &Path,
+    executable: &str,
+) -> Result<(), String> {
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("read {} archive from {}: {e}", spec.name, spec.url))?
+    {
+        let mut entry = entry
+            .map_err(|e| format!("read {} archive entry from {}: {e}", spec.name, spec.url))?;
+        let path = entry
+            .path()
+            .map_err(|e| {
+                format!(
+                    "read {} archive entry path from {}: {e}",
+                    spec.name, spec.url
+                )
+            })?
+            .into_owned();
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            return Err(format!(
+                "unsafe {} tar path {} from {}",
+                spec.name,
+                path.display(),
+                spec.url
+            ));
+        }
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(format!(
+                "unsafe {} tar entry {} from {}",
+                spec.name,
+                path.display(),
+                spec.url
+            ));
+        }
+        entry.unpack_in(stage).map_err(|e| {
+            format!(
+                "unpack {} archive entry {} from {} into {}: {e}",
+                spec.name,
+                path.display(),
+                spec.url,
+                stage.display()
+            )
+        })?;
+    }
+    if !stage.join(executable).is_file() || !stage.join("package/lib/lib.d.ts").is_file() {
+        return Err(format!(
+            "{} archive from {} lacks executable {} or declaration libraries in {}",
+            spec.name,
+            spec.url,
+            executable,
+            stage.display()
+        ));
+    }
+    fs::write(stage.join(".sha256"), spec.digest).map_err(|e| {
+        format!(
+            "write {} digest marker {} from {}: {e}",
+            spec.name,
+            stage.join(".sha256").display(),
+            spec.url
+        )
+    })?;
+    Ok(())
+}
+
+fn install_single_file(
+    spec: &ToolSpec,
+    root: &Path,
+    stage: &Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let staged = stage.join("binary");
+    let mut file = fs::File::create(&staged).map_err(|e| {
+        format!(
+            "create {} download from {} at {}: {e}",
+            spec.name,
+            spec.url,
+            staged.display()
+        )
+    })?;
+    file.write_all(bytes).map_err(|e| {
+        format!(
+            "write {} download from {} at {}: {e}",
+            spec.name,
+            spec.url,
+            staged.display()
+        )
+    })?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(|e| {
+            format!(
+                "set permissions on {} download from {} at {}: {e}",
+                spec.name,
+                spec.url,
+                staged.display()
+            )
+        })?;
+    }
+    fs::rename(&staged, root).map_err(|e| {
+        format!(
+            "install {} download from {} from {} to {}: {e}",
+            spec.name,
+            spec.url,
+            staged.display(),
+            root.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -422,7 +644,8 @@ pub(crate) fn fetch_https(spec: &ToolSpec) -> Result<Vec<u8>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(READ_TIMEOUT)
-        .timeout(OVERALL_TIMEOUT)
+        // ureq 2.12.1's overall deadline replaces timeout_read on each read. A
+        // progressing large binary must not fail after an arbitrary wall time.
         .build();
     let response = agent
         .get(url)
@@ -434,26 +657,37 @@ pub(crate) fn fetch_https(spec: &ToolSpec) -> Result<Vec<u8>, String> {
             response.get_url()
         ));
     }
-    if response
+    let content_length = response
         .header("Content-Length")
-        .and_then(|s| s.parse::<u64>().ok())
-        .is_some_and(|n| n > spec.max_bytes)
-    {
+        .and_then(|s| s.parse().ok());
+    read_capped(response.into_reader(), content_length, spec)
+}
+
+fn read_capped(
+    reader: impl io::Read,
+    content_length: Option<u64>,
+    spec: &ToolSpec,
+) -> Result<Vec<u8>, String> {
+    if content_length.is_some_and(|n| n > spec.max_bytes) {
         return Err(format!(
             "{} download from {} exceeds {} bytes",
-            spec.name, url, spec.max_bytes
+            spec.name, spec.url, spec.max_bytes
         ));
     }
     let mut bytes = Vec::new();
-    response
-        .into_reader()
+    reader
         .take(spec.max_bytes + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            format!(
+                "read {} download from {} (limit {} bytes): {e}",
+                spec.name, spec.url, spec.max_bytes
+            )
+        })?;
     if bytes.len() as u64 > spec.max_bytes {
         return Err(format!(
             "{} download from {} exceeds {} bytes",
-            spec.name, url, spec.max_bytes
+            spec.name, spec.url, spec.max_bytes
         ));
     }
     Ok(bytes)
@@ -525,6 +759,110 @@ mod tests {
             tool: Tool::Tailwind,
             max_bytes: 128 * 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn tailwind_platform_specs_and_unsupported_host() {
+        for (host, asset, digest) in [
+            (
+                "linux-x64",
+                "tailwindcss-linux-x64",
+                "dc61b3ac6b8c9ca874c0cc4c57b2409791a64c5540404ca5f5367360babc313a",
+            ),
+            (
+                "linux-arm64",
+                "tailwindcss-linux-arm64",
+                "55fd0b241214eff3de1e8ee4f22796662f2d2e7a49bcfca7477cfd0bac398195",
+            ),
+            (
+                "linux-x64-musl",
+                "tailwindcss-linux-x64-musl",
+                "a04d34ceacc8f52cbe8920ad846cdeb61d3d0021dba32db0d1f77c9d9fad7a6c",
+            ),
+            (
+                "linux-arm64-musl",
+                "tailwindcss-linux-arm64-musl",
+                "71ea4be79c9de9827545682df3e040053fb535d37c71ed2cfdedf9385a0868e0",
+            ),
+            (
+                "darwin-x64",
+                "tailwindcss-macos-x64",
+                "7922e0953f2110c05976e3bf58f14e643d90427575e766b7d433f5f80cbee7e1",
+            ),
+            (
+                "darwin-arm64",
+                "tailwindcss-macos-arm64",
+                "cdf646702987a743464dff4d9c60fd4480d1c1e73dd819a9a67f1078815dce9d",
+            ),
+        ] {
+            let spec = ToolSpec::tailwind(host).unwrap();
+            assert!(spec.url.ends_with(asset));
+            assert_eq!(spec.digest, digest);
+            assert_eq!(spec.key(), format!("tailwindcss-4.3.3-{host}"));
+            assert_eq!(spec.max_bytes, TAILWIND_MAX_DOWNLOAD);
+            assert!(spec.archive_executable.is_none());
+        }
+        let unsupported = ToolSpec::tailwind("windows-x64").unwrap_err();
+        assert!(
+            unsupported.contains("unsupported native tailwindcss build host")
+                && unsupported.contains("set TAILWIND_CLI"),
+            "{unsupported}"
+        );
+    }
+
+    #[test]
+    fn capped_download_rejects_headers_and_streams() {
+        let mut spec = file_spec(b"1234");
+        spec.max_bytes = 4;
+        for (reader, length) in [(b"1234".as_slice(), Some(5)), (b"12345".as_slice(), None)] {
+            let error = read_capped(reader, length, &spec).unwrap_err();
+            assert!(
+                error.contains("tailwindcss")
+                    && error.contains(&spec.url)
+                    && error.contains("4 bytes"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            read_capped(b"1234".as_slice(), Some(4), &spec).unwrap(),
+            b"1234"
+        );
+    }
+
+    #[test]
+    fn tailwind_override_and_cache_rehash() {
+        let _guard = crate::SPAWN.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-tailwind");
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut env = env(dir.path());
+        env.host = "unsupported".to_owned();
+        env.tailwind_override = Some(path.as_os_str().to_os_string());
+        env.offline = true;
+        assert_eq!(
+            resolve_tailwind(&env, |_| panic!("download")).unwrap(),
+            path
+        );
+        env.tailwind_override = None;
+        env.host = "linux-arm64".to_owned();
+        let spec = file_spec(b"good");
+        let error = resolve(&spec, &env, |_| panic!("offline")).unwrap_err();
+        assert!(error.contains("TAILWIND_CLI"));
+        env.offline = false;
+        let cached = resolve(&spec, &env, |_| Ok(b"good".to_vec())).unwrap();
+        env.offline = true;
+        assert_eq!(
+            resolve(&spec, &env, |_| panic!("cache hit")).unwrap(),
+            cached
+        );
+        fs::write(&cached, b"bad").unwrap();
+        let error = resolve(&spec, &env, |_| panic!("offline")).unwrap_err();
+        assert!(error.contains("invalid cache entry"));
     }
 
     fn tar_bytes(link: bool) -> Vec<u8> {
@@ -667,15 +1005,54 @@ mod tests {
     }
 
     #[test]
-    fn file_cache_rehashes_every_hit() {
+    fn file_cache_marker_rehashes_after_mtime_change() {
         let dir = tempfile::tempdir().unwrap();
         let spec = file_spec(b"good");
         let env = env(dir.path());
         let path = resolve(&spec, &env, |_| Ok(b"good".to_vec())).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"good");
-        fs::write(&path, b"corrupt").unwrap();
+        assert!(valid_file_cache(&spec, &path).unwrap());
+        assert!(
+            path.with_file_name(format!("{}.verified", spec.key()))
+                .is_file()
+        );
+        let original = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, b"evil").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(original + Duration::from_secs(2))
+            .unwrap();
         let error = resolve(&spec, &env, |_| Ok(b"bad".to_vec())).unwrap_err();
         assert!(error.contains("SHA-256 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn file_cache_marker_trusts_original_mtime_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec(b"good");
+        let path = resolve(&spec, &env(dir.path()), |_| Ok(b"good".to_vec())).unwrap();
+        assert!(valid_file_cache(&spec, &path).unwrap());
+        let original = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, b"evil").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(original)
+            .unwrap();
+        assert!(valid_file_cache(&spec, &path).unwrap());
+    }
+
+    #[test]
+    fn file_cache_marker_write_failure_is_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec(b"good");
+        let path = resolve(&spec, &env(dir.path()), |_| Ok(b"good".to_vec())).unwrap();
+        let marker = path.with_file_name(format!("{}.verified", spec.key()));
+        fs::create_dir(&marker).unwrap();
+        let error = valid_file_cache(&spec, &path).unwrap_err();
+        assert!(
+            error.contains("verified marker") && error.contains(&marker.display().to_string()),
+            "{error}"
+        );
     }
 
     #[test]
@@ -706,10 +1083,9 @@ mod tests {
 
     #[test]
     fn download_cap_is_per_tool_and_names_tool_and_url() {
-        let dir = tempfile::tempdir().unwrap();
         let mut spec = file_spec(b"oversized");
         spec.max_bytes = 2;
-        let error = resolve(&spec, &env(dir.path()), |_| Ok(b"oversized".to_vec())).unwrap_err();
+        let error = read_capped(b"oversized".as_slice(), None, &spec).unwrap_err();
         assert!(
             error.contains("tailwindcss") && error.contains("2 bytes") && error.contains(&spec.url),
             "{error}"
@@ -802,7 +1178,10 @@ mod tests {
         let spec = tar_spec(&archive);
         let env = env(dir.path());
         let error = resolve(&spec, &env, |_| Ok(archive.clone())).unwrap_err();
-        assert!(error.contains("unsafe tar entry"), "{error}");
+        assert!(
+            error.contains("unsafe tsc tar entry") && error.contains(&spec.url),
+            "{error}"
+        );
         let good = tar_bytes(false);
         let good_spec = tar_spec(&good);
         let root = dir.path().join("cache/cja").join(good_spec.key());
