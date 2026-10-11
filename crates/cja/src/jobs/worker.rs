@@ -1,7 +1,16 @@
-use std::{any::Any, collections::HashSet, future::Future, pin::Pin, sync::Mutex, time::Duration};
+use std::{
+    any::Any,
+    collections::HashSet,
+    future::Future,
+    num::NonZeroUsize,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures::FutureExt;
 use thiserror::Error;
+use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 use tracing::Span;
 
@@ -22,9 +31,110 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Default reclaim window after the last successful heartbeat.
 pub const DEFAULT_RECLAIM_WINDOW: Duration = Duration::from_mins(2);
 
+/// Process-local admission for idle job claims. Clone one instance into every
+/// worker that should share the same periodic claim limit. The permits do not
+/// limit running jobs or heartbeats.
+#[derive(Clone, Debug)]
+pub struct IdlePollGate(Arc<IdlePollGateInner>);
+
+#[derive(Debug)]
+struct IdlePollGateInner {
+    periodic_claims: Semaphore,
+    wake: Notify,
+    #[cfg(test)]
+    probe: ClaimProbe,
+}
+
+impl IdlePollGate {
+    pub fn new(periodic_claimers: NonZeroUsize) -> Self {
+        Self(Arc::new(IdlePollGateInner {
+            periodic_claims: Semaphore::new(periodic_claimers.get()),
+            wake: Notify::new(),
+            #[cfg(test)]
+            probe: ClaimProbe::default(),
+        }))
+    }
+
+    /// Wake one parked worker for one immediate claim. Wakes may coalesce or
+    /// be lost; periodic claims remain necessary for durable discovery.
+    pub fn wake_one(&self) {
+        self.0.wake.notify_one();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClaimKind {
+    Periodic,
+    Notified,
+    AfterJob,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ClaimProbe {
+    attempts: std::sync::atomic::AtomicUsize,
+    empty_periodic: std::sync::atomic::AtomicUsize,
+    in_flight_periodic: std::sync::atomic::AtomicUsize,
+    max_in_flight_periodic: std::sync::atomic::AtomicUsize,
+    notified: std::sync::atomic::AtomicUsize,
+    waiting: std::sync::atomic::AtomicUsize,
+    errors: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ClaimProbe {
+    fn claim(&self, kind: ClaimKind) -> ClaimGuard<'_> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.attempts.fetch_add(1, SeqCst);
+        if matches!(kind, ClaimKind::Notified) {
+            self.notified.fetch_add(1, SeqCst);
+        }
+        if matches!(kind, ClaimKind::Periodic) {
+            let current = self.in_flight_periodic.fetch_add(1, SeqCst) + 1;
+            self.max_in_flight_periodic.fetch_max(current, SeqCst);
+        }
+        ClaimGuard { probe: self, kind }
+    }
+
+    fn waiting(&self) -> WaitingGuard<'_> {
+        self.waiting
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        WaitingGuard(self)
+    }
+}
+
+#[cfg(test)]
+struct ClaimGuard<'a> {
+    probe: &'a ClaimProbe,
+    kind: ClaimKind,
+}
+
+#[cfg(test)]
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if matches!(self.kind, ClaimKind::Periodic) {
+            self.probe
+                .in_flight_periodic
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+struct WaitingGuard<'a>(&'a ClaimProbe);
+
+#[cfg(test)]
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Settings for the sole job worker. The reclaim window must be at least three
 /// heartbeat intervals; a larger window allows more transient DB failures.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct JobWorkerConfig {
     /// Time between heartbeat attempts while a job runs (30 seconds by default).
     pub heartbeat_interval: Duration,
@@ -36,6 +146,8 @@ pub struct JobWorkerConfig {
     /// match the `job_drain` of the `ShutdownBudget` given to the `Supervisor`;
     /// apps constructing a custom budget must set this field to the same value.
     pub shutdown_drain_timeout: Duration,
+    /// Optional shared admission for idle claims. `None` keeps independent polling.
+    pub idle_poll_gate: Option<IdlePollGate>,
 }
 
 impl Default for JobWorkerConfig {
@@ -44,12 +156,13 @@ impl Default for JobWorkerConfig {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             reclaim_window: DEFAULT_RECLAIM_WINDOW,
             shutdown_drain_timeout: crate::tasks::ShutdownBudget::from_env().job_drain,
+            idle_poll_gate: None,
         }
     }
 }
 
 impl JobWorkerConfig {
-    fn validate(self) -> color_eyre::Result<i64> {
+    fn validate(&self) -> color_eyre::Result<i64> {
         use color_eyre::eyre::eyre;
         if self.heartbeat_interval.is_zero() {
             return Err(eyre!(
@@ -109,12 +222,13 @@ struct ClaimedJob {
 
 struct LeaseTracker {
     last_refresh_sent: tokio::time::Instant,
-    config: JobWorkerConfig,
+    heartbeat_interval: Duration,
+    reclaim_window: Duration,
 }
 
 impl LeaseTracker {
     fn deadline(&self) -> tokio::time::Instant {
-        self.last_refresh_sent + self.config.reclaim_window - self.config.heartbeat_interval / 2
+        self.last_refresh_sent + self.reclaim_window - self.heartbeat_interval / 2
     }
 }
 
@@ -222,7 +336,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         let job = claimed.job;
         let mut tracker = LeaseTracker {
             last_refresh_sent: claimed.claim_sent_at,
-            config: self.config,
+            heartbeat_interval: self.config.heartbeat_interval,
+            reclaim_window: self.config.reclaim_window,
         };
         if tokio::time::Instant::now() >= tracker.deadline() {
             tracing::warn!(job_id = %job.job_id, "Claim response exceeded lease deadline");
@@ -662,50 +777,59 @@ pub async fn job_worker<AppState: AS>(
     verify_jobs_schema(worker.state.db()).await?;
 
     let mut tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
+    let gate = worker.config.idle_poll_gate.clone();
+    let mut permit: Option<SemaphorePermit<'_>> = None;
+    let mut after_job = false;
 
     loop {
+        let claim_kind = if let Some(gate) = &gate {
+            match admit_claim(gate, &mut permit, after_job, &shutdown_token).await {
+                Some(kind) => kind,
+                None => break,
+            }
+        } else {
+            ClaimKind::Periodic
+        };
+        #[cfg(test)]
+        let claim_guard = gate.as_ref().map(|gate| gate.0.probe.claim(claim_kind));
+        #[cfg(not(test))]
+        let _ = claim_kind;
         let fetched = tokio::select! {
             result = worker.fetch_next_job() => result,
             () = shutdown_token.cancelled() => break,
         };
+        #[cfg(test)]
+        if let Some(gate) = &gate {
+            use std::sync::atomic::Ordering::SeqCst;
+            if matches!(claim_kind, ClaimKind::Periodic) && matches!(fetched.as_ref(), Ok(None)) {
+                gate.0.probe.empty_periodic.fetch_add(1, SeqCst);
+            }
+            if fetched.is_err() {
+                gate.0.probe.errors.fetch_add(1, SeqCst);
+            }
+        }
+        #[cfg(test)]
+        drop(claim_guard);
         let result = match fetched {
             Ok(Some(job)) => {
-                let mut running = std::pin::pin!(worker.run_next_job(job));
-                let run_result = tokio::select! {
-                    result = &mut running => result,
-                    () = shutdown_token.cancelled() => {
-                        match tokio::time::timeout(worker.config.shutdown_drain_timeout, &mut running).await {
-                            Ok(result) => result,
-                            Err(_) => break,
-                        }
-                    }
-                };
-                // Fold the infrastructure error into `result` instead of
-                // `?`-ing out: a transient failure while running/finalizing a
-                // job (e.g. a DB blip during completion bookkeeping) must hit
-                // the same backoff-and-retry arm as a fetch failure — never
-                // kill the worker, which would take down apps that join on
-                // all worker tasks.
-                match run_result {
-                    Ok(RunJobOutcome::Completed(Ok(RunJobSuccess(job)))) => {
-                        tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
-                        Ok(())
-                    }
-                    Ok(RunJobOutcome::Completed(Err(job_error))) => {
-                        tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
-                        Ok(())
-                    }
-                    Ok(RunJobOutcome::LeaseLost(job_id)) => {
-                        tracing::warn!(worker.id = %worker.id, %job_id, "Job lease lost; body stopped");
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
+                drop(permit.take());
+                after_job = gate.is_some();
+                match run_claimed_job(&worker, job, &shutdown_token).await {
+                    Some(result) => result,
+                    None => break,
                 }
             }
-            Ok(None) => tokio::select! {
-                () = tokio::time::sleep(worker.sleep_duration) => Ok(()),
-                () = shutdown_token.cancelled() => break,
-            },
+            Ok(None) => {
+                after_job = false;
+                if gate.is_some() && permit.is_none() {
+                    Ok(())
+                } else {
+                    tokio::select! {
+                        () = tokio::time::sleep(worker.sleep_duration) => Ok(()),
+                        () = shutdown_token.cancelled() => break,
+                    }
+                }
+            }
             Err(error) => Err(error),
         };
         match result {
@@ -713,6 +837,8 @@ pub async fn job_worker<AppState: AS>(
                 tick_error_backoff = TICK_ERROR_BACKOFF_BASE;
             }
             Err(error) => {
+                drop(permit.take());
+                after_job = false;
                 // A tick error here is a transient infrastructure failure
                 // (e.g. couldn't reach the database to claim a job), not a
                 // job failure — jobs have their own retry machinery. Log it
@@ -738,9 +864,73 @@ pub async fn job_worker<AppState: AS>(
         }
     }
 
+    drop(permit);
     cleanup_worker_locks(&worker).await?;
     tracing::info!(worker_id = %worker.id, "Job worker shutdown complete");
     Ok(())
+}
+
+async fn admit_claim<'a>(
+    gate: &'a IdlePollGate,
+    permit: &mut Option<SemaphorePermit<'a>>,
+    after_job: bool,
+    shutdown_token: &CancellationToken,
+) -> Option<ClaimKind> {
+    if after_job {
+        return Some(ClaimKind::AfterJob);
+    }
+    if permit.is_some() {
+        return Some(ClaimKind::Periodic);
+    }
+    #[cfg(test)]
+    let _waiting = gate.0.probe.waiting();
+    tokio::select! {
+        biased;
+        () = shutdown_token.cancelled() => None,
+        acquired = gate.0.periodic_claims.acquire() => {
+            *permit = Some(acquired.expect("idle poll semaphore is never closed"));
+            Some(ClaimKind::Periodic)
+        }
+        () = gate.0.wake.notified() => Some(ClaimKind::Notified),
+    }
+}
+
+async fn run_claimed_job<AppState: AS, R: JobRegistry<AppState>>(
+    worker: &Worker<AppState, R>,
+    job: ClaimedJob,
+    shutdown_token: &CancellationToken,
+) -> Option<color_eyre::Result<()>> {
+    let mut running = std::pin::pin!(worker.run_next_job(job));
+    let run_result = tokio::select! {
+        result = &mut running => result,
+        () = shutdown_token.cancelled() => {
+            match tokio::time::timeout(worker.config.shutdown_drain_timeout, &mut running).await {
+                Ok(result) => result,
+                Err(_) => return None,
+            }
+        }
+    };
+    // Fold the infrastructure error into `result` instead of
+    // `?`-ing out: a transient failure while running/finalizing a
+    // job (e.g. a DB blip during completion bookkeeping) must hit
+    // the same backoff-and-retry arm as a fetch failure — never
+    // kill the worker, which would take down apps that join on
+    // all worker tasks.
+    Some(match run_result {
+        Ok(RunJobOutcome::Completed(Ok(RunJobSuccess(job)))) => {
+            tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
+            Ok(())
+        }
+        Ok(RunJobOutcome::Completed(Err(job_error))) => {
+            tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+            Ok(())
+        }
+        Ok(RunJobOutcome::LeaseLost(job_id)) => {
+            tracing::warn!(worker.id = %worker.id, %job_id, "Job lease lost; body stopped");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    })
 }
 
 #[cfg(test)]
@@ -919,14 +1109,14 @@ mod tests {
 
         let invalid = JobWorkerConfig {
             heartbeat_interval: Duration::ZERO,
-            ..config
+            ..config.clone()
         };
         assert!(format!("{:#}", invalid.validate().unwrap_err()).contains("positive"));
 
         let invalid = JobWorkerConfig {
             heartbeat_interval: Duration::from_secs(2),
             reclaim_window: Duration::from_secs(5),
-            ..config
+            ..config.clone()
         };
         let message = format!("{:#}", invalid.validate().unwrap_err());
         assert!(
@@ -937,7 +1127,7 @@ mod tests {
         let invalid = JobWorkerConfig {
             heartbeat_interval: Duration::MAX,
             reclaim_window: Duration::MAX,
-            ..config
+            ..config.clone()
         };
         assert!(format!("{:#}", invalid.validate().unwrap_err()).contains("three"));
 
@@ -945,7 +1135,7 @@ mod tests {
         let invalid = JobWorkerConfig {
             heartbeat_interval: beyond_pg,
             reclaim_window: beyond_pg * 3,
-            ..config
+            ..config.clone()
         };
         assert!(
             format!("{:#}", invalid.validate().unwrap_err()).contains("heartbeat interval exceeds")
@@ -953,7 +1143,7 @@ mod tests {
 
         let invalid = JobWorkerConfig {
             reclaim_window: beyond_pg,
-            ..config
+            ..config.clone()
         };
         assert!(
             format!("{:#}", invalid.validate().unwrap_err()).contains("reclaim window exceeds")
@@ -962,7 +1152,7 @@ mod tests {
         let invalid = JobWorkerConfig {
             heartbeat_interval: Duration::from_nanos(2),
             reclaim_window: Duration::from_nanos(6),
-            ..config
+            ..config.clone()
         };
         assert!(
             format!("{:#}", invalid.validate().unwrap_err()).contains("positive query timeout")
@@ -971,7 +1161,7 @@ mod tests {
         let tiny_valid = JobWorkerConfig {
             heartbeat_interval: Duration::from_micros(3),
             reclaim_window: Duration::from_micros(9),
-            ..config
+            ..config.clone()
         };
         assert_eq!(tiny_valid.validate().unwrap(), 9);
     }
@@ -1055,6 +1245,7 @@ mod tests {
                 heartbeat_interval: Duration::from_millis(300),
                 reclaim_window: Duration::from_millis(1200),
                 shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
             },
         ));
         wait_for(|| async {
@@ -1107,6 +1298,7 @@ mod tests {
                     heartbeat_interval: Duration::from_millis(300),
                     reclaim_window: Duration::from_millis(1200),
                     shutdown_drain_timeout: Duration::ZERO,
+                    idle_poll_gate: None,
                 },
             ));
             let count: i32 = wait_for(|| async {
@@ -1534,7 +1726,7 @@ mod tests {
                 Duration::from_millis(20),
                 20,
                 CancellationToken::new(),
-                lease,
+                lease.clone(),
             )
             .unwrap(),
         );
@@ -1609,7 +1801,7 @@ mod tests {
                 Duration::from_millis(20),
                 20,
                 CancellationToken::new(),
-                lease,
+                lease.clone(),
             )
             .unwrap(),
         );
@@ -1715,11 +1907,8 @@ mod tests {
         let sent = tokio::time::Instant::now();
         let tracker = LeaseTracker {
             last_refresh_sent: sent,
-            config: JobWorkerConfig {
-                heartbeat_interval: Duration::from_millis(300),
-                reclaim_window: Duration::from_millis(1200),
-                ..Default::default()
-            },
+            heartbeat_interval: Duration::from_millis(300),
+            reclaim_window: Duration::from_millis(1200),
         };
         assert_eq!(tracker.deadline(), sent + Duration::from_millis(1050));
         tokio::time::advance(Duration::from_millis(1049)).await;
@@ -2045,5 +2234,494 @@ mod tests {
                 "job body was not polled for {max_gap}ms while a heartbeat UPDATE was in flight"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_gate_tests {
+    use super::*;
+    use crate::{app_state::AppState, impl_job_registry, jobs::Job, server::cookies::CookieKey};
+    use serde::{Deserialize, Serialize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use tokio::task::JoinHandle;
+
+    #[derive(Clone)]
+    struct State {
+        db: sqlx::PgPool,
+        key: CookieKey,
+        gate: IdlePollGate,
+        hooks: Arc<AtomicUsize>,
+        park: Arc<AtomicBool>,
+        release: Arc<Notify>,
+        in_body: Arc<AtomicUsize>,
+        max_in_body: Arc<AtomicUsize>,
+    }
+
+    impl AppState for State {
+        fn version(&self) -> &'static str {
+            "gate-test"
+        }
+        fn db(&self) -> &sqlx::PgPool {
+            &self.db
+        }
+        fn cookie_key(&self) -> &CookieKey {
+            &self.key
+        }
+        fn job_enqueued(&self) {
+            self.hooks.fetch_add(1, SeqCst);
+            self.gate.wake_one();
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct GateJob {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<State> for GateJob {
+        const NAME: &'static str = "GateJob";
+        async fn run(&self, state: State) -> color_eyre::Result<()> {
+            sqlx::query("INSERT INTO gate_job_starts (id) VALUES ($1)")
+                .bind(&self.id)
+                .execute(&state.db)
+                .await?;
+            let current = state.in_body.fetch_add(1, SeqCst) + 1;
+            state.max_in_body.fetch_max(current, SeqCst);
+            if state.park.load(SeqCst) {
+                state.release.notified().await;
+            }
+            state.in_body.fetch_sub(1, SeqCst);
+            Ok(())
+        }
+    }
+    impl_job_registry!(State, GateJob);
+
+    #[derive(Clone, Debug, Deserialize)]
+    struct BadJob;
+
+    impl Serialize for BadJob {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("fixture serialization failure"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Job<State> for BadJob {
+        const NAME: &'static str = "BadJob";
+        async fn run(&self, _: State) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_state(db: sqlx::PgPool, gate: IdlePollGate) -> State {
+        State {
+            db,
+            key: CookieKey::generate(),
+            gate,
+            hooks: Arc::new(AtomicUsize::new(0)),
+            park: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(Notify::new()),
+            in_body: Arc::new(AtomicUsize::new(0)),
+            max_in_body: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    async fn setup(db: &sqlx::PgPool) {
+        sqlx::query("CREATE TABLE gate_job_starts (id TEXT PRIMARY KEY)")
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    struct Workers {
+        token: CancellationToken,
+        handles: Vec<JoinHandle<color_eyre::Result<()>>>,
+    }
+    impl Workers {
+        fn start(state: &State, count: usize, interval: Duration, enabled: bool) -> Self {
+            let token = CancellationToken::new();
+            let handles = (0..count)
+                .map(|_| {
+                    tokio::spawn(job_worker(
+                        state.clone(),
+                        Jobs,
+                        interval,
+                        20,
+                        token.clone(),
+                        JobWorkerConfig {
+                            idle_poll_gate: enabled.then(|| state.gate.clone()),
+                            ..Default::default()
+                        },
+                    ))
+                })
+                .collect();
+            Self { token, handles }
+        }
+        async fn stop(self) {
+            self.token.cancel();
+            for handle in self.handles {
+                tokio::time::timeout(Duration::from_secs(10), handle)
+                    .await
+                    .expect("worker shutdown timeout")
+                    .expect("worker panic")
+                    .expect("worker error");
+            }
+        }
+    }
+
+    async fn until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("gate condition timeout");
+    }
+
+    async fn started(db: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM gate_job_starts")
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    async fn insert_sql(
+        db: &sqlx::PgPool,
+        id: &str,
+        delay: &str,
+        owner: Option<&str>,
+    ) -> uuid::Uuid {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, locked_by, locked_at) VALUES ($1, $2, $3, 0, NOW() + $4::interval, NOW(), $5, $6, CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END)")
+            .bind(job_id).bind(GateJob::NAME).bind(serde_json::json!({"id": id}))
+            .bind(delay).bind(id).bind(owner).execute(db).await.unwrap();
+        job_id
+    }
+
+    #[sqlx::test]
+    async fn quiet_gate_limits_claim_rate_and_in_flight(db: sqlx::PgPool) {
+        setup(&db).await;
+        let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
+        let state = make_state(db, gate.clone());
+        let workers = Workers::start(&state, 100, Duration::from_millis(200), true);
+        until(|| {
+            gate.0.probe.waiting.load(SeqCst) == 98 && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+        })
+        .await;
+        gate.0.probe.attempts.store(0, SeqCst);
+        gate.0.probe.max_in_flight_periodic.store(0, SeqCst);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let attempts = gate.0.probe.attempts.load(SeqCst);
+        let max = gate.0.probe.max_in_flight_periodic.load(SeqCst);
+        workers.stop().await;
+        assert!((1..=24).contains(&attempts), "{attempts} attempts");
+        assert!(max <= 2, "{max} periodic claims in flight");
+    }
+
+    #[sqlx::test]
+    async fn direct_sql_burst_releases_permits_before_bodies(db: sqlx::PgPool) {
+        setup(&db).await;
+        let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
+        let state = make_state(db.clone(), gate.clone());
+        state.park.store(true, SeqCst);
+        let workers = Workers::start(&state, 100, Duration::from_millis(200), true);
+        until(|| {
+            gate.0.probe.waiting.load(SeqCst) == 98 && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+        })
+        .await;
+        for id in 0..32 {
+            insert_sql(&db, &format!("burst-{id}"), "0 seconds", None).await;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            while started(&db).await < 32 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let max = state.max_in_body.load(SeqCst);
+        state.release.notify_waiters();
+        workers.stop().await;
+        result.expect("32 body starts within two seconds");
+        assert!(max >= 32, "only {max} overlapping bodies");
+    }
+
+    #[sqlx::test]
+    async fn enqueue_wakes_parked_worker_and_sql_still_polls(db: sqlx::PgPool) {
+        setup(&db).await;
+        let gate = IdlePollGate::new(NonZeroUsize::new(1).unwrap());
+        let state = make_state(db.clone(), gate.clone());
+        let workers = Workers::start(&state, 3, Duration::from_secs(5), true);
+        until(|| {
+            gate.0.probe.waiting.load(SeqCst) == 2 && gate.0.probe.empty_periodic.load(SeqCst) >= 1
+        })
+        .await;
+        GateJob { id: "wake".into() }
+            .enqueue(state.clone(), "wake".into(), None)
+            .await
+            .unwrap();
+        let fast = tokio::time::timeout(Duration::from_secs(1), async {
+            while started(&db).await < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let hooks = state.hooks.load(SeqCst);
+        workers.stop().await;
+        fast.expect("local wake should start body before periodic tick");
+        assert_eq!(hooks, 1);
+    }
+
+    #[sqlx::test]
+    async fn failed_enqueue_does_not_wake_and_wakes_coalesce(db: sqlx::PgPool) {
+        setup(&db).await;
+        let gate = IdlePollGate::new(NonZeroUsize::new(1).unwrap());
+        let state = make_state(db.clone(), gate.clone());
+        let workers = Workers::start(&state, 3, Duration::from_secs(5), true);
+        until(|| {
+            gate.0.probe.waiting.load(SeqCst) == 2 && gate.0.probe.empty_periodic.load(SeqCst) >= 1
+        })
+        .await;
+        let before = gate.0.probe.notified.load(SeqCst);
+        let error = BadJob
+            .enqueue(state.clone(), "bad".into(), None)
+            .await
+            .unwrap_err();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = gate.0.probe.notified.load(SeqCst);
+        let hooks = state.hooks.load(SeqCst);
+        workers.stop().await;
+        assert!(matches!(
+            error,
+            super::super::EnqueueError::SerdeJsonError(_)
+        ));
+        assert_eq!(hooks, 0);
+        assert_eq!(after, before);
+
+        for _ in 0..20 {
+            gate.wake_one();
+        }
+        let state = make_state(db.clone(), gate.clone());
+        let before = gate.0.probe.notified.load(SeqCst);
+        let workers = Workers::start(&state, 3, Duration::from_millis(100), true);
+        until(|| {
+            gate.0.probe.waiting.load(SeqCst) == 2 && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+        })
+        .await;
+        let notified = gate.0.probe.notified.load(SeqCst) - before;
+        insert_sql(&db, "coalesced", "0 seconds", None).await;
+        let found = tokio::time::timeout(Duration::from_secs(1), async {
+            while started(&db).await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        workers.stop().await;
+        assert!(notified <= 1, "{notified} stored notifications consumed");
+        found.expect("periodic claim discovers SQL job after coalesced wakes");
+    }
+
+    #[sqlx::test]
+    async fn cancellation_releases_held_and_waiting_permits(db: sqlx::PgPool) {
+        setup(&db).await;
+        let gate = IdlePollGate::new(NonZeroUsize::new(1).unwrap());
+        let state = make_state(db, gate.clone());
+        let config = JobWorkerConfig {
+            idle_poll_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let first_token = CancellationToken::new();
+        let first = tokio::spawn(job_worker(
+            state.clone(),
+            Jobs,
+            Duration::from_secs(5),
+            20,
+            first_token.clone(),
+            config.clone(),
+        ));
+        until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 1).await;
+        let second_token = CancellationToken::new();
+        let second = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_secs(5),
+            20,
+            second_token.clone(),
+            config,
+        ));
+        until(|| gate.0.probe.waiting.load(SeqCst) == 1).await;
+        first_token.cancel();
+        let first_exit = tokio::time::timeout(Duration::from_secs(1), first).await;
+        until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 2).await;
+        second_token.cancel();
+        let second_exit = tokio::time::timeout(Duration::from_secs(1), second).await;
+        first_exit.expect("holder exits promptly").unwrap().unwrap();
+        second_exit
+            .expect("waiter exits promptly")
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate.0.probe.waiting.load(SeqCst), 0);
+        assert_eq!(gate.0.probe.in_flight_periodic.load(SeqCst), 0);
+    }
+
+    #[sqlx::test]
+    async fn pool_failure_releases_permits_before_backoff(db: sqlx::PgPool) {
+        use sqlx::postgres::PgPoolOptions;
+        setup(&db).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
+        let state = make_state(pool.clone(), gate.clone());
+        let workers = Workers::start(&state, 100, Duration::from_millis(200), true);
+        until(|| {
+            gate.0.probe.waiting.load(SeqCst) == 98 && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+        })
+        .await;
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        until(|| gate.0.probe.errors.load(SeqCst) >= 2).await;
+        let errors = gate.0.probe.errors.load(SeqCst);
+        let released = tokio::time::timeout(Duration::from_millis(500), async {
+            while gate.0.probe.errors.load(SeqCst) <= errors {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        drop(held);
+        until(|| {
+            gate.0.probe.waiting.load(SeqCst) == 98 && gate.0.probe.empty_periodic.load(SeqCst) >= 4
+        })
+        .await;
+        gate.0.probe.attempts.store(0, SeqCst);
+        gate.0.probe.max_in_flight_periodic.store(0, SeqCst);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let attempts = gate.0.probe.attempts.load(SeqCst);
+        let max = gate.0.probe.max_in_flight_periodic.load(SeqCst);
+        workers.stop().await;
+        assert!(released, "permits remained held during backoff");
+        assert!(
+            (1..=24).contains(&attempts),
+            "{attempts} claims after recovery"
+        );
+        assert!(max <= 2, "{max} periodic claims in flight");
+    }
+
+    #[sqlx::test]
+    async fn cancelling_blocked_claim_drops_probe_and_permit(db: sqlx::PgPool) {
+        use sqlx::postgres::PgPoolOptions;
+        setup(&db).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let gate = IdlePollGate::new(NonZeroUsize::new(1).unwrap());
+        let state = make_state(pool.clone(), gate.clone());
+        let token = CancellationToken::new();
+        let worker = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(100),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                idle_poll_gate: Some(gate.clone()),
+                ..Default::default()
+            },
+        ));
+        until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 1).await;
+        let held = pool.acquire().await.unwrap();
+        until(|| gate.0.probe.in_flight_periodic.load(SeqCst) == 1).await;
+        token.cancel();
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("blocked claim cancellation exits")
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate.0.probe.in_flight_periodic.load(SeqCst), 0);
+        assert_eq!(gate.0.periodic_claims.available_permits(), 1);
+    }
+
+    #[sqlx::test]
+    async fn periodic_discovers_due_retry_and_expired_lease(db: sqlx::PgPool) {
+        setup(&db).await;
+        let gate = IdlePollGate::new(NonZeroUsize::new(1).unwrap());
+        let state = make_state(db.clone(), gate.clone());
+        state.park.store(true, SeqCst);
+        let config = JobWorkerConfig {
+            heartbeat_interval: Duration::from_millis(300),
+            reclaim_window: Duration::from_millis(1200),
+            idle_poll_gate: Some(gate),
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        let first = tokio::spawn(job_worker(
+            state.clone(),
+            Jobs,
+            Duration::from_millis(100),
+            20,
+            token.clone(),
+            config.clone(),
+        ));
+        let second = tokio::spawn(job_worker(
+            state.clone(),
+            Jobs,
+            Duration::from_millis(100),
+            20,
+            token.clone(),
+            config,
+        ));
+        let retry_id = insert_sql(&db, "retry", "0.5 seconds", None).await;
+        sqlx::query("UPDATE jobs SET error_count = 1, last_error_message = 'previous attempt failed' WHERE job_id = $1")
+            .bind(retry_id).execute(&db).await.unwrap();
+        let lease_id = insert_sql(&db, "lease", "0 seconds", Some("dead-worker")).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let early = started(&db).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            while started(&db).await < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let row: (i32, String) =
+            sqlx::query_as("SELECT error_count, last_error_message FROM jobs WHERE job_id = $1")
+                .bind(lease_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        state.release.notify_waiters();
+        token.cancel();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(early, 0);
+        result.expect("periodic discovery of retry and lease");
+        assert_eq!(row.0, 1);
+        assert!(row.1.starts_with("Job lease expired"));
+    }
+
+    #[sqlx::test]
+    async fn disabled_gate_keeps_independent_polling(db: sqlx::PgPool) {
+        setup(&db).await;
+        let state = make_state(db.clone(), IdlePollGate::new(NonZeroUsize::new(1).unwrap()));
+        let workers = Workers::start(&state, 1, Duration::from_millis(100), false);
+        insert_sql(&db, "none", "0 seconds", None).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            while started(&db).await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        workers.stop().await;
+        result.expect("ungated polling should discover direct SQL");
     }
 }
