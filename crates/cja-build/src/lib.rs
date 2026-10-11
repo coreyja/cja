@@ -182,24 +182,7 @@ impl AssetsBuilder {
                 source,
             })?;
         }
-        for name in [
-            "TSC",
-            "TAILWIND_CLI",
-            "XDG_CACHE_HOME",
-            "CARGO_NET_OFFLINE",
-            "HOME",
-            "PATH",
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "https_proxy",
-            "http_proxy",
-            "all_proxy",
-            "no_proxy",
-        ] {
-            println!("cargo::rerun-if-env-changed={name}");
-        }
+        self.emit_env_watches(tool_env);
         if let Some(assets_dir) = self.assets_dir.clone() {
             let source_dir = manifest_dir.join(assets_dir);
             watch_dir(&source_dir, out_dir)?;
@@ -265,6 +248,37 @@ impl AssetsBuilder {
             source,
         })?;
         Ok(())
+    }
+
+    fn emit_env_watches(&self, tool_env: &tool_cache::ToolEnv) {
+        for name in [
+            "TSC",
+            "TAILWIND_CLI",
+            "XDG_CACHE_HOME",
+            "CARGO_NET_OFFLINE",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            println!("cargo::rerun-if-env-changed={name}");
+        }
+        if !self.entries.is_empty() {
+            if tool_env
+                .override_path
+                .as_deref()
+                .is_some_and(|path| !path.contains('/'))
+            {
+                println!("cargo::rerun-if-env-changed=PATH");
+            }
+            if tool_env.override_path.is_none() && tool_env.xdg_cache_home.is_none() {
+                println!("cargo::rerun-if-env-changed=HOME");
+            }
+        }
     }
 
     fn add_output(
@@ -404,10 +418,15 @@ impl AssetsBuilder {
             Ok(files) => files,
             Err(diagnostics) => {
                 let mut detail = diagnostics;
-                for (index, entry) in self.entries.iter().enumerate() {
-                    let scratch = out_dir.join(format!("cja-bundle-diagnostics-{index}"));
+                for entry in &self.entries {
+                    let scratch = tempfile::Builder::new()
+                        .prefix("cja-bundle-diagnostics-")
+                        .tempdir_in(out_dir)
+                        .map_err(|e| {
+                            BuildError::Frontend(format!("create diagnostic scratch: {e}"))
+                        })?;
                     if let Err(error) =
-                        bundler::bundle_entry(entry, frontend, app_root, &scratch, false)
+                        bundler::bundle_entry(entry, frontend, app_root, scratch.path(), false)
                     {
                         use fmt::Write as _;
                         let _ = write!(detail, "\nRolldown: {error}");
@@ -417,6 +436,41 @@ impl AssetsBuilder {
             }
         };
         let tool_lib = executable.parent().unwrap_or(&executable);
+        let checked_files = listed
+            .iter()
+            .map(|file| {
+                file.canonicalize().map_err(|error| {
+                    BuildError::Frontend(format!(
+                        "canonicalize tsc-listed {}: {error}",
+                        file.display()
+                    ))
+                })
+            })
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        for entry in &self.entries {
+            let source = frontend
+                .join(&entry.source)
+                .canonicalize()
+                .map_err(|error| {
+                    BuildError::Frontend(format!("entry {}: {error}", entry.source.display()))
+                })?;
+            if !checked_files.contains(&source) {
+                return Err(BuildError::Frontend(format!(
+                    "entry {} is outside the TypeScript program in {}; add it to tsconfig include or files{}",
+                    entry.source.display(),
+                    config.display(),
+                    if entry
+                        .source
+                        .extension()
+                        .is_some_and(|extension| extension == "js")
+                    {
+                        " and enable allowJs for JavaScript entries"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+        }
         for file in listed {
             if !file.starts_with(tool_lib) {
                 watch_dir(&file, out_dir)?;
@@ -458,9 +512,12 @@ impl AssetsBuilder {
         watch_config(&config, out_dir, &mut Vec::new())?;
         self.validate_entries()?;
         self.check_types(&frontend, &config, &app_root, out_dir, tool_env)?;
-        for (index, entry) in self.entries.clone().iter().enumerate() {
-            let scratch = out_dir.join(format!("cja-bundle-{index}"));
-            let bundle = bundler::bundle_entry(entry, &frontend, &app_root, &scratch, true)
+        for entry in self.entries.clone() {
+            let scratch = tempfile::Builder::new()
+                .prefix("cja-bundle-")
+                .tempdir_in(out_dir)
+                .map_err(|e| BuildError::Frontend(format!("create bundle scratch: {e}")))?;
+            let bundle = bundler::bundle_entry(&entry, &frontend, &app_root, scratch.path(), true)
                 .map_err(BuildError::Frontend)?;
             for file in bundle.watch_files {
                 watch_dir(&file, out_dir)?;
@@ -883,6 +940,29 @@ mod tests {
     }
 
     #[test]
+    fn javascript_entry_requires_allow_js_and_program_membership() {
+        let root = fixture();
+        let frontend = root.path().join("frontend");
+        fs::create_dir_all(frontend.join("src")).unwrap();
+        fs::copy(
+            fixture_path("basic/tsconfig.json"),
+            frontend.join("tsconfig.json"),
+        )
+        .unwrap();
+        fs::write(frontend.join("src/main.js"), "console.log('unchecked');\n").unwrap();
+        fs::write(frontend.join("src/util.ts"), "export const value = 1;\n").unwrap();
+        let out = root.path().join("out");
+        let _guard = crate::SPAWN.lock().unwrap();
+        let error = AssetsBuilder::new()
+            .entry(Entry::new("src/main.js", "studio.js"))
+            .build_in(root.path(), &out, &fake_env(root.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("allowJs"), "{error}");
+        assert!(!out.join("cja_assets.rs").exists());
+    }
+
+    #[test]
     fn duplicate_entries_and_static_collision_fail() {
         let root = fixture_path("basic");
         let out = tempfile::tempdir().unwrap();
@@ -925,6 +1005,13 @@ mod tests {
         let manifest = fs::read_to_string(out.join("cja_assets.rs")).unwrap();
         assert!(manifest.contains("studio.js") && manifest.contains("other.js"));
         assert_eq!(fs::read(out.join("unrelated")).unwrap(), b"keep");
+        assert!(fs::read_dir(&out).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cja-bundle-")
+        }));
         AssetsBuilder::new()
             .entry(Entry::new("src/main.ts", "studio.js"))
             .build_in(root.path(), &out, &env)
@@ -948,6 +1035,13 @@ mod tests {
         assert!(!out.join("cja_assets.rs").exists());
         assert_eq!(fs::read_dir(out.join("cja-assets")).unwrap().count(), 0);
         assert_eq!(fs::read(out.join("unrelated")).unwrap(), b"keep");
+        assert!(fs::read_dir(&out).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cja-bundle-")
+        }));
     }
 
     #[test]

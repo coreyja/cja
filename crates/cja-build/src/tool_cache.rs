@@ -15,6 +15,7 @@ const MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
 pub(crate) struct ToolEnv {
     pub manifest_dir: PathBuf,
     pub override_path: Option<String>,
+    pub tailwind_override_path: Option<String>,
     pub xdg_cache_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
     pub path: Option<String>,
@@ -27,6 +28,7 @@ impl ToolEnv {
         Self {
             manifest_dir: manifest_dir.to_path_buf(),
             override_path: env::var("TSC").ok(),
+            tailwind_override_path: env::var("TAILWIND_CLI").ok(),
             xdg_cache_home: env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
             home: env::var_os("HOME").map(PathBuf::from),
             path: env::var("PATH").ok(),
@@ -64,6 +66,7 @@ pub(crate) struct ToolSpec {
     pub url: String,
     pub digest: &'static str,
     pub archive_executable: Option<&'static str>,
+    pub override_env: &'static str,
 }
 
 impl ToolSpec {
@@ -85,6 +88,7 @@ impl ToolSpec {
             ),
             digest,
             archive_executable: Some("package/lib/tsc"),
+            override_env: "TSC",
         })
     }
 
@@ -105,7 +109,7 @@ pub(crate) fn resolve_tsc(
     fetch: impl Fn(&str) -> Result<Vec<u8>, String>,
 ) -> Result<PathBuf, String> {
     if let Some(value) = &env.override_path {
-        return resolve_override(value, env);
+        return resolve_override(value, env, "TSC");
     }
     let spec = ToolSpec::tsc(&env.host)?;
     resolve(&spec, env, fetch)
@@ -116,14 +120,24 @@ pub(crate) fn resolve(
     env: &ToolEnv,
     fetch: impl Fn(&str) -> Result<Vec<u8>, String>,
 ) -> Result<PathBuf, String> {
-    if let Some(override_path) = &env.override_path {
-        return resolve_override(override_path, env);
+    let override_path = match spec.override_env {
+        "TSC" => env.override_path.as_ref(),
+        "TAILWIND_CLI" => env.tailwind_override_path.as_ref(),
+        _ => None,
+    };
+    if let Some(override_path) = override_path {
+        return resolve_override(override_path, env, spec.override_env);
     }
     let base = env
         .xdg_cache_home
         .clone()
         .or_else(|| env.home.as_ref().map(|p| p.join(".cache")))
-        .ok_or("no tool cache base: set XDG_CACHE_HOME or HOME, or set TSC")?;
+        .ok_or_else(|| {
+            format!(
+                "no tool cache base: set XDG_CACHE_HOME or HOME, or set {}",
+                spec.override_env
+            )
+        })?;
     let cache_parent = base.join("cja");
     fs::create_dir_all(&cache_parent)
         .map_err(|e| format!("create {}: {e}", cache_parent.display()))?;
@@ -138,7 +152,7 @@ pub(crate) fn resolve(
     result
 }
 
-fn resolve_override(value: &str, env: &ToolEnv) -> Result<PathBuf, String> {
+fn resolve_override(value: &str, env: &ToolEnv, override_env: &str) -> Result<PathBuf, String> {
     let path = Path::new(value);
     let candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -152,14 +166,14 @@ fn resolve_override(value: &str, env: &ToolEnv) -> Result<PathBuf, String> {
             .map(Path::new)
             .map(|dir| dir.join(value))
             .find(|path| path.is_file())
-            .ok_or_else(|| format!("TSC command {value:?} not found on captured PATH"))?
+            .ok_or_else(|| format!("{override_env} command {value:?} not found on captured PATH"))?
     };
     let candidate = candidate
         .canonicalize()
-        .map_err(|e| format!("TSC override {}: {e}", candidate.display()))?;
+        .map_err(|e| format!("{override_env} override {}: {e}", candidate.display()))?;
     if !candidate.is_file() {
         return Err(format!(
-            "TSC override is not a regular file: {}",
+            "{override_env} override is not a regular file: {}",
             candidate.display()
         ));
     }
@@ -174,7 +188,7 @@ fn resolve_override(value: &str, env: &ToolEnv) -> Result<PathBuf, String> {
             == 0
         {
             return Err(format!(
-                "TSC override is not executable: {}",
+                "{override_env} override is not executable: {}",
                 candidate.display()
             ));
         }
@@ -194,29 +208,35 @@ fn resolve_locked(
     if env.offline {
         if root.exists() {
             return Err(format!(
-                "{} {} has an invalid cache entry at {}; remove it and reinstall online, or set TSC",
+                "{} {} has an invalid cache entry at {}; remove it and reinstall online, or set {}",
                 spec.name,
                 spec.version,
-                root.display()
+                root.display(),
+                spec.override_env
             ));
         }
         return Err(format!(
-            "{} {} unavailable offline at {}; install it in the cache or set TSC",
+            "{} {} unavailable offline at {}; install it in the cache or set {}",
             spec.name,
             spec.version,
-            root.display()
+            root.display(),
+            spec.override_env
         ));
     }
     let mut stale = None;
     if root.exists() {
-        let path = root.with_extension(format!(
-            "stale-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_nanos()
-        ));
+        let path = root
+            .parent()
+            .ok_or("cache entry has no parent")?
+            .join(format!(
+                "{}.stale-{}-{}",
+                spec.key(),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_nanos()
+            ));
         fs::rename(root, &path).map_err(|e| {
             format!(
                 "move corrupt cache {}: {e}; remove it and retry",
@@ -269,7 +289,13 @@ fn install(
     root: &Path,
     fetch: impl Fn(&str) -> Result<Vec<u8>, String>,
 ) -> Result<(), String> {
-    let bytes = fetch(&spec.url)?;
+    let bytes = fetch(&spec.url).map_err(|error| {
+        format!(
+            "{error}; set {} to an installed executable or populate the verified cache at {}",
+            spec.override_env,
+            root.display()
+        )
+    })?;
     let actual = format!("{:x}", Sha256::digest(&bytes));
     if actual != spec.digest {
         return Err(format!(
@@ -416,6 +442,7 @@ mod tests {
         ToolEnv {
             manifest_dir: root.to_path_buf(),
             override_path: None,
+            tailwind_override_path: None,
             xdg_cache_home: Some(root.join("cache")),
             home: None,
             path: None,
@@ -432,6 +459,7 @@ mod tests {
             url: "https://example.test/tool".to_owned(),
             digest: Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str()),
             archive_executable: None,
+            override_env: "TAILWIND_CLI",
         }
     }
 
@@ -472,6 +500,7 @@ mod tests {
             url: "https://example.test/tsc.tgz".to_owned(),
             digest: Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str()),
             archive_executable: Some("package/lib/tsc"),
+            override_env: "TSC",
         }
     }
 
@@ -490,7 +519,7 @@ mod tests {
         env.override_path = Some("fake-tsc".to_owned());
         env.path = Some(dir.path().display().to_string());
         env.offline = true;
-        let spec = file_spec(b"expected");
+        let spec = tar_spec(b"expected");
         assert_eq!(
             resolve(&spec, &env, |_| panic!("no download")).unwrap(),
             path
@@ -530,6 +559,26 @@ mod tests {
     }
 
     #[test]
+    fn tailwind_override_is_independent_of_tsc_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let tailwind = dir.path().join("fake-tailwind");
+        fs::write(&tailwind, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&tailwind, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut env = env(dir.path());
+        env.override_path = Some("/missing/tsc".to_owned());
+        env.tailwind_override_path = Some(tailwind.display().to_string());
+        env.offline = true;
+        assert_eq!(
+            resolve(&file_spec(b"tailwind"), &env, |_| panic!("no download")).unwrap(),
+            tailwind.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn checksum_mismatch_and_offline_empty_cache_fail() {
         let dir = tempfile::tempdir().unwrap();
         let spec = file_spec(b"expected");
@@ -538,7 +587,7 @@ mod tests {
         assert!(error.contains("SHA-256 mismatch"), "{error}");
         env.offline = true;
         let error = resolve(&spec, &env, |_| panic!("no download")).unwrap_err();
-        assert!(error.contains("set TSC"), "{error}");
+        assert!(error.contains("set TAILWIND_CLI"), "{error}");
     }
 
     #[test]
@@ -564,6 +613,19 @@ mod tests {
     }
 
     #[test]
+    fn online_download_failure_names_override_and_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = ToolSpec::tsc("linux-arm64").unwrap();
+        let error = resolve(&spec, &env(dir.path()), |_| {
+            Err("network unavailable".to_owned())
+        })
+        .unwrap_err();
+        assert!(error.contains("network unavailable"), "{error}");
+        assert!(error.contains("set TSC"), "{error}");
+        assert!(error.contains("tsc-7.0.2-linux-arm64"), "{error}");
+    }
+
+    #[test]
     fn markerless_directory_is_replaced_and_failure_preserves_it() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ToolSpec::tsc("linux-arm64").unwrap();
@@ -583,7 +645,7 @@ mod tests {
                     .unwrap()
                     .file_name()
                     .to_string_lossy()
-                    .contains("stale-"))
+                    .starts_with("tsc-7.0.2-linux-arm64.stale-"))
         );
     }
 

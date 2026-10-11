@@ -22,6 +22,8 @@ fn main() -> Result<(), cja_build::BuildError> {
 Entries are relative to `frontend/` by default; `.frontend_dir(path)` changes
 that root. A TypeScript entry requires `frontend/tsconfig.json`. Start with
 `{"compilerOptions":{"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true,"allowImportingTsExtensions":true,"lib":["ES2022","DOM"],"types":[]},"include":["src/**/*.ts"]}`.
+Every entry must belong to the tsconfig program. Include each TypeScript entry
+through `include` or `files`; for JavaScript entries, also enable `allowJs`.
 `cja-build` runs native TypeScript 7.0.2 for type checking, then Rolldown for
 minified IIFE bundles and external source maps. No Node installation is needed.
 Imports must be relative and stay inside the app; `node_modules`, CSS, and

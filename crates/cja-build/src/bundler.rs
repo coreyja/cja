@@ -350,7 +350,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(String::from_utf8_lossy(&global.js).contains("cjaPasskey"));
+        let global_js = String::from_utf8_lossy(&global.js);
+        assert!(global_js.contains("var cjaPasskey="), "{global_js}");
         let esm = run("esm", EntryFormat::Esm).unwrap();
         let js = String::from_utf8(esm.js).unwrap();
         assert!(
