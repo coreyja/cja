@@ -13,11 +13,11 @@ fn base_layout(title: &str, content: &Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="description" content="CJA is a Rust web framework with database-backed background jobs, cron scheduling, and a production-ready Axum server.";
                 title { (title) }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
+                link rel="icon" type="image/svg+xml" href=(crate::site_assets::asset_url("favicon.svg"));
                 link rel="preconnect" href="https://fonts.googleapis.com";
                 link rel="preconnect" href="https://fonts.gstatic.com" crossorigin;
                 link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
-                link rel="stylesheet" href="/style.css";
+                link rel="stylesheet" href=(crate::site_assets::asset_url("style.css"));
             }
             body {
                 (content)
@@ -294,4 +294,14 @@ fn cron_icon() -> Markup {
 
 fn server_icon() -> Markup {
     PreEscaped(r#"<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>"#.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn landing_page_resolves_all_assets() {
+        let html = super::landing_page().into_string();
+        assert!(html.contains(&crate::site_assets::asset_url("style.css")));
+        assert!(html.contains(&crate::site_assets::asset_url("favicon.svg")));
+    }
 }

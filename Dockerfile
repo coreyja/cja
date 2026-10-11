@@ -6,7 +6,7 @@ COPY . .
 RUN cargo build --release --package cja-site
 
 # Build rustdoc (no --release needed — output goes to target/doc/ regardless)
-RUN RUSTDOCFLAGS="--html-in-header crates/cja.app/assets/docs-header.html" \
+RUN RUSTDOCFLAGS="--html-in-header crates/cja.app/docs-header.html" \
     cargo doc --no-deps --package cja
 
 FROM debian:bookworm-slim
@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 
 COPY --from=builder /app/target/release/cja-site /usr/local/bin/cja-site
 COPY --from=builder /app/target/doc/ /app/docs/
+COPY --from=builder /app/crates/cja.app/assets/favicon.svg /app/docs/favicon.svg
 
 ENV DOCS_PATH=/app/docs
 ENV PORT=8080

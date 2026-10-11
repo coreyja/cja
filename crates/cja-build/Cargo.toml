@@ -1,0 +1,17 @@
+[package]
+name = "cja-build"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Compile-time embedded asset builder for cja"
+
+[dependencies]
+sha2 = "0.10.9"
+mime_guess = "2.0.5"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
