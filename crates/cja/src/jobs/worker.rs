@@ -46,6 +46,8 @@ struct IdlePollGateInner {
 }
 
 impl IdlePollGate {
+    /// Create a gate that allows up to `periodic_claimers` concurrent periodic
+    /// idle claims. This does not limit running jobs or their heartbeats.
     pub fn new(periodic_claimers: NonZeroUsize) -> Self {
         Self(Arc::new(IdlePollGateInner {
             periodic_claims: Semaphore::new(periodic_claimers.get()),
@@ -681,11 +683,14 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 ///
 /// * `app_state` - The application state containing database connection and configuration
 /// * `registry` - The job registry that maps job names to their implementations
-/// * `sleep_duration` - How long to sleep when no jobs are available
+/// * `sleep_duration` - How long to sleep when no jobs are available. With an
+///   idle poll gate, only permit holders sleep on this interval; permitless
+///   workers park at admission.
 /// * `max_retries` - Maximum number of times to retry a failed job before moving to the dead letter queue (default: 20)
 /// * `shutdown_token` - Cancellation token for graceful shutdown. When cancelled, the worker
 ///   will stop accepting new jobs and release database locks before exiting.
-/// * `config` - Heartbeat interval, reclaim window, and local shutdown drain budget
+/// * `config` - Heartbeat interval, reclaim window, local shutdown drain budget,
+///   and optional shared idle poll gate
 ///
 /// # Retry Behavior
 ///
@@ -2409,9 +2414,21 @@ mod idle_gate_tests {
         owner: Option<&str>,
     ) -> uuid::Uuid {
         let job_id = uuid::Uuid::new_v4();
-        sqlx::query("INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, locked_by, locked_at) VALUES ($1, $2, $3, 0, NOW() + $4::interval, NOW(), $5, $6, CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END)")
-            .bind(job_id).bind(GateJob::NAME).bind(serde_json::json!({"id": id}))
-            .bind(delay).bind(id).bind(owner).execute(db).await.unwrap();
+        sqlx::query(concat!(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, ",
+            "context, locked_by, locked_at) VALUES ($1, $2, $3, 0, ",
+            "NOW() + $4::interval, NOW(), $5, $6, ",
+            "CASE WHEN $6::text IS NULL THEN NULL ELSE NOW() END)"
+        ))
+        .bind(job_id)
+        .bind(GateJob::NAME)
+        .bind(serde_json::json!({"id": id}))
+        .bind(delay)
+        .bind(id)
+        .bind(owner)
+        .execute(db)
+        .await
+        .unwrap();
         job_id
     }
 
@@ -2451,10 +2468,11 @@ mod idle_gate_tests {
                     && gate.0.probe.empty_periodic.load(SeqCst) >= 2
             })
             .await;
+            let burst_started = tokio::time::Instant::now();
             for id in 0..32 {
                 insert_sql(&db, &format!("burst-{id}"), "0 seconds", None).await;
             }
-            let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let result = tokio::time::timeout_at(burst_started + Duration::from_secs(2), async {
                 while started(&db).await < 32 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -2583,14 +2601,6 @@ mod idle_gate_tests {
                 config,
             )));
             until(|| gate.0.probe.waiting.load(SeqCst) == 1).await;
-            first_token.cancel();
-            tokio::time::timeout(Duration::from_secs(1), first.as_mut().unwrap())
-                .await
-                .expect("holder exits promptly")
-                .unwrap()
-                .unwrap();
-            first.take();
-            until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 2).await;
             second_token.cancel();
             tokio::time::timeout(Duration::from_secs(1), second.as_mut().unwrap())
                 .await
@@ -2599,6 +2609,15 @@ mod idle_gate_tests {
                 .unwrap();
             second.take();
             assert_eq!(gate.0.probe.waiting.load(SeqCst), 0);
+            assert_eq!(gate.0.periodic_claims.available_permits(), 0);
+            first_token.cancel();
+            tokio::time::timeout(Duration::from_secs(1), first.as_mut().unwrap())
+                .await
+                .expect("holder exits promptly")
+                .unwrap()
+                .unwrap();
+            first.take();
+            assert_eq!(gate.0.periodic_claims.available_permits(), 1);
             assert_eq!(gate.0.probe.in_flight_periodic.load(SeqCst), 0);
         })
         .catch_unwind()
@@ -2750,30 +2769,38 @@ mod idle_gate_tests {
             handles: vec![first, second],
         };
         with_workers(workers, async {
-        let retry_id = insert_sql(&db, "retry", "0.5 seconds", None).await;
-        sqlx::query("UPDATE jobs SET error_count = 1, last_error_message = 'previous attempt failed' WHERE job_id = $1")
-            .bind(retry_id).execute(&db).await.unwrap();
-        let lease_id = insert_sql(&db, "lease", "0 seconds", Some("dead-worker")).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let early = started(&db).await;
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            while started(&db).await < 2 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            let retry_id = insert_sql(&db, "retry", "0.5 seconds", None).await;
+            sqlx::query(concat!(
+                "UPDATE jobs SET error_count = 1, ",
+                "last_error_message = 'previous attempt failed' WHERE job_id = $1"
+            ))
+            .bind(retry_id)
+            .execute(&db)
+            .await
+            .unwrap();
+            let lease_id = insert_sql(&db, "lease", "0 seconds", Some("dead-worker")).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let early = started(&db).await;
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                while started(&db).await < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            let row: (i32, String) = sqlx::query_as(
+                "SELECT error_count, last_error_message FROM jobs WHERE job_id = $1",
+            )
+            .bind(lease_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            state.release.notify_waiters();
+            assert_eq!(early, 0);
+            result.expect("periodic discovery of retry and lease");
+            assert_eq!(row.0, 1);
+            assert!(row.1.starts_with("Job lease expired"));
         })
         .await;
-        let row: (i32, String) =
-            sqlx::query_as("SELECT error_count, last_error_message FROM jobs WHERE job_id = $1")
-                .bind(lease_id)
-                .fetch_one(&db)
-                .await
-                .unwrap();
-        state.release.notify_waiters();
-        assert_eq!(early, 0);
-        result.expect("periodic discovery of retry and lease");
-        assert_eq!(row.0, 1);
-        assert!(row.1.starts_with("Job lease expired"));
-        }).await;
     }
 
     #[sqlx::test]
