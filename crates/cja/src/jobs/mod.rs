@@ -193,7 +193,8 @@ pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
 pub use worker::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MAX_RETRIES, DEFAULT_RECLAIM_WINDOW, JobWorkerConfig,
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MAX_RETRIES, DEFAULT_RECLAIM_WINDOW, IdlePollGate,
+    JobWorkerConfig,
 };
 
 #[derive(Debug, Error)]
@@ -496,7 +497,10 @@ pub trait Job<AppState: AS>:
             }
             .await;
             match &result {
-                Ok(()) => enqueue_receipt(job_id, Self::NAME),
+                Ok(()) => {
+                    enqueue_receipt(job_id, Self::NAME);
+                    app_state.job_enqueued();
+                }
                 Err(error) => enqueue_failure(job_id, error),
             }
             result
