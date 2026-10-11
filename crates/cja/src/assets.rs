@@ -2,8 +2,9 @@
 
 use axum::{
     Router,
+    http::StatusCode,
     http::header::{CACHE_CONTROL, CONTENT_TYPE},
-    routing::get,
+    routing::{any, get},
 };
 use std::{collections::HashMap, fmt};
 
@@ -62,7 +63,12 @@ impl fmt::Display for AssetError {
 
 impl std::error::Error for AssetError {}
 
-/// Build a root-mounted Axum router for one or more manifests.
+/// Build a root-mounted Axum router for all manifests in one call.
+///
+/// The `/assets/{*rest}` route forces unknown asset URLs to return 404 even
+/// when the surrounding application has a fallback or root wildcard route.
+/// Calling this more than once, or adding another `/assets` wildcard, conflicts
+/// at startup.
 pub fn router<S>(manifests: &[&'static Manifest]) -> Result<Router<S>, AssetError>
 where
     S: Clone + Send + Sync + 'static,
@@ -93,7 +99,9 @@ where
             }),
         );
     }
-    Ok(router)
+    Ok(router
+        .route("/assets", any(|| async { StatusCode::NOT_FOUND }))
+        .route("/assets/{*rest}", any(|| async { StatusCode::NOT_FOUND })))
 }
 
 fn register(

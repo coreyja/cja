@@ -8,7 +8,7 @@ use std::{
 
 #[derive(thiserror::Error)]
 pub enum BuildError {
-    #[error("assets directory is missing or is not a directory: {}", path.display())]
+    #[error("assets path is not a directory: {}", path.display())]
     MissingAssetsDir { path: PathBuf },
     #[error("asset I/O failed at {}", path.display())]
     Io {
@@ -54,6 +54,7 @@ struct AssetRecord {
 }
 
 /// Collects all outputs for one crate and owns `OUT_DIR/cja-assets`.
+/// Dot-prefixed files and directories at any depth are ignored.
 pub struct AssetsBuilder {
     assets_dir: PathBuf,
     outputs: Vec<AssetRecord>,
@@ -91,14 +92,21 @@ impl AssetsBuilder {
 
     fn build_in(mut self, manifest_dir: &Path, out_dir: &Path) -> Result<(), BuildError> {
         let source_dir = manifest_dir.join(&self.assets_dir);
-        if !source_dir.is_dir()
-            || fs::symlink_metadata(&source_dir)
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
+        let metadata = fs::symlink_metadata(&source_dir).map_err(|source| BuildError::Io {
+            path: source_dir.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(BuildError::InvalidPath {
+                path: source_dir,
+                reason: "symlinks are not supported",
+            });
+        }
+        if !metadata.is_dir() {
             return Err(BuildError::MissingAssetsDir { path: source_dir });
         }
         let mut files = Vec::new();
-        collect_files(&source_dir, &source_dir, &mut files)?;
+        collect_files(&source_dir, Path::new(""), &mut files)?;
         files.sort();
         for (logical_name, path) in files {
             let bytes = fs::read(&path).map_err(|source| BuildError::Io {
@@ -133,13 +141,13 @@ impl AssetsBuilder {
                 source,
             })?;
             let relative = format!("/cja-assets/{}", record.hashed_name);
-            use std::fmt::Write as _;
-            writeln!(
+            use fmt::Write as _;
+            // Writing to a String is infallible; discard only fmt::Result.
+            let _ = writeln!(
                 manifest,
                 "Asset {{ logical_name: {:?}, hashed_name: {:?}, content_type: {:?}, bytes: include_bytes!(concat!(env!(\"OUT_DIR\"), {:?})) }},",
                 record.logical_name, record.hashed_name, record.content_type, relative
-            )
-            .expect("writing to a String cannot fail");
+            );
         }
         manifest.push_str("]\n");
         let manifest_path = out_dir.join("cja_assets.rs");
@@ -211,8 +219,8 @@ pub(crate) fn short_hash(bytes: &[u8]) -> String {
 }
 
 fn collect_files(
-    root: &Path,
     dir: &Path,
+    relative_dir: &Path,
     files: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), BuildError> {
     let entries = fs::read_dir(dir).map_err(|source| BuildError::Io {
@@ -224,8 +232,11 @@ fn collect_files(
             path: dir.to_path_buf(),
             source,
         })?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let path = entry.path();
-        let relative = path.strip_prefix(root).expect("entry is below root");
+        let relative = relative_dir.join(entry.file_name());
         let name = relative.to_str().ok_or_else(|| BuildError::InvalidPath {
             path: path.clone(),
             reason: "non-UTF-8 name",
@@ -242,7 +253,7 @@ fn collect_files(
             });
         }
         if kind.is_dir() {
-            collect_files(root, &path, files)?;
+            collect_files(&path, &relative, files)?;
         } else if kind.is_file() {
             files.push((name.replace('\\', "/"), path));
         } else {
@@ -315,6 +326,8 @@ mod tests {
         fs::write(assets.join("img/logo.svg"), b"<svg/>").unwrap();
         fs::write(assets.join("empty"), b"").unwrap();
         fs::write(assets.join(".hidden"), b"secret").unwrap();
+        fs::create_dir(assets.join(".dir")).unwrap();
+        fs::write(assets.join(".dir/inner.css"), b"secret").unwrap();
         fs::write(out.join("unrelated"), b"keep").unwrap();
         AssetsBuilder::new("assets")
             .build_in(temp.path(), &out)
@@ -326,7 +339,8 @@ mod tests {
         assert!(generated.contains(&empty_name));
         assert!(generated.contains("image/svg+xml"));
         assert!(generated.contains("include_bytes!"));
-        assert!(generated.find(".hidden").unwrap() < generated.find("empty.").unwrap());
+        assert!(!generated.contains(".hidden"));
+        assert!(!generated.contains("inner.css"));
         assert!(generated.find("empty.").unwrap() < generated.find("img/logo.").unwrap());
         assert_eq!(
             fs::read(out.join("cja-assets").join(&logo_name)).unwrap(),
@@ -343,11 +357,24 @@ mod tests {
     #[test]
     fn missing_directory_names_the_path() {
         let temp = fixture();
-        let err = AssetsBuilder::new("missing")
+        let err = AssetsBuilder::new("no-such-assets")
+            .build_in(temp.path(), temp.path())
+            .unwrap_err();
+        assert!(matches!(err, BuildError::Io { .. }));
+        assert!(format!("{err:?}").contains("no-such-assets"));
+        assert!(format!("{err:?}").contains("No such file"));
+    }
+
+    #[test]
+    fn file_as_root_is_not_a_directory() {
+        let temp = fixture();
+        fs::write(temp.path().join("assets"), b"not a directory").unwrap();
+        let err = AssetsBuilder::new("assets")
             .build_in(temp.path(), temp.path())
             .unwrap_err();
         assert!(matches!(err, BuildError::MissingAssetsDir { .. }));
-        assert!(err.to_string().contains("missing"));
+        assert!(err.to_string().contains("assets"));
+        assert!(err.to_string().contains("not a directory"));
     }
 
     #[test]
@@ -383,7 +410,7 @@ mod tests {
         assert!(err.to_string().contains("second.svg"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn symlink_and_non_utf8_names_fail() {
         use std::{
@@ -406,6 +433,60 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, BuildError::InvalidPath { .. }));
         assert!(err.to_string().contains("non-UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_root_fails_but_dot_prefixed_symlink_is_skipped() {
+        use std::os::unix::fs::symlink;
+        let temp = fixture();
+        fs::create_dir(temp.path().join("real-assets")).unwrap();
+        symlink("real-assets", temp.path().join("assets")).unwrap();
+        let err = AssetsBuilder::new("assets")
+            .build_in(temp.path(), temp.path())
+            .unwrap_err();
+        assert!(matches!(err, BuildError::InvalidPath { .. }));
+        assert!(err.to_string().contains("symlinks are not supported"));
+        fs::remove_file(temp.path().join("assets")).unwrap();
+        fs::create_dir(temp.path().join("assets")).unwrap();
+        symlink("missing", temp.path().join("assets/.#lock")).unwrap();
+        AssetsBuilder::new("assets")
+            .build_in(temp.path(), temp.path())
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_file_names_the_socket() {
+        use std::os::unix::net::UnixListener;
+        let temp = fixture();
+        fs::create_dir(temp.path().join("assets")).unwrap();
+        let socket = temp.path().join("assets/socket");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let err = AssetsBuilder::new("assets")
+            .build_in(temp.path(), temp.path())
+            .unwrap_err();
+        assert!(matches!(err, BuildError::InvalidPath { .. }));
+        assert!(err.to_string().contains("socket"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subdirectory_names_the_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = fixture();
+        let assets = temp.path().join("assets");
+        let secret = assets.join("secret-subdirectory");
+        fs::create_dir_all(&secret).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+        let direct = fs::read_dir(&secret).expect_err("this test must run as a non-root user");
+        assert_eq!(direct.kind(), io::ErrorKind::PermissionDenied);
+        let err = AssetsBuilder::new("assets")
+            .build_in(temp.path(), temp.path())
+            .unwrap_err();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(err, BuildError::Io { .. }));
+        assert!(format!("{err:?}").contains("secret-subdirectory"));
     }
 
     #[cfg(unix)]

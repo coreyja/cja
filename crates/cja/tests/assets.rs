@@ -1,9 +1,11 @@
 use axum::{
+    Router,
     body::to_bytes,
     http::{
         Request, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE},
     },
+    routing::get,
 };
 use cja::assets::{Asset, AssetError, Manifest};
 use tower::ServiceExt as _;
@@ -174,4 +176,103 @@ fn collisions_fail_before_router_startup() {
             second: "robots.txt"
         }
     );
+}
+
+static FAVICON_ASSETS: [Asset; 2] = [
+    Asset {
+        logical_name: "favicon.ico",
+        hashed_name: "favicon.abc12345.ico",
+        content_type: "image/vnd.microsoft.icon",
+        bytes: b"icon",
+    },
+    Asset {
+        logical_name: "img/robots.txt",
+        hashed_name: "img/robots.abc12345.txt",
+        content_type: "text/plain",
+        bytes: b"nested",
+    },
+];
+static FAVICON: Manifest = Manifest::new(&FAVICON_ASSETS);
+
+#[tokio::test]
+async fn favicon_alias_is_root_only() {
+    let app = cja::assets::router::<()>(&[&FAVICON]).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/favicon.ico")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CACHE_CONTROL], "public, max-age=3600");
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        &b"icon"[..]
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/robots.txt")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unknown_assets_stay_404_with_app_fallbacks() {
+    let assets = cja::assets::router::<()>(&[&APP]).unwrap();
+    let fallback = Router::new()
+        .fallback(|| async { (StatusCode::OK, "spa") })
+        .merge(assets.clone());
+    let wildcard = Router::new()
+        .route("/{*path}", get(|| async { (StatusCode::OK, "spa") }))
+        .merge(assets);
+    for app in [fallback, wildcard] {
+        for path in [
+            "/assets",
+            "/assets/style.css",
+            "/assets/style.deadbeef.css",
+            "/assets/unknown/nested.js",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let hit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/style.abc12345.css")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hit.status(), StatusCode::OK);
+        let spa = app
+            .oneshot(
+                Request::builder()
+                    .uri("/other")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spa.status(), StatusCode::OK);
+    }
 }
