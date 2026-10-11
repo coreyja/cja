@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           test ! -e "$XDG_CACHE_HOME/cja/tailwindcss-4.3.3-linux-x64"
-          cargo test -p cja-build --lib tests::real_tailwind_cold_cache -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/tailwind-real.log"
+          CJA_REAL_TAILWIND_CACHE_HOME="$XDG_CACHE_HOME" cargo test -p cja-build --lib tests::real_tailwind_cold_cache -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/tailwind-real.log"
           grep -q 'test tests::real_tailwind_cold_cache ... ok' "$RUNNER_TEMP/tailwind-real.log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/tailwind-real.log"
           test -x "$XDG_CACHE_HOME/cja/tailwindcss-4.3.3-linux-x64"

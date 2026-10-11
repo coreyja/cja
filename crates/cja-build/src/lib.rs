@@ -667,7 +667,10 @@ impl AssetsBuilder {
                 .arg("--minify")
                 .output()
                 .map_err(|e| {
-                    BuildError::Frontend(format!("run Tailwind {}: {e}", executable.display()))
+                    BuildError::Frontend(format!(
+                        "run Tailwind {}: {e}\nstdout:\n<not started>\nstderr:\n<not started>",
+                        executable.display()
+                    ))
                 })?;
             let streams = format!(
                 "stdout:\n{}\nstderr:\n{}",
@@ -1568,6 +1571,31 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tailwind_spawn_failure_is_loud() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _guard = crate::SPAWN.lock().unwrap();
+        let root = fixture();
+        css_fixture(root.path(), "");
+        let out = root.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let invalid = root.path().join("invalid-tailwind");
+        fs::write(&invalid, b"not an executable format").unwrap();
+        fs::set_permissions(&invalid, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = fake_tailwind_env(root.path());
+        env.tailwind_override = Some(invalid.into_os_string());
+        let error = AssetsBuilder::new()
+            .tailwind(Tailwind::new("frontend/app.css", "app.css"))
+            .build_in(root.path(), &out, &env)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("run Tailwind"), "{error}");
+        assert!(error.contains("stdout:\n<not started>"), "{error}");
+        assert!(error.contains("stderr:\n<not started>"), "{error}");
+        assert!(!out.join("cja_assets.rs").exists());
+    }
+
     #[test]
     fn tailwind_rejects_invalid_inputs_before_spawn() {
         let root = fixture();
@@ -1613,7 +1641,10 @@ mod tests {
         fs::create_dir(&out).unwrap();
         let mut env = fake_tailwind_env(root.path());
         env.tailwind_override = None;
-        env.xdg_cache_home = Some(root.path().join("cold-cache"));
+        env.xdg_cache_home = Some(
+            std::env::var_os("CJA_REAL_TAILWIND_CACHE_HOME")
+                .map_or_else(|| root.path().join("cold-cache"), PathBuf::from),
+        );
         env.offline = false;
         AssetsBuilder::new()
             .tailwind(Tailwind::new("frontend/app.css", "app.css"))
