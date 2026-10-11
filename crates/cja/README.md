@@ -38,6 +38,58 @@ bundle errors fail `cargo build`. Cargo reruns the build for config, source,
 declaration, and static changes. Source map `sources` are frontend-relative
 labels with embedded `sourcesContent`, not served source URLs.
 
+### Tailwind CSS inputs
+
+Add `.tailwind(cja_build::Tailwind::new("assets/input.css", "app.css"))` to
+the build script. A root stylesheet starts with explicit, top-level inputs:
+
+```css
+@import "tailwindcss" source(none);
+@source "../src";
+@import "./portfolio.css";
+```
+
+Add a separate top-level `@source "../...";` for every template directory
+under the app manifest, relative to `assets/input.css`. The root stylesheet
+needs exactly one Tailwind import and at least one source. Imported CSS may
+contain local `./` or `../` `.css` imports, but no Tailwind import or source.
+The scanner accepts a strict subset of Tailwind CSS: one leading UTF-8 BOM,
+ASCII bytes outside strings and comments, and ASCII whitespace around at-rule
+arguments. `source(` outside strings and comments is reserved for the exact
+root Tailwind import, even when comments split the token. Source paths are
+literal directories beginning `./` or `../`, with no glob metacharacters.
+Parentheses must balance and cannot contain braces.
+`@import` and `@source` must start a statement (at the start of the file or
+after `;`, `{` or `}`, outside parentheses) and be followed by a space, tab
+or newline. Neutral whitespace before these rules is only space, tab, LF or
+CRLF; a lone CR or form feed can make Tailwind drop a rule. Custom-property
+values cannot contain at-rules and must balance `()`, `[]` and `{}`.
+All inputs must remain inside the manifest directory, outside `target/`, and
+free of symlinks. Unsupported at-rules fail the build, including `@plugin`,
+`@config`, `@reference`, and `@tailwind`.
+
+| Allowed at-rule | Consumer or reason allowed |
+| --- | --- |
+| `import` | cja.app and eyes; exact Tailwind root import or confined local `.css` imports |
+| `source` | cja.app and future-form eyes; explicit depth-zero directories |
+| `media` | cja.app and eyes; no file/path input or `source(...)` |
+| `supports` | No file/path input or `source(...)` |
+| `layer` | No file/path input or `source(...)` |
+| `keyframes` | cja.app; no file/path input or `source(...)` |
+| `font-face` | No file/path input or `source(...)` |
+| `theme` | No file/path input or `source(...)` |
+| `utility` | No file/path input or `source(...)` |
+| `variant` | No file/path input or `source(...)` |
+| `custom-variant` | No file/path input or `source(...)` |
+| `apply` | No file/path input or `source(...)` |
+| `container` | No file/path input or `source(...)` |
+| `property` | No file/path input or `source(...)` |
+| `starting-style` | No file/path input or `source(...)` |
+| `page` | No file/path input or `source(...)` |
+| `charset` | No file/path input or `source(...)` |
+
+Arena does not use Tailwind.
+
 At module scope, call `cja::include_assets!(site_assets)`. Use
 `site_assets::asset_url("img/logo.svg")` for a scoped logical-name lookup; an
 unknown name panics. Merge
