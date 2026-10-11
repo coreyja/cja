@@ -12,8 +12,29 @@ SHA-256-verified native TypeScript 7.0.2 executable on first use, then reuses
 Set `TSC` to an executable path or command to override it. An offline cold
 build fails with installation instructions; use a verified warm cache or set
 `TSC` for `CARGO_NET_OFFLINE=true`. The source map is served as JSON beside
-the hashed script. Cargo reruns the build script when frontend inputs change;
-there is no live reload of embedded assets without a rebuild.
+the hashed script. Tailwind inputs use `Tailwind::new("frontend/app.css", "app.css")`
+in `build.rs`; the input path is relative to `CARGO_MANIFEST_DIR`. The root CSS
+requires `@import "tailwindcss" source(none);` plus explicit relative directory
+`@source` rules. Local quoted `./` and `../` `.css` imports are checked
+recursively. All files and scan roots must stay inside the app directory;
+resolving symlinks and JS config are rejected. Dangling symlinks (such as
+Emacs lock files) are ignored. Tailwind skips nested `node_modules` when the
+explicit `@source` root is outside one; an explicit root inside `node_modules`
+scans its nested directories too, so those directories are checked for symlinks.
+`cja-build` downloads and verifies the
+standalone Tailwind v4.3.3 binary into the same shared cache, or uses
+`TAILWIND_CLI` when set. Offline cold builds fail with installation guidance.
+Cargo reruns the build script when CSS, imported CSS, or scanned Rust sources
+change; every output is embedded, with no live reload or runtime disk mode.
+Ordinary CSS can still be provided via `static_dir`.
+Existing ancestor `.gitignore`, `.ignore`, and `.git/info/exclude` files are
+watched. Tailwind may not use every Git exclude file in worktrees or submodules;
+watching one can cause an extra rebuild. Creating a
+new ancestor ignore file takes effect on the next Cargo rerun; creation alone
+does not trigger one. In worktrees, the common Git directory's `info/exclude`
+is watched; in submodules, the submodule Git directory's file is watched.
+Docker builds omit `.git/info/exclude` because
+`.dockerignore` removes `.git` from the build context.
 
 ## Setup
 
