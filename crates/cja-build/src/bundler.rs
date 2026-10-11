@@ -18,7 +18,7 @@ use std::{
 
 #[derive(Debug)]
 struct RelativeImports {
-    app_root: PathBuf,
+    frontend_root: PathBuf,
 }
 
 impl Plugin for RelativeImports {
@@ -81,10 +81,10 @@ impl Plugin for RelativeImports {
         let canonical = id
             .canonicalize()
             .map_err(|error| anyhow::anyhow!("resolve {specifier:?} in {location}: {error}"))?;
-        if !canonical.starts_with(&self.app_root) {
+        if !canonical.starts_with(&self.frontend_root) {
             return Err(anyhow::anyhow!(
-                "import {specifier:?} in {location} escapes app root {}",
-                self.app_root.display()
+                "import {specifier:?} in {location} escapes frontend root {}",
+                self.frontend_root.display()
             ));
         }
         Ok(Some(HookResolveIdOutput::from_resolved_id(resolved)))
@@ -97,10 +97,22 @@ impl Plugin for RelativeImports {
 
 fn source_location(importer: &str, specifier: &str) -> String {
     let Some((line, column)) = std::fs::read_to_string(importer).ok().and_then(|source| {
+        let quoted = [format!("'{specifier}'"), format!("\"{specifier}\"")];
         source
             .lines()
             .enumerate()
-            .find_map(|(index, text)| text.find(specifier).map(|column| (index + 1, column + 1)))
+            .find_map(|(index, text)| {
+                quoted
+                    .iter()
+                    .filter_map(|needle| text.find(needle))
+                    .min()
+                    .map(|column| (index + 1, column + 1))
+            })
+            .or_else(|| {
+                source.lines().enumerate().find_map(|(index, text)| {
+                    text.find(specifier).map(|column| (index + 1, column + 1))
+                })
+            })
     }) else {
         return importer.to_owned();
     };
@@ -116,22 +128,24 @@ pub(crate) struct Bundle {
 pub(crate) fn bundle_entry(
     entry: &Entry,
     frontend: &Path,
-    app_root: &Path,
     scratch: &Path,
     write: bool,
 ) -> Result<Bundle, String> {
     let frontend = frontend.canonicalize().map_err(|e| e.to_string())?;
-    let app_root = app_root.canonicalize().map_err(|e| e.to_string())?;
     let source = frontend
         .join(&entry.source)
         .canonicalize()
         .map_err(|e| format!("entry {}: {e}", entry.source.display()))?;
-    if !source.starts_with(&app_root) {
-        return Err(format!("entry {} escapes app root", entry.source.display()));
+    if !source.starts_with(&frontend) {
+        return Err(format!(
+            "entry {} escapes frontend root {}",
+            entry.source.display(),
+            frontend.display()
+        ));
     }
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let scratch = scratch.canonicalize().map_err(|e| e.to_string())?;
-    let options = make_options(entry, &source, frontend, &scratch);
+    let options = make_options(entry, &source, frontend.clone(), &scratch);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -139,7 +153,7 @@ pub(crate) fn bundle_entry(
     runtime.block_on(async {
         let mut bundler = Bundler::with_plugins(
             options,
-            vec![RelativeImports::new_shared(RelativeImports { app_root })],
+            vec![RelativeImports::new_shared(RelativeImports { frontend_root: frontend.clone() })],
         )
         .map_err(|e| e.to_string())?;
         let output = if write {
@@ -148,18 +162,28 @@ pub(crate) fn bundle_entry(
             bundler.generate().await
         }
         .map_err(|e| {
-            e.iter()
+            let diagnostics = e.iter()
                 .map(|diagnostic| diagnostic.to_diagnostic().to_string())
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n");
+            if diagnostics.contains("MISSING_NAME_OPTION_FOR_IIFE_EXPORT") {
+                format!("{diagnostics}\nSet EntryFormat::Iife {{ global_name: Some(..) }} for an exported entry")
+            } else {
+                diagnostics
+            }
         })?;
         if !output.warnings.is_empty() {
-            return Err(output
+            let diagnostics = output
                 .warnings
                 .iter()
                 .map(|diagnostic| diagnostic.to_diagnostic().to_string())
                 .collect::<Vec<_>>()
-                .join("\n"));
+                .join("\n");
+            return Err(if diagnostics.contains("MISSING_NAME_OPTION_FOR_IIFE_EXPORT") {
+                format!("{diagnostics}\nSet EntryFormat::Iife {{ global_name: Some(..) }} for an exported entry")
+            } else {
+                diagnostics
+            });
         }
         let (js, map) = parse_outputs(output.assets.iter().map(|asset| {
             (
@@ -291,7 +315,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = fixture(name);
         let entry = Entry::new("src/main.ts", "studio.js").format(format);
-        bundle_entry(&entry, &root, &root, temp.path(), false)
+        bundle_entry(&entry, &root, temp.path(), false)
     }
 
     #[test]
@@ -378,6 +402,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn import_outside_frontend_is_rejected_with_context() {
+        let app = tempfile::tempdir().unwrap();
+        let frontend = app.path().join("frontend");
+        let source = frontend.join("src/main.ts");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir(app.path().join("shared")).unwrap();
+        std::fs::write(app.path().join("shared/x.ts"), "export const x = 42;").unwrap();
+        std::fs::write(
+            &source,
+            "import { x } from '../../shared/x.ts';\nconsole.log(x);",
+        )
+        .unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let Err(error) = bundle_entry(
+            &Entry::new("src/main.ts", "studio.js"),
+            &frontend,
+            output.path(),
+            false,
+        ) else {
+            panic!("escaped import bundled")
+        };
+        assert!(error.contains("../../shared/x.ts"), "{error}");
+        assert!(error.contains("main.ts:1:"), "{error}");
+        assert!(error.contains("frontend root"), "{error}");
+    }
+
+    #[test]
+    fn exported_iife_without_global_suggests_name() {
+        let Err(error) = run("global", EntryFormat::Iife { global_name: None }) else {
+            panic!("unnamed export bundled")
+        };
+        assert!(
+            error.contains("EntryFormat::Iife { global_name: Some(..) }"),
+            "{error}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlinked_import_outside_app_is_rejected() {
@@ -404,13 +466,12 @@ mod tests {
         let Err(error) = bundle_entry(
             &Entry::new("src/main.ts", "studio.js"),
             app.path(),
-            app.path(),
             output.path(),
             false,
         ) else {
             panic!("escaped import bundled")
         };
-        assert!(error.contains("escapes app root"), "{error}");
+        assert!(error.contains("escapes frontend root"), "{error}");
         assert!(error.contains("main.ts:1:"), "{error}");
     }
 
@@ -431,11 +492,11 @@ mod tests {
         let root = fixture("basic");
         let out = tempfile::tempdir().unwrap();
         let mut env = crate::tool_cache::ToolEnv::capture(&root);
-        env.override_path = Some(
+        env.tsc_override = Some(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/bin/fake-tsc")
-                .display()
-                .to_string(),
+                .as_os_str()
+                .to_os_string(),
         );
         AssetsBuilder::new()
             .frontend_dir(&root)

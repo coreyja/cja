@@ -2,23 +2,45 @@
 
 use sha2::{Digest as _, Sha256};
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, Cursor, Read as _, Write as _},
     path::{Component, Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 const TSC_VERSION: &str = "7.0.2";
-const MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
+const TSC_MAX_DOWNLOAD: u64 = 64 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Tool {
+    Tsc,
+    #[allow(dead_code)] // The shared resolver's Tailwind caller lands in DEV-1654.
+    Tailwind,
+}
+
+impl Tool {
+    pub fn override_env(self) -> &'static str {
+        match self {
+            Self::Tsc => "TSC",
+            Self::Tailwind => "TAILWIND_CLI",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ToolEnv {
     pub manifest_dir: PathBuf,
-    pub override_path: Option<String>,
-    pub tailwind_override_path: Option<String>,
+    pub tsc_override: Option<OsString>,
+    pub tailwind_override: Option<OsString>,
     pub xdg_cache_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
-    pub path: Option<String>,
+    pub path: Option<OsString>,
     pub offline: bool,
     pub host: String,
 }
@@ -27,14 +49,29 @@ impl ToolEnv {
     pub fn capture(manifest_dir: &Path) -> Self {
         Self {
             manifest_dir: manifest_dir.to_path_buf(),
-            override_path: env::var("TSC").ok(),
-            tailwind_override_path: env::var("TAILWIND_CLI").ok(),
+            tsc_override: env::var_os("TSC"),
+            tailwind_override: env::var_os("TAILWIND_CLI"),
             xdg_cache_home: env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
             home: env::var_os("HOME").map(PathBuf::from),
-            path: env::var("PATH").ok(),
+            path: env::var_os("PATH"),
             offline: env::var("CARGO_NET_OFFLINE").is_ok_and(|v| v == "true"),
             host: host_platform(),
         }
+    }
+
+    pub fn override_for(&self, tool: Tool) -> Option<&OsString> {
+        match tool {
+            Tool::Tsc => self.tsc_override.as_ref(),
+            Tool::Tailwind => self.tailwind_override.as_ref(),
+        }
+    }
+
+    pub fn uses_home_cache(&self, tool: Tool) -> bool {
+        self.override_for(tool).is_none()
+            && !self
+                .xdg_cache_home
+                .as_ref()
+                .is_some_and(|p| p.is_absolute())
     }
 }
 
@@ -66,7 +103,8 @@ pub(crate) struct ToolSpec {
     pub url: String,
     pub digest: &'static str,
     pub archive_executable: Option<&'static str>,
-    pub override_env: &'static str,
+    pub tool: Tool,
+    pub max_bytes: u64,
 }
 
 impl ToolSpec {
@@ -88,7 +126,8 @@ impl ToolSpec {
             ),
             digest,
             archive_executable: Some("package/lib/tsc"),
-            override_env: "TSC",
+            tool: Tool::Tsc,
+            max_bytes: TSC_MAX_DOWNLOAD,
         })
     }
 
@@ -106,10 +145,10 @@ impl ToolSpec {
 
 pub(crate) fn resolve_tsc(
     env: &ToolEnv,
-    fetch: impl Fn(&str) -> Result<Vec<u8>, String>,
+    fetch: impl Fn(&ToolSpec) -> Result<Vec<u8>, String>,
 ) -> Result<PathBuf, String> {
-    if let Some(value) = &env.override_path {
-        return resolve_override(value, env, "TSC");
+    if let Some(value) = env.override_for(Tool::Tsc) {
+        return resolve_override(value, env, Tool::Tsc.override_env());
     }
     let spec = ToolSpec::tsc(&env.host)?;
     resolve(&spec, env, fetch)
@@ -118,24 +157,22 @@ pub(crate) fn resolve_tsc(
 pub(crate) fn resolve(
     spec: &ToolSpec,
     env: &ToolEnv,
-    fetch: impl Fn(&str) -> Result<Vec<u8>, String>,
+    fetch: impl Fn(&ToolSpec) -> Result<Vec<u8>, String>,
 ) -> Result<PathBuf, String> {
-    let override_path = match spec.override_env {
-        "TSC" => env.override_path.as_ref(),
-        "TAILWIND_CLI" => env.tailwind_override_path.as_ref(),
-        _ => None,
-    };
-    if let Some(override_path) = override_path {
-        return resolve_override(override_path, env, spec.override_env);
+    let tsc_override = env.override_for(spec.tool);
+    if let Some(tsc_override) = tsc_override {
+        return resolve_override(tsc_override, env, spec.tool.override_env());
     }
     let base = env
         .xdg_cache_home
-        .clone()
+        .as_ref()
+        .filter(|path| path.is_absolute())
+        .cloned()
         .or_else(|| env.home.as_ref().map(|p| p.join(".cache")))
         .ok_or_else(|| {
             format!(
                 "no tool cache base: set XDG_CACHE_HOME or HOME, or set {}",
-                spec.override_env
+                spec.tool.override_env()
             )
         })?;
     let cache_parent = base.join("cja");
@@ -152,19 +189,24 @@ pub(crate) fn resolve(
     result
 }
 
-fn resolve_override(value: &str, env: &ToolEnv, override_env: &str) -> Result<PathBuf, String> {
+#[allow(clippy::unnecessary_debug_formatting)] // Preserve invalid UTF-8 bytes in TSC errors.
+fn resolve_override(
+    value: &OsString,
+    env: &ToolEnv,
+    override_env: &str,
+) -> Result<PathBuf, String> {
     let path = Path::new(value);
     let candidate = if path.is_absolute() {
         path.to_path_buf()
-    } else if value.contains('/') {
+    } else if path.components().count() > 1 {
         env.manifest_dir.join(path)
     } else {
         env.path
             .as_deref()
-            .unwrap_or("")
-            .split(':')
-            .map(Path::new)
-            .map(|dir| dir.join(value))
+            .map(env::split_paths)
+            .into_iter()
+            .flatten()
+            .map(|dir| dir.join(path))
             .find(|path| path.is_file())
             .ok_or_else(|| format!("{override_env} command {value:?} not found on captured PATH"))?
     };
@@ -200,7 +242,7 @@ fn resolve_locked(
     spec: &ToolSpec,
     env: &ToolEnv,
     root: &Path,
-    fetch: impl Fn(&str) -> Result<Vec<u8>, String>,
+    fetch: impl Fn(&ToolSpec) -> Result<Vec<u8>, String>,
 ) -> Result<PathBuf, String> {
     if valid_cache(spec, root)? {
         return Ok(spec.executable(root));
@@ -212,7 +254,7 @@ fn resolve_locked(
                 spec.name,
                 spec.version,
                 root.display(),
-                spec.override_env
+                spec.tool.override_env()
             ));
         }
         return Err(format!(
@@ -220,7 +262,7 @@ fn resolve_locked(
             spec.name,
             spec.version,
             root.display(),
-            spec.override_env
+            spec.tool.override_env()
         ));
     }
     let mut stale = None;
@@ -287,15 +329,21 @@ fn valid_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
 fn install(
     spec: &ToolSpec,
     root: &Path,
-    fetch: impl Fn(&str) -> Result<Vec<u8>, String>,
+    fetch: impl Fn(&ToolSpec) -> Result<Vec<u8>, String>,
 ) -> Result<(), String> {
-    let bytes = fetch(&spec.url).map_err(|error| {
+    let bytes = fetch(spec).map_err(|error| {
         format!(
             "{error}; set {} to an installed executable or populate the verified cache at {}",
-            spec.override_env,
+            spec.tool.override_env(),
             root.display()
         )
     })?;
+    if bytes.len() as u64 > spec.max_bytes {
+        return Err(format!(
+            "{} download from {} exceeds {} bytes",
+            spec.name, spec.url, spec.max_bytes
+        ));
+    }
     let actual = format!("{:x}", Sha256::digest(&bytes));
     if actual != spec.digest {
         return Err(format!(
@@ -336,9 +384,10 @@ fn install(
         let staged = stage.into_path();
         if let Err(e) = fs::rename(&staged, root) {
             fs::remove_dir_all(&staged).map_err(|cleanup| cleanup.to_string())?;
-            if matches!(e.kind(), io::ErrorKind::AlreadyExists)
-                || matches!(e.raw_os_error(), Some(17 | 39))
-            {
+            if matches!(
+                e.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty
+            ) {
                 if valid_cache(spec, root)? {
                     return Ok(());
                 }
@@ -353,6 +402,7 @@ fn install(
         let staged = stage.path().join("binary");
         let mut file = fs::File::create(&staged).map_err(|e| e.to_string())?;
         file.write_all(&bytes).map_err(|e| e.to_string())?;
+        drop(file);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -364,11 +414,18 @@ fn install(
     Ok(())
 }
 
-pub(crate) fn fetch_https(url: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn fetch_https(spec: &ToolSpec) -> Result<Vec<u8>, String> {
+    let url = &spec.url;
     if !url.starts_with("https://") {
         return Err(format!("tool download requires HTTPS: {url}"));
     }
-    let response = ureq::get(url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .timeout(OVERALL_TIMEOUT)
+        .build();
+    let response = agent
+        .get(url)
         .call()
         .map_err(|e| format!("download {url}: {e}"))?;
     if !response.get_url().starts_with("https://") {
@@ -380,18 +437,24 @@ pub(crate) fn fetch_https(url: &str) -> Result<Vec<u8>, String> {
     if response
         .header("Content-Length")
         .and_then(|s| s.parse::<u64>().ok())
-        .is_some_and(|n| n > MAX_DOWNLOAD)
+        .is_some_and(|n| n > spec.max_bytes)
     {
-        return Err("tool download exceeds 64 MiB".to_owned());
+        return Err(format!(
+            "{} download from {} exceeds {} bytes",
+            spec.name, url, spec.max_bytes
+        ));
     }
     let mut bytes = Vec::new();
     response
         .into_reader()
-        .take(MAX_DOWNLOAD + 1)
+        .take(spec.max_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_DOWNLOAD {
-        return Err("tool download exceeds 64 MiB".to_owned());
+    if bytes.len() as u64 > spec.max_bytes {
+        return Err(format!(
+            "{} download from {} exceeds {} bytes",
+            spec.name, url, spec.max_bytes
+        ));
     }
     Ok(bytes)
 }
@@ -441,8 +504,8 @@ mod tests {
     fn env(root: &Path) -> ToolEnv {
         ToolEnv {
             manifest_dir: root.to_path_buf(),
-            override_path: None,
-            tailwind_override_path: None,
+            tsc_override: None,
+            tailwind_override: None,
             xdg_cache_home: Some(root.join("cache")),
             home: None,
             path: None,
@@ -459,7 +522,8 @@ mod tests {
             url: "https://example.test/tool".to_owned(),
             digest: Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str()),
             archive_executable: None,
-            override_env: "TAILWIND_CLI",
+            tool: Tool::Tailwind,
+            max_bytes: 128 * 1024 * 1024,
         }
     }
 
@@ -500,7 +564,8 @@ mod tests {
             url: "https://example.test/tsc.tgz".to_owned(),
             digest: Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str()),
             archive_executable: Some("package/lib/tsc"),
-            override_env: "TSC",
+            tool: Tool::Tsc,
+            max_bytes: TSC_MAX_DOWNLOAD,
         }
     }
 
@@ -516,8 +581,8 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut env = env(dir.path());
-        env.override_path = Some("fake-tsc".to_owned());
-        env.path = Some(dir.path().display().to_string());
+        env.tsc_override = Some("fake-tsc".into());
+        env.path = Some(dir.path().as_os_str().to_os_string());
         env.offline = true;
         let spec = tar_spec(b"expected");
         assert_eq!(
@@ -526,11 +591,22 @@ mod tests {
         );
         env.host = "unsupported-arch".to_owned();
         assert_eq!(resolve_tsc(&env, |_| panic!("no download")).unwrap(), path);
-        env.override_path = Some("./fake-tsc".to_owned());
+        env.tsc_override = Some("./fake-tsc".into());
         assert_eq!(
             resolve(&spec, &env, |_| panic!("no download")).unwrap(),
             path
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_override_is_not_ignored() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = env(dir.path());
+        env.tsc_override = Some(OsString::from_vec(vec![b'm', b'i', 0xff]));
+        let error = resolve_tsc(&env, |_| panic!("must not download")).unwrap_err();
+        assert!(error.contains("TSC command"), "{error}");
     }
 
     #[test]
@@ -546,7 +622,7 @@ mod tests {
             fs::set_permissions(&tsc, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut env = env(dir.path());
-        env.override_path = Some(tsc.display().to_string());
+        env.tsc_override = Some(tsc.as_os_str().to_os_string());
         let spec = file_spec(b"tailwind");
         let resolved = resolve(&spec, &env, |_| Ok(b"tailwind".to_vec())).unwrap();
         assert_ne!(
@@ -569,8 +645,8 @@ mod tests {
             fs::set_permissions(&tailwind, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut env = env(dir.path());
-        env.override_path = Some("/missing/tsc".to_owned());
-        env.tailwind_override_path = Some(tailwind.display().to_string());
+        env.tsc_override = Some("/missing/tsc".into());
+        env.tailwind_override = Some(tailwind.as_os_str().to_os_string());
         env.offline = true;
         assert_eq!(
             resolve(&file_spec(b"tailwind"), &env, |_| panic!("no download")).unwrap(),
@@ -610,6 +686,34 @@ mod tests {
         env.home = None;
         let error = resolve(&file_spec(b"x"), &env, |_| panic!("no download")).unwrap_err();
         assert!(error.contains("XDG_CACHE_HOME or HOME"), "{error}");
+    }
+
+    #[test]
+    fn relative_or_empty_xdg_cache_home_falls_back_to_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = env(dir.path());
+        env.home = Some(dir.path().join("home"));
+        for xdg in ["", "relative/cache"] {
+            env.xdg_cache_home = Some(PathBuf::from(xdg));
+            let path = resolve(&file_spec(b"binary"), &env, |_| Ok(b"binary".to_vec())).unwrap();
+            assert!(
+                path.starts_with(dir.path().join("home/.cache/cja")),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn download_cap_is_per_tool_and_names_tool_and_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = file_spec(b"oversized");
+        spec.max_bytes = 2;
+        let error = resolve(&spec, &env(dir.path()), |_| Ok(b"oversized".to_vec())).unwrap_err();
+        assert!(
+            error.contains("tailwindcss") && error.contains("2 bytes") && error.contains(&spec.url),
+            "{error}"
+        );
     }
 
     #[test]

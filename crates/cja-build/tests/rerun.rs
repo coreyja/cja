@@ -18,7 +18,7 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 #[test]
-#[ignore = "launches two nested Cargo builds"]
+#[ignore = "launches nested Cargo builds"]
 fn warm_add_ambient_declaration() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let temp = tempfile::tempdir().unwrap();
@@ -58,6 +58,12 @@ fn warm_add_ambient_declaration() {
     };
     build();
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    build();
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().lines().count(),
+        1,
+        "unchanged inputs must not rerun the build script"
+    );
     fs::write(
         fixture.join("frontend/src/new-ambient.d.ts"),
         "declare const newAmbient: string;\n",
@@ -65,4 +71,11 @@ fn warm_add_ambient_declaration() {
     .unwrap();
     build();
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
+    fs::write(
+        fixture.join("types/new-external.d.ts"),
+        "declare const externalAmbient: string;\n",
+    )
+    .unwrap();
+    build();
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 3);
 }

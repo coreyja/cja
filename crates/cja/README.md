@@ -26,7 +26,7 @@ Every entry must belong to the tsconfig program. Include each TypeScript entry
 through `include` or `files`; for JavaScript entries, also enable `allowJs`.
 `cja-build` runs native TypeScript 7.0.2 for type checking, then Rolldown for
 minified IIFE bundles and external source maps. No Node installation is needed.
-Imports must be relative and stay inside the app; `node_modules`, CSS, and
+Imports must be relative and stay inside the frontend directory; `node_modules`, CSS, and
 dynamic imports are rejected. Each ESM entry (`.format(EntryFormat::Esm)`) must
 remain one self-contained chunk. For an IIFE export, set
 `.format(EntryFormat::Iife { global_name: Some("cjaPasskey".into()) })`.

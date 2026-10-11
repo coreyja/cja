@@ -269,13 +269,12 @@ impl AssetsBuilder {
         }
         if !self.entries.is_empty() {
             if tool_env
-                .override_path
-                .as_deref()
-                .is_some_and(|path| !path.contains('/'))
+                .override_for(tool_cache::Tool::Tsc)
+                .is_some_and(|path| Path::new(path).components().count() == 1)
             {
                 println!("cargo::rerun-if-env-changed=PATH");
             }
-            if tool_env.override_path.is_none() && tool_env.xdg_cache_home.is_none() {
+            if tool_env.uses_home_cache(tool_cache::Tool::Tsc) {
                 println!("cargo::rerun-if-env-changed=HOME");
             }
         }
@@ -396,14 +395,13 @@ impl AssetsBuilder {
         &self,
         frontend: &Path,
         config: &Path,
-        app_root: &Path,
         out_dir: &Path,
         tool_env: &tool_cache::ToolEnv,
     ) -> Result<(), BuildError> {
         let executable = tool_cache::resolve_tsc(tool_env, tool_cache::fetch_https)
             .map_err(BuildError::Frontend)?;
         watch_dir(&executable, out_dir)?;
-        if tool_env.override_path.is_none() {
+        if tool_env.override_for(tool_cache::Tool::Tsc).is_none() {
             watch_dir(
                 &executable
                     .ancestors()
@@ -426,7 +424,7 @@ impl AssetsBuilder {
                             BuildError::Frontend(format!("create diagnostic scratch: {e}"))
                         })?;
                     if let Err(error) =
-                        bundler::bundle_entry(entry, frontend, app_root, scratch.path(), false)
+                        bundler::bundle_entry(entry, frontend, scratch.path(), false)
                     {
                         use fmt::Write as _;
                         let _ = write!(detail, "\nRolldown: {error}");
@@ -474,9 +472,6 @@ impl AssetsBuilder {
         for file in listed {
             if !file.starts_with(tool_lib) {
                 watch_dir(&file, out_dir)?;
-                if let Some(parent) = file.parent() {
-                    watch_dir(parent, out_dir)?;
-                }
             }
         }
         Ok(())
@@ -511,13 +506,13 @@ impl AssetsBuilder {
         }
         watch_config(&config, out_dir, &mut Vec::new())?;
         self.validate_entries()?;
-        self.check_types(&frontend, &config, &app_root, out_dir, tool_env)?;
+        self.check_types(&frontend, &config, out_dir, tool_env)?;
         for entry in self.entries.clone() {
             let scratch = tempfile::Builder::new()
                 .prefix("cja-bundle-")
                 .tempdir_in(out_dir)
                 .map_err(|e| BuildError::Frontend(format!("create bundle scratch: {e}")))?;
-            let bundle = bundler::bundle_entry(&entry, &frontend, &app_root, scratch.path(), true)
+            let bundle = bundler::bundle_entry(&entry, &frontend, scratch.path(), true)
                 .map_err(BuildError::Frontend)?;
             for file in bundle.watch_files {
                 watch_dir(&file, out_dir)?;
@@ -595,9 +590,6 @@ fn watch_config(path: &Path, out_dir: &Path, seen: &mut Vec<PathBuf>) -> Result<
     }
     seen.push(path.clone());
     watch_dir(&path, out_dir)?;
-    if let Some(parent) = path.parent() {
-        watch_dir(parent, out_dir)?;
-    }
     let text = fs::read_to_string(&path)
         .map_err(|e| BuildError::Frontend(format!("tsconfig {}: {e}", path.display())))?;
     let value: serde_json::Value = json5::from_str(&text)
@@ -614,7 +606,9 @@ fn watch_config(path: &Path, out_dir: &Path, seen: &mut Vec<PathBuf>) -> Result<
                         path.display()
                     ))
                 })?;
-                watch_pattern_root(&path, pattern, out_dir)?;
+                if seen.len() == 1 && key == "include" {
+                    watch_pattern_root(&path, pattern, out_dir)?;
+                }
             }
         }
     }
@@ -647,10 +641,12 @@ fn watch_config(path: &Path, out_dir: &Path, seen: &mut Vec<PathBuf>) -> Result<
                 .parent()
                 .ok_or_else(|| BuildError::Frontend("tsconfig has no parent".to_owned()))?;
             let target = parent.join(raw);
-            let target = if target.extension().is_some() {
+            let target = if target.extension().is_some_and(|ext| ext == "json") {
                 target
             } else {
-                target.with_extension("json")
+                let mut name = target.into_os_string();
+                name.push(".json");
+                PathBuf::from(name)
             };
             watch_config(&target, out_dir, seen)?;
         }
@@ -798,7 +794,7 @@ mod tests {
 
     fn fake_env(root: &Path) -> tool_cache::ToolEnv {
         let mut env = tool_cache::ToolEnv::capture(root);
-        env.override_path = Some(fixture_path("bin/fake-tsc").display().to_string());
+        env.tsc_override = Some(fixture_path("bin/fake-tsc").as_os_str().to_os_string());
         env
     }
 
@@ -1123,6 +1119,33 @@ mod tests {
         let error = watch_config(&config, &shared.join("target/out"), &mut Vec::new()).unwrap_err();
         assert!(error.to_string().contains("shared"));
         assert!(error.to_string().contains("OUT_DIR"));
+    }
+
+    #[test]
+    fn extensionless_relative_extends_appends_json() {
+        let root = fixture();
+        let frontend = root.path().join("frontend");
+        fs::create_dir(&frontend).unwrap();
+        fs::write(frontend.join("tsconfig.base.json"), "{}").unwrap();
+        let config = frontend.join("tsconfig.json");
+        fs::write(&config, "{extends: './tsconfig.base'}").unwrap();
+        let mut seen = Vec::new();
+        watch_config(&config, &root.path().join("out"), &mut seen).unwrap();
+        assert!(seen.iter().any(|path| path.ends_with("tsconfig.base.json")));
+    }
+
+    #[test]
+    fn extended_config_parent_with_target_is_not_watched() {
+        let root = fixture();
+        let frontend = root.path().join("app/frontend");
+        fs::create_dir_all(&frontend).unwrap();
+        fs::create_dir(root.path().join("target")).unwrap();
+        fs::write(root.path().join("tsconfig.base.json"), "{}").unwrap();
+        let config = frontend.join("tsconfig.json");
+        fs::write(&config, "{extends: '../../tsconfig.base'}").unwrap();
+        let mut seen = Vec::new();
+        watch_config(&config, &root.path().join("out"), &mut seen).unwrap();
+        assert_eq!(seen.len(), 2);
     }
 
     #[cfg(target_os = "linux")]

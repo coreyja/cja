@@ -7,3 +7,6 @@ if grep -r -q TYPE_ERROR "$root/src"; then
   exit 2
 fi
 find "$root/src" -type f \( -name '*.ts' -o -name '*.d.ts' \) -print
+if [ -d "$root/../types" ]; then
+  find "$root/../types" -type f -name '*.d.ts' -print
+fi

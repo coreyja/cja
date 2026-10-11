@@ -66,7 +66,11 @@ jobs:
           grep -q '2 passed; 0 failed' "$RUNNER_TEMP/tsc-tests.log"
           test -f "$XDG_CACHE_HOME/cja/tsc-7.0.2-linux-x64/.sha256"
       - name: Verify warm rerun on a new ambient declaration
-        run: cargo test -p cja-build --test rerun warm_add_ambient_declaration -- --ignored --exact --nocapture --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p cja-build --test rerun warm_add_ambient_declaration -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/rerun-tests.log"
+          grep -q '1 passed; 0 failed' "$RUNNER_TEMP/rerun-tests.log"
 
   passkey-browser:
     name: Passkey browser
