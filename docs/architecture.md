@@ -22,6 +22,9 @@ validated recursively, and all CSS files and scan roots stay inside the app's
 manifest directory. Cargo watches the CSS graph and every explicit scan root,
 including Rust Maud templates. Tailwind's minified output uses the same hashed,
 embedded manifest path as static files; ordinary CSS may still use `static_dir`.
+The scanner accepts only the [documented at-rule allow-list](../crates/cja/README.md#tailwind-css-inputs),
+depth-zero root directives, ASCII outside strings/comments, and literal source
+directories without globs.
 `cja-build` watches existing ancestor `.gitignore`, `.ignore`, and
 `.git/info/exclude` files, including the common Git directory's exclude in a
 worktree or a submodule Git directory's exclude. Watching those files can cause

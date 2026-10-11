@@ -1697,6 +1697,244 @@ mod tests {
         );
     }
 
+    enum Expectation {
+        Emits(&'static str),
+        Errors(&'static str),
+    }
+    enum Setup {
+        None,
+        QuotedCss,
+        BraceDirectory,
+    }
+    struct Case {
+        name: &'static str,
+        css: String,
+        setup: Setup,
+        expectation: Expectation,
+    }
+
+    fn old_corpus_cases(root_rule: &str) -> Vec<Case> {
+        let old_cases = [
+            (
+                "escaped double quote",
+                ".a\\\"{} @source \"../../secret\"; /* \" */",
+                Expectation::Emits(".italic{"),
+            ),
+            (
+                "escaped single quote",
+                ".a\\'{} @source '../../secret'; /* ' */",
+                Expectation::Emits(".italic{"),
+            ),
+            (
+                "escaped comment close source",
+                "/* \\*/ \" */ @source \"../../secret\"; /* \" */",
+                Expectation::Emits(".italic{"),
+            ),
+            (
+                "escaped comment close import",
+                "/* \\*/ \" */ @import \"../../secret.css\"; /* \" */",
+                Expectation::Emits(".cja-outside-marker{"),
+            ),
+            (
+                "split import",
+                "@im/**/port \"../../secret.css\";",
+                Expectation::Emits(".cja-outside-marker{"),
+            ),
+            (
+                "split source",
+                "@sou/**/rce \"../../secret\";",
+                Expectation::Emits(".italic{"),
+            ),
+            (
+                "comment before import",
+                "@/**/import \"../../secret.css\";",
+                Expectation::Emits(".cja-outside-marker{"),
+            ),
+            (
+                "split plugin",
+                "@plu/**/gin \"x\";",
+                Expectation::Errors("Can't resolve 'x'"),
+            ),
+            (
+                "split config",
+                "@con/**/fig \"x\";",
+                Expectation::Errors("Can't resolve 'x'"),
+            ),
+            (
+                "important comment split import",
+                "@im/*! x */port \"../../secret.css\";",
+                Expectation::Emits(".cja-outside-marker{"),
+            ),
+            (
+                "comment after import name",
+                "@import/**/ \"../../secret.css\";",
+                Expectation::Emits(".cja-outside-marker{"),
+            ),
+            (
+                "comment after import argument",
+                "@import \"../../secret.css\" /**/;",
+                Expectation::Emits(".cja-outside-marker{"),
+            ),
+            (
+                "extra BOM and split import",
+                "\u{feff}@im/**/port \"../../secret.css\";",
+                Expectation::Errors("Invalid declaration"),
+            ),
+            (
+                "nested media split import",
+                "@media screen { @im/**/port \"../../secret.css\"; }",
+                Expectation::Emits(".cja-outside-marker{"),
+            ),
+            (
+                "nested selector split import",
+                ".x { @im/**/port \"../../secret.css\"; }",
+                Expectation::Emits(".cja-outside-marker{"),
+            ),
+        ];
+        let cases: Vec<Case> = old_cases
+            .into_iter()
+            .map(|(name, suffix, expectation)| Case {
+                name,
+                css: format!("{root_rule} {suffix}"),
+                setup: Setup::None,
+                expectation,
+            })
+            .collect();
+        cases
+    }
+
+    fn new_corpus_cases(root_rule: &str) -> Vec<Case> {
+        vec![
+            Case {
+                name: "media source wraps root import",
+                css: "@media source(\"../../secret\") { @import \"tailwindcss\" source(none); } @source \"../src\";".into(),
+                setup: Setup::None,
+                expectation: Expectation::Emits(".italic{"),
+            },
+            Case {
+                name: "Unicode trim mismatch",
+                css: format!("{root_rule} @import \"./a.css\"\u{0085};"),
+                setup: Setup::QuotedCss,
+                expectation: Expectation::Emits(".cja-outside-marker{"),
+            },
+            Case {
+                name: "brace source expansion",
+                css: "@import \"tailwindcss\" source(none); @source \"../{src,../secret}\";".into(),
+                setup: Setup::BraceDirectory,
+                expectation: Expectation::Emits(".italic{"),
+            },
+            Case {
+                name: "media comment split source call",
+                css: "@media source/**/(\"../../secret\") { @import \"tailwindcss\" source(none); } @source \"../src\";".into(),
+                setup: Setup::None,
+                expectation: Expectation::Emits(".italic{"),
+            },
+            Case {
+                name: "media comment split source name",
+                css: "@media sou/**/rce(\"../../secret\") { @import \"tailwindcss\" source(none); } @source \"../src\";".into(),
+                setup: Setup::None,
+                expectation: Expectation::Emits(".italic{"),
+            },
+        ]
+    }
+
+    fn assert_corpus_case(app: &Path, binary: &Path, index: usize, case: &Case) {
+        let input = app.join("frontend/app.css");
+        match case.setup {
+            Setup::None => {}
+            Setup::QuotedCss => {
+                fs::write(app.join("frontend/a.css"), ".benign{}").unwrap();
+                fs::write(
+                    app.join("frontend/a.css\""),
+                    "@import \"../../secret.css\";",
+                )
+                .unwrap();
+            }
+            Setup::BraceDirectory => {
+                fs::create_dir_all(app.join("{src,..").join("secret}")).unwrap();
+            }
+        }
+        fs::write(&input, &case.css).unwrap();
+        let output = app.join("out").join(format!("corpus-{index}.css"));
+        if output.exists() {
+            fs::remove_file(&output).unwrap();
+        }
+        let result = std::process::Command::new(binary)
+            .args([
+                "-i",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--minify",
+            ])
+            .current_dir(app.join("frontend"))
+            .output()
+            .unwrap();
+        match case.expectation {
+            Expectation::Emits(marker) => {
+                assert!(
+                    result.status.success(),
+                    "{}: Tailwind failed: {}",
+                    case.name,
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let emitted = fs::read_to_string(&output).unwrap();
+                assert!(
+                    emitted.contains(marker),
+                    "{}: live marker {marker} absent",
+                    case.name
+                );
+            }
+            Expectation::Errors(message) => {
+                assert!(
+                    !result.status.success(),
+                    "{}: Tailwind unexpectedly succeeded",
+                    case.name
+                );
+                assert!(
+                    String::from_utf8_lossy(&result.stderr).contains(message),
+                    "{}: wrong Tailwind error: {}",
+                    case.name,
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+        let validation = tailwind::validate_css(&input, app, &app.join("out"));
+        assert!(validation.is_err(), "{}: bypass validated", case.name);
+    }
+
+    fn assert_benign_corpus(app: &Path, binary: &Path, root_rule: &str) {
+        let input = app.join("frontend/app.css");
+        fs::write(&input, format!("{root_rule} .inside{{}}")).unwrap();
+        tailwind::validate_css(&input, app, &app.join("out")).unwrap();
+        let output = app.join("out/benign.css");
+        let result = std::process::Command::new(binary)
+            .args([
+                "-i",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--minify",
+            ])
+            .current_dir(app.join("frontend"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "benign Tailwind failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let emitted = fs::read_to_string(output).unwrap();
+        assert!(
+            emitted.contains(".underline{"),
+            "benign fixture emitted no inside marker"
+        );
+        assert!(
+            !emitted.contains(".italic{") && !emitted.contains(".cja-outside-marker{"),
+            "benign fixture emitted outside marker"
+        );
+    }
+
     #[test]
     #[ignore = "runs pinned Tailwind binary"]
     fn real_tailwind_adversarial_corpus() {
@@ -1724,78 +1962,13 @@ mod tests {
         env.offline = false;
         let binary = tool_cache::resolve_tailwind(&env, tool_cache::fetch_https).unwrap();
         let root_rule = "@import \"tailwindcss\" source(none); @source \"../src\";";
-        let bypasses = [
-            ".a\\\"{} @source \"../../secret\"; /* \" */",
-            ".a\\'{} @source '../../secret'; /* ' */",
-            "/* \\*/ \" */ @source \"../../secret\"; /* \" */",
-            "/* \\*/ \" */ @import \"../../secret.css\"; /* \" */",
-            "@im/**/port \"../../secret.css\";",
-            "@sou/**/rce \"../../secret\";",
-            "@/**/import \"../../secret.css\";",
-            "@plu/**/gin \"x\";",
-            "@con/**/fig \"x\";",
-            "@im/*! x */port \"../../secret.css\";",
-            "@import/**/ \"../../secret.css\";",
-            "@import \"../../secret.css\" /**/;",
-            "\u{feff}@im/**/port \"../../secret.css\";",
-            "@media screen { @im/**/port \"../../secret.css\"; }",
-            ".x { @im/**/port \"../../secret.css\"; }",
-        ];
-        for (index, suffix) in bypasses
-            .iter()
-            .enumerate()
-            .chain(std::iter::once((bypasses.len(), &".inside{}")))
-        {
-            let css = format!("{root_rule} {suffix}");
-            let input = app.join("frontend/app.css");
-            fs::write(&input, css).unwrap();
-            let validation = tailwind::validate_css(&input, &app, &app.join("out"));
-            if index < bypasses.len() {
-                assert!(
-                    validation.is_err(),
-                    "known bypass {index} validated: {suffix}"
-                );
-            } else {
-                assert!(
-                    validation.is_ok(),
-                    "benign fixture rejected: {validation:?}"
-                );
-            }
-            if validation.is_err() {
-                continue;
-            }
-            let output = app.join("out").join(format!("corpus-{index}.css"));
-            let result = std::process::Command::new(&binary)
-                .args([
-                    "-i",
-                    input.to_str().unwrap(),
-                    "-o",
-                    output.to_str().unwrap(),
-                    "--minify",
-                ])
-                .current_dir(app.join("frontend"))
-                .output()
-                .unwrap();
-            if !result.status.success() {
-                assert!(
-                    index < bypasses.len(),
-                    "benign Tailwind failed: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-                continue;
-            }
-            let emitted = fs::read_to_string(output).unwrap();
-            assert!(
-                !emitted.contains(".italic{") && !emitted.contains(".cja-outside-marker{"),
-                "outside marker emitted for {suffix}"
-            );
-            if index == bypasses.len() {
-                assert!(
-                    emitted.contains(".underline{"),
-                    "benign fixture emitted no inside marker"
-                );
-            }
+        let cases = old_corpus_cases(root_rule)
+            .into_iter()
+            .chain(new_corpus_cases(root_rule));
+        for (index, case) in cases.enumerate() {
+            assert_corpus_case(&app, &binary, index, &case);
         }
+        assert_benign_corpus(&app, &binary, root_rule);
     }
 
     #[test]
