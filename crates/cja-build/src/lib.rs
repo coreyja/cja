@@ -1754,4 +1754,30 @@ mod tests {
             .to_string();
         assert!(error.contains("symlink"), "{error}");
     }
+    // Pinned (PR review round 1): only symlinks *inside* the app are a
+    // confinement concern. A symlinked ancestor of CARGO_MANIFEST_DIR (macOS
+    // /var -> /private/var, a symlinked ~/code) must not reject every input;
+    // static_dir already accepts this layout.
+    #[cfg(unix)]
+    #[test]
+    fn tailwind_accepts_manifest_dir_below_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+        let guard = crate::SPAWN.lock().unwrap();
+        let temp = fixture();
+        let real = temp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        css_fixture(&real, "");
+        symlink(&real, temp.path().join("link")).unwrap();
+        let manifest_dir = temp.path().join("link");
+        let out = temp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let result = AssetsBuilder::new()
+            .tailwind(Tailwind::new("frontend/app.css", "app.css"))
+            .build_in(&manifest_dir, &out, &fake_tailwind_env(&manifest_dir));
+        // Release the spawn lock before asserting so a red pin cannot poison it.
+        drop(guard);
+        result.unwrap();
+        let manifest = fs::read_to_string(out.join("cja_assets.rs")).unwrap();
+        assert!(manifest.contains("app.") && manifest.contains("text/css"));
+    }
 }
