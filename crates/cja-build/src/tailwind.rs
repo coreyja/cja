@@ -73,6 +73,18 @@ fn ascii_trim(text: &str) -> &str {
     text.trim_matches([' ', '\t', '\n', '\r', '\u{000c}'])
 }
 
+fn line_number(css: &str, pos: usize) -> usize {
+    css[..pos].match_indices('\n').count() + 1
+}
+
+fn readable_byte(byte: Option<&u8>) -> String {
+    match byte {
+        None => "<EOF>".to_owned(),
+        Some(byte) if byte.is_ascii_graphic() || *byte == b' ' => char::from(*byte).to_string(),
+        Some(byte) => format!("\\x{byte:02X}"),
+    }
+}
+
 fn non_ascii(css: &str, pos: usize, file: &Path) -> BuildError {
     let token = css
         .get(pos..)
@@ -157,6 +169,7 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
     let mut depth = 0usize;
     let mut paren_depth = 0usize;
     let mut statement_has_content = false;
+    let mut custom_closers: Option<Vec<u8>> = None;
     let mut result = Directives::default();
     while pos < bytes.len() {
         if bytes[pos..].starts_with(b"/*") {
@@ -177,6 +190,49 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
             return Err(non_ascii(css, pos, file));
         }
         reject_source_token(bytes, pos, file)?;
+        if let Some(closers) = custom_closers.as_mut() {
+            let byte = bytes[pos];
+            if byte == b'@' {
+                return Err(error(format!(
+                    "at-rule inside custom property value in {}:{}: @",
+                    file.display(),
+                    line_number(css, pos)
+                )));
+            }
+            if let Some(closer) = match byte {
+                b'(' => Some(b')'),
+                b'[' => Some(b']'),
+                b'{' => Some(b'}'),
+                _ => None,
+            } {
+                closers.push(closer);
+            } else if matches!(byte, b')' | b']' | b'}') {
+                if closers.last() == Some(&byte) {
+                    closers.pop();
+                } else if !closers.is_empty() {
+                    return Err(error(format!(
+                        "mismatched {} inside custom property value in {}:{}",
+                        char::from(byte),
+                        file.display(),
+                        line_number(css, pos)
+                    )));
+                } else if byte == b'}' {
+                    custom_closers = None;
+                    continue;
+                }
+            } else if byte == b';' && closers.is_empty() {
+                custom_closers = None;
+                statement_has_content = false;
+            }
+            pos += 1;
+            continue;
+        }
+        if !statement_has_content && bytes[pos..].starts_with(b"--") {
+            custom_closers = Some(Vec::new());
+            statement_has_content = true;
+            pos += 2;
+            continue;
+        }
         if bytes[pos] == b'(' {
             paren_depth += 1;
             statement_has_content = true;
@@ -219,7 +275,9 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         if bytes[pos] != b'@' {
             if bytes[pos] == b';' && paren_depth == 0 {
                 statement_has_content = false;
-            } else if !matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
+            } else if !(matches!(bytes[pos], b' ' | b'\t' | b'\n')
+                || bytes[pos] == b'\r' && bytes.get(pos + 1) == Some(&b'\n'))
+            {
                 statement_has_content = true;
             }
             pos += 1;
@@ -268,20 +326,20 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         }
         if statement_has_content {
             return Err(error(format!(
-                "@{name} must start a statement in {} (missing ; before it?)",
-                file.display()
+                "@{name} must start a statement in {}:{} (missing ; before it?)",
+                file.display(),
+                line_number(css, pos)
             )));
         }
         if !(matches!(bytes.get(end), Some(b' ' | b'\t' | b'\n'))
             || bytes.get(end) == Some(&b'\r') && bytes.get(end + 1) == Some(&b'\n'))
         {
             return Err(error(format!(
-                "@{name} must be followed by a space, tab or newline in {}: @{}{}",
+                "@{name} must be followed by a space, tab or newline in {}:{}: @{}{}",
                 file.display(),
+                line_number(css, pos),
                 name,
-                bytes
-                    .get(end)
-                    .map_or(String::new(), |byte| format!("\\x{byte:02X}"))
+                readable_byte(bytes.get(end))
             )));
         }
         let mut cursor = end;
@@ -314,6 +372,7 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
                     || argument == "'tailwindcss' source(none)"
                 {
                     if depth != 0 || paren_depth != 0 {
+                        // Defence in depth: statement-start validation already rejects parens.
                         return Err(error(format!(
                             "@import \"tailwindcss\" source(none) must be at depth 0 in {}",
                             file.display()
@@ -358,6 +417,16 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
     }
     if paren_depth != 0 {
         return Err(error(format!("unmatched ( in {}", file.display())));
+    }
+    if let Some(closers) = custom_closers
+        && let Some(closer) = closers.last()
+    {
+        return Err(error(format!(
+            "unclosed {} inside custom property value in {}:{}",
+            char::from(*closer),
+            file.display(),
+            line_number(css, css.len())
+        )));
     }
     Ok(result)
 }
@@ -1041,7 +1110,6 @@ mod tests {
         );
         for css in [
             "(x @import \"tailwindcss\" source(none); y) {} @source \"../src\";",
-            "--x: @import \"tailwindcss\" source(none); @source \"../src\";",
             "a:b @import \"tailwindcss\" source(none); @source \"../src\";",
         ] {
             rejected(
@@ -1051,6 +1119,12 @@ mod tests {
                 "@import",
             );
         }
+        rejected(
+            root.path(),
+            "--x: @import \"tailwindcss\" source(none); @source \"../src\";",
+            "at-rule inside custom property value",
+            "@",
+        );
     }
 
     #[test]
@@ -1076,6 +1150,152 @@ mod tests {
             "@import\"tailwindcss\" source(none); @source \"../src\";",
             "@import must be followed",
             "@import",
+        );
+        let message = check(root.path(), &format!("{ROOT} @source"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("@source<EOF>"), "{message}");
+        let message = check(root.path(), &format!("{ROOT}\n@source\r\"../src\";"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("app.css:2"), "{message}");
+        assert!(message.contains("@source\\x0D"), "{message}");
+    }
+
+    #[test]
+    fn lone_cr_and_form_feed_before_graph_rules_are_rejected() {
+        let root = fixture();
+        fs::write(root.path().join("frontend/a.css"), ".safe{}").unwrap();
+        check(
+            root.path(),
+            "@import \"tailwindcss\" source(none);\r\n@source \"../src\";\r\n.x { color: red; }\r\n",
+        )
+        .unwrap();
+        let message = check(
+            root.path(),
+            "@import \"tailwindcss\" source(none);\n\r@source \"../src\";",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("app.css:2"), "{message}");
+    }
+
+    #[test]
+    fn lone_cr_before_source_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT}\r@source \"../src\";"),
+            "must start a statement",
+            "@source",
+        );
+    }
+
+    #[test]
+    fn form_feed_before_source_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT}\x0c@source \"../src\";"),
+            "must start a statement",
+            "@source",
+        );
+    }
+
+    #[test]
+    fn lone_cr_before_import_is_rejected() {
+        let root = fixture();
+        fs::write(root.path().join("frontend/a.css"), ".safe{}").unwrap();
+        rejected(
+            root.path(),
+            &format!("{ROOT}\r@import \"./a.css\";"),
+            "must start a statement",
+            "@import",
+        );
+    }
+
+    #[test]
+    fn custom_property_values_keep_graph_rules_visible() {
+        let root = fixture();
+        fs::write(root.path().join("frontend/a.css"), ".imported-marker{}").unwrap();
+        for (css, expected, token) in [
+            (
+                format!("{ROOT} --x: [; @source \"../src\"; ];"),
+                "at-rule inside custom property value",
+                "@",
+            ),
+            (
+                format!("{ROOT} @theme {{ --x: [; @import \"./a.css\"; ]; }}"),
+                "at-rule inside custom property value",
+                "@",
+            ),
+            (
+                format!("{ROOT} .a {{ --x: [ }} ]; }}"),
+                "mismatched } inside custom property value",
+                "}",
+            ),
+            (
+                format!("{ROOT} --x: ("),
+                "unclosed ) inside custom property value",
+                ")",
+            ),
+            (
+                format!("{ROOT} --x: {{ @media x {{}} }};"),
+                "at-rule inside custom property value",
+                "@",
+            ),
+        ] {
+            rejected(root.path(), &css, expected, token);
+        }
+        for css in [
+            format!(
+                "{ROOT} @theme {{ --color-x: oklch(0.7 0.1 200); --font-x: \"A;B\", serif; --shadow: 0 0 [x] {{y}}; }}"
+            ),
+            format!("{ROOT} --x: 1;"),
+            format!("{ROOT} .a {{ --x: 1 }}"),
+        ] {
+            check(root.path(), &css).unwrap();
+        }
+        let message = check(
+            root.path(),
+            &format!("{ROOT}\n--x: [; @source \"../src\"; ];"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("app.css:2"), "{message}");
+    }
+
+    #[test]
+    fn custom_property_source_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} --x: [; @source \"../src\"; ];"),
+            "at-rule inside custom property value",
+            "@",
+        );
+    }
+
+    #[test]
+    fn custom_property_import_is_rejected() {
+        let root = fixture();
+        fs::write(root.path().join("frontend/a.css"), ".imported-marker{}").unwrap();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @theme {{ --x: [; @import \"./a.css\"; ]; }}"),
+            "at-rule inside custom property value",
+            "@",
+        );
+    }
+
+    #[test]
+    fn custom_property_mismatched_closer_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} .a {{ --x: [ }} ]; }}"),
+            "mismatched } inside custom property value",
+            "}",
         );
     }
 

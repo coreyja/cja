@@ -61,7 +61,9 @@ literal directories beginning `./` or `../`, with no glob metacharacters.
 Parentheses must balance and cannot contain braces.
 `@import` and `@source` must start a statement (at the start of the file or
 after `;`, `{` or `}`, outside parentheses) and be followed by a space, tab
-or newline.
+or newline. Neutral whitespace before these rules is only space, tab, LF or
+CRLF; a lone CR or form feed can make Tailwind drop a rule. Custom-property
+values cannot contain at-rules and must balance `()`, `[]` and `{}`.
 All inputs must remain inside the manifest directory, outside `target/`, and
 free of symlinks. Unsupported at-rules fail the build, including `@plugin`,
 `@config`, `@reference`, and `@tailwind`.

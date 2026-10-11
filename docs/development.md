@@ -22,10 +22,12 @@ Emacs lock files) are ignored.
 The [allow-list grammar](../crates/cja/README.md#tailwind-css-inputs) requires
 depth-zero root directives, ASCII outside strings/comments, and literal source
 directories without globs. `@import` and `@source` must start statements outside
-parentheses and have a space, tab or newline after their names. Tailwind skips
-nested `node_modules` when the
-explicit `@source` root is outside one; an explicit root inside `node_modules`
-scans its nested directories too, so those directories are checked for symlinks.
+parentheses and have a space, tab or newline after their names. Only space,
+tab, LF or CRLF is neutral before them; custom-property values cannot contain
+at-rules and must balance `()`, `[]` and `{}`. Tailwind skips nested
+`node_modules` when the explicit `@source` root is outside one. An explicit
+root inside `node_modules` scans its nested directories too, so those
+directories are checked for symlinks.
 `cja-build` downloads and verifies the
 standalone Tailwind v4.3.3 binary into the same shared cache, or uses
 `TAILWIND_CLI` when set. Offline cold builds fail with installation guidance.

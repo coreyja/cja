@@ -1706,6 +1706,8 @@ mod tests {
         None,
         QuotedCss,
         BraceDirectory,
+        ColonSource,
+        ImportedCss,
     }
     struct Case {
         name: &'static str,
@@ -1715,115 +1717,112 @@ mod tests {
         rejects: &'static str,
     }
 
-    const OLD_CASE_REJECTIONS: [&str; 15] = [
-        "escapes manifest directory",
-        "escapes manifest directory",
-        "escapes manifest directory",
-        "escapes manifest directory",
-        "comment inside or directly after",
-        "comment inside or directly after",
-        "comment inside or directly after",
-        "comment inside or directly after",
-        "comment inside or directly after",
-        "comment inside or directly after",
-        "comment inside or directly after",
-        "unsupported @import",
-        "non-ASCII U+FEFF",
-        "comment inside or directly after",
-        "comment inside or directly after",
-    ];
-
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the original corpus cases and each rejection adjacent"
+    )]
     fn old_corpus_cases(root_rule: &str) -> Vec<Case> {
-        let old_cases = [
+        [
             (
                 "escaped double quote",
                 ".a\\\"{} @source \"../../secret\"; /* \" */",
                 Expectation::Emits(".italic{"),
+                "escapes manifest directory",
             ),
             (
                 "escaped single quote",
                 ".a\\'{} @source '../../secret'; /* ' */",
                 Expectation::Emits(".italic{"),
+                "escapes manifest directory",
             ),
             (
                 "escaped comment close source",
                 "/* \\*/ \" */ @source \"../../secret\"; /* \" */",
                 Expectation::Emits(".italic{"),
+                "escapes manifest directory",
             ),
             (
                 "escaped comment close import",
                 "/* \\*/ \" */ @import \"../../secret.css\"; /* \" */",
                 Expectation::Emits(".cja-outside-marker{"),
+                "escapes manifest directory",
             ),
             (
                 "split import",
                 "@im/**/port \"../../secret.css\";",
                 Expectation::Emits(".cja-outside-marker{"),
+                "comment inside or directly after",
             ),
             (
                 "split source",
                 "@sou/**/rce \"../../secret\";",
                 Expectation::Emits(".italic{"),
+                "comment inside or directly after",
             ),
             (
                 "comment before import",
                 "@/**/import \"../../secret.css\";",
                 Expectation::Emits(".cja-outside-marker{"),
+                "comment inside or directly after",
             ),
             (
                 "split plugin",
                 "@plu/**/gin \"x\";",
                 Expectation::Errors("Can't resolve 'x'"),
+                "comment inside or directly after",
             ),
             (
                 "split config",
                 "@con/**/fig \"x\";",
                 Expectation::Errors("Can't resolve 'x'"),
+                "comment inside or directly after",
             ),
             (
                 "important comment split import",
                 "@im/*! x */port \"../../secret.css\";",
                 Expectation::Emits(".cja-outside-marker{"),
+                "comment inside or directly after",
             ),
             (
                 "comment after import name",
                 "@import/**/ \"../../secret.css\";",
                 Expectation::Emits(".cja-outside-marker{"),
+                "comment inside or directly after",
             ),
             (
                 "comment after import argument",
                 "@import \"../../secret.css\" /**/;",
                 Expectation::Emits(".cja-outside-marker{"),
+                "unsupported @import",
             ),
-            // Tailwind itself rejects this one; retain it as a consistency case.
             (
                 "extra BOM and split import",
                 "\u{feff}@im/**/port \"../../secret.css\";",
                 Expectation::Errors("Invalid declaration"),
+                "non-ASCII U+FEFF",
             ),
             (
                 "nested media split import",
                 "@media screen { @im/**/port \"../../secret.css\"; }",
                 Expectation::Emits(".cja-outside-marker{"),
+                "comment inside or directly after",
             ),
             (
                 "nested selector split import",
                 ".x { @im/**/port \"../../secret.css\"; }",
                 Expectation::Emits(".cja-outside-marker{"),
+                "comment inside or directly after",
             ),
-        ];
-        let cases: Vec<Case> = old_cases
-            .into_iter()
-            .zip(OLD_CASE_REJECTIONS)
-            .map(|((name, suffix, expectation), rejects)| Case {
-                name,
-                css: format!("{root_rule} {suffix}"),
-                setup: Setup::None,
-                expectation,
-                rejects,
-            })
-            .collect();
-        cases
+        ]
+        .into_iter()
+        .map(|(name, suffix, expectation, rejects)| Case {
+            name,
+            css: format!("{root_rule} {suffix}"),
+            setup: Setup::None,
+            expectation,
+            rejects,
+        })
+        .collect()
     }
 
     fn new_corpus_cases(root_rule: &str) -> Vec<Case> {
@@ -1884,6 +1883,34 @@ mod tests {
                 expectation: Expectation::Emits(".italic{"),
                 rejects: "@source must start a statement",
             },
+            Case {
+                name: "lone CR drops source",
+                css: "@import \"tailwindcss\" source(none);\r@source \"../s:rc\";".into(),
+                setup: Setup::ColonSource,
+                expectation: Expectation::Drops(".line-through{"),
+                rejects: "@source must start a statement",
+            },
+            Case {
+                name: "form feed drops source",
+                css: "@import \"tailwindcss\" source(none);\x0c@source \"../s:rc\";".into(),
+                setup: Setup::ColonSource,
+                expectation: Expectation::Drops(".line-through{"),
+                rejects: "@source must start a statement",
+            },
+            Case {
+                name: "custom property drops source",
+                css: "@import \"tailwindcss\" source(none); --x: [; @source \"../src\"; ];".into(),
+                setup: Setup::None,
+                expectation: Expectation::Drops(".underline{"),
+                rejects: "at-rule inside custom property value",
+            },
+            Case {
+                name: "custom property drops import",
+                css: format!("{root_rule} @theme {{ --x: [; @import \"./a.css\"; ]; }}"),
+                setup: Setup::ImportedCss,
+                expectation: Expectation::Drops(".imported-marker{"),
+                rejects: "at-rule inside custom property value",
+            },
         ]
     }
 
@@ -1901,6 +1928,13 @@ mod tests {
             }
             Setup::BraceDirectory => {
                 fs::create_dir_all(app.join("{src,..").join("secret}")).unwrap();
+            }
+            Setup::ColonSource => {
+                fs::create_dir(app.join("s:rc")).unwrap();
+                fs::write(app.join("s:rc/a.rs"), "class=\"line-through\"").unwrap();
+            }
+            Setup::ImportedCss => {
+                fs::write(app.join("frontend/a.css"), ".imported-marker{color:red}").unwrap();
             }
         }
         fs::write(&input, &case.css).unwrap();
