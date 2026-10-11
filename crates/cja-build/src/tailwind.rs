@@ -900,6 +900,20 @@ mod tests {
         );
     }
 
+    // Tailwind 4.3.3's css-parser ignores `{` and `}` while a `(` is open, so
+    // here it nests the root import inside `.p { ... }` (it still honours
+    // source(none) there). The task requires the root import at depth 0.
+    #[test]
+    fn root_import_nested_via_braces_inside_parens_is_rejected() {
+        let root = fixture();
+        let css =
+            ".p { a: (}); @import \"tailwindcss\" source(none); a: ({); } @source \"../src\";";
+        let message = check(root.path(), css)
+            .expect_err("Tailwind nests this root import; validation must reject it")
+            .to_string();
+        assert!(message.contains("app.css"), "{css}: {message}");
+    }
+
     #[test]
     fn allowed_at_rules_and_unicode_literals_pass() {
         let root = fixture();
