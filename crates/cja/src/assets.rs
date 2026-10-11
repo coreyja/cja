@@ -31,6 +31,7 @@ impl Manifest {
     }
 
     /// Resolve only within this manifest's logical namespace.
+    #[track_caller]
     pub fn asset_url(&self, logical_name: &str) -> String {
         let asset = self
             .entries
@@ -65,8 +66,8 @@ impl std::error::Error for AssetError {}
 
 /// Build a root-mounted Axum router for all manifests in one call.
 ///
-/// The `/assets/{*rest}` route forces unknown asset URLs to return 404 even
-/// when the surrounding application has a fallback or root wildcard route.
+/// The `/assets`, `/assets/`, and `/assets/{*rest}` routes force unknown asset
+/// URLs to return 404 even when the app has a fallback or root wildcard route.
 /// Calling this more than once, or adding another `/assets` wildcard, conflicts
 /// at startup.
 pub fn router<S>(manifests: &[&'static Manifest]) -> Result<Router<S>, AssetError>
@@ -101,6 +102,7 @@ where
     }
     Ok(router
         .route("/assets", any(|| async { StatusCode::NOT_FOUND }))
+        .route("/assets/", any(|| async { StatusCode::NOT_FOUND }))
         .route("/assets/{*rest}", any(|| async { StatusCode::NOT_FOUND })))
 }
 
@@ -129,6 +131,7 @@ macro_rules! include_assets {
             pub static MANIFEST: Manifest =
                 Manifest::new(&include!(concat!(env!("OUT_DIR"), "/cja_assets.rs")));
 
+            #[track_caller]
             pub fn asset_url(logical_name: &str) -> String {
                 MANIFEST.asset_url(logical_name)
             }

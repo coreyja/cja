@@ -9,7 +9,7 @@ use std::{
 #[derive(thiserror::Error)]
 pub enum BuildError {
     #[error("assets path is not a directory: {}", path.display())]
-    MissingAssetsDir { path: PathBuf },
+    NotADirectory { path: PathBuf },
     #[error("asset I/O failed at {}", path.display())]
     Io {
         path: PathBuf,
@@ -70,8 +70,6 @@ impl AssetsBuilder {
 
     /// Called from the consuming crate's `build.rs`.
     pub fn build(self) -> Result<(), BuildError> {
-        println!("cargo::rerun-if-env-changed=CARGO_MANIFEST_DIR");
-        println!("cargo::rerun-if-env-changed=OUT_DIR");
         println!("cargo::rerun-if-changed=build.rs");
         println!("cargo::rerun-if-changed={}", self.assets_dir.display());
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|source| {
@@ -103,10 +101,10 @@ impl AssetsBuilder {
             });
         }
         if !metadata.is_dir() {
-            return Err(BuildError::MissingAssetsDir { path: source_dir });
+            return Err(BuildError::NotADirectory { path: source_dir });
         }
         let mut files = Vec::new();
-        collect_files(&source_dir, Path::new(""), &mut files)?;
+        collect_files(&source_dir, "", &mut files)?;
         files.sort();
         for (logical_name, path) in files {
             let bytes = fs::read(&path).map_err(|source| BuildError::Io {
@@ -185,10 +183,10 @@ impl AssetsBuilder {
             }
             _ => format!("{file_name}.{hash}"),
         };
-        let hashed_name = path
-            .with_file_name(hashed_file)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let hashed_name = match logical_name.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{hashed_file}"),
+            None => hashed_file,
+        };
         if let Some(first) = self
             .outputs
             .iter()
@@ -220,7 +218,7 @@ pub(crate) fn short_hash(bytes: &[u8]) -> String {
 
 fn collect_files(
     dir: &Path,
-    relative_dir: &Path,
+    relative_dir: &str,
     files: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), BuildError> {
     let entries = fs::read_dir(dir).map_err(|source| BuildError::Io {
@@ -232,16 +230,21 @@ fn collect_files(
             path: dir.to_path_buf(),
             source,
         })?;
-        if entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
+        let file_name = entry.file_name();
         let path = entry.path();
-        let relative = relative_dir.join(entry.file_name());
-        let name = relative.to_str().ok_or_else(|| BuildError::InvalidPath {
+        let component = file_name.to_str().ok_or_else(|| BuildError::InvalidPath {
             path: path.clone(),
             reason: "non-UTF-8 name",
         })?;
-        validate_name(name, &path)?;
+        if component.starts_with('.') {
+            continue;
+        }
+        let name = if relative_dir.is_empty() {
+            component.to_owned()
+        } else {
+            format!("{relative_dir}/{component}")
+        };
+        validate_name(&name, &path)?;
         let kind = entry.file_type().map_err(|source| BuildError::Io {
             path: path.clone(),
             source,
@@ -253,9 +256,9 @@ fn collect_files(
             });
         }
         if kind.is_dir() {
-            collect_files(&path, &relative, files)?;
+            collect_files(&path, &name, files)?;
         } else if kind.is_file() {
-            files.push((name.replace('\\', "/"), path));
+            files.push((name, path));
         } else {
             return Err(BuildError::InvalidPath {
                 path,
@@ -323,6 +326,9 @@ mod tests {
         let out = temp.path().join("out");
         fs::create_dir_all(assets.join("img")).unwrap();
         fs::create_dir_all(&out).unwrap();
+        for name in ["z.css", "a.css", "m.css", "b.css"] {
+            fs::write(assets.join(name), name.as_bytes()).unwrap();
+        }
         fs::write(assets.join("img/logo.svg"), b"<svg/>").unwrap();
         fs::write(assets.join("empty"), b"").unwrap();
         fs::write(assets.join(".hidden"), b"secret").unwrap();
@@ -341,7 +347,15 @@ mod tests {
         assert!(generated.contains("include_bytes!"));
         assert!(!generated.contains(".hidden"));
         assert!(!generated.contains("inner.css"));
-        assert!(generated.find("empty.").unwrap() < generated.find("img/logo.").unwrap());
+        let logical_names: Vec<_> = generated
+            .lines()
+            .filter_map(|line| line.split("logical_name: \"").nth(1))
+            .map(|tail| tail.split('"').next().unwrap())
+            .collect();
+        assert_eq!(
+            logical_names,
+            ["a.css", "b.css", "empty", "img/logo.svg", "m.css", "z.css"]
+        );
         assert_eq!(
             fs::read(out.join("cja-assets").join(&logo_name)).unwrap(),
             b"<svg/>"
@@ -372,7 +386,7 @@ mod tests {
         let err = AssetsBuilder::new("assets")
             .build_in(temp.path(), temp.path())
             .unwrap_err();
-        assert!(matches!(err, BuildError::MissingAssetsDir { .. }));
+        assert!(matches!(err, BuildError::NotADirectory { .. }));
         assert!(err.to_string().contains("assets"));
         assert!(err.to_string().contains("not a directory"));
     }

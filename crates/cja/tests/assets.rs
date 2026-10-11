@@ -234,9 +234,11 @@ async fn unknown_assets_stay_404_with_app_fallbacks() {
     let wildcard = Router::new()
         .route("/{*path}", get(|| async { (StatusCode::OK, "spa") }))
         .merge(assets);
+    let mut trailing_slash_statuses = Vec::new();
     for app in [fallback, wildcard] {
         for path in [
             "/assets",
+            "/assets/",
             "/assets/style.css",
             "/assets/style.deadbeef.css",
             "/assets/unknown/nested.js",
@@ -251,7 +253,11 @@ async fn unknown_assets_stay_404_with_app_fallbacks() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            if path == "/assets/" {
+                trailing_slash_statuses.push(response.status());
+            } else {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            }
         }
         let hit = app
             .clone()
@@ -275,4 +281,8 @@ async fn unknown_assets_stay_404_with_app_fallbacks() {
             .unwrap();
         assert_eq!(spa.status(), StatusCode::OK);
     }
+    assert_eq!(
+        trailing_slash_statuses,
+        [StatusCode::NOT_FOUND, StatusCode::NOT_FOUND]
+    );
 }
