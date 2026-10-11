@@ -44,12 +44,15 @@ jobs:
     name: Native TypeScript and warm rerun
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      XDG_CACHE_HOME: ${{ runner.temp }}/cja-cold-cache
-      CARGO_BUILD_BUILD_DIR: ${{ runner.temp }}/cja-native-build
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cja-native-target
     steps:
       - uses: actions/checkout@v4
+      - name: Set isolated build paths
+        run: |
+          {
+            echo "XDG_CACHE_HOME=$RUNNER_TEMP/cja-cold-cache"
+            echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/cja-native-build"
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cja-native-target"
+          } >> "$GITHUB_ENV"
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
