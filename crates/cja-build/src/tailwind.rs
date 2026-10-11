@@ -79,6 +79,7 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
                 {
                     result.tailwind_imports += 1;
                 } else {
+                    reject_near_miss_root_import(argument, file)?;
                     let path = quoted_only(argument).ok_or_else(|| {
                         error(format!(
                             "unsupported @import {argument:?} in {}: use a local quoted .css path",
@@ -119,6 +120,16 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         pos = cursor + 1;
     }
     Ok(result)
+}
+
+fn reject_near_miss_root_import(argument: &str, file: &Path) -> Result<(), BuildError> {
+    if argument.starts_with("\"tailwindcss\"") || argument.starts_with("'tailwindcss'") {
+        return Err(error(format!(
+            "unsupported @import {argument:?} in {}: root import must be exactly @import \"tailwindcss\" source(none);",
+            file.display()
+        )));
+    }
+    Ok(())
 }
 
 fn skip_string(bytes: &[u8], mut pos: usize, file: &Path) -> Result<usize, BuildError> {
@@ -221,7 +232,16 @@ pub(super) fn validate_css(
             manifest_dir.display()
         ))
     })?;
-    let input = confined(input, &root, false)?;
+    // CARGO_MANIFEST_DIR can itself contain a symlinked ancestor (macOS /var,
+    // for example). Check symlinks only in the path owned by this app.
+    let relative = input.strip_prefix(manifest_dir).map_err(|_| {
+        error(format!(
+            "CSS input {} is outside manifest directory limit {}",
+            input.display(),
+            manifest_dir.display()
+        ))
+    })?;
+    let input = confined(&root.join(relative), &root, false)?;
     let parent = input
         .parent()
         .ok_or_else(|| error("CSS input has no parent"))?;
@@ -391,6 +411,23 @@ mod tests {
         ] {
             let error = check(root.path(), css).unwrap_err().to_string();
             assert!(error.contains(expected), "{css}: {error}");
+        }
+    }
+
+    #[test]
+    fn near_miss_tailwind_import_names_required_root_form() {
+        let root = fixture();
+        for rule in [
+            "@import \"tailwindcss\"  source(none);",
+            "@import \"tailwindcss\" source(none) prefix(tw);",
+        ] {
+            let error = check(root.path(), &format!("{rule} @source \"../src\";"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("root import must be exactly @import \"tailwindcss\" source(none);"),
+                "{error}"
+            );
         }
     }
 
