@@ -2461,7 +2461,11 @@ mod idle_gate_tests {
         let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
         let state = make_state(db.clone(), gate.clone());
         state.park.store(true, SeqCst);
-        let workers = Workers::start(&state, 100, Duration::from_millis(200), true);
+        // A one-second idle interval keeps the deadline meaningful on slow CI
+        // runners: immediate permit handoff needs at most one interval plus 16
+        // serial claims per permit, while waiting an interval per handoff needs
+        // about 16 seconds and holding permits through bodies never gets past 2.
+        let workers = Workers::start(&state, 100, Duration::from_secs(1), true);
         with_workers(workers, async {
             until(|| {
                 gate.0.probe.waiting.load(SeqCst) == 98
@@ -2472,16 +2476,22 @@ mod idle_gate_tests {
             for id in 0..32 {
                 insert_sql(&db, &format!("burst-{id}"), "0 seconds", None).await;
             }
-            let result = tokio::time::timeout_at(burst_started + Duration::from_secs(2), async {
-                while started(&db).await < 32 {
+            // Wait on the overlap counter itself. Bodies record their start row
+            // before counting themselves in, so polling the start rows can see
+            // 32 starts before the last body is counted as overlapping.
+            let result = tokio::time::timeout_at(burst_started + Duration::from_secs(8), async {
+                while state.in_body.load(SeqCst) < 32 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await;
             let max = state.max_in_body.load(SeqCst);
             state.release.notify_waiters();
-            result.expect("32 body starts within two seconds");
-            assert!(max >= 32, "only {max} overlapping bodies");
+            assert!(
+                result.is_ok(),
+                "only {max} of 32 bodies overlapped within eight seconds"
+            );
+            assert_eq!(started(&db).await, 32);
         })
         .await;
     }
