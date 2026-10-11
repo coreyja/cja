@@ -1935,24 +1935,32 @@ mod tests {
         );
     }
 
+    fn corpus_app(outer: &Path) -> PathBuf {
+        let app = outer.join("app");
+        fs::create_dir_all(app.join("frontend")).unwrap();
+        fs::create_dir(app.join("src")).unwrap();
+        fs::create_dir(app.join("out")).unwrap();
+        fs::create_dir(outer.join("secret")).unwrap();
+        fs::write(app.join("src/a.rs"), "html! { div class=\"underline\" {} }").unwrap();
+        fs::write(
+            outer.join("secret/a.rs"),
+            "html! { div class=\"italic\" {} }",
+        )
+        .unwrap();
+        fs::write(
+            outer.join("secret.css"),
+            ".cja-outside-marker { color: red; }",
+        )
+        .unwrap();
+        app
+    }
+
     #[test]
     #[ignore = "runs pinned Tailwind binary"]
     fn real_tailwind_adversarial_corpus() {
         let _guard = crate::SPAWN.lock().unwrap();
         let outer = fixture();
-        let app = outer.path().join("app");
-        fs::create_dir_all(app.join("frontend")).unwrap();
-        fs::create_dir(app.join("src")).unwrap();
-        fs::create_dir(app.join("out")).unwrap();
-        let secret = outer.path().join("secret");
-        fs::create_dir(&secret).unwrap();
-        fs::write(app.join("src/a.rs"), "html! { div class=\"underline\" {} }").unwrap();
-        fs::write(secret.join("a.rs"), "html! { div class=\"italic\" {} }").unwrap();
-        fs::write(
-            outer.path().join("secret.css"),
-            ".cja-outside-marker { color: red; }",
-        )
-        .unwrap();
+        let app = corpus_app(&outer.path().join("cache-fixture"));
         let mut env = fake_tailwind_env(&app);
         env.tailwind_override = None;
         env.xdg_cache_home = Some(
@@ -1966,9 +1974,11 @@ mod tests {
             .into_iter()
             .chain(new_corpus_cases(root_rule));
         for (index, case) in cases.enumerate() {
-            assert_corpus_case(&app, &binary, index, &case);
+            let case_app = corpus_app(&outer.path().join(format!("case-{index}")));
+            assert_corpus_case(&case_app, &binary, index, &case);
         }
-        assert_benign_corpus(&app, &binary, root_rule);
+        let benign_app = corpus_app(&outer.path().join("benign"));
+        assert_benign_corpus(&benign_app, &binary, root_rule);
     }
 
     #[test]

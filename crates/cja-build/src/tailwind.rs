@@ -155,6 +155,7 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         0
     };
     let mut depth = 0usize;
+    let mut paren_depth = 0usize;
     let mut result = Directives::default();
     while pos < bytes.len() {
         if bytes[pos..].starts_with(b"/*") {
@@ -173,6 +174,28 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
             return Err(non_ascii(css, pos, file));
         }
         reject_source_token(bytes, pos, file)?;
+        if bytes[pos] == b'(' {
+            paren_depth += 1;
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b')' {
+            if paren_depth == 0 {
+                return Err(error(format!("unmatched ) in {}", file.display())));
+            }
+            paren_depth -= 1;
+            pos += 1;
+            continue;
+        }
+        // Tailwind does not treat these as structure inside parentheses.
+        // Reject them so our brace depth cannot diverge from Tailwind's.
+        if paren_depth != 0 && matches!(bytes[pos], b'{' | b'}' | b';') {
+            return Err(error(format!(
+                "unsupported {} inside parentheses in {}",
+                char::from(bytes[pos]),
+                file.display()
+            )));
+        }
         if bytes[pos] == b'{' {
             depth += 1;
             pos += 1;
@@ -298,6 +321,9 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
     }
     if depth != 0 {
         return Err(error(format!("unmatched {{ in {}", file.display())));
+    }
+    if paren_depth != 0 {
+        return Err(error(format!("unmatched ( in {}", file.display())));
     }
     Ok(result)
 }
@@ -912,6 +938,38 @@ mod tests {
             .expect_err("Tailwind nests this root import; validation must reject it")
             .to_string();
         assert!(message.contains("app.css"), "{css}: {message}");
+    }
+
+    #[test]
+    fn structural_tokens_inside_parentheses_are_rejected() {
+        let root = fixture();
+        for token in ['{', '}', ';'] {
+            rejected(
+                root.path(),
+                &format!("{ROOT} .x {{ a: (foo{token}bar); }}"),
+                "inside parentheses",
+                &token.to_string(),
+            );
+        }
+        rejected(
+            root.path(),
+            &format!("{ROOT} .x {{ a: (foo; }}"),
+            "inside parentheses",
+            ";",
+        );
+        rejected(
+            root.path(),
+            &format!("{ROOT} .x {{ a: foo); }}"),
+            "unmatched )",
+            ")",
+        );
+        rejected(
+            root.path(),
+            &format!("{ROOT} .x {{ a: (foo }}"),
+            "inside parentheses",
+            "}",
+        );
+        rejected(root.path(), &format!("{ROOT} a: (foo"), "unmatched (", "(");
     }
 
     #[test]

@@ -58,6 +58,7 @@ ASCII bytes outside strings and comments, and ASCII whitespace around at-rule
 arguments. `source(` outside strings and comments is reserved for the exact
 root Tailwind import, even when comments split the token. Source paths are
 literal directories beginning `./` or `../`, with no glob metacharacters.
+Parentheses must balance and cannot contain braces or semicolons.
 All inputs must remain inside the manifest directory, outside `target/`, and
 free of symlinks. Unsupported at-rules fail the build, including `@plugin`,
 `@config`, `@reference`, and `@tailwind`.

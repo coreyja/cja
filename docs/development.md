@@ -16,12 +16,12 @@ the hashed script. Tailwind inputs use `Tailwind::new("frontend/app.css", "app.c
 in `build.rs`; the input path is relative to `CARGO_MANIFEST_DIR`. The root CSS
 requires `@import "tailwindcss" source(none);` plus explicit relative directory
 `@source` rules. Local quoted `./` and `../` `.css` imports are checked
-recursively. All files and scan roots must stay inside the app directory;
-the [allow-list grammar](../crates/cja/README.md#tailwind-css-inputs) requires
+recursively. All files and scan roots must stay inside the app directory.
+Symlinks and JS config are rejected. Dangling symlinks (such as
+Emacs lock files) are ignored.
+The [allow-list grammar](../crates/cja/README.md#tailwind-css-inputs) requires
 depth-zero root directives, ASCII outside strings/comments, and literal source
-directories without globs.
-resolving symlinks and JS config are rejected. Dangling symlinks (such as
-Emacs lock files) are ignored. Tailwind skips nested `node_modules` when the
+directories without globs. Tailwind skips nested `node_modules` when the
 explicit `@source` root is outside one; an explicit root inside `node_modules`
 scans its nested directories too, so those directories are checked for symlinks.
 `cja-build` downloads and verifies the
