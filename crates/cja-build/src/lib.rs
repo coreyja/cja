@@ -847,6 +847,42 @@ mod tests {
     }
 
     #[test]
+    fn entry_outside_tsconfig_program_is_not_bundled_unchecked() {
+        // tsc --listFiles names every file it checked. An entry absent from that list was never
+        // type checked, so bundling it would ship unchecked TypeScript.
+        let root = fixture();
+        let frontend = root.path().join("frontend");
+        fs::create_dir_all(frontend.join("src")).unwrap();
+        fs::copy(
+            fixture_path("basic/tsconfig.json"),
+            frontend.join("tsconfig.json"),
+        )
+        .unwrap();
+        fs::write(frontend.join("src/util.ts"), "export const suffix = 'x';\n").unwrap();
+        // Outside `include: ["src/**/*.ts"]`; real tsc would never see this type error.
+        fs::write(
+            frontend.join("main.ts"),
+            "const answer: number = 'not checked';\nconsole.log(answer);\n",
+        )
+        .unwrap();
+        let out = root.path().join("out");
+        let result = {
+            // Release SPAWN before asserting so this pin cannot poison other tests.
+            let _guard = crate::SPAWN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            AssetsBuilder::new()
+                .entry(Entry::new("main.ts", "studio.js"))
+                .build_in(root.path(), &out, &fake_env(root.path()))
+        };
+        assert!(
+            result.is_err(),
+            "entry main.ts was bundled although tsc never listed it"
+        );
+        assert!(!out.join("cja_assets.rs").exists());
+    }
+
+    #[test]
     fn duplicate_entries_and_static_collision_fail() {
         let root = fixture_path("basic");
         let out = tempfile::tempdir().unwrap();

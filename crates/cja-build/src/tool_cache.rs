@@ -505,6 +505,31 @@ mod tests {
     }
 
     #[test]
+    fn tsc_override_does_not_replace_other_tools() {
+        // `TSC` overrides tsc only; the shared resolver is also the Tailwind path (DEV-1654).
+        // Nothing is executed here, so SPAWN is not needed.
+        let dir = tempfile::tempdir().unwrap();
+        let tsc = dir.path().join("fake-tsc");
+        fs::write(&tsc, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&tsc, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut env = env(dir.path());
+        env.override_path = Some(tsc.display().to_string());
+        let spec = file_spec(b"tailwind");
+        let resolved = resolve(&spec, &env, |_| Ok(b"tailwind".to_vec())).unwrap();
+        assert_ne!(
+            resolved,
+            tsc.canonicalize().unwrap(),
+            "TSC override leaked into {}",
+            spec.name
+        );
+        assert_eq!(fs::read(&resolved).unwrap(), b"tailwind");
+    }
+
+    #[test]
     fn checksum_mismatch_and_offline_empty_cache_fail() {
         let dir = tempfile::tempdir().unwrap();
         let spec = file_spec(b"expected");
