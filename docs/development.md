@@ -21,7 +21,9 @@ Symlinks and JS config are rejected. Dangling symlinks (such as
 Emacs lock files) are ignored.
 The [allow-list grammar](../crates/cja/README.md#tailwind-css-inputs) requires
 depth-zero root directives, ASCII outside strings/comments, and literal source
-directories without globs. Tailwind skips nested `node_modules` when the
+directories without globs. `@import` and `@source` must start statements outside
+parentheses and have a space, tab or newline after their names. Tailwind skips
+nested `node_modules` when the
 explicit `@source` root is outside one; an explicit root inside `node_modules`
 scans its nested directories too, so those directories are checked for symlinks.
 `cja-build` downloads and verifies the

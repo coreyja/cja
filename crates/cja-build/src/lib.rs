@@ -1700,6 +1700,7 @@ mod tests {
     enum Expectation {
         Emits(&'static str),
         Errors(&'static str),
+        Drops(&'static str),
     }
     enum Setup {
         None,
@@ -1711,7 +1712,26 @@ mod tests {
         css: String,
         setup: Setup,
         expectation: Expectation,
+        rejects: &'static str,
     }
+
+    const OLD_CASE_REJECTIONS: [&str; 15] = [
+        "escapes manifest directory",
+        "escapes manifest directory",
+        "escapes manifest directory",
+        "escapes manifest directory",
+        "comment inside or directly after",
+        "comment inside or directly after",
+        "comment inside or directly after",
+        "comment inside or directly after",
+        "comment inside or directly after",
+        "comment inside or directly after",
+        "comment inside or directly after",
+        "unsupported @import",
+        "non-ASCII U+FEFF",
+        "comment inside or directly after",
+        "comment inside or directly after",
+    ];
 
     fn old_corpus_cases(root_rule: &str) -> Vec<Case> {
         let old_cases = [
@@ -1775,6 +1795,7 @@ mod tests {
                 "@import \"../../secret.css\" /**/;",
                 Expectation::Emits(".cja-outside-marker{"),
             ),
+            // Tailwind itself rejects this one; retain it as a consistency case.
             (
                 "extra BOM and split import",
                 "\u{feff}@im/**/port \"../../secret.css\";",
@@ -1793,11 +1814,13 @@ mod tests {
         ];
         let cases: Vec<Case> = old_cases
             .into_iter()
-            .map(|(name, suffix, expectation)| Case {
+            .zip(OLD_CASE_REJECTIONS)
+            .map(|((name, suffix, expectation), rejects)| Case {
                 name,
                 css: format!("{root_rule} {suffix}"),
                 setup: Setup::None,
                 expectation,
+                rejects,
             })
             .collect();
         cases
@@ -1810,30 +1833,56 @@ mod tests {
                 css: "@media source(\"../../secret\") { @import \"tailwindcss\" source(none); } @source \"../src\";".into(),
                 setup: Setup::None,
                 expectation: Expectation::Emits(".italic{"),
+                rejects: "unsupported source(",
             },
             Case {
                 name: "Unicode trim mismatch",
                 css: format!("{root_rule} @import \"./a.css\"\u{0085};"),
                 setup: Setup::QuotedCss,
                 expectation: Expectation::Emits(".cja-outside-marker{"),
+                rejects: "non-ASCII U+0085",
             },
             Case {
                 name: "brace source expansion",
                 css: "@import \"tailwindcss\" source(none); @source \"../{src,../secret}\";".into(),
                 setup: Setup::BraceDirectory,
                 expectation: Expectation::Emits(".italic{"),
+                rejects: "contain no globs",
             },
             Case {
                 name: "media comment split source call",
                 css: "@media source/**/(\"../../secret\") { @import \"tailwindcss\" source(none); } @source \"../src\";".into(),
                 setup: Setup::None,
                 expectation: Expectation::Emits(".italic{"),
+                rejects: "unsupported source(",
             },
             Case {
                 name: "media comment split source name",
                 css: "@media sou/**/rce(\"../../secret\") { @import \"tailwindcss\" source(none); } @source \"../src\";".into(),
                 setup: Setup::None,
                 expectation: Expectation::Emits(".italic{"),
+                rejects: "unsupported source(",
+            },
+            Case {
+                name: "missing statement terminator before source",
+                css: "@import \"tailwindcss\" source(none);\n@custom-variant dark (&:where(.dark, .dark *))\n@source \"../src\";".into(),
+                setup: Setup::None,
+                expectation: Expectation::Drops(".underline{"),
+                rejects: "@source must start a statement",
+            },
+            Case {
+                name: "source without separator",
+                css: "@import \"tailwindcss\" source(none); @source\"../src\";".into(),
+                setup: Setup::None,
+                expectation: Expectation::Drops(".underline{"),
+                rejects: "@source must be followed",
+            },
+            Case {
+                name: "source inside semicolon parenthesis",
+                css: "@import \"tailwindcss\" source(none); @media (x; @source \"../../secret\"; ) {} @source \"../src\";".into(),
+                setup: Setup::None,
+                expectation: Expectation::Emits(".italic{"),
+                rejects: "@source must start a statement",
             },
         ]
     }
@@ -1898,9 +1947,34 @@ mod tests {
                     String::from_utf8_lossy(&result.stderr)
                 );
             }
+            Expectation::Drops(marker) => {
+                assert!(
+                    result.status.success(),
+                    "{}: Tailwind failed: {}",
+                    case.name,
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let emitted = fs::read_to_string(&output).unwrap();
+                assert!(
+                    emitted.starts_with("/*! tailwindcss v4.3.3 |"),
+                    "{}: pinned banner absent",
+                    case.name
+                );
+                assert!(
+                    !emitted.contains(marker),
+                    "{}: dropped marker {marker} was emitted",
+                    case.name
+                );
+            }
         }
-        let validation = tailwind::validate_css(&input, app, &app.join("out"));
-        assert!(validation.is_err(), "{}: bypass validated", case.name);
+        let validation = tailwind::validate_css(&input, app, &app.join("out"))
+            .expect_err(&format!("{}: bypass validated", case.name));
+        assert!(
+            validation.to_string().contains(case.rejects),
+            "{}: expected rejection {:?}, got {validation}",
+            case.name,
+            case.rejects
+        );
     }
 
     fn assert_benign_corpus(app: &Path, binary: &Path, root_rule: &str) {
@@ -1976,6 +2050,7 @@ mod tests {
         for (index, case) in cases.enumerate() {
             let case_app = corpus_app(&outer.path().join(format!("case-{index}")));
             assert_corpus_case(&case_app, &binary, index, &case);
+            println!("corpus case {} passed: {}", index + 1, case.name);
         }
         let benign_app = corpus_app(&outer.path().join("benign"));
         assert_benign_corpus(&benign_app, &binary, root_rule);
