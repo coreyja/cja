@@ -2360,13 +2360,19 @@ mod idle_gate_tests {
         }
         async fn stop(self) {
             self.token.cancel();
-            for handle in self.handles {
-                tokio::time::timeout(Duration::from_secs(10), handle)
-                    .await
-                    .expect("worker shutdown timeout")
-                    .expect("worker panic")
-                    .expect("worker error");
+            let mut all_exited_cleanly = true;
+            for mut handle in self.handles {
+                match tokio::time::timeout(Duration::from_secs(10), &mut handle).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(_) => all_exited_cleanly = false,
+                    Err(_) => {
+                        handle.abort();
+                        let _ = handle.await;
+                        all_exited_cleanly = false;
+                    }
+                }
             }
+            assert!(all_exited_cleanly, "worker shutdown failed");
         }
     }
 
@@ -2556,37 +2562,58 @@ mod idle_gate_tests {
             ..Default::default()
         };
         let first_token = CancellationToken::new();
-        let first = tokio::spawn(job_worker(
+        let mut first = Some(tokio::spawn(job_worker(
             state.clone(),
             Jobs,
             Duration::from_secs(5),
             20,
             first_token.clone(),
             config.clone(),
-        ));
-        until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 1).await;
+        )));
         let second_token = CancellationToken::new();
-        let second = tokio::spawn(job_worker(
-            state,
-            Jobs,
-            Duration::from_secs(5),
-            20,
-            second_token.clone(),
-            config,
-        ));
-        until(|| gate.0.probe.waiting.load(SeqCst) == 1).await;
+        let mut second = None;
+        let result = std::panic::AssertUnwindSafe(async {
+            until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 1).await;
+            second = Some(tokio::spawn(job_worker(
+                state,
+                Jobs,
+                Duration::from_secs(5),
+                20,
+                second_token.clone(),
+                config,
+            )));
+            until(|| gate.0.probe.waiting.load(SeqCst) == 1).await;
+            first_token.cancel();
+            tokio::time::timeout(Duration::from_secs(1), first.as_mut().unwrap())
+                .await
+                .expect("holder exits promptly")
+                .unwrap()
+                .unwrap();
+            first.take();
+            until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 2).await;
+            second_token.cancel();
+            tokio::time::timeout(Duration::from_secs(1), second.as_mut().unwrap())
+                .await
+                .expect("waiter exits promptly")
+                .unwrap()
+                .unwrap();
+            second.take();
+            assert_eq!(gate.0.probe.waiting.load(SeqCst), 0);
+            assert_eq!(gate.0.probe.in_flight_periodic.load(SeqCst), 0);
+        })
+        .catch_unwind()
+        .await;
         first_token.cancel();
-        let first_exit = tokio::time::timeout(Duration::from_secs(1), first).await;
-        until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 2).await;
         second_token.cancel();
-        let second_exit = tokio::time::timeout(Duration::from_secs(1), second).await;
-        first_exit.expect("holder exits promptly").unwrap().unwrap();
-        second_exit
-            .expect("waiter exits promptly")
-            .unwrap()
-            .unwrap();
-        assert_eq!(gate.0.probe.waiting.load(SeqCst), 0);
-        assert_eq!(gate.0.probe.in_flight_periodic.load(SeqCst), 0);
+        Workers {
+            token: first_token,
+            handles: first.into_iter().chain(second).collect(),
+        }
+        .stop()
+        .await;
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[sqlx::test]
@@ -2666,18 +2693,27 @@ mod idle_gate_tests {
                 ..Default::default()
             },
         ));
-        until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 1).await;
-        let held = pool.acquire().await.unwrap();
-        until(|| gate.0.probe.in_flight_periodic.load(SeqCst) == 1).await;
-        token.cancel();
-        drop(held);
-        tokio::time::timeout(Duration::from_secs(1), worker)
+        let workers = Workers {
+            token: token.clone(),
+            handles: vec![worker],
+        };
+        with_workers(workers, async {
+            until(|| gate.0.probe.empty_periodic.load(SeqCst) >= 1).await;
+            let held = pool.acquire().await.unwrap();
+            until(|| gate.0.probe.in_flight_periodic.load(SeqCst) == 1).await;
+            token.cancel();
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while gate.0.periodic_claims.available_permits() != 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .expect("blocked claim cancellation exits")
-            .unwrap()
-            .unwrap();
-        assert_eq!(gate.0.probe.in_flight_periodic.load(SeqCst), 0);
-        assert_eq!(gate.0.periodic_claims.available_permits(), 1);
+            .expect("blocked claim releases permit promptly");
+            assert_eq!(gate.0.probe.in_flight_periodic.load(SeqCst), 0);
+            assert_eq!(gate.0.periodic_claims.available_permits(), 1);
+        })
+        .await;
     }
 
     #[sqlx::test]
@@ -2709,6 +2745,11 @@ mod idle_gate_tests {
             token.clone(),
             config,
         ));
+        let workers = Workers {
+            token,
+            handles: vec![first, second],
+        };
+        with_workers(workers, async {
         let retry_id = insert_sql(&db, "retry", "0.5 seconds", None).await;
         sqlx::query("UPDATE jobs SET error_count = 1, last_error_message = 'previous attempt failed' WHERE job_id = $1")
             .bind(retry_id).execute(&db).await.unwrap();
@@ -2728,13 +2769,11 @@ mod idle_gate_tests {
                 .await
                 .unwrap();
         state.release.notify_waiters();
-        token.cancel();
-        first.await.unwrap().unwrap();
-        second.await.unwrap().unwrap();
         assert_eq!(early, 0);
         result.expect("periodic discovery of retry and lease");
         assert_eq!(row.0, 1);
         assert!(row.1.starts_with("Job lease expired"));
+        }).await;
     }
 
     #[sqlx::test]
@@ -2742,14 +2781,16 @@ mod idle_gate_tests {
         setup(&db).await;
         let state = make_state(db.clone(), IdlePollGate::new(NonZeroUsize::new(1).unwrap()));
         let workers = Workers::start(&state, 1, Duration::from_millis(100), false);
-        insert_sql(&db, "none", "0 seconds", None).await;
-        let result = tokio::time::timeout(Duration::from_secs(1), async {
-            while started(&db).await == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        with_workers(workers, async {
+            insert_sql(&db, "none", "0 seconds", None).await;
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                while started(&db).await == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            result.expect("ungated polling should discover direct SQL");
         })
         .await;
-        workers.stop().await;
-        result.expect("ungated polling should discover direct SQL");
     }
 }
