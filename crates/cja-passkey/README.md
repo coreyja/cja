@@ -18,13 +18,30 @@ The router mounts these routes at its merge path:
 | `POST /auth/finish` | WebAuthn assertion credential JSON | `200` on success |
 | `POST /auth/discoverable/start` | No body required (the JS client sends `{}`) | WebAuthn assertion challenge with empty `allowCredentials` and a top-level `mediation: "conditional"` hint |
 | `POST /auth/discoverable/finish` | WebAuthn assertion credential JSON, including `response.userHandle` | `200` on success |
-| `GET /passkey-client.js` | None | Bundled browser client JavaScript |
 
 Registration requests `residentKey: "preferred"` and
 `requireResidentKey: false`. This encourages discoverable credentials on capable
 authenticators while allowing older or nonresident security keys to register.
 The discoverable chooser may omit a nonresident credential; users can still sign
 in through the username path.
+
+Mount the library manifest with any app manifest in one root asset router call,
+before applying state:
+
+```rust
+.merge(cja::assets::router::<AppState>(&[
+    &app_assets::MANIFEST,
+    &cja_passkey::passkey_assets::MANIFEST,
+])?)
+```
+
+Render `<script src>` with
+`cja_passkey::passkey_assets::asset_url("passkey-client.js")`. The resulting
+content-hashed JS and its external source map are embedded and served with
+immutable cache headers. The `passkey_router` serves only authentication
+endpoints. A Cargo build type checks and bundles the client using native tsc
+and Rolldown; the first build may download pinned tsc into the shared cja cache.
+Node and pnpm are needed only for browser E2E tests.
 
 The browser client exposes `cjaPasskey.createPasskeyClient(basePath)`. The
 default `basePath` is empty; pass the router's mount prefix when needed. Call
@@ -49,14 +66,12 @@ revision. Calling `.login({ username })` now silently ignores the argument and
 starts discoverable login.
 
 To run the real Chromium test locally, supply a PostgreSQL master database URL
-whose role can create databases, then install the two separate pnpm packages:
+whose role can create databases, then install the E2E pnpm package:
 
 ```sh
-cd crates/cja-passkey/frontend && pnpm install --frozen-lockfile && pnpm check && pnpm build
-cd ../e2e && pnpm install --frozen-lockfile && pnpm check && pnpm exec playwright install chromium
+cd crates/cja-passkey/e2e && pnpm install --frozen-lockfile && pnpm check && pnpm exec playwright install chromium
 cd ../../..
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/test_db \
-  CJA_PASSKEY_STRICT_FRONTEND_BUILD=1 \
   cargo test -p cja-passkey --test browser_fixture -- --ignored --nocapture
 ```
 

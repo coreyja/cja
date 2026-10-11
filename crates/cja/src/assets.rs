@@ -22,12 +22,13 @@ pub struct Asset {
 
 /// Assets owned by a single app or library crate.
 pub struct Manifest {
+    pub owner: &'static str,
     pub entries: &'static [Asset],
 }
 
 impl Manifest {
-    pub const fn new(entries: &'static [Asset]) -> Self {
-        Self { entries }
+    pub const fn new(owner: &'static str, entries: &'static [Asset]) -> Self {
+        Self { owner, entries }
     }
 
     /// Resolve only within this manifest's logical namespace.
@@ -49,16 +50,27 @@ impl Manifest {
 pub enum AssetError {
     Collision {
         url: String,
-        first: &'static str,
-        second: &'static str,
+        first_owner: &'static str,
+        first_logical_name: &'static str,
+        second_owner: &'static str,
+        second_logical_name: &'static str,
     },
 }
 
 impl fmt::Display for AssetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Collision { url, first, second } => {
-                write!(f, "asset URL collision at {url}: {first} and {second}")
+            Self::Collision {
+                url,
+                first_owner,
+                first_logical_name,
+                second_owner,
+                second_logical_name,
+            } => {
+                write!(
+                    f,
+                    "asset URL collision at {url}: {first_owner} ({first_logical_name}) and {second_owner} ({second_logical_name})"
+                )
             }
         }
     }
@@ -81,11 +93,11 @@ where
     for manifest in manifests {
         for asset in manifest.entries {
             let hashed_url = format!("/assets/{}", asset.hashed_name);
-            register(&mut paths, &hashed_url, asset.logical_name)?;
+            register(&mut paths, &hashed_url, manifest.owner, asset.logical_name)?;
             registrations.push((hashed_url, asset, IMMUTABLE_CACHE));
             if STABLE_ROOT_FILES.contains(&asset.logical_name) {
                 let stable_url = format!("/{}", asset.logical_name);
-                register(&mut paths, &stable_url, asset.logical_name)?;
+                register(&mut paths, &stable_url, manifest.owner, asset.logical_name)?;
                 registrations.push((stable_url, asset, STABLE_CACHE));
             }
         }
@@ -109,15 +121,20 @@ where
 }
 
 fn register(
-    paths: &mut HashMap<String, &'static str>,
+    paths: &mut HashMap<String, (&'static str, &'static str)>,
     url: &str,
+    owner: &'static str,
     logical_name: &'static str,
 ) -> Result<(), AssetError> {
-    if let Some(first) = paths.insert(url.to_owned(), logical_name) {
+    if let Some((first_owner, first_logical_name)) =
+        paths.insert(url.to_owned(), (owner, logical_name))
+    {
         return Err(AssetError::Collision {
             url: url.to_owned(),
-            first,
-            second: logical_name,
+            first_owner,
+            first_logical_name,
+            second_owner: owner,
+            second_logical_name: logical_name,
         });
     }
     Ok(())
@@ -130,8 +147,10 @@ macro_rules! include_assets {
         pub mod $name {
             use $crate::assets::{Asset, Manifest};
 
-            pub static MANIFEST: Manifest =
-                Manifest::new(&include!(concat!(env!("OUT_DIR"), "/cja_assets.rs")));
+            pub static MANIFEST: Manifest = Manifest::new(
+                env!("CARGO_PKG_NAME"),
+                &include!(concat!(env!("OUT_DIR"), "/cja_assets.rs")),
+            );
 
             #[track_caller]
             pub fn asset_url(logical_name: &str) -> String {

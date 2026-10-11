@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use cja::app_state::AppState;
 use cja::server::session::{AppSession, Session};
 use cja_passkey::config::HasPasskeyConfig;
-use cja_passkey::{CurrentUser, PasskeyConfig, PasskeySession};
+use cja_passkey::{CurrentUser, PasskeyConfig, PasskeySession, passkey_assets};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 use url::Url;
@@ -168,37 +168,47 @@ async fn mutate(
     axum::http::StatusCode::NO_CONTENT
 }
 
-async fn page() -> axum::response::Html<&'static str> {
-    axum::response::Html(
+async fn page() -> axum::response::Html<String> {
+    axum::response::Html(format!(
         r#"<!doctype html><html><body>
 <button id="register" onclick="run('register')">Register</button>
 <button id="login" onclick="run('login')">Login</button>
 <button id="named" onclick="run('loginWithUsername')">Named login</button>
-<script src="/passkey-client.js"></script>
+<script src="{}"></script>
 <script>
 const client = cjaPasskey.createPasskeyClient();
-window.run = async (method) => {
-  try {
+window.run = async (method) => {{
+  try {{
     const result = method === 'register'
-      ? await client.register({username: window.username})
+      ? await client.register({{username: window.username}})
       : method === 'loginWithUsername'
-        ? await client.loginWithUsername({username: window.username})
+        ? await client.loginWithUsername({{username: window.username}})
         : await client.login();
-    window.outcome = {ok: true, result};
-  } catch (e) { window.outcome = {ok: false, error: String(e)}; }
-};
+    window.outcome = {{ok: true, result}};
+  }} catch (e) {{ window.outcome = {{ok: false, error: String(e)}}; }}
+}};
 </script></body></html>"#,
-    )
+        passkey_assets::asset_url("passkey-client.js"),
+    ))
 }
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL, pnpm, and Chromium"]
 async fn discoverable_browser_round_trip() {
+    let manifest = &passkey_assets::MANIFEST;
     assert!(
-        cja_passkey::passkey_js().contains("loginWithUsername")
-            && cja_passkey::passkey_js().contains("/auth/discoverable/start"),
-        "embedded JS is a placeholder or lacks the discoverable API"
+        manifest
+            .entries
+            .iter()
+            .any(|asset| asset.logical_name == "passkey-client.js")
     );
+    assert!(
+        manifest
+            .entries
+            .iter()
+            .any(|asset| asset.logical_name == "passkey-client.js.map")
+    );
+    assert!(passkey_assets::asset_url("passkey-client.js").starts_with("/assets/passkey-client."));
     let name = format!("cja_passkey_browser_{}", Uuid::new_v4().simple());
     let admin = PgPoolOptions::new()
         .max_connections(1)
@@ -233,6 +243,10 @@ async fn discoverable_browser_round_trip() {
         passkey: PasskeyConfig::new("localhost", &Url::parse(&origin).unwrap()).unwrap(),
     };
     let app = axum::Router::new()
+        .merge(
+            cja::assets::router::<TestState>(&[&passkey_assets::MANIFEST])
+                .expect("passkey asset router"),
+        )
         .merge(cja_passkey::passkey_router::<TestState>())
         .route("/", get(page))
         .route("/me", get(me))
