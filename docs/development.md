@@ -6,6 +6,15 @@
 - **PostgreSQL** — any recent version
 - **systemfd** (optional) — for zero-downtime hot reload during development
 
+The example app's TypeScript builds without Node. `cja-build` downloads a
+SHA-256-verified native TypeScript 7.0.2 executable on first use, then reuses
+`$XDG_CACHE_HOME/cja` or `~/.cache/cja` across worktrees and `cargo clean`.
+Set `TSC` to an executable path or command to override it. An offline cold
+build fails with installation instructions; use a verified warm cache or set
+`TSC` for `CARGO_NET_OFFLINE=true`. The source map is served as JSON beside
+the hashed script. Cargo reruns the build script when frontend inputs change;
+there is no live reload of embedded assets without a rebuild.
+
 ## Setup
 
 ```bash

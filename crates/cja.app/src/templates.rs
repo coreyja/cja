@@ -18,6 +18,7 @@ fn base_layout(title: &str, content: &Markup) -> Markup {
                 link rel="preconnect" href="https://fonts.gstatic.com" crossorigin;
                 link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
                 link rel="stylesheet" href=(crate::site_assets::asset_url("style.css"));
+                script defer src=(crate::site_assets::asset_url("studio.js")) {}
             }
             body {
                 (content)
@@ -303,5 +304,26 @@ mod tests {
         let html = super::landing_page().into_string();
         assert!(html.contains(&crate::site_assets::asset_url("style.css")));
         assert!(html.contains(&crate::site_assets::asset_url("favicon.svg")));
+        assert!(html.contains(&crate::site_assets::asset_url("studio.js")));
+        let js = crate::site_assets::MANIFEST
+            .entries
+            .iter()
+            .find(|asset| asset.logical_name == "studio.js")
+            .unwrap();
+        let map = crate::site_assets::MANIFEST
+            .entries
+            .iter()
+            .find(|asset| asset.logical_name == "studio.js.map")
+            .unwrap();
+        let js_text = std::str::from_utf8(js.bytes).unwrap();
+        assert!(js_text.contains("studio.ts-ready"));
+        assert!(js_text.contains("sourceMappingURL=studio.js."));
+        assert_eq!(map.content_type, "application/json");
+        let map_json: serde_json::Value = serde_json::from_slice(map.bytes).unwrap();
+        assert!(
+            map_json["sourcesContent"]
+                .as_array()
+                .is_some_and(|sources| !sources.is_empty())
+        );
     }
 }

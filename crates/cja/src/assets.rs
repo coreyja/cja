@@ -33,11 +33,13 @@ impl Manifest {
     /// Resolve only within this manifest's logical namespace.
     #[track_caller]
     pub fn asset_url(&self, logical_name: &str) -> String {
-        let asset = self
+        let Some(asset) = self
             .entries
             .iter()
             .find(|asset| asset.logical_name == logical_name)
-            .unwrap_or_else(|| panic!("unknown asset: {logical_name}"));
+        else {
+            panic!("unknown asset: {logical_name}");
+        };
         format!("/assets/{}", asset.hashed_name)
     }
 }

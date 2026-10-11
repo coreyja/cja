@@ -1,14 +1,20 @@
 # Architecture
 
-## Embedded static assets
+## Embedded frontend assets
 
-An app's `build.rs` calls `cja-build` with its `assets/` directory. The builder
-hashes final bytes with SHA-256, writes hashed copies under its owned
+An app's `build.rs` calls `cja-build` with optional `assets/` static files and
+TypeScript/JavaScript entries from `frontend/`. Native tsc checks the
+`tsconfig.json` once and Rolldown bundles each entry into a minified IIFE (or
+single-chunk ESM) with an external source map. The builder hashes final bytes
+with SHA-256, writes hashed copies under its owned
 `OUT_DIR/cja-assets/`, and generates `OUT_DIR/cja_assets.rs` last. The
 `cja::include_assets!` macro embeds those bytes and exposes a manifest plus
 scoped logical-name lookup. At startup, `cja::assets::router` validates all
 manifest URLs and registers concrete Axum routes. A source change reruns the
-build script; serving never reads an asset from disk.
+build script; serving never reads an asset from disk. Cargo watches the static
+root, frontend root, tsconfig chain, tsc-listed app files and ambient
+declarations, and Rolldown's resolved files. Source map labels are relative to
+the frontend root and contain `sourcesContent`.
 
 CJA is organized as three subsystems — Cron, Jobs, and Axum (HTTP server) — plus supporting modules for sessions, tracing, and database management. Everything coordinates through a shared `AppState` trait and `CancellationToken` for graceful shutdown.
 
@@ -18,6 +24,7 @@ CJA is organized as three subsystems — Cron, Jobs, and Axum (HTTP server) — 
 Cargo.toml          — Workspace root, clippy/lint config
 crates/
   cja/              — Core framework library
+  cja-build/        — Compile-time static hashing, type checking, and bundling
   cja.app/          — Example application (canonical usage reference)
   cli/              — `cja` CLI tool (project scaffolding)
 migrations/         — Copy of crates/cja/migrations/ for sqlx CLI
