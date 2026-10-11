@@ -6,7 +6,7 @@ COPY . .
 RUN cargo build --release --package cja-site
 
 # Build rustdoc (no --release needed — output goes to target/doc/ regardless)
-RUN RUSTDOCFLAGS="--html-in-header crates/cja.app/assets/docs-header.html" \
+RUN RUSTDOCFLAGS="--html-in-header crates/cja.app/docs-header.html" \
     cargo doc --no-deps --package cja
 
 FROM debian:bookworm-slim

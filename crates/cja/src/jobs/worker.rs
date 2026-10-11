@@ -268,7 +268,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                         let sent_at = tokio::time::Instant::now();
                         next_tick = sent_at + self.config.heartbeat_interval;
                         #[cfg(test)]
-                        if self.fail_heartbeats.fetch_update(
+                        if self.fail_heartbeats.try_update(
                             std::sync::atomic::Ordering::SeqCst,
                             std::sync::atomic::Ordering::SeqCst,
                             |n| n.checked_sub(1),

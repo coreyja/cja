@@ -162,6 +162,7 @@
 //! ```
 
 pub use eyes_subscriber;
+pub mod assets;
 pub use sqlx;
 pub use uuid;
 

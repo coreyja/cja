@@ -13,11 +13,11 @@ fn base_layout(title: &str, content: &Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="description" content="CJA is a Rust web framework with database-backed background jobs, cron scheduling, and a production-ready Axum server.";
                 title { (title) }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
+                link rel="icon" type="image/svg+xml" href=(crate::site_assets::asset_url("favicon.svg"));
                 link rel="preconnect" href="https://fonts.googleapis.com";
                 link rel="preconnect" href="https://fonts.gstatic.com" crossorigin;
                 link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
-                link rel="stylesheet" href="/style.css";
+                link rel="stylesheet" href=(crate::site_assets::asset_url("style.css"));
             }
             body {
                 (content)
