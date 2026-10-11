@@ -75,6 +75,12 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
+      - name: Cache native cja tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cja
+          key: cja-tools-${{ runner.os }}-${{ runner.arch }}-tsc-7.0.2
+
       - name: Run clippy
         run: cargo clippy --all-targets ${{ matrix.features-args }} -- -D warnings
         continue-on-error: ${{ inputs.rust-version == 'nightly' }}

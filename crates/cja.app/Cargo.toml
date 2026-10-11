@@ -38,3 +38,6 @@ workspace = true
 
 [build-dependencies]
 cja-build = { path = "../cja-build" }
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -40,6 +40,38 @@ jobs:
       - name: Run cargo deny
         run: cargo deny check bans
 
+  native-tsc:
+    name: Native TypeScript and warm rerun
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set isolated build paths
+        run: |
+          {
+            echo "XDG_CACHE_HOME=$RUNNER_TEMP/cja-cold-cache"
+            echo "CARGO_BUILD_BUILD_DIR=$RUNNER_TEMP/cja-native-build"
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cja-native-target"
+          } >> "$GITHUB_ENV"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - name: Run real TypeScript tests from a cold cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$XDG_CACHE_HOME/cja"
+          cargo test -p cja-build --lib real_tsc_ -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/tsc-tests.log"
+          grep -q '2 passed; 0 failed' "$RUNNER_TEMP/tsc-tests.log"
+          test -f "$XDG_CACHE_HOME/cja/tsc-7.0.2-linux-x64/.sha256"
+      - name: Verify warm rerun on a new ambient declaration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p cja-build --test rerun warm_add_ambient_declaration -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/rerun-tests.log"
+          grep -q '1 passed; 0 failed' "$RUNNER_TEMP/rerun-tests.log"
+
   passkey-browser:
     name: Passkey browser
     runs-on: ubuntu-latest

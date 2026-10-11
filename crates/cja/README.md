@@ -5,16 +5,38 @@
 A Rust web framework that combines background job processing, cron scheduling,
 and an HTTP server built on [Axum](https://docs.rs/axum).
 
-## Embedded static assets
+## Embedded frontend assets
 
 Add `cja-build = { git = "https://github.com/coreyja/cja", rev = "<same rev as cja>" }` under `[build-dependencies]` and
 put files in `assets/`. Pin `cja-build` and `cja` to the same revision. The build script is:
 
 ```rust
 fn main() -> Result<(), cja_build::BuildError> {
-    cja_build::AssetsBuilder::new("assets").build()
+    cja_build::AssetsBuilder::new()
+        .static_dir("assets")
+        .entry(cja_build::Entry::new("src/studio.ts", "studio.js"))
+        .build()
 }
 ```
+
+Entries are relative to `frontend/` by default; `.frontend_dir(path)` changes
+that root. A TypeScript entry requires `frontend/tsconfig.json`. Start with
+`{"compilerOptions":{"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true,"allowImportingTsExtensions":true,"lib":["ES2022","DOM"],"types":[]},"include":["src/**/*.ts"]}`.
+Every entry must belong to the tsconfig program. Include each TypeScript entry
+through `include` or `files`; for JavaScript entries, also enable `allowJs`.
+`cja-build` runs native TypeScript 7.0.2 for type checking, then Rolldown for
+minified IIFE bundles and external source maps. No Node installation is needed.
+Imports must be relative and stay inside the frontend directory; `node_modules`, CSS, and
+dynamic imports are rejected. Each ESM entry (`.format(EntryFormat::Esm)`) must
+remain one self-contained chunk. For an IIFE export, set
+`.format(EntryFormat::Iife { global_name: Some("cjaPasskey".into()) })`.
+
+The native tsc resolves through `TSC`, the shared `$XDG_CACHE_HOME/cja` cache
+(or `~/.cache/cja`), then a pinned HTTPS download verified by SHA-256. Set
+`CARGO_NET_OFFLINE=true` only with a verified cache or `TSC` override. Type or
+bundle errors fail `cargo build`. Cargo reruns the build for config, source,
+declaration, and static changes. Source map `sources` are frontend-relative
+labels with embedded `sourcesContent`, not served source URLs.
 
 At module scope, call `cja::include_assets!(site_assets)`. Use
 `site_assets::asset_url("img/logo.svg")` for a scoped logical-name lookup; an

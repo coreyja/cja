@@ -43,6 +43,13 @@ static APP_ASSETS: [Asset; 5] = [
     },
 ];
 static APP: Manifest = Manifest::new(&APP_ASSETS);
+static MAP_ASSETS: [Asset; 1] = [Asset {
+    logical_name: "studio.js.map",
+    hashed_name: "studio.js.abc12345.map",
+    content_type: "application/json",
+    bytes: br#"{"version":3,"sources":[],"mappings":""}"#,
+}];
+static MAP: Manifest = Manifest::new(&MAP_ASSETS);
 static LIB_ASSETS: [Asset; 1] = [Asset {
     logical_name: "style.css",
     hashed_name: "lib.abc12345.css",
@@ -105,12 +112,14 @@ async fn serves_hashed_assets_and_stable_alias() {
 
 #[tokio::test]
 async fn unknown_and_unhashed_paths_are_404() {
-    let app = cja::assets::router::<()>(&[&APP]).unwrap();
+    let app = cja::assets::router::<()>(&[&APP, &MAP]).unwrap();
     for path in [
         "/assets/style.css",
         "/assets/style.deadbeef.css",
         "/favicon.ico",
         "/assets/unknown",
+        "/assets/studio.js.map",
+        "/assets/studio.js.deadbeef.map",
     ] {
         let response = app
             .clone()
@@ -126,11 +135,48 @@ async fn unknown_and_unhashed_paths_are_404() {
     }
 }
 
+#[tokio::test]
+async fn source_map_has_json_mime_and_immutable_cache() {
+    let app = cja::assets::router::<()>(&[&MAP]).unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/assets/studio.js.abc12345.map")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    assert_eq!(
+        response.headers()[CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
+}
+
 #[test]
 fn lookup_is_scoped_and_missing_name_panics() {
     assert_eq!(APP.asset_url("style.css"), "/assets/style.abc12345.css");
     assert_eq!(LIB.asset_url("style.css"), "/assets/lib.abc12345.css");
+    static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = HOOK.lock().unwrap();
+    let old_hook = std::panic::take_hook();
+    let location = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured = location.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        *captured.lock().unwrap() = info.location().map(|l| l.file().to_owned());
+    }));
     let panic = std::panic::catch_unwind(|| APP.asset_url("missing.png")).unwrap_err();
+    std::panic::set_hook(old_hook);
+    assert!(
+        location
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap_or("")
+            .ends_with("crates/cja/tests/assets.rs")
+    );
     let message = panic
         .downcast_ref::<String>()
         .expect("String panic payload");

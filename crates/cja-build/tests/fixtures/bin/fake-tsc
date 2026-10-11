@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+for arg do config="$arg"; done
+root=$(dirname "$config")
+if grep -r -q TYPE_ERROR "$root/src"; then
+  printf '%s\n' "$root/src/main.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'."
+  exit 2
+fi
+find "$root/src" -type f \( -name '*.ts' -o -name '*.d.ts' \) -print
+if [ -d "$root/../types" ]; then
+  find "$root/../types" -type f -name '*.d.ts' -print
+fi
