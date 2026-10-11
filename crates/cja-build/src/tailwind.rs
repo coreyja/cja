@@ -26,13 +26,150 @@ struct VisitState {
     watches: Vec<PathBuf>,
 }
 
-// Mirror Tailwind v4.3.3 css-parser escapes, escape-aware comments, strings,
-// and comments dropped from the statement buffer. Any mismatch fails closed:
-// unterminated strings/comments are errors, and a comment in an at-rule name
-// could join fragments into a directive we would otherwise miss.
+// This allow-list grammar is a strict subset of Tailwind CSS, not a mirror of
+// its parser. Only import and source may add input-graph edges; all other
+// allowed rules must be file-free and cannot take source(...).
+// at-rule        consumer or reason allowed
+// import         cja.app/eyes; confined CSS or exact Tailwind root import
+// source         cja.app/eyes; explicit top-level directories
+// media          cja.app/eyes; no file/path input
+// supports       no file/path input
+// layer          no file/path input
+// keyframes      cja.app; no file/path input
+// font-face      no file/path input
+// theme          no file/path input
+// utility        no file/path input
+// variant        no file/path input
+// custom-variant no file/path input
+// apply          no file/path input
+// container      no file/path input
+// property       no file/path input
+// starting-style no file/path input
+// page           no file/path input
+// charset        no file/path input
+const ALLOWED_RULES: &[&str] = &[
+    "import",
+    "source",
+    "media",
+    "supports",
+    "layer",
+    "keyframes",
+    "font-face",
+    "theme",
+    "utility",
+    "variant",
+    "custom-variant",
+    "apply",
+    "container",
+    "property",
+    "starting-style",
+    "page",
+    "charset",
+];
+
+const EXCLUDED_RULES: &[&str] = &["plugin", "config", "reference", "tailwind"];
+
+fn ascii_trim(text: &str) -> &str {
+    text.trim_matches([' ', '\t', '\n', '\r', '\u{000c}'])
+}
+
+fn line_number(css: &str, pos: usize) -> usize {
+    css[..pos].match_indices('\n').count() + 1
+}
+
+fn readable_byte(byte: Option<&u8>) -> String {
+    match byte {
+        None => "<EOF>".to_owned(),
+        Some(byte) if byte.is_ascii_graphic() || *byte == b' ' => char::from(*byte).to_string(),
+        Some(byte) => format!("\\x{byte:02X}"),
+    }
+}
+
+fn non_ascii(css: &str, pos: usize, file: &Path) -> BuildError {
+    let token = css
+        .get(pos..)
+        .and_then(|tail| tail.chars().next())
+        .map_or_else(
+            || format!("0x{:02X}", css.as_bytes()[pos]),
+            |ch| format!("U+{:04X}", u32::from(ch)),
+        );
+    error(format!(
+        "non-ASCII {token} outside CSS string/comment in {}",
+        file.display()
+    ))
+}
+
+fn skip_escape(css: &str, pos: usize, file: &Path) -> Result<usize, BuildError> {
+    let bytes = css.as_bytes();
+    if bytes.get(pos + 1).is_some_and(|byte| !byte.is_ascii()) {
+        return Err(non_ascii(css, pos + 1, file));
+    }
+    Ok((pos + 2).min(bytes.len()))
+}
+
+// Tailwind elides comments between tokens, including inside source/**/(.
+fn source_token(bytes: &[u8], pos: usize, file: &Path) -> Result<bool, BuildError> {
+    if !bytes[pos].eq_ignore_ascii_case(&b's') {
+        return Ok(false);
+    }
+    let mut cursor = pos;
+    for letter in b"source(" {
+        while bytes[cursor..].starts_with(b"/*") {
+            cursor = skip_comment(bytes, cursor, file)?;
+        }
+        if !bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.eq_ignore_ascii_case(letter))
+        {
+            return Ok(false);
+        }
+        cursor += 1;
+    }
+    Ok(true)
+}
+
+fn reject_source_token(bytes: &[u8], pos: usize, file: &Path) -> Result<(), BuildError> {
+    if source_token(bytes, pos, file)? {
+        return Err(error(format!(
+            "unsupported source( in {}: only the root Tailwind import may use source(none)",
+            file.display()
+        )));
+    }
+    Ok(())
+}
+
+fn reject_source_in_statement(
+    bytes: &[u8],
+    mut pos: usize,
+    end: usize,
+    file: &Path,
+) -> Result<(), BuildError> {
+    while pos < end {
+        if bytes[pos..].starts_with(b"/*") {
+            pos = skip_comment(bytes, pos, file)?;
+        } else if matches!(bytes[pos], b'\'' | b'"') {
+            pos = skip_string(bytes, pos, file)?;
+        } else if bytes[pos] == b'\\' {
+            pos = (pos + 2).min(end);
+        } else {
+            reject_source_token(bytes, pos, file)?;
+            pos += 1;
+        }
+    }
+    Ok(())
+}
+
 fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
     let bytes = css.as_bytes();
-    let mut pos = 0;
+    let mut pos = if bytes.starts_with(b"\xef\xbb\xbf") {
+        3
+    } else {
+        0
+    };
+    let mut depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut statement_has_content = false;
+    let mut custom_closers: Option<Vec<u8>> = None;
     let mut result = Directives::default();
     while pos < bytes.len() {
         if bytes[pos..].starts_with(b"/*") {
@@ -41,16 +178,113 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         }
         if matches!(bytes[pos], b'\'' | b'"') {
             pos = skip_string(bytes, pos, file)?;
+            statement_has_content = true;
             continue;
         }
         if bytes[pos] == b'\\' {
-            pos = (pos + 2).min(bytes.len());
+            pos = skip_escape(css, pos, file)?;
+            statement_has_content = true;
             continue;
         }
-        if bytes[pos] != b'@' {
+        if !bytes[pos].is_ascii() {
+            return Err(non_ascii(css, pos, file));
+        }
+        reject_source_token(bytes, pos, file)?;
+        if let Some(closers) = custom_closers.as_mut() {
+            let byte = bytes[pos];
+            if byte == b'@' {
+                return Err(error(format!(
+                    "at-rule inside custom property value in {}:{}: @",
+                    file.display(),
+                    line_number(css, pos)
+                )));
+            }
+            if let Some(closer) = match byte {
+                b'(' => Some(b')'),
+                b'[' => Some(b']'),
+                b'{' => Some(b'}'),
+                _ => None,
+            } {
+                closers.push(closer);
+            } else if matches!(byte, b')' | b']' | b'}') {
+                if closers.last() == Some(&byte) {
+                    closers.pop();
+                } else if !closers.is_empty() {
+                    return Err(error(format!(
+                        "mismatched {} inside custom property value in {}:{}",
+                        char::from(byte),
+                        file.display(),
+                        line_number(css, pos)
+                    )));
+                } else if byte == b'}' {
+                    custom_closers = None;
+                    continue;
+                }
+            } else if byte == b';' && closers.is_empty() {
+                custom_closers = None;
+                statement_has_content = false;
+            }
             pos += 1;
             continue;
         }
+        if !statement_has_content && bytes[pos..].starts_with(b"--") {
+            custom_closers = Some(Vec::new());
+            statement_has_content = true;
+            pos += 2;
+            continue;
+        }
+        if bytes[pos] == b'(' {
+            paren_depth += 1;
+            statement_has_content = true;
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b')' {
+            if paren_depth == 0 {
+                return Err(error(format!("unmatched ) in {}", file.display())));
+            }
+            paren_depth -= 1;
+            statement_has_content = true;
+            pos += 1;
+            continue;
+        }
+        // Tailwind does not treat these as structure inside parentheses.
+        // Reject them so our brace depth cannot diverge from Tailwind's.
+        if paren_depth != 0 && matches!(bytes[pos], b'{' | b'}') {
+            return Err(error(format!(
+                "unsupported {} inside parentheses in {}",
+                char::from(bytes[pos]),
+                file.display()
+            )));
+        }
+        if bytes[pos] == b'{' {
+            depth += 1;
+            statement_has_content = false;
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b'}' {
+            if depth == 0 {
+                return Err(error(format!("unmatched }} in {}", file.display())));
+            }
+            depth -= 1;
+            statement_has_content = false;
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] != b'@' {
+            if bytes[pos] == b';' && paren_depth == 0 {
+                statement_has_content = false;
+            } else if !(matches!(bytes[pos], b' ' | b'\t' | b'\n')
+                || bytes[pos] == b'\r' && bytes.get(pos + 1) == Some(&b'\n'))
+            {
+                statement_has_content = true;
+            }
+            pos += 1;
+            continue;
+        }
+        // Tailwind recognizes at-rules even inside parentheses after a semicolon.
+        // Keep recognizing every @ here or a nested input-graph edge can escape us.
         let start = pos + 1;
         let mut end = start;
         while end < bytes.len() && (bytes[end].is_ascii_alphabetic() || bytes[end] == b'-') {
@@ -58,18 +292,55 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         }
         if bytes[end..].starts_with(b"/*") {
             return Err(error(format!(
-                "comment inside or directly after an at-rule name is unsupported in {}",
-                file.display()
+                "comment inside or directly after an at-rule name is unsupported in {}: @{}/*",
+                file.display(),
+                &css[start..end],
             )));
+        }
+        if bytes.get(start).is_some_and(|byte| !byte.is_ascii()) {
+            return Err(non_ascii(css, start, file));
         }
         let name = &css[start..end];
         check_rule_case(name, file)?;
-        if !matches!(
-            name,
-            "import" | "source" | "config" | "plugin" | "reference" | "tailwind"
-        ) {
+        if name.is_empty()
+            || bytes
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'_')
+        {
+            return Err(error(format!(
+                "malformed at-rule @{} in {}: expected ASCII letters or hyphens",
+                css.get(start..=end).unwrap_or(name),
+                file.display()
+            )));
+        }
+        if !ALLOWED_RULES.contains(&name) {
+            return Err(error(format!(
+                "unsupported @{name} in {}: at-rule is not in cja-build's Tailwind allow-list",
+                file.display()
+            )));
+        }
+        if !matches!(name, "import" | "source") {
+            statement_has_content = true;
             pos = end;
             continue;
+        }
+        if statement_has_content {
+            return Err(error(format!(
+                "@{name} must start a statement in {}:{} (missing ; before it?)",
+                file.display(),
+                line_number(css, pos)
+            )));
+        }
+        if !(matches!(bytes.get(end), Some(b' ' | b'\t' | b'\n'))
+            || bytes.get(end) == Some(&b'\r') && bytes.get(end + 1) == Some(&b'\n'))
+        {
+            return Err(error(format!(
+                "@{name} must be followed by a space, tab or newline in {}:{}: @{}{}",
+                file.display(),
+                line_number(css, pos),
+                name,
+                readable_byte(bytes.get(end))
+            )));
         }
         let mut cursor = end;
         while cursor < bytes.len() && bytes[cursor] != b';' {
@@ -78,7 +349,15 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
             } else if matches!(bytes[cursor], b'\'' | b'"') {
                 cursor = skip_string(bytes, cursor, file)?;
             } else if bytes[cursor] == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
+                cursor = skip_escape(css, cursor, file)?;
+            } else if !bytes[cursor].is_ascii() {
+                return Err(non_ascii(css, cursor, file));
+            } else if matches!(bytes[cursor], b'{' | b'}') {
+                return Err(error(format!(
+                    "unsupported {} in @{name} in {}: expected semicolon before brace",
+                    char::from(bytes[cursor]),
+                    file.display()
+                )));
             } else {
                 cursor += 1;
             }
@@ -86,15 +365,23 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         if cursor == bytes.len() {
             return Err(error(format!("unterminated @{name} in {}", file.display())));
         }
-        let argument = css[end..cursor].trim();
+        let argument = ascii_trim(&css[end..cursor]);
         match name {
             "import" => {
                 if argument == "\"tailwindcss\" source(none)"
                     || argument == "'tailwindcss' source(none)"
                 {
+                    if depth != 0 || paren_depth != 0 {
+                        // Defence in depth: statement-start validation already rejects parens.
+                        return Err(error(format!(
+                            "@import \"tailwindcss\" source(none) must be at depth 0 in {}",
+                            file.display()
+                        )));
+                    }
                     result.tailwind_imports += 1;
                 } else {
                     reject_near_miss_root_import(argument, file)?;
+                    reject_source_in_statement(bytes, end, cursor, file)?;
                     let path = quoted_only(argument).ok_or_else(|| {
                         error(format!(
                             "unsupported @import {argument:?} in {}: use a local quoted .css path",
@@ -110,15 +397,36 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
                     result.imports.push(path.to_owned());
                 }
             }
-            "source" => result.sources.push(source_path(argument, file)?.to_owned()),
-            _ => {
-                return Err(error(format!(
-                    "@{name} is unsupported in {}: use Tailwind v4 CSS-first configuration",
-                    file.display()
-                )));
+            "source" => {
+                reject_source_in_statement(bytes, end, cursor, file)?;
+                if depth != 0 {
+                    return Err(error(format!(
+                        "@source must be at depth 0 in {}",
+                        file.display()
+                    )));
+                }
+                result.sources.push(source_path(argument, file)?.to_owned());
             }
+            _ => {}
         }
         pos = cursor + 1;
+        statement_has_content = false;
+    }
+    if depth != 0 {
+        return Err(error(format!("unmatched {{ in {}", file.display())));
+    }
+    if paren_depth != 0 {
+        return Err(error(format!("unmatched ( in {}", file.display())));
+    }
+    if let Some(closers) = custom_closers
+        && let Some(closer) = closers.last()
+    {
+        return Err(error(format!(
+            "unclosed {} inside custom property value in {}:{}",
+            char::from(*closer),
+            file.display(),
+            line_number(css, css.len())
+        )));
     }
     Ok(result)
 }
@@ -141,16 +449,10 @@ fn skip_comment(bytes: &[u8], mut pos: usize, file: &Path) -> Result<usize, Buil
 }
 
 fn check_rule_case(name: &str, file: &Path) -> Result<(), BuildError> {
-    if [
-        "import",
-        "source",
-        "config",
-        "plugin",
-        "reference",
-        "tailwind",
-    ]
-    .iter()
-    .any(|known| name.eq_ignore_ascii_case(known) && name != *known)
+    if ALLOWED_RULES
+        .iter()
+        .chain(EXCLUDED_RULES.iter())
+        .any(|known| name.eq_ignore_ascii_case(known) && name != *known)
     {
         return Err(error(format!(
             "at-rule names must be lowercase in {}: Tailwind ignores @{name}",
@@ -161,15 +463,21 @@ fn check_rule_case(name: &str, file: &Path) -> Result<(), BuildError> {
 }
 
 fn source_path<'a>(argument: &'a str, file: &Path) -> Result<&'a str, BuildError> {
+    if argument.contains(['*', '?', '[', ']', '{', '}', ',', '!', '(', ')', '\\']) {
+        return Err(error(format!(
+            "unsupported @source {argument} in {}: directory must start with ./ or ../ and contain no globs",
+            file.display()
+        )));
+    }
     let path = quoted_only(argument).ok_or_else(|| {
         error(format!(
-            "unsupported @source {argument:?} in {}: use a quoted positive directory",
+            "unsupported @source {argument} in {}: use a quoted positive directory",
             file.display()
         ))
     })?;
-    if !relative(path) || path.contains(['*', '?', '[', ']']) || path.starts_with('!') {
+    if !relative(path) {
         return Err(error(format!(
-            "unsupported @source {argument:?} in {}: directory must start with ./ or ../ and contain no globs",
+            "unsupported @source {argument} in {}: directory must start with ./ or ../ and contain no globs",
             file.display()
         )));
     }
@@ -498,6 +806,7 @@ fn existing_ignore_files(root: &Path) -> Result<Vec<PathBuf>, BuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn fixture() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -514,6 +823,513 @@ mod tests {
     }
 
     const ROOT: &str = "@import \"tailwindcss\" source(none); @source \"../src\";";
+
+    fn rejected(root: &Path, css: &str, expected: &str, token: &str) {
+        let message = check(root, css).unwrap_err().to_string();
+        assert!(message.contains(expected), "{css}: {message}");
+        assert!(message.contains(token), "{css}: {message}");
+        assert!(message.contains("app.css"), "{css}: {message}");
+    }
+
+    #[test]
+    fn nested_root_import_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            "@media screen { @import \"tailwindcss\" source(none); } @source \"../src\";",
+            "must be at depth 0",
+            "@import \"tailwindcss\" source(none)",
+        );
+    }
+
+    #[test]
+    fn source_function_is_rejected_everywhere_outside_strings_and_comments() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} .x {{ color: source(../../secret); }}"),
+            "only the root Tailwind import may use source(none)",
+            "source(",
+        );
+        rejected(
+            root.path(),
+            "@media source(\"../../secret\") { @import \"tailwindcss\" source(none); } @source \"../src\";",
+            "only the root Tailwind import may use source(none)",
+            "source(",
+        );
+        rejected(
+            root.path(),
+            &format!("{ROOT} @source source(../src);"),
+            "only the root Tailwind import may use source(none)",
+            "source(",
+        );
+    }
+
+    #[test]
+    fn plain_source_function_in_media_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @media source(\"../../secret\") {{ .x{{}} }}"),
+            "only the root Tailwind import may use source(none)",
+            "source(",
+        );
+    }
+
+    #[test]
+    fn comment_split_source_function_in_media_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @media source/**/(\"../../secret\") {{ .x{{}} }}"),
+            "only the root Tailwind import may use source(none)",
+            "source(",
+        );
+    }
+
+    #[test]
+    fn comment_split_source_name_in_media_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @media sou/**/rce(\"../../secret\") {{ .x{{}} }}"),
+            "only the root Tailwind import may use source(none)",
+            "source(",
+        );
+    }
+
+    #[test]
+    fn unknown_at_rule_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @mystery x;"),
+            "Tailwind allow-list",
+            "@mystery",
+        );
+    }
+
+    #[test]
+    fn unicode_outside_strings_comments_is_rejected_before_import_resolution() {
+        let outer = tempfile::tempdir().unwrap();
+        let app = outer.path().join("app");
+        fs::create_dir_all(app.join("frontend")).unwrap();
+        fs::create_dir(app.join("src")).unwrap();
+        fs::create_dir(app.join("out")).unwrap();
+        fs::write(app.join("frontend/a.css"), ".safe{}").unwrap();
+        fs::write(
+            app.join("frontend/a.css\""),
+            "@import \"../../secret.css\";",
+        )
+        .unwrap();
+        fs::write(outer.path().join("secret.css"), ".cja-outside-marker{}").unwrap();
+        rejected(
+            &app,
+            &format!("{ROOT} @import \"./a.css\"\u{0085};"),
+            "non-ASCII U+0085",
+            "U+0085",
+        );
+        rejected(
+            app.as_path(),
+            &format!("{ROOT} @media (width > 1px)\u{2212} {{}}"),
+            "non-ASCII U+2212",
+            "U+2212",
+        );
+        rejected(
+            app.as_path(),
+            &format!("{ROOT} @é x;"),
+            "non-ASCII U+00E9",
+            "U+00E9",
+        );
+        rejected(
+            app.as_path(),
+            &format!("{ROOT} \u{feff}.x{{}}"),
+            "non-ASCII U+FEFF",
+            "U+FEFF",
+        );
+    }
+
+    #[test]
+    fn source_glob_metacharacters_are_rejected_before_confinement() {
+        let root = fixture();
+        for ch in ['*', '?', '[', ']', '{', '}', ',', '!', '(', ')', '\\'] {
+            let argument = format!("\"../sr{ch}c\"");
+            rejected(
+                root.path(),
+                &format!("@import \"tailwindcss\" source(none); @source {argument};"),
+                "contain no globs",
+                &argument,
+            );
+        }
+    }
+
+    #[test]
+    fn literal_brace_source_is_rejected_even_when_directory_exists() {
+        let root = fixture();
+        let odd = root.path().join("{src,..").join("secret}");
+        fs::create_dir_all(&odd).unwrap();
+        assert!(odd.canonicalize().unwrap().starts_with(root.path()));
+        rejected(
+            root.path(),
+            "@import \"tailwindcss\" source(none); @source \"../{src,../secret}\";",
+            "contain no globs",
+            "../{src,../secret}",
+        );
+    }
+
+    #[test]
+    fn unknown_and_malformed_at_rules_are_rejected_at_any_depth() {
+        let root = fixture();
+        for rule in ["@mystery x;", "@media screen { @mystery x; }"] {
+            rejected(
+                root.path(),
+                &format!("{ROOT} {rule}"),
+                "Tailwind allow-list",
+                "@mystery",
+            );
+        }
+        for name in ["plugin", "config", "reference", "tailwind"] {
+            rejected(
+                root.path(),
+                &format!("{ROOT} @{name} \"./x.css\";"),
+                "Tailwind allow-list",
+                &format!("@{name}"),
+            );
+        }
+        rejected(
+            root.path(),
+            &format!("{ROOT} @1bad x;"),
+            "malformed at-rule",
+            "@1",
+        );
+        rejected(
+            root.path(),
+            &format!("{ROOT} @media_foo x;"),
+            "malformed at-rule",
+            "@media_",
+        );
+    }
+
+    #[test]
+    fn braces_and_nested_source_are_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @media screen {{ @source \"../src\"; }}"),
+            "@source must be at depth 0",
+            "@source",
+        );
+        rejected(root.path(), &format!("{ROOT} }}"), "unmatched }", "}");
+        rejected(root.path(), &format!("{ROOT} {{"), "unmatched {", "{");
+        rejected(
+            root.path(),
+            "@import \"tailwindcss\" source(none) { @source \"../src\"; }",
+            "semicolon before brace",
+            "{",
+        );
+    }
+
+    // Tailwind 4.3.3's css-parser ignores `{` and `}` while a `(` is open, so
+    // here it nests the root import inside `.p { ... }` (it still honours
+    // source(none) there). The task requires the root import at depth 0.
+    #[test]
+    fn root_import_nested_via_braces_inside_parens_is_rejected() {
+        let root = fixture();
+        let css =
+            ".p { a: (}); @import \"tailwindcss\" source(none); a: ({); } @source \"../src\";";
+        let message = check(root.path(), css)
+            .expect_err("Tailwind nests this root import; validation must reject it")
+            .to_string();
+        assert!(message.contains("app.css"), "{css}: {message}");
+    }
+
+    #[test]
+    fn braces_inside_parentheses_are_rejected() {
+        let root = fixture();
+        for token in ['{', '}'] {
+            rejected(
+                root.path(),
+                &format!("{ROOT} .x {{ a: (foo{token}bar); }}"),
+                "inside parentheses",
+                &token.to_string(),
+            );
+        }
+        rejected(
+            root.path(),
+            &format!("{ROOT} .x {{ a: foo); }}"),
+            "unmatched )",
+            ")",
+        );
+        rejected(
+            root.path(),
+            &format!("{ROOT} .x {{ a: (foo }}"),
+            "inside parentheses",
+            "}",
+        );
+        rejected(root.path(), &format!("{ROOT} a: (foo"), "unmatched (", "(");
+    }
+
+    #[test]
+    fn semicolons_inside_parentheses_and_nested_at_rules() {
+        let root = fixture();
+        check(
+            root.path(),
+            &format!(
+                "{ROOT} .x {{ background: url(data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=); }}"
+            ),
+        )
+        .unwrap();
+        check(
+            root.path(),
+            &format!("{ROOT} @custom-variant pointer-coarse (@media (pointer: coarse));"),
+        )
+        .unwrap();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @media (x; @source \"../src\"; ) {{}}"),
+            "@source must start a statement",
+            "@source",
+        );
+    }
+
+    #[test]
+    fn graph_rules_must_start_statements() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            "@import \"tailwindcss\" source(none);\n@custom-variant dark (&:where(.dark, .dark *))\n@source \"../src\";",
+            "@source must start a statement",
+            "@source",
+        );
+        fs::write(root.path().join("frontend/a.css"), ".safe{}").unwrap();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @layer theme, base\n@import \"./a.css\";"),
+            "@import must start a statement",
+            "@import",
+        );
+        for css in [
+            "(x @import \"tailwindcss\" source(none); y) {} @source \"../src\";",
+            "a:b @import \"tailwindcss\" source(none); @source \"../src\";",
+        ] {
+            rejected(
+                root.path(),
+                css,
+                "@import must start a statement",
+                "@import",
+            );
+        }
+        rejected(
+            root.path(),
+            "--x: @import \"tailwindcss\" source(none); @source \"../src\";",
+            "at-rule inside custom property value",
+            "@",
+        );
+    }
+
+    #[test]
+    fn graph_rule_separator_matches_tailwind() {
+        let root = fixture();
+        for separator in ["\t", "\r\n"] {
+            check(
+                root.path(),
+                &format!("@import \"tailwindcss\" source(none);\n@source{separator}\"../src\";"),
+            )
+            .unwrap();
+        }
+        for separator in ["", "\r", "\x0c"] {
+            rejected(
+                root.path(),
+                &format!("@import \"tailwindcss\" source(none); @source{separator}\"../src\";"),
+                "@source must be followed",
+                "@source",
+            );
+        }
+        rejected(
+            root.path(),
+            "@import\"tailwindcss\" source(none); @source \"../src\";",
+            "@import must be followed",
+            "@import",
+        );
+        let message = check(root.path(), &format!("{ROOT} @source"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("@source<EOF>"), "{message}");
+        let message = check(root.path(), &format!("{ROOT}\n@source\r\"../src\";"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("app.css:2"), "{message}");
+        assert!(message.contains("@source\\x0D"), "{message}");
+    }
+
+    #[test]
+    fn lone_cr_and_form_feed_before_graph_rules_are_rejected() {
+        let root = fixture();
+        fs::write(root.path().join("frontend/a.css"), ".safe{}").unwrap();
+        check(
+            root.path(),
+            "@import \"tailwindcss\" source(none);\r\n@source \"../src\";\r\n.x { color: red; }\r\n",
+        )
+        .unwrap();
+        let message = check(
+            root.path(),
+            "@import \"tailwindcss\" source(none);\n\r@source \"../src\";",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("app.css:2"), "{message}");
+    }
+
+    #[test]
+    fn lone_cr_before_source_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT}\r@source \"../src\";"),
+            "must start a statement",
+            "@source",
+        );
+    }
+
+    #[test]
+    fn form_feed_before_source_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT}\x0c@source \"../src\";"),
+            "must start a statement",
+            "@source",
+        );
+    }
+
+    #[test]
+    fn lone_cr_before_import_is_rejected() {
+        let root = fixture();
+        fs::write(root.path().join("frontend/a.css"), ".safe{}").unwrap();
+        rejected(
+            root.path(),
+            &format!("{ROOT}\r@import \"./a.css\";"),
+            "must start a statement",
+            "@import",
+        );
+    }
+
+    #[test]
+    fn custom_property_values_keep_graph_rules_visible() {
+        let root = fixture();
+        fs::write(root.path().join("frontend/a.css"), ".imported-marker{}").unwrap();
+        for (css, expected, token) in [
+            (
+                format!("{ROOT} --x: [; @source \"../src\"; ];"),
+                "at-rule inside custom property value",
+                "@",
+            ),
+            (
+                format!("{ROOT} @theme {{ --x: [; @import \"./a.css\"; ]; }}"),
+                "at-rule inside custom property value",
+                "@",
+            ),
+            (
+                format!("{ROOT} .a {{ --x: [ }} ]; }}"),
+                "mismatched } inside custom property value",
+                "}",
+            ),
+            (
+                format!("{ROOT} --x: ("),
+                "unclosed ) inside custom property value",
+                ")",
+            ),
+            (
+                format!("{ROOT} --x: {{ @media x {{}} }};"),
+                "at-rule inside custom property value",
+                "@",
+            ),
+        ] {
+            rejected(root.path(), &css, expected, token);
+        }
+        for css in [
+            format!(
+                "{ROOT} @theme {{ --color-x: oklch(0.7 0.1 200); --font-x: \"A;B\", serif; --shadow: 0 0 [x] {{y}}; }}"
+            ),
+            format!("{ROOT} --x: 1;"),
+            format!("{ROOT} .a {{ --x: 1 }}"),
+        ] {
+            check(root.path(), &css).unwrap();
+        }
+        let message = check(
+            root.path(),
+            &format!("{ROOT}\n--x: [; @source \"../src\"; ];"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("app.css:2"), "{message}");
+    }
+
+    #[test]
+    fn custom_property_source_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} --x: [; @source \"../src\"; ];"),
+            "at-rule inside custom property value",
+            "@",
+        );
+    }
+
+    #[test]
+    fn custom_property_import_is_rejected() {
+        let root = fixture();
+        fs::write(root.path().join("frontend/a.css"), ".imported-marker{}").unwrap();
+        rejected(
+            root.path(),
+            &format!("{ROOT} @theme {{ --x: [; @import \"./a.css\"; ]; }}"),
+            "at-rule inside custom property value",
+            "@",
+        );
+    }
+
+    #[test]
+    fn custom_property_mismatched_closer_is_rejected() {
+        let root = fixture();
+        rejected(
+            root.path(),
+            &format!("{ROOT} .a {{ --x: [ }} ]; }}"),
+            "mismatched } inside custom property value",
+            "}",
+        );
+    }
+
+    #[test]
+    fn allowed_at_rules_and_unicode_literals_pass() {
+        let root = fixture();
+        fs::create_dir_all(root.path().join("node_modules/@scope/pkg")).unwrap();
+        let css = format!(
+            "\u{feff}{ROOT} @source \"../node_modules/@scope/pkg\"; /* — · source( */ .x {{ content: \"− source(\"; }} @media screen {{}} @supports (display: grid) {{}} @layer components {{}} @keyframes fade {{ from {{ opacity: 0; }} }} @font-face {{}} @theme {{}} @utility foo {{}} @variant foo {{}} @custom-variant foo (&:hover); @apply foo; @container (width > 1px) {{}} @property --foo {{}} @starting-style {{}} @page {{}} @charset \"UTF-8\";"
+        );
+        check(root.path(), &css).unwrap();
+    }
+
+    #[test]
+    fn eyes_css_fixture_accepts_allow_list() {
+        let portfolio = include_bytes!("../tests/fixtures/eyes/portfolio.css");
+        assert_eq!(portfolio.len(), 16_392);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(portfolio)),
+            "caaf47e1ae2d809e1a7b10c04a2b5d97258d164f211662a9cbc631a538553f18"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("app");
+        fs::create_dir_all(app.join("assets")).unwrap();
+        fs::create_dir(app.join("src")).unwrap();
+        fs::create_dir(app.join("out")).unwrap();
+        fs::write(
+            app.join("assets/input.css"),
+            include_bytes!("../tests/fixtures/eyes/input.css"),
+        )
+        .unwrap();
+        fs::write(app.join("assets/portfolio.css"), portfolio).unwrap();
+        validate_css(&app.join("assets/input.css"), &app, &app.join("out")).unwrap();
+    }
 
     #[test]
     fn comments_strings_and_nested_imports() {
@@ -565,10 +1381,10 @@ mod tests {
                 "@import \"tailwindcss\" source(none); @source \"../frontend/app.css\";",
                 "directory",
             ),
-            ("@config \"./tailwind.config.js\";", "CSS-first"),
-            ("@plugin \"typography\";", "CSS-first"),
-            ("@reference \"./a.css\";", "CSS-first"),
-            ("@tailwind utilities;", "CSS-first"),
+            ("@config \"./tailwind.config.js\";", "allow-list"),
+            ("@plugin \"typography\";", "allow-list"),
+            ("@reference \"./a.css\";", "allow-list"),
+            ("@tailwind utilities;", "allow-list"),
         ] {
             let error = check(root.path(), css).unwrap_err().to_string();
             assert!(error.contains(expected), "{css}: {error}");
@@ -923,7 +1739,7 @@ mod tests {
             check(&app, &css)
                 .unwrap_err()
                 .to_string()
-                .contains("@plugin is unsupported")
+                .contains("unsupported @plugin")
         );
         check(&app, &format!("{ROOT} /* C:\\dir */ .x{{}} ")).unwrap();
     }

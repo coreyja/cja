@@ -16,11 +16,18 @@ the hashed script. Tailwind inputs use `Tailwind::new("frontend/app.css", "app.c
 in `build.rs`; the input path is relative to `CARGO_MANIFEST_DIR`. The root CSS
 requires `@import "tailwindcss" source(none);` plus explicit relative directory
 `@source` rules. Local quoted `./` and `../` `.css` imports are checked
-recursively. All files and scan roots must stay inside the app directory;
-resolving symlinks and JS config are rejected. Dangling symlinks (such as
-Emacs lock files) are ignored. Tailwind skips nested `node_modules` when the
-explicit `@source` root is outside one; an explicit root inside `node_modules`
-scans its nested directories too, so those directories are checked for symlinks.
+recursively. All files and scan roots must stay inside the app directory.
+Symlinks and JS config are rejected. Dangling symlinks (such as
+Emacs lock files) are ignored.
+The [allow-list grammar](../crates/cja/README.md#tailwind-css-inputs) requires
+depth-zero root directives, ASCII outside strings/comments, and literal source
+directories without globs. `@import` and `@source` must start statements outside
+parentheses and have a space, tab or newline after their names. Only space,
+tab, LF or CRLF is neutral before them; custom-property values cannot contain
+at-rules and must balance `()`, `[]` and `{}`. Tailwind skips nested
+`node_modules` when the explicit `@source` root is outside one. An explicit
+root inside `node_modules` scans its nested directories too, so those
+directories are checked for symlinks.
 `cja-build` downloads and verifies the
 standalone Tailwind v4.3.3 binary into the same shared cache, or uses
 `TAILWIND_CLI` when set. Offline cold builds fail with installation guidance.
