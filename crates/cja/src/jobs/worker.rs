@@ -2370,6 +2370,15 @@ mod idle_gate_tests {
         }
     }
 
+    async fn with_workers<T>(workers: Workers, body: impl Future<Output = T>) -> T {
+        let result = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+        workers.stop().await;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     async fn until(mut condition: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(30), async {
             while !condition() {
@@ -2406,18 +2415,21 @@ mod idle_gate_tests {
         let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
         let state = make_state(db, gate.clone());
         let workers = Workers::start(&state, 100, Duration::from_millis(200), true);
-        until(|| {
-            gate.0.probe.waiting.load(SeqCst) == 98 && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+        with_workers(workers, async {
+            until(|| {
+                gate.0.probe.waiting.load(SeqCst) == 98
+                    && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+            })
+            .await;
+            gate.0.probe.attempts.store(0, SeqCst);
+            gate.0.probe.max_in_flight_periodic.store(0, SeqCst);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let attempts = gate.0.probe.attempts.load(SeqCst);
+            let max = gate.0.probe.max_in_flight_periodic.load(SeqCst);
+            assert!((1..=24).contains(&attempts), "{attempts} attempts");
+            assert!(max <= 2, "{max} periodic claims in flight");
         })
         .await;
-        gate.0.probe.attempts.store(0, SeqCst);
-        gate.0.probe.max_in_flight_periodic.store(0, SeqCst);
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let attempts = gate.0.probe.attempts.load(SeqCst);
-        let max = gate.0.probe.max_in_flight_periodic.load(SeqCst);
-        workers.stop().await;
-        assert!((1..=24).contains(&attempts), "{attempts} attempts");
-        assert!(max <= 2, "{max} periodic claims in flight");
     }
 
     #[sqlx::test]
@@ -2427,24 +2439,27 @@ mod idle_gate_tests {
         let state = make_state(db.clone(), gate.clone());
         state.park.store(true, SeqCst);
         let workers = Workers::start(&state, 100, Duration::from_millis(200), true);
-        until(|| {
-            gate.0.probe.waiting.load(SeqCst) == 98 && gate.0.probe.empty_periodic.load(SeqCst) >= 2
-        })
-        .await;
-        for id in 0..32 {
-            insert_sql(&db, &format!("burst-{id}"), "0 seconds", None).await;
-        }
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            while started(&db).await < 32 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        with_workers(workers, async {
+            until(|| {
+                gate.0.probe.waiting.load(SeqCst) == 98
+                    && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+            })
+            .await;
+            for id in 0..32 {
+                insert_sql(&db, &format!("burst-{id}"), "0 seconds", None).await;
             }
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                while started(&db).await < 32 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            let max = state.max_in_body.load(SeqCst);
+            state.release.notify_waiters();
+            result.expect("32 body starts within two seconds");
+            assert!(max >= 32, "only {max} overlapping bodies");
         })
         .await;
-        let max = state.max_in_body.load(SeqCst);
-        state.release.notify_waiters();
-        workers.stop().await;
-        result.expect("32 body starts within two seconds");
-        assert!(max >= 32, "only {max} overlapping bodies");
     }
 
     #[sqlx::test]
@@ -2453,24 +2468,27 @@ mod idle_gate_tests {
         let gate = IdlePollGate::new(NonZeroUsize::new(1).unwrap());
         let state = make_state(db.clone(), gate.clone());
         let workers = Workers::start(&state, 3, Duration::from_secs(5), true);
-        until(|| {
-            gate.0.probe.waiting.load(SeqCst) == 2 && gate.0.probe.empty_periodic.load(SeqCst) >= 1
+        with_workers(workers, async {
+            until(|| {
+                gate.0.probe.waiting.load(SeqCst) == 2
+                    && gate.0.probe.empty_periodic.load(SeqCst) >= 1
+            })
+            .await;
+            GateJob { id: "wake".into() }
+                .enqueue(state.clone(), "wake".into(), None)
+                .await
+                .unwrap();
+            let fast = tokio::time::timeout(Duration::from_secs(1), async {
+                while started(&db).await < 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            let hooks = state.hooks.load(SeqCst);
+            fast.expect("local wake should start body before periodic tick");
+            assert_eq!(hooks, 1);
         })
         .await;
-        GateJob { id: "wake".into() }
-            .enqueue(state.clone(), "wake".into(), None)
-            .await
-            .unwrap();
-        let fast = tokio::time::timeout(Duration::from_secs(1), async {
-            while started(&db).await < 1 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        let hooks = state.hooks.load(SeqCst);
-        workers.stop().await;
-        fast.expect("local wake should start body before periodic tick");
-        assert_eq!(hooks, 1);
     }
 
     #[sqlx::test]
@@ -2479,25 +2497,28 @@ mod idle_gate_tests {
         let gate = IdlePollGate::new(NonZeroUsize::new(1).unwrap());
         let state = make_state(db.clone(), gate.clone());
         let workers = Workers::start(&state, 3, Duration::from_secs(5), true);
-        until(|| {
-            gate.0.probe.waiting.load(SeqCst) == 2 && gate.0.probe.empty_periodic.load(SeqCst) >= 1
+        with_workers(workers, async {
+            until(|| {
+                gate.0.probe.waiting.load(SeqCst) == 2
+                    && gate.0.probe.empty_periodic.load(SeqCst) >= 1
+            })
+            .await;
+            let before = gate.0.probe.notified.load(SeqCst);
+            let error = BadJob
+                .enqueue(state.clone(), "bad".into(), None)
+                .await
+                .unwrap_err();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let after = gate.0.probe.notified.load(SeqCst);
+            let hooks = state.hooks.load(SeqCst);
+            assert!(matches!(
+                error,
+                super::super::EnqueueError::SerdeJsonError(_)
+            ));
+            assert_eq!(hooks, 0);
+            assert_eq!(after, before);
         })
         .await;
-        let before = gate.0.probe.notified.load(SeqCst);
-        let error = BadJob
-            .enqueue(state.clone(), "bad".into(), None)
-            .await
-            .unwrap_err();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let after = gate.0.probe.notified.load(SeqCst);
-        let hooks = state.hooks.load(SeqCst);
-        workers.stop().await;
-        assert!(matches!(
-            error,
-            super::super::EnqueueError::SerdeJsonError(_)
-        ));
-        assert_eq!(hooks, 0);
-        assert_eq!(after, before);
 
         for _ in 0..20 {
             gate.wake_one();
@@ -2505,21 +2526,24 @@ mod idle_gate_tests {
         let state = make_state(db.clone(), gate.clone());
         let before = gate.0.probe.notified.load(SeqCst);
         let workers = Workers::start(&state, 3, Duration::from_millis(100), true);
-        until(|| {
-            gate.0.probe.waiting.load(SeqCst) == 2 && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+        with_workers(workers, async {
+            until(|| {
+                gate.0.probe.waiting.load(SeqCst) == 2
+                    && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+            })
+            .await;
+            let notified = gate.0.probe.notified.load(SeqCst) - before;
+            insert_sql(&db, "coalesced", "0 seconds", None).await;
+            let found = tokio::time::timeout(Duration::from_secs(1), async {
+                while started(&db).await == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(notified <= 1, "{notified} stored notifications consumed");
+            found.expect("periodic claim discovers SQL job after coalesced wakes");
         })
         .await;
-        let notified = gate.0.probe.notified.load(SeqCst) - before;
-        insert_sql(&db, "coalesced", "0 seconds", None).await;
-        let found = tokio::time::timeout(Duration::from_secs(1), async {
-            while started(&db).await == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        workers.stop().await;
-        assert!(notified <= 1, "{notified} stored notifications consumed");
-        found.expect("periodic claim discovers SQL job after coalesced wakes");
     }
 
     #[sqlx::test]
@@ -2578,40 +2602,44 @@ mod idle_gate_tests {
         let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
         let state = make_state(pool.clone(), gate.clone());
         let workers = Workers::start(&state, 100, Duration::from_millis(200), true);
-        until(|| {
-            gate.0.probe.waiting.load(SeqCst) == 98 && gate.0.probe.empty_periodic.load(SeqCst) >= 2
-        })
-        .await;
-        let mut held = Vec::new();
-        for _ in 0..2 {
-            held.push(pool.acquire().await.unwrap());
-        }
-        until(|| gate.0.probe.errors.load(SeqCst) >= 2).await;
-        let errors = gate.0.probe.errors.load(SeqCst);
-        let released = tokio::time::timeout(Duration::from_millis(500), async {
-            while gate.0.probe.errors.load(SeqCst) <= errors {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        with_workers(workers, async {
+            until(|| {
+                gate.0.probe.waiting.load(SeqCst) == 98
+                    && gate.0.probe.empty_periodic.load(SeqCst) >= 2
+            })
+            .await;
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                held.push(pool.acquire().await.unwrap());
             }
-        })
-        .await
-        .is_ok();
-        drop(held);
-        until(|| {
-            gate.0.probe.waiting.load(SeqCst) == 98 && gate.0.probe.empty_periodic.load(SeqCst) >= 4
+            until(|| gate.0.probe.errors.load(SeqCst) >= 2).await;
+            let errors = gate.0.probe.errors.load(SeqCst);
+            let released = tokio::time::timeout(Duration::from_millis(500), async {
+                while gate.0.probe.errors.load(SeqCst) <= errors {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            drop(held);
+            until(|| {
+                gate.0.probe.waiting.load(SeqCst) == 98
+                    && gate.0.probe.empty_periodic.load(SeqCst) >= 4
+            })
+            .await;
+            gate.0.probe.attempts.store(0, SeqCst);
+            gate.0.probe.max_in_flight_periodic.store(0, SeqCst);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let attempts = gate.0.probe.attempts.load(SeqCst);
+            let max = gate.0.probe.max_in_flight_periodic.load(SeqCst);
+            assert!(released, "permits remained held during backoff");
+            assert!(
+                (1..=24).contains(&attempts),
+                "{attempts} claims after recovery"
+            );
+            assert!(max <= 2, "{max} periodic claims in flight");
         })
         .await;
-        gate.0.probe.attempts.store(0, SeqCst);
-        gate.0.probe.max_in_flight_periodic.store(0, SeqCst);
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let attempts = gate.0.probe.attempts.load(SeqCst);
-        let max = gate.0.probe.max_in_flight_periodic.load(SeqCst);
-        workers.stop().await;
-        assert!(released, "permits remained held during backoff");
-        assert!(
-            (1..=24).contains(&attempts),
-            "{attempts} claims after recovery"
-        );
-        assert!(max <= 2, "{max} periodic claims in flight");
     }
 
     #[sqlx::test]
