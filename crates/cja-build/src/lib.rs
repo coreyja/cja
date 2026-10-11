@@ -1698,6 +1698,107 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "runs pinned Tailwind binary"]
+    fn real_tailwind_adversarial_corpus() {
+        let _guard = crate::SPAWN.lock().unwrap();
+        let outer = fixture();
+        let app = outer.path().join("app");
+        fs::create_dir_all(app.join("frontend")).unwrap();
+        fs::create_dir(app.join("src")).unwrap();
+        fs::create_dir(app.join("out")).unwrap();
+        let secret = outer.path().join("secret");
+        fs::create_dir(&secret).unwrap();
+        fs::write(app.join("src/a.rs"), "html! { div class=\"underline\" {} }").unwrap();
+        fs::write(secret.join("a.rs"), "html! { div class=\"italic\" {} }").unwrap();
+        fs::write(
+            outer.path().join("secret.css"),
+            ".cja-outside-marker { color: red; }",
+        )
+        .unwrap();
+        let mut env = fake_tailwind_env(&app);
+        env.tailwind_override = None;
+        env.xdg_cache_home = Some(
+            std::env::var_os("CJA_REAL_TAILWIND_CACHE_HOME")
+                .map_or_else(|| outer.path().join("cache"), PathBuf::from),
+        );
+        env.offline = false;
+        let binary = tool_cache::resolve_tailwind(&env, tool_cache::fetch_https).unwrap();
+        let root_rule = "@import \"tailwindcss\" source(none); @source \"../src\";";
+        let bypasses = [
+            ".a\\\"{} @source \"../../secret\"; /* \" */",
+            ".a\\'{} @source '../../secret'; /* ' */",
+            "/* \\*/ \" */ @source \"../../secret\"; /* \" */",
+            "/* \\*/ \" */ @import \"../../secret.css\"; /* \" */",
+            "@im/**/port \"../../secret.css\";",
+            "@sou/**/rce \"../../secret\";",
+            "@/**/import \"../../secret.css\";",
+            "@plu/**/gin \"x\";",
+            "@con/**/fig \"x\";",
+            "@im/*! x */port \"../../secret.css\";",
+            "@import/**/ \"../../secret.css\";",
+            "@import \"../../secret.css\" /**/;",
+            "\u{feff}@im/**/port \"../../secret.css\";",
+            "@media screen { @im/**/port \"../../secret.css\"; }",
+            ".x { @im/**/port \"../../secret.css\"; }",
+        ];
+        for (index, suffix) in bypasses
+            .iter()
+            .enumerate()
+            .chain(std::iter::once((bypasses.len(), &".inside{}")))
+        {
+            let css = format!("{root_rule} {suffix}");
+            let input = app.join("frontend/app.css");
+            fs::write(&input, css).unwrap();
+            let validation = tailwind::validate_css(&input, &app, &app.join("out"));
+            if index < bypasses.len() {
+                assert!(
+                    validation.is_err(),
+                    "known bypass {index} validated: {suffix}"
+                );
+            } else {
+                assert!(
+                    validation.is_ok(),
+                    "benign fixture rejected: {validation:?}"
+                );
+            }
+            if validation.is_err() {
+                continue;
+            }
+            let output = app.join("out").join(format!("corpus-{index}.css"));
+            let result = std::process::Command::new(&binary)
+                .args([
+                    "-i",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                    "--minify",
+                ])
+                .current_dir(app.join("frontend"))
+                .output()
+                .unwrap();
+            if !result.status.success() {
+                assert!(
+                    index < bypasses.len(),
+                    "benign Tailwind failed: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                continue;
+            }
+            let emitted = fs::read_to_string(output).unwrap();
+            assert!(
+                !emitted.contains(".italic{") && !emitted.contains(".cja-outside-marker{"),
+                "outside marker emitted for {suffix}"
+            );
+            if index == bypasses.len() {
+                assert!(
+                    emitted.contains(".underline{"),
+                    "benign fixture emitted no inside marker"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn env_watches_cover_tailwind_only_and_deduplicate_tools() {
         let root = fixture();
         let mut env = fake_tailwind_env(root.path());

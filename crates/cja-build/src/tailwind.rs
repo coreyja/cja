@@ -26,8 +26,10 @@ struct VisitState {
     watches: Vec<PathBuf>,
 }
 
-// Walk CSS bytes rather than searching lines: comments and quoted content can
-// contain inert @rules, while an actual rule may span several lines.
+// Mirror Tailwind v4.3.3 css-parser escapes, escape-aware comments, strings,
+// and comments dropped from the statement buffer. Any mismatch fails closed:
+// unterminated strings/comments are errors, and a comment in an at-rule name
+// could join fragments into a directive we would otherwise miss.
 fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
     let bytes = css.as_bytes();
     let mut pos = 0;
@@ -53,6 +55,12 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         let mut end = start;
         while end < bytes.len() && (bytes[end].is_ascii_alphabetic() || bytes[end] == b'-') {
             end += 1;
+        }
+        if bytes[end..].starts_with(b"/*") {
+            return Err(error(format!(
+                "comment inside or directly after an at-rule name is unsupported in {}",
+                file.display()
+            )));
         }
         let name = &css[start..end];
         check_rule_case(name, file)?;
@@ -391,8 +399,14 @@ fn visit(
 
 fn reject_source_symlinks(root: &Path) -> Result<(), BuildError> {
     let mut pending = vec![root.to_path_buf()];
+    let root_in_node_modules = root
+        .components()
+        .any(|component| component.as_os_str() == "node_modules");
     while let Some(dir) = pending.pop() {
-        if dir.file_name().is_some_and(|name| name == "node_modules") {
+        if !root_in_node_modules
+            && dir != root
+            && dir.file_name().is_some_and(|name| name == "node_modules")
+        {
             continue;
         }
         for entry in fs::read_dir(&dir)
@@ -450,18 +464,25 @@ fn existing_ignore_files(root: &Path) -> Result<Vec<PathBuf>, BuildError> {
                 .lines()
                 .find_map(|line| line.strip_prefix("gitdir: "))
                 .ok_or_else(|| error(format!("missing gitdir: line in {}", dot_git.display())))?;
-            let gitdir = ancestor
-                .join(gitdir)
-                .canonicalize()
-                .map_err(|e| error(format!("resolve gitdir in {}: {e}", dot_git.display())))?;
+            let gitdir = match ancestor.join(gitdir).canonicalize() {
+                Ok(path) => path,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(error(format!(
+                        "resolve gitdir in {}: {e}",
+                        dot_git.display()
+                    )));
+                }
+            };
             let common = gitdir.join("commondir");
             let base = if common.is_file() {
                 let relative = fs::read_to_string(&common)
                     .map_err(|e| error(format!("read {}: {e}", common.display())))?;
-                gitdir
-                    .join(relative.trim())
-                    .canonicalize()
-                    .map_err(|e| error(format!("resolve {}: {e}", common.display())))?
+                match gitdir.join(relative.trim()).canonicalize() {
+                    Ok(path) => path,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(error(format!("resolve {}: {e}", common.display()))),
+                }
             } else {
                 gitdir
             };
@@ -728,8 +749,9 @@ mod tests {
     fn source_tree_rejects_symlinked_files_and_directories() {
         use std::os::unix::fs::symlink;
         let root = fixture();
+        let canonical = root.path().canonicalize().unwrap();
         for (name, target) in [("file.rs", "/etc/hosts"), ("linked", "/tmp")] {
-            let link = root.path().join("src").join(name);
+            let link = canonical.join("src").join(name);
             symlink(target, &link).unwrap();
             let message = check(root.path(), ROOT).unwrap_err().to_string();
             assert!(message.contains(&link.display().to_string()), "{message}");
@@ -744,6 +766,7 @@ mod tests {
     #[test]
     fn watches_existing_ancestor_ignore_files() {
         let root = fixture();
+        let canonical = root.path().canonicalize().unwrap();
         let gitdir = root.path().join("repo/.git/worktrees/wt");
         fs::create_dir_all(&gitdir).unwrap();
         fs::create_dir_all(root.path().join("repo/.git/info")).unwrap();
@@ -761,11 +784,11 @@ mod tests {
         fs::write(&input, format!("{ROOT} @import \"./extra.css\";")).unwrap();
         let (_, emitted) = validate_css_with_watches(&input, &wt, &wt.join("out")).unwrap();
         for expected in [
-            &input,
-            &wt.join("frontend/extra.css"),
-            &wt.join("src"),
-            &wt.join(".gitignore"),
-            &exclude,
+            &canonical.join("wt/frontend/app.css"),
+            &canonical.join("wt/frontend/extra.css"),
+            &canonical.join("wt/src"),
+            &canonical.join("wt/.gitignore"),
+            &canonical.join("repo/.git/info/exclude"),
         ] {
             assert!(
                 emitted.contains(expected),
@@ -776,8 +799,83 @@ mod tests {
         assert!(
             existing_ignore_files(&wt.join("src"))
                 .unwrap()
-                .contains(&exclude)
+                .contains(&canonical.join("repo/.git/info/exclude"))
         );
+    }
+
+    #[test]
+    fn missing_gitdir_is_ignored() {
+        let root = fixture();
+        fs::write(root.path().join(".git"), "gitdir: missing\n").unwrap();
+        check(root.path(), ROOT).unwrap();
+        assert_eq!(
+            existing_ignore_files(&root.path().join("src")).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn comments_inside_at_rule_names_fail_closed() {
+        let outer = tempfile::tempdir().unwrap();
+        let app = outer.path().join("app");
+        fs::create_dir_all(app.join("frontend")).unwrap();
+        fs::create_dir(app.join("src")).unwrap();
+        fs::create_dir(app.join("out")).unwrap();
+        fs::create_dir(outer.path().join("secret")).unwrap();
+        fs::write(outer.path().join("secret.css"), ".secret{}").unwrap();
+        fs::write(app.join("frontend/x.css"), ".x{}").unwrap();
+        for rule in [
+            "@im/**/port \"../../secret.css\";",
+            "@sou/**/rce \"../../secret\";",
+            "@/**/import \"./x.css\";",
+            "@plu/**/gin \"x\";",
+            "@im/*! x */port \"./x.css\";",
+            "@media screen { @im/**/port \"../../secret.css\"; }",
+            ".x { @im/**/port \"../../secret.css\"; }",
+        ] {
+            let message = check(&app, &format!("{ROOT} {rule}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("comment inside or directly after an at-rule name"),
+                "{rule}: {message}"
+            );
+            assert!(message.contains("app.css"), "{message}");
+        }
+        check(&app, &format!("{ROOT} @media screen {{ .x{{}} }}")).unwrap();
+        check(
+            &app,
+            "@import \"tailwindcss\" source(none); /* note */ @source \"../src\";",
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_node_modules_roots_reject_resolving_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = fixture();
+        let canonical = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let modules = canonical.join("node_modules");
+        fs::create_dir_all(modules.join("ui-lib/node_modules")).unwrap();
+        symlink(outside.path(), modules.join("out")).unwrap();
+        symlink(outside.path(), modules.join("ui-lib/node_modules/dep")).unwrap();
+        for (source, link) in [
+            ("../node_modules", modules.join("out")),
+            (
+                "../node_modules/ui-lib",
+                modules.join("ui-lib/node_modules/dep"),
+            ),
+        ] {
+            let message = check(
+                root.path(),
+                &format!("@import \"tailwindcss\" source(none); @source \"{source}\";"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(message.contains(&link.display().to_string()), "{message}");
+        }
     }
 
     #[test]

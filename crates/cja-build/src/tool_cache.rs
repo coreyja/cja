@@ -404,13 +404,15 @@ fn valid_file_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
     let modified = metadata
         .modified()
         .map_err(|e| format!("inspect {} cache mtime {}: {e}", spec.name, root.display()))?;
-    let modified_nanos = modified
+    let stamp = modified
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("timestamp {} cache {}: {e}", spec.name, root.display()))?
-        .as_nanos();
-    let stamp = format!("{} {} {}", metadata.len(), modified_nanos, spec.digest);
+        .ok()
+        .map(|elapsed| format!("{} {} {}", metadata.len(), elapsed.as_nanos(), spec.digest));
     let marker = root.with_file_name(format!("{}.verified", spec.key()));
-    if fs::read_to_string(&marker).is_ok_and(|value| value == stamp) {
+    if stamp
+        .as_ref()
+        .is_some_and(|stamp| fs::read_to_string(&marker).is_ok_and(|value| value == *stamp))
+    {
         return Ok(true);
     }
     let mut file = fs::File::open(root)
@@ -427,7 +429,7 @@ fn valid_file_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
         hasher.update(&buffer[..count]);
     }
     let valid = format!("{:x}", hasher.finalize()) == spec.digest;
-    if valid {
+    if let (true, Some(stamp)) = (valid, stamp) {
         fs::write(&marker, stamp).map_err(|e| {
             format!(
                 "write {} verified marker {}: {e}",
