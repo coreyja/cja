@@ -42,21 +42,21 @@ static APP_ASSETS: [Asset; 5] = [
         bytes: b"User-agent: *",
     },
 ];
-static APP: Manifest = Manifest::new(&APP_ASSETS);
+static APP: Manifest = Manifest::new("test-app", &APP_ASSETS);
 static MAP_ASSETS: [Asset; 1] = [Asset {
     logical_name: "studio.js.map",
     hashed_name: "studio.js.abc12345.map",
     content_type: "application/json",
     bytes: br#"{"version":3,"sources":[],"mappings":""}"#,
 }];
-static MAP: Manifest = Manifest::new(&MAP_ASSETS);
+static MAP: Manifest = Manifest::new("test-app", &MAP_ASSETS);
 static LIB_ASSETS: [Asset; 1] = [Asset {
     logical_name: "style.css",
     hashed_name: "lib.abc12345.css",
     content_type: "text/css",
     bytes: b"lib{}",
 }];
-static LIB: Manifest = Manifest::new(&LIB_ASSETS);
+static LIB: Manifest = Manifest::new("test-lib", &LIB_ASSETS);
 
 #[tokio::test]
 async fn serves_hashed_assets_and_stable_alias() {
@@ -189,14 +189,14 @@ static COLLIDING_HASH_ASSETS: [Asset; 1] = [Asset {
     content_type: "text/css",
     bytes: b"x",
 }];
-static COLLIDING_HASH: Manifest = Manifest::new(&COLLIDING_HASH_ASSETS);
+static COLLIDING_HASH: Manifest = Manifest::new("test-lib", &COLLIDING_HASH_ASSETS);
 static COLLIDING_ALIAS_ASSETS: [Asset; 1] = [Asset {
     logical_name: "robots.txt",
     hashed_name: "other.abc12345.txt",
     content_type: "text/plain",
     bytes: b"x",
 }];
-static COLLIDING_ALIAS: Manifest = Manifest::new(&COLLIDING_ALIAS_ASSETS);
+static COLLIDING_ALIAS: Manifest = Manifest::new("test-lib", &COLLIDING_ALIAS_ASSETS);
 
 #[test]
 fn collisions_fail_before_router_startup() {
@@ -207,9 +207,15 @@ fn collisions_fail_before_router_startup() {
         err,
         AssetError::Collision {
             url: "/assets/style.abc12345.css".to_owned(),
-            first: "style.css",
-            second: "other.css"
+            first_owner: "test-app",
+            first_logical_name: "style.css",
+            second_owner: "test-lib",
+            second_logical_name: "other.css"
         }
+    );
+    assert_eq!(
+        err.to_string(),
+        "asset URL collision at /assets/style.abc12345.css: test-app (style.css) and test-lib (other.css)"
     );
     let err = cja::assets::router::<()>(&[&APP, &COLLIDING_ALIAS])
         .err()
@@ -218,9 +224,15 @@ fn collisions_fail_before_router_startup() {
         err,
         AssetError::Collision {
             url: "/robots.txt".to_owned(),
-            first: "robots.txt",
-            second: "robots.txt"
+            first_owner: "test-app",
+            first_logical_name: "robots.txt",
+            second_owner: "test-lib",
+            second_logical_name: "robots.txt"
         }
+    );
+    assert_eq!(
+        err.to_string(),
+        "asset URL collision at /robots.txt: test-app (robots.txt) and test-lib (robots.txt)"
     );
 }
 
@@ -238,7 +250,7 @@ static FAVICON_ASSETS: [Asset; 2] = [
         bytes: b"nested",
     },
 ];
-static FAVICON: Manifest = Manifest::new(&FAVICON_ASSETS);
+static FAVICON: Manifest = Manifest::new("test-app", &FAVICON_ASSETS);
 
 #[tokio::test]
 async fn favicon_alias_is_root_only() {
