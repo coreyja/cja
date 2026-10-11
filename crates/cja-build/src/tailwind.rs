@@ -36,6 +36,10 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
             pos = skip_string(bytes, pos, file)?;
             continue;
         }
+        if bytes[pos] == b'\\' {
+            pos = (pos + 2).min(bytes.len());
+            continue;
+        }
         if bytes[pos] != b'@' {
             pos += 1;
             continue;
@@ -46,6 +50,7 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
             end += 1;
         }
         let name = &css[start..end];
+        check_rule_case(name, file)?;
         if !matches!(
             name,
             "import" | "source" | "config" | "plugin" | "reference" | "tailwind"
@@ -64,6 +69,8 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
                     })?;
             } else if matches!(bytes[cursor], b'\'' | b'"') {
                 cursor = skip_string(bytes, cursor, file)?;
+            } else if bytes[cursor] == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
             } else {
                 cursor += 1;
             }
@@ -95,21 +102,7 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
                     result.imports.push(path.to_owned());
                 }
             }
-            "source" => {
-                let path = quoted_only(argument).ok_or_else(|| {
-                    error(format!(
-                        "unsupported @source {argument:?} in {}: use a quoted positive directory",
-                        file.display()
-                    ))
-                })?;
-                if !relative(path) || path.contains(['*', '?', '[', ']']) || path.starts_with('!') {
-                    return Err(error(format!(
-                        "unsupported @source {argument:?} in {}: use a relative directory without globs",
-                        file.display()
-                    )));
-                }
-                result.sources.push(path.to_owned());
-            }
+            "source" => result.sources.push(source_path(argument, file)?.to_owned()),
             _ => {
                 return Err(error(format!(
                     "@{name} is unsupported in {}: use Tailwind v4 CSS-first configuration",
@@ -120,6 +113,42 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         pos = cursor + 1;
     }
     Ok(result)
+}
+
+fn check_rule_case(name: &str, file: &Path) -> Result<(), BuildError> {
+    if [
+        "import",
+        "source",
+        "config",
+        "plugin",
+        "reference",
+        "tailwind",
+    ]
+    .iter()
+    .any(|known| name.eq_ignore_ascii_case(known) && name != *known)
+    {
+        return Err(error(format!(
+            "at-rule names must be lowercase in {}: Tailwind ignores @{name}",
+            file.display()
+        )));
+    }
+    Ok(())
+}
+
+fn source_path<'a>(argument: &'a str, file: &Path) -> Result<&'a str, BuildError> {
+    let path = quoted_only(argument).ok_or_else(|| {
+        error(format!(
+            "unsupported @source {argument:?} in {}: use a quoted positive directory",
+            file.display()
+        ))
+    })?;
+    if !relative(path) || path.contains(['*', '?', '[', ']']) || path.starts_with('!') {
+        return Err(error(format!(
+            "unsupported @source {argument:?} in {}: directory must start with ./ or ../ and contain no globs",
+            file.display()
+        )));
+    }
+    Ok(path)
 }
 
 fn reject_near_miss_root_import(argument: &str, file: &Path) -> Result<(), BuildError> {
@@ -206,6 +235,16 @@ fn confined(path: &Path, root: &Path, directory: bool) -> Result<PathBuf, BuildE
             root.display()
         )));
     }
+    if canonical.strip_prefix(root).is_ok_and(|relative| {
+        relative
+            .components()
+            .any(|part| part.as_os_str() == "target")
+    }) {
+        return Err(error(format!(
+            "refusing Tailwind CSS path inside target/: {}",
+            canonical.display()
+        )));
+    }
     if (directory && !canonical.is_dir()) || (!directory && !canonical.is_file()) {
         return Err(error(format!(
             "CSS path {} must be a {} under manifest directory {}",
@@ -225,7 +264,7 @@ pub(super) fn validate_css(
     input: &Path,
     manifest_dir: &Path,
     out_dir: &Path,
-) -> Result<(), BuildError> {
+) -> Result<PathBuf, BuildError> {
     let root = manifest_dir.canonicalize().map_err(|e| {
         error(format!(
             "manifest directory {}: {e}",
@@ -244,7 +283,7 @@ pub(super) fn validate_css(
     let input = confined(&root.join(relative), &root, false)?;
     let parent = input
         .parent()
-        .ok_or_else(|| error("CSS input has no parent"))?;
+        .ok_or_else(|| error(format!("CSS input {} has no parent", input.display())))?;
     for name in [
         "tailwind.config.js",
         "tailwind.config.ts",
@@ -269,7 +308,8 @@ pub(super) fn validate_css(
         &mut seen,
         &mut chain,
         &mut sources,
-    )
+    )?;
+    Ok(input)
 }
 
 fn visit(
@@ -297,6 +337,9 @@ fn visit(
     let css =
         fs::read_to_string(file).map_err(|e| error(format!("read CSS {}: {e}", file.display())))?;
     let rules = directives(&css, file)?;
+    let parent = file
+        .parent()
+        .ok_or_else(|| error(format!("CSS file {} has no parent", file.display())))?;
     if is_root {
         if rules.tailwind_imports != 1 || rules.sources.is_empty() {
             return Err(error(format!(
@@ -305,17 +348,7 @@ fn visit(
             )));
         }
         for source in rules.sources {
-            let directory = confined(&file.parent().unwrap().join(source), root, true)?;
-            if directory.strip_prefix(root).is_ok_and(|relative| {
-                relative
-                    .components()
-                    .any(|part| part.as_os_str() == "target")
-            }) {
-                return Err(error(format!(
-                    "refusing Tailwind @source inside target/: {}",
-                    directory.display()
-                )));
-            }
+            let directory = confined(&parent.join(source), root, true)?;
             if !sources.insert(directory.clone()) {
                 return Err(error(format!(
                     "duplicate @source directory {}",
@@ -323,6 +356,8 @@ fn visit(
                 )));
             }
             watch_dir(&directory, out_dir)?;
+            reject_source_symlinks(&directory)?;
+            watch_ignore_files(&directory, out_dir)?;
         }
     } else if rules.tailwind_imports != 0 || !rules.sources.is_empty() {
         return Err(error(format!(
@@ -331,11 +366,57 @@ fn visit(
         )));
     }
     for import in rules.imports {
-        let path = confined(&file.parent().unwrap().join(import), root, false)?;
+        let path = confined(&parent.join(import), root, false)?;
         visit(&path, root, out_dir, false, seen, chain, sources)?;
     }
     chain.pop();
     Ok(())
+}
+
+fn reject_source_symlinks(root: &Path) -> Result<(), BuildError> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)
+            .map_err(|e| error(format!("read Tailwind source {}: {e}", dir.display())))?
+        {
+            let entry =
+                entry.map_err(|e| error(format!("read Tailwind source {}: {e}", dir.display())))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| error(format!("inspect Tailwind source {}: {e}", path.display())))?;
+            if kind.is_symlink() {
+                return Err(error(format!(
+                    "symlink in Tailwind @source directory: {}",
+                    path.display()
+                )));
+            }
+            if kind.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn watch_ignore_files(root: &Path, out_dir: &Path) -> Result<(), BuildError> {
+    for path in existing_ignore_files(root) {
+        watch_dir(&path, out_dir)?;
+    }
+    Ok(())
+}
+
+fn existing_ignore_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for ancestor in root.ancestors() {
+        for relative in [".gitignore", ".ignore", ".git/info/exclude"] {
+            let path = ancestor.join(relative);
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 #[cfg(test)]
@@ -353,7 +434,7 @@ mod tests {
     fn check(root: &Path, css: &str) -> Result<(), BuildError> {
         let input = root.join("frontend/app.css");
         fs::write(&input, css).unwrap();
-        validate_css(&input, root, &root.join("out"))
+        validate_css(&input, root, &root.join("out")).map(|_| ())
     }
 
     const ROOT: &str = "@import \"tailwindcss\" source(none); @source \"../src\";";
@@ -394,7 +475,11 @@ mod tests {
             ),
             (
                 "@import \"tailwindcss\" source(none); @source \"../src/*.rs\";",
-                "without globs",
+                "contain no globs",
+            ),
+            (
+                "@import \"tailwindcss\" source(none); @source \"src\";",
+                "start with ./ or ../",
             ),
             (
                 "@import \"tailwindcss\" source(none); @source \"../../outside\";",
@@ -499,5 +584,95 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("OUT_DIR"), "{error}");
+    }
+
+    #[test]
+    fn mis_cased_tailwind_rules_fail() {
+        let root = fixture();
+        for rule in [
+            "@SOURCE \"../src\";",
+            "@Import \"./x.css\";",
+            "@Plugin \"x\";",
+        ] {
+            let message = check(root.path(), &format!("{ROOT} {rule}"))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("must be lowercase"), "{message}");
+        }
+    }
+
+    #[test]
+    fn escaped_selectors_cannot_hide_rules() {
+        let root = fixture();
+        let message = check(
+            root.path(),
+            &format!("{ROOT} .a\\\"{{}} @source \"../../secret\"; /* \" */"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("manifest directory"), "{message}");
+
+        fs::write(root.path().join("frontend/hidden.css"), ".hidden{}").unwrap();
+        check(
+            root.path(),
+            &format!("{ROOT} .a\\'{{}} @import \"./hidden.css\"; /* ' */"),
+        )
+        .unwrap();
+        fs::remove_file(root.path().join("frontend/hidden.css")).unwrap();
+        let message = check(
+            root.path(),
+            &format!("{ROOT} .a\\'{{}} @import \"./hidden.css\"; /* ' */"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("hidden.css"), "{message}");
+        check(root.path(), &format!("{ROOT} .md\\:x{{}} .a\\\"{{}}")).unwrap();
+    }
+
+    #[test]
+    fn css_files_cannot_live_under_target() {
+        let root = fixture();
+        fs::create_dir_all(root.path().join("target")).unwrap();
+        fs::write(root.path().join("target/app.css"), ROOT).unwrap();
+        let message = validate_css(
+            &root.path().join("target/app.css"),
+            root.path(),
+            &root.path().join("out"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("target/"), "{message}");
+        fs::write(root.path().join("target/gen.css"), ".x{}").unwrap();
+        let message = check(
+            root.path(),
+            &format!("{ROOT} @import \"../target/gen.css\";"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("target/"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_tree_rejects_symlinked_files_and_directories() {
+        use std::os::unix::fs::symlink;
+        let root = fixture();
+        for (name, target) in [("file.rs", "/etc/hosts"), ("linked", "/tmp")] {
+            let link = root.path().join("src").join(name);
+            symlink(target, &link).unwrap();
+            let message = check(root.path(), ROOT).unwrap_err().to_string();
+            assert!(message.contains(&link.display().to_string()), "{message}");
+            fs::remove_file(link).unwrap();
+        }
+    }
+
+    #[test]
+    fn watches_existing_ancestor_ignore_files() {
+        let root = fixture();
+        let ignore = root.path().join(".gitignore");
+        fs::write(&ignore, "ignored.rs\n").unwrap();
+        let out = root.path().join("out");
+        watch_ignore_files(&root.path().join("src"), &out).unwrap();
+        assert!(existing_ignore_files(&root.path().join("src")).contains(&ignore));
     }
 }

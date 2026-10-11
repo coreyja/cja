@@ -23,6 +23,11 @@ standalone Tailwind v4.3.3 binary into the same shared cache, or uses
 Cargo reruns the build script when CSS, imported CSS, or scanned Rust sources
 change; every output is embedded, with no live reload or runtime disk mode.
 Ordinary CSS can still be provided via `static_dir`.
+Tailwind honours `.gitignore`, `.ignore`, and `.git/info/exclude` in source
+directories and their ancestors. Existing ignore files are watched. Creating a
+new ancestor ignore file takes effect on the next Cargo rerun; creation alone
+does not trigger one. Docker builds omit `.git/info/exclude` because
+`.dockerignore` removes `.git` from the build context.
 
 ## Setup
 

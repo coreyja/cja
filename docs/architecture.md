@@ -22,6 +22,10 @@ validated recursively, and all CSS files and scan roots stay inside the app's
 manifest directory. Cargo watches the CSS graph and every explicit scan root,
 including Rust Maud templates. Tailwind's minified output uses the same hashed,
 embedded manifest path as static files; ordinary CSS may still use `static_dir`.
+Tailwind also honours ancestor `.gitignore` and `.ignore` files and
+`.git/info/exclude`; existing files are watched. A newly created ancestor
+ignore file is noticed on the next rerun, not immediately. Docker builds omit
+`.git/info/exclude` because `.dockerignore` removes `.git`.
 
 CJA is organized as three subsystems — Cron, Jobs, and Axum (HTTP server) — plus supporting modules for sessions, tracing, and database management. Everything coordinates through a shared `AppState` trait and `CancellationToken` for graceful shutdown.
 

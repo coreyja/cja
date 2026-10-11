@@ -134,7 +134,11 @@ impl ToolSpec {
                 "tailwindcss-macos-arm64",
                 "cdf646702987a743464dff4d9c60fd4480d1c1e73dd819a9a67f1078815dce9d",
             ),
-            _ => return Err(format!("unsupported native tailwindcss build host: {host}")),
+            _ => {
+                return Err(format!(
+                    "unsupported native tailwindcss build host: {host}; set TAILWIND_CLI to an installed executable"
+                ));
+            }
         };
         Ok(Self {
             name: "tailwindcss",
@@ -370,12 +374,48 @@ fn valid_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
                 && spec.executable(root).is_file()
                 && root.join("package/lib/lib.d.ts").is_file())
         }
-        None => Ok(root.is_file()
-            && format!(
-                "{:x}",
-                Sha256::digest(fs::read(root).map_err(|e| e.to_string())?)
-            ) == spec.digest),
+        None => valid_file_cache(spec, root),
     }
+}
+
+fn valid_file_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
+    if !root.is_file() {
+        return Ok(false);
+    }
+    let metadata = fs::metadata(root)
+        .map_err(|e| format!("inspect {} cache {}: {e}", spec.name, root.display()))?;
+    let modified = metadata
+        .modified()
+        .map_err(|e| format!("inspect {} cache mtime {}: {e}", spec.name, root.display()))?;
+    let stamp = format!("{} {:?} {}", metadata.len(), modified, spec.digest);
+    let marker = root.with_file_name(format!("{}.verified", spec.key()));
+    if fs::read_to_string(&marker).is_ok_and(|value| value == stamp) {
+        return Ok(true);
+    }
+    let mut file = fs::File::open(root)
+        .map_err(|e| format!("open {} cache {}: {e}", spec.name, root.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| format!("read {} cache {}: {e}", spec.name, root.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let valid = format!("{:x}", hasher.finalize()) == spec.digest;
+    if valid {
+        fs::write(&marker, stamp).map_err(|e| {
+            format!(
+                "write {} verified marker {}: {e}",
+                spec.name,
+                marker.display()
+            )
+        })?;
+    }
+    Ok(valid)
 }
 
 fn install(
@@ -393,15 +433,32 @@ fn install(
     let actual = format!("{:x}", Sha256::digest(&bytes));
     if actual != spec.digest {
         return Err(format!(
-            "{} SHA-256 mismatch: expected {}, got {actual}",
-            spec.name, spec.digest
+            "{} download from {} for cache {} SHA-256 mismatch: expected {}, got {actual}",
+            spec.name,
+            spec.url,
+            root.display(),
+            spec.digest
         ));
     }
-    let parent = root.parent().ok_or("cache entry has no parent")?;
+    let parent = root.parent().ok_or_else(|| {
+        format!(
+            "{} cache entry {} for {} has no parent",
+            spec.name,
+            root.display(),
+            spec.url
+        )
+    })?;
     let stage = tempfile::Builder::new()
         .prefix(".cja-tool-")
         .tempdir_in(parent)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            format!(
+                "stage {} download from {} in {}: {e}",
+                spec.name,
+                spec.url,
+                parent.display()
+            )
+        })?;
     if let Some(executable) = spec.archive_executable {
         let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
         let mut archive = tar::Archive::new(decoder);
@@ -445,18 +502,56 @@ fn install(
             return Err(format!("install {}: {e}", root.display()));
         }
     } else {
-        let staged = stage.path().join("binary");
-        let mut file = fs::File::create(&staged).map_err(|e| e.to_string())?;
-        file.write_all(&bytes).map_err(|e| e.to_string())?;
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
-                .map_err(|e| e.to_string())?;
-        }
-        fs::rename(staged, root).map_err(|e| format!("install {}: {e}", root.display()))?;
+        install_single_file(spec, root, stage.path(), &bytes)?;
     }
+    Ok(())
+}
+
+fn install_single_file(
+    spec: &ToolSpec,
+    root: &Path,
+    stage: &Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let staged = stage.join("binary");
+    let mut file = fs::File::create(&staged).map_err(|e| {
+        format!(
+            "create {} download from {} at {}: {e}",
+            spec.name,
+            spec.url,
+            staged.display()
+        )
+    })?;
+    file.write_all(bytes).map_err(|e| {
+        format!(
+            "write {} download from {} at {}: {e}",
+            spec.name,
+            spec.url,
+            staged.display()
+        )
+    })?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(|e| {
+            format!(
+                "set permissions on {} download from {} at {}: {e}",
+                spec.name,
+                spec.url,
+                staged.display()
+            )
+        })?;
+    }
+    fs::rename(&staged, root).map_err(|e| {
+        format!(
+            "install {} download from {} from {} to {}: {e}",
+            spec.name,
+            spec.url,
+            staged.display(),
+            root.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -502,7 +597,12 @@ fn read_capped(
     reader
         .take(spec.max_bytes + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            format!(
+                "read {} download from {} (limit {} bytes): {e}",
+                spec.name, spec.url, spec.max_bytes
+            )
+        })?;
     if bytes.len() as u64 > spec.max_bytes {
         return Err(format!(
             "{} download from {} exceeds {} bytes",
@@ -823,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn file_cache_rehashes_every_hit() {
+    fn file_cache_rehashes_after_change() {
         let dir = tempfile::tempdir().unwrap();
         let spec = file_spec(b"good");
         let env = env(dir.path());

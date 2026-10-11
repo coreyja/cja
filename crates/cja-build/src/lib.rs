@@ -619,6 +619,7 @@ impl AssetsBuilder {
         out_dir: &Path,
         tool_env: &tool_cache::ToolEnv,
     ) -> Result<(), BuildError> {
+        let mut validated = Vec::with_capacity(self.tailwinds.len());
         for input in &self.tailwinds {
             validate_name(&input.logical_name, &input.input)?;
             if Path::new(&input.logical_name)
@@ -643,23 +644,29 @@ impl AssetsBuilder {
                     css.display()
                 )));
             }
-            tailwind::validate_css(&css, manifest_dir, out_dir)?;
+            validated.push(tailwind::validate_css(&css, manifest_dir, out_dir)?);
         }
         let executable = tool_cache::resolve_tailwind(tool_env, tool_cache::fetch_https)
             .map_err(BuildError::Frontend)?;
         watch_dir(&executable, out_dir)?;
-        for input in self.tailwinds.clone() {
-            let css = manifest_dir
-                .join(&input.input)
-                .canonicalize()
-                .map_err(|e| BuildError::Frontend(e.to_string()))?;
+        for (input, css) in self.tailwinds.clone().into_iter().zip(validated) {
             let scratch = tempfile::Builder::new()
                 .prefix("cja-tailwind-")
                 .tempdir_in(out_dir)
-                .map_err(|e| BuildError::Frontend(format!("create Tailwind scratch: {e}")))?;
+                .map_err(|e| {
+                    BuildError::Frontend(format!(
+                        "create Tailwind scratch in {}: {e}",
+                        out_dir.display()
+                    ))
+                })?;
             let output_path = scratch.path().join("app.css");
             let output = std::process::Command::new(&executable)
-                .current_dir(css.parent().expect("CSS file has parent"))
+                .current_dir(css.parent().ok_or_else(|| {
+                    BuildError::Frontend(format!(
+                        "validated Tailwind CSS {} has no parent",
+                        css.display()
+                    ))
+                })?)
                 .arg("-i")
                 .arg(&css)
                 .arg("-o")
@@ -1569,6 +1576,20 @@ mod tests {
             }
             assert!(!out.join("cja_assets.rs").exists());
         }
+    }
+
+    #[test]
+    fn tailwind_spawns_with_validated_canonical_input() {
+        let _guard = crate::SPAWN.lock().unwrap();
+        let root = fixture();
+        css_fixture(root.path(), "");
+        let out = root.path().join("out");
+        fs::create_dir(&out).unwrap();
+        AssetsBuilder::new()
+            .tailwind(Tailwind::new("frontend/missing/../app.css", "app.css"))
+            .build_in(root.path(), &out, &fake_tailwind_env(root.path()))
+            .unwrap();
+        assert!(out.join("cja_assets.rs").is_file());
     }
 
     #[cfg(unix)]
