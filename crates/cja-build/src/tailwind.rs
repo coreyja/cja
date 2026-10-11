@@ -18,6 +18,14 @@ struct Directives {
     tailwind_imports: usize,
 }
 
+#[derive(Default)]
+struct VisitState {
+    seen: HashSet<PathBuf>,
+    chain: Vec<PathBuf>,
+    sources: HashSet<PathBuf>,
+    watches: Vec<PathBuf>,
+}
+
 // Walk CSS bytes rather than searching lines: comments and quoted content can
 // contain inert @rules, while an actual rule may span several lines.
 fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
@@ -26,10 +34,7 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
     let mut result = Directives::default();
     while pos < bytes.len() {
         if bytes[pos..].starts_with(b"/*") {
-            pos = css[pos + 2..]
-                .find("*/")
-                .map(|end| pos + 2 + end + 2)
-                .ok_or_else(|| error(format!("unterminated CSS comment in {}", file.display())))?;
+            pos = skip_comment(bytes, pos, file)?;
             continue;
         }
         if matches!(bytes[pos], b'\'' | b'"') {
@@ -61,12 +66,7 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         let mut cursor = end;
         while cursor < bytes.len() && bytes[cursor] != b';' {
             if bytes[cursor..].starts_with(b"/*") {
-                cursor = css[cursor + 2..]
-                    .find("*/")
-                    .map(|n| cursor + 2 + n + 2)
-                    .ok_or_else(|| {
-                        error(format!("unterminated CSS comment in {}", file.display()))
-                    })?;
+                cursor = skip_comment(bytes, cursor, file)?;
             } else if matches!(bytes[cursor], b'\'' | b'"') {
                 cursor = skip_string(bytes, cursor, file)?;
             } else if bytes[cursor] == b'\\' {
@@ -113,6 +113,23 @@ fn directives(css: &str, file: &Path) -> Result<Directives, BuildError> {
         pos = cursor + 1;
     }
     Ok(result)
+}
+
+fn skip_comment(bytes: &[u8], mut pos: usize, file: &Path) -> Result<usize, BuildError> {
+    pos += 2;
+    while pos < bytes.len() {
+        if bytes[pos] == b'\\' {
+            pos = (pos + 2).min(bytes.len());
+        } else if bytes[pos..].starts_with(b"*/") {
+            return Ok(pos + 2);
+        } else {
+            pos += 1;
+        }
+    }
+    Err(error(format!(
+        "unterminated CSS comment in {}",
+        file.display()
+    )))
 }
 
 fn check_rule_case(name: &str, file: &Path) -> Result<(), BuildError> {
@@ -241,7 +258,7 @@ fn confined(path: &Path, root: &Path, directory: bool) -> Result<PathBuf, BuildE
             .any(|part| part.as_os_str() == "target")
     }) {
         return Err(error(format!(
-            "refusing Tailwind CSS path inside target/: {}",
+            "refusing Tailwind path inside target/ (reserved for Cargo output): {}",
             canonical.display()
         )));
     }
@@ -265,6 +282,14 @@ pub(super) fn validate_css(
     manifest_dir: &Path,
     out_dir: &Path,
 ) -> Result<PathBuf, BuildError> {
+    validate_css_with_watches(input, manifest_dir, out_dir).map(|(input, _)| input)
+}
+
+fn validate_css_with_watches(
+    input: &Path,
+    manifest_dir: &Path,
+    out_dir: &Path,
+) -> Result<(PathBuf, Vec<PathBuf>), BuildError> {
     let root = manifest_dir.canonicalize().map_err(|e| {
         error(format!(
             "manifest directory {}: {e}",
@@ -297,19 +322,9 @@ pub(super) fn validate_css(
             )));
         }
     }
-    let mut seen = HashSet::new();
-    let mut chain = Vec::new();
-    let mut sources = HashSet::new();
-    visit(
-        &input,
-        &root,
-        out_dir,
-        true,
-        &mut seen,
-        &mut chain,
-        &mut sources,
-    )?;
-    Ok(input)
+    let mut state = VisitState::default();
+    visit(&input, &root, out_dir, true, &mut state)?;
+    Ok((input, state.watches))
 }
 
 fn visit(
@@ -317,14 +332,13 @@ fn visit(
     root: &Path,
     out_dir: &Path,
     is_root: bool,
-    seen: &mut HashSet<PathBuf>,
-    chain: &mut Vec<PathBuf>,
-    sources: &mut HashSet<PathBuf>,
+    state: &mut VisitState,
 ) -> Result<(), BuildError> {
-    if !seen.insert(file.to_path_buf()) {
+    if !state.seen.insert(file.to_path_buf()) {
         return Err(error(format!(
             "CSS import cycle or duplicate: {} -> {}",
-            chain
+            state
+                .chain
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
@@ -332,8 +346,9 @@ fn visit(
             file.display()
         )));
     }
-    chain.push(file.to_path_buf());
+    state.chain.push(file.to_path_buf());
     watch_dir(file, out_dir)?;
+    state.watches.push(file.to_path_buf());
     let css =
         fs::read_to_string(file).map_err(|e| error(format!("read CSS {}: {e}", file.display())))?;
     let rules = directives(&css, file)?;
@@ -349,15 +364,16 @@ fn visit(
         }
         for source in rules.sources {
             let directory = confined(&parent.join(source), root, true)?;
-            if !sources.insert(directory.clone()) {
+            if !state.sources.insert(directory.clone()) {
                 return Err(error(format!(
                     "duplicate @source directory {}",
                     directory.display()
                 )));
             }
             watch_dir(&directory, out_dir)?;
+            state.watches.push(directory.clone());
             reject_source_symlinks(&directory)?;
-            watch_ignore_files(&directory, out_dir)?;
+            watch_ignore_files(&directory, out_dir, &mut state.watches)?;
         }
     } else if rules.tailwind_imports != 0 || !rules.sources.is_empty() {
         return Err(error(format!(
@@ -367,15 +383,18 @@ fn visit(
     }
     for import in rules.imports {
         let path = confined(&parent.join(import), root, false)?;
-        visit(&path, root, out_dir, false, seen, chain, sources)?;
+        visit(&path, root, out_dir, false, state)?;
     }
-    chain.pop();
+    state.chain.pop();
     Ok(())
 }
 
 fn reject_source_symlinks(root: &Path) -> Result<(), BuildError> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
+        if dir.file_name().is_some_and(|name| name == "node_modules") {
+            continue;
+        }
         for entry in fs::read_dir(&dir)
             .map_err(|e| error(format!("read Tailwind source {}: {e}", dir.display())))?
         {
@@ -386,6 +405,9 @@ fn reject_source_symlinks(root: &Path) -> Result<(), BuildError> {
                 .file_type()
                 .map_err(|e| error(format!("inspect Tailwind source {}: {e}", path.display())))?;
             if kind.is_symlink() {
+                if fs::metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+                    continue;
+                }
                 return Err(error(format!(
                     "symlink in Tailwind @source directory: {}",
                     path.display()
@@ -399,14 +421,19 @@ fn reject_source_symlinks(root: &Path) -> Result<(), BuildError> {
     Ok(())
 }
 
-fn watch_ignore_files(root: &Path, out_dir: &Path) -> Result<(), BuildError> {
-    for path in existing_ignore_files(root) {
+fn watch_ignore_files(
+    root: &Path,
+    out_dir: &Path,
+    watches: &mut Vec<PathBuf>,
+) -> Result<(), BuildError> {
+    for path in existing_ignore_files(root)? {
         watch_dir(&path, out_dir)?;
+        watches.push(path);
     }
     Ok(())
 }
 
-fn existing_ignore_files(root: &Path) -> Vec<PathBuf> {
+fn existing_ignore_files(root: &Path) -> Result<Vec<PathBuf>, BuildError> {
     let mut files = Vec::new();
     for ancestor in root.ancestors() {
         for relative in [".gitignore", ".ignore", ".git/info/exclude"] {
@@ -415,8 +442,36 @@ fn existing_ignore_files(root: &Path) -> Vec<PathBuf> {
                 files.push(path);
             }
         }
+        let dot_git = ancestor.join(".git");
+        if dot_git.is_file() {
+            let content = fs::read_to_string(&dot_git)
+                .map_err(|e| error(format!("read {}: {e}", dot_git.display())))?;
+            let gitdir = content
+                .lines()
+                .find_map(|line| line.strip_prefix("gitdir: "))
+                .ok_or_else(|| error(format!("missing gitdir: line in {}", dot_git.display())))?;
+            let gitdir = ancestor
+                .join(gitdir)
+                .canonicalize()
+                .map_err(|e| error(format!("resolve gitdir in {}: {e}", dot_git.display())))?;
+            let common = gitdir.join("commondir");
+            let base = if common.is_file() {
+                let relative = fs::read_to_string(&common)
+                    .map_err(|e| error(format!("read {}: {e}", common.display())))?;
+                gitdir
+                    .join(relative.trim())
+                    .canonicalize()
+                    .map_err(|e| error(format!("resolve {}: {e}", common.display())))?
+            } else {
+                gitdir
+            };
+            let exclude = base.join("info/exclude");
+            if exclude.is_file() {
+                files.push(exclude);
+            }
+        }
     }
-    files
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -603,30 +658,40 @@ mod tests {
 
     #[test]
     fn escaped_selectors_cannot_hide_rules() {
-        let root = fixture();
+        let outer = tempfile::tempdir().unwrap();
+        let app = outer.path().join("app");
+        fs::create_dir_all(app.join("frontend")).unwrap();
+        fs::create_dir(app.join("src")).unwrap();
+        fs::create_dir(app.join("out")).unwrap();
+        let root = app.as_path();
+        let secret = outer.path().join("secret");
+        fs::create_dir_all(&secret).unwrap();
         let message = check(
-            root.path(),
+            root,
             &format!("{ROOT} .a\\\"{{}} @source \"../../secret\"; /* \" */"),
         )
         .unwrap_err()
         .to_string();
-        assert!(message.contains("manifest directory"), "{message}");
+        assert!(
+            message.contains("escapes manifest directory limit"),
+            "{message}"
+        );
 
-        fs::write(root.path().join("frontend/hidden.css"), ".hidden{}").unwrap();
+        fs::write(root.join("frontend/hidden.css"), ".hidden{}").unwrap();
         check(
-            root.path(),
+            root,
             &format!("{ROOT} .a\\'{{}} @import \"./hidden.css\"; /* ' */"),
         )
         .unwrap();
-        fs::remove_file(root.path().join("frontend/hidden.css")).unwrap();
+        fs::remove_file(root.join("frontend/hidden.css")).unwrap();
         let message = check(
-            root.path(),
+            root,
             &format!("{ROOT} .a\\'{{}} @import \"./hidden.css\"; /* ' */"),
         )
         .unwrap_err()
         .to_string();
         assert!(message.contains("hidden.css"), "{message}");
-        check(root.path(), &format!("{ROOT} .md\\:x{{}} .a\\\"{{}}")).unwrap();
+        check(root, &format!("{ROOT} .md\\:x{{}} .a\\\"{{}}")).unwrap();
     }
 
     #[test]
@@ -641,7 +706,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(message.contains("target/"), "{message}");
+        assert!(
+            message.contains("refusing Tailwind path inside target/ (reserved for Cargo output):"),
+            "{message}"
+        );
         fs::write(root.path().join("target/gen.css"), ".x{}").unwrap();
         let message = check(
             root.path(),
@@ -649,7 +717,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(message.contains("target/"), "{message}");
+        assert!(
+            message.contains("refusing Tailwind path inside target/ (reserved for Cargo output):"),
+            "{message}"
+        );
     }
 
     #[cfg(unix)]
@@ -664,15 +735,98 @@ mod tests {
             assert!(message.contains(&link.display().to_string()), "{message}");
             fs::remove_file(link).unwrap();
         }
+        symlink("missing.rs", root.path().join("src/.#a.rs")).unwrap();
+        fs::create_dir(root.path().join("src/node_modules")).unwrap();
+        symlink("/etc/hosts", root.path().join("src/node_modules/tool")).unwrap();
+        check(root.path(), ROOT).unwrap();
     }
 
     #[test]
     fn watches_existing_ancestor_ignore_files() {
         let root = fixture();
-        let ignore = root.path().join(".gitignore");
-        fs::write(&ignore, "ignored.rs\n").unwrap();
-        let out = root.path().join("out");
-        watch_ignore_files(&root.path().join("src"), &out).unwrap();
-        assert!(existing_ignore_files(&root.path().join("src")).contains(&ignore));
+        let gitdir = root.path().join("repo/.git/worktrees/wt");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::create_dir_all(root.path().join("repo/.git/info")).unwrap();
+        fs::write(gitdir.join("commondir"), "../..").unwrap();
+        let exclude = root.path().join("repo/.git/info/exclude");
+        fs::write(&exclude, "g.rs\n").unwrap();
+        let wt = root.path().join("wt");
+        fs::create_dir_all(wt.join("frontend")).unwrap();
+        fs::create_dir(wt.join("src")).unwrap();
+        fs::create_dir(wt.join("out")).unwrap();
+        fs::write(wt.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
+        fs::write(wt.join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::write(wt.join("frontend/extra.css"), ".extra{}").unwrap();
+        let input = wt.join("frontend/app.css");
+        fs::write(&input, format!("{ROOT} @import \"./extra.css\";")).unwrap();
+        let (_, emitted) = validate_css_with_watches(&input, &wt, &wt.join("out")).unwrap();
+        for expected in [
+            &input,
+            &wt.join("frontend/extra.css"),
+            &wt.join("src"),
+            &wt.join(".gitignore"),
+            &exclude,
+        ] {
+            assert!(
+                emitted.contains(expected),
+                "missing {} from {emitted:?}",
+                expected.display()
+            );
+        }
+        assert!(
+            existing_ignore_files(&wt.join("src"))
+                .unwrap()
+                .contains(&exclude)
+        );
+    }
+
+    #[test]
+    fn malformed_worktree_gitdir_is_loud() {
+        let root = fixture();
+        fs::write(root.path().join(".git"), "broken\n").unwrap();
+        let message = check(root.path(), ROOT).unwrap_err().to_string();
+        assert!(
+            message.contains("missing gitdir: line") && message.contains(".git"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn escaped_comment_close_cannot_hide_rules() {
+        let outer = tempfile::tempdir().unwrap();
+        let app = outer.path().join("app");
+        fs::create_dir_all(app.join("frontend")).unwrap();
+        fs::create_dir(app.join("src")).unwrap();
+        fs::create_dir(app.join("out")).unwrap();
+        fs::create_dir(outer.path().join("secret")).unwrap();
+        for quote in ['"', '\''] {
+            let css = format!(
+                "{ROOT} /* \\*/ {quote} */ @source {quote}../../secret{quote}; /* {quote} */"
+            );
+            let message = check(&app, &css).unwrap_err().to_string();
+            assert!(
+                message.contains("escapes manifest directory limit"),
+                "{message}"
+            );
+        }
+        let hidden = app.join("frontend/hidden.css");
+        let css = format!("{ROOT} /* \\*/ \" */ @import \"./hidden.css\"; /* \" */");
+        fs::write(&hidden, ".hidden{}").unwrap();
+        check(&app, &css).unwrap();
+        fs::remove_file(hidden).unwrap();
+        assert!(
+            check(&app, &css)
+                .unwrap_err()
+                .to_string()
+                .contains("hidden.css")
+        );
+        let css = format!("{ROOT} /* \\*/ \" */ @plugin \"x\"; /* \" */");
+        assert!(
+            check(&app, &css)
+                .unwrap_err()
+                .to_string()
+                .contains("@plugin is unsupported")
+        );
+        check(&app, &format!("{ROOT} /* C:\\dir */ .x{{}} ")).unwrap();
     }
 }

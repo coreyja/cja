@@ -23,7 +23,9 @@ manifest directory. Cargo watches the CSS graph and every explicit scan root,
 including Rust Maud templates. Tailwind's minified output uses the same hashed,
 embedded manifest path as static files; ordinary CSS may still use `static_dir`.
 Tailwind also honours ancestor `.gitignore` and `.ignore` files and
-`.git/info/exclude`; existing files are watched. A newly created ancestor
+`.git/info/exclude`; existing files are watched, including the common Git
+directory's exclude in a worktree (or the submodule Git directory's exclude).
+A newly created ancestor
 ignore file is noticed on the next rerun, not immediately. Docker builds omit
 `.git/info/exclude` because `.dockerignore` removes `.git`.
 

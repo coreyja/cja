@@ -17,7 +17,9 @@ in `build.rs`; the input path is relative to `CARGO_MANIFEST_DIR`. The root CSS
 requires `@import "tailwindcss" source(none);` plus explicit relative directory
 `@source` rules. Local quoted `./` and `../` `.css` imports are checked
 recursively. All files and scan roots must stay inside the app directory;
-symlinks and JS config are rejected. `cja-build` downloads and verifies the
+resolving symlinks and JS config are rejected. Dangling symlinks (such as
+Emacs lock files) are ignored, and `node_modules` directories are not scanned.
+`cja-build` downloads and verifies the
 standalone Tailwind v4.3.3 binary into the same shared cache, or uses
 `TAILWIND_CLI` when set. Offline cold builds fail with installation guidance.
 Cargo reruns the build script when CSS, imported CSS, or scanned Rust sources
@@ -26,7 +28,9 @@ Ordinary CSS can still be provided via `static_dir`.
 Tailwind honours `.gitignore`, `.ignore`, and `.git/info/exclude` in source
 directories and their ancestors. Existing ignore files are watched. Creating a
 new ancestor ignore file takes effect on the next Cargo rerun; creation alone
-does not trigger one. Docker builds omit `.git/info/exclude` because
+does not trigger one. In worktrees, the common Git directory's `info/exclude`
+is watched; in submodules, the submodule Git directory's file is watched.
+Docker builds omit `.git/info/exclude` because
 `.dockerignore` removes `.git` from the build context.
 
 ## Setup

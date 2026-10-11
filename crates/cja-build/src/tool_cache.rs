@@ -279,7 +279,12 @@ fn resolve_override(
     {
         use std::os::unix::fs::PermissionsExt as _;
         if fs::metadata(&candidate)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| {
+                format!(
+                    "inspect {override_env} override {}: {e}",
+                    candidate.display()
+                )
+            })?
             .permissions()
             .mode()
             & 0o111
@@ -325,14 +330,26 @@ fn resolve_locked(
     if root.exists() {
         let path = root
             .parent()
-            .ok_or("cache entry has no parent")?
+            .ok_or_else(|| {
+                format!(
+                    "{} cache entry {} for {} has no parent",
+                    spec.name,
+                    root.display(),
+                    spec.url
+                )
+            })?
             .join(format!(
                 "{}.stale-{}-{}",
                 spec.key(),
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!(
+                        "timestamp {} cache {} from {}: {e}",
+                        spec.name,
+                        root.display(),
+                        spec.url
+                    ))?
                     .as_nanos()
             ));
         fs::rename(root, &path).map_err(|e| {
@@ -387,7 +404,11 @@ fn valid_file_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
     let modified = metadata
         .modified()
         .map_err(|e| format!("inspect {} cache mtime {}: {e}", spec.name, root.display()))?;
-    let stamp = format!("{} {:?} {}", metadata.len(), modified, spec.digest);
+    let modified_nanos = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("timestamp {} cache {}: {e}", spec.name, root.display()))?
+        .as_nanos();
+    let stamp = format!("{} {} {}", metadata.len(), modified_nanos, spec.digest);
     let marker = root.with_file_name(format!("{}.verified", spec.key()));
     if fs::read_to_string(&marker).is_ok_and(|value| value == stamp) {
         return Ok(true);
@@ -460,33 +481,17 @@ fn install(
             )
         })?;
     if let Some(executable) = spec.archive_executable {
-        let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
-        let mut archive = tar::Archive::new(decoder);
-        for entry in archive.entries().map_err(|e| e.to_string())? {
-            let mut entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path().map_err(|e| e.to_string())?;
-            if path.is_absolute()
-                || path
-                    .components()
-                    .any(|c| !matches!(c, Component::Normal(_)))
-            {
-                return Err(format!("unsafe tar path: {}", path.display()));
-            }
-            let kind = entry.header().entry_type();
-            if !kind.is_file() && !kind.is_dir() {
-                return Err(format!("unsafe tar entry: {}", path.display()));
-            }
-            entry.unpack_in(stage.path()).map_err(|e| e.to_string())?;
-        }
-        if !stage.path().join(executable).is_file()
-            || !stage.path().join("package/lib/lib.d.ts").is_file()
-        {
-            return Err("tsc archive lacks executable or declaration libraries".to_owned());
-        }
-        fs::write(stage.path().join(".sha256"), spec.digest).map_err(|e| e.to_string())?;
+        unpack_archive(spec, &bytes, stage.path(), executable)?;
         let staged = stage.into_path();
         if let Err(e) = fs::rename(&staged, root) {
-            fs::remove_dir_all(&staged).map_err(|cleanup| cleanup.to_string())?;
+            fs::remove_dir_all(&staged).map_err(|cleanup| {
+                format!(
+                    "clean staged {} archive {} from {}: {cleanup}",
+                    spec.name,
+                    staged.display(),
+                    spec.url
+                )
+            })?;
             if matches!(
                 e.kind(),
                 io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty
@@ -504,6 +509,80 @@ fn install(
     } else {
         install_single_file(spec, root, stage.path(), &bytes)?;
     }
+    Ok(())
+}
+
+fn unpack_archive(
+    spec: &ToolSpec,
+    bytes: &[u8],
+    stage: &Path,
+    executable: &str,
+) -> Result<(), String> {
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("read {} archive from {}: {e}", spec.name, spec.url))?
+    {
+        let mut entry = entry
+            .map_err(|e| format!("read {} archive entry from {}: {e}", spec.name, spec.url))?;
+        let path = entry
+            .path()
+            .map_err(|e| {
+                format!(
+                    "read {} archive entry path from {}: {e}",
+                    spec.name, spec.url
+                )
+            })?
+            .into_owned();
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            return Err(format!(
+                "unsafe {} tar path {} from {}",
+                spec.name,
+                path.display(),
+                spec.url
+            ));
+        }
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(format!(
+                "unsafe {} tar entry {} from {}",
+                spec.name,
+                path.display(),
+                spec.url
+            ));
+        }
+        entry.unpack_in(stage).map_err(|e| {
+            format!(
+                "unpack {} archive entry {} from {} into {}: {e}",
+                spec.name,
+                path.display(),
+                spec.url,
+                stage.display()
+            )
+        })?;
+    }
+    if !stage.join(executable).is_file() || !stage.join("package/lib/lib.d.ts").is_file() {
+        return Err(format!(
+            "{} archive from {} lacks executable {} or declaration libraries in {}",
+            spec.name,
+            spec.url,
+            executable,
+            stage.display()
+        ));
+    }
+    fs::write(stage.join(".sha256"), spec.digest).map_err(|e| {
+        format!(
+            "write {} digest marker {} from {}: {e}",
+            spec.name,
+            stage.join(".sha256").display(),
+            spec.url
+        )
+    })?;
     Ok(())
 }
 
@@ -721,10 +800,11 @@ mod tests {
             assert_eq!(spec.max_bytes, TAILWIND_MAX_DOWNLOAD);
             assert!(spec.archive_executable.is_none());
         }
+        let unsupported = ToolSpec::tailwind("windows-x64").unwrap_err();
         assert!(
-            ToolSpec::tailwind("windows-x64")
-                .unwrap_err()
-                .contains("unsupported")
+            unsupported.contains("unsupported native tailwindcss build host")
+                && unsupported.contains("set TAILWIND_CLI"),
+            "{unsupported}"
         );
     }
 
@@ -923,15 +1003,54 @@ mod tests {
     }
 
     #[test]
-    fn file_cache_rehashes_after_change() {
+    fn file_cache_marker_rehashes_after_mtime_change() {
         let dir = tempfile::tempdir().unwrap();
         let spec = file_spec(b"good");
         let env = env(dir.path());
         let path = resolve(&spec, &env, |_| Ok(b"good".to_vec())).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"good");
-        fs::write(&path, b"corrupt").unwrap();
+        assert!(valid_file_cache(&spec, &path).unwrap());
+        assert!(
+            path.with_file_name(format!("{}.verified", spec.key()))
+                .is_file()
+        );
+        let original = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, b"evil").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(original + Duration::from_secs(2))
+            .unwrap();
         let error = resolve(&spec, &env, |_| Ok(b"bad".to_vec())).unwrap_err();
         assert!(error.contains("SHA-256 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn file_cache_marker_trusts_original_mtime_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec(b"good");
+        let path = resolve(&spec, &env(dir.path()), |_| Ok(b"good".to_vec())).unwrap();
+        assert!(valid_file_cache(&spec, &path).unwrap());
+        let original = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, b"evil").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(original)
+            .unwrap();
+        assert!(valid_file_cache(&spec, &path).unwrap());
+    }
+
+    #[test]
+    fn file_cache_marker_write_failure_is_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec(b"good");
+        let path = resolve(&spec, &env(dir.path()), |_| Ok(b"good".to_vec())).unwrap();
+        let marker = path.with_file_name(format!("{}.verified", spec.key()));
+        fs::create_dir(&marker).unwrap();
+        let error = valid_file_cache(&spec, &path).unwrap_err();
+        assert!(
+            error.contains("verified marker") && error.contains(&marker.display().to_string()),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1057,7 +1176,10 @@ mod tests {
         let spec = tar_spec(&archive);
         let env = env(dir.path());
         let error = resolve(&spec, &env, |_| Ok(archive.clone())).unwrap_err();
-        assert!(error.contains("unsafe tar entry"), "{error}");
+        assert!(
+            error.contains("unsafe tsc tar entry") && error.contains(&spec.url),
+            "{error}"
+        );
         let good = tar_bytes(false);
         let good_spec = tar_spec(&good);
         let root = dir.path().join("cache/cja").join(good_spec.key());
