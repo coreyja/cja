@@ -36,6 +36,13 @@
 //!     fn passkey_config(&self) -> &PasskeyConfig { &self.passkey }
 //! }
 //!
+//! async fn page() -> axum::response::Html<String> {
+//!     axum::response::Html(format!(
+//!         r#"<script src="{}"></script>"#,
+//!         cja_passkey::passkey_assets::asset_url("passkey-client.js"),
+//!     ))
+//! }
+//!
 //! async fn build() -> cja::Result<axum::Router> {
 //!     let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //!     cja::db::run_migrations(&db).await?;
@@ -45,6 +52,7 @@
 //!     let state = AppState { db, cookie_key: CookieKey::generate(), passkey };
 //!
 //!     Ok(axum::Router::new()
+//!         .route("/", axum::routing::get(page))
 //!         .merge(cja::assets::router::<AppState>(&[&cja_passkey::passkey_assets::MANIFEST])?)
 //!         .merge(cja_passkey::passkey_router::<AppState>())
 //!         .layer(tower_cookies::CookieManagerLayer::new())

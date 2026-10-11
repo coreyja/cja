@@ -193,7 +193,7 @@ window.run = async (method) => {{
 }
 
 #[tokio::test]
-#[ignore = "requires PostgreSQL, pnpm, and Chromium"]
+#[ignore = "requires PostgreSQL, pnpm/Playwright (e2e/), and Chromium"]
 async fn discoverable_browser_round_trip() {
     let manifest = &passkey_assets::MANIFEST;
     assert!(

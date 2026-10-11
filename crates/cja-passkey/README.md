@@ -43,6 +43,15 @@ endpoints. A Cargo build type checks and bundles the client using native tsc
 and Rolldown; the first build may download pinned tsc into the shared cja cache.
 Node and pnpm are needed only for browser E2E tests.
 
+**Consumer migration:** `cja-passkey` now requires rustc 1.97 or newer because
+`cja-build`'s Rolldown dependency brings in `oxc` 0.153.0. Bump the consumer's
+`rust-toolchain.toml` and any Docker builder base image. Remove
+`CJA_PASSKEY_STRICT_FRONTEND_BUILD` and `CJA_PASSKEY_PREBUILT_JS` from Dockerfiles
+and CI; the crate no longer reads them. Remove a Node/pnpm Docker stage or CI
+install if passkey was its only user. Code matching `AssetError::Collision` must
+replace the old `first`/`second` fields with `first_owner`,
+`first_logical_name`, `second_owner`, and `second_logical_name`.
+
 The browser client exposes `cjaPasskey.createPasskeyClient(basePath)`. The
 default `basePath` is empty; pass the router's mount prefix when needed. Call
 its methods directly in a click handler:
