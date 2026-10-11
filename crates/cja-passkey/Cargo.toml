@@ -27,6 +27,9 @@ http = "1"
 async-trait.workspace = true
 tower-cookies = { version = "0.11.0", features = ["private"] }
 
+[build-dependencies]
+cja-build = { path = "../cja-build" }
+
 [dev-dependencies]
 sqlx.workspace = true
 tokio = { workspace = true, features = ["full"] }

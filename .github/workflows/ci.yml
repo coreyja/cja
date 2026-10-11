@@ -118,27 +118,21 @@ jobs:
           - 5432:5432
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
-      CJA_PASSKEY_STRICT_FRONTEND_BUILD: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" --component rustfmt --component clippy
+      - name: Cache native cja tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cja
+          key: cja-tools-${{ runner.os }}-${{ runner.arch }}-tsc-7.0.2-tailwindcss-4.3.3
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - uses: pnpm/action-setup@v4
         with:
           version: 10.6.0
-      - name: Install frontend dependencies
-        working-directory: crates/cja-passkey/frontend
-        run: pnpm install --frozen-lockfile
-      - name: Check and build frontend
-        working-directory: crates/cja-passkey/frontend
-        run: |
-          pnpm check
-          pnpm build
-          grep -q 'loginWithUsername' dist/passkey-client.js
-          grep -q 'discoverable/start' dist/passkey-client.js
       - name: Install browser test dependencies
         working-directory: crates/cja-passkey/e2e
         run: pnpm install --frozen-lockfile

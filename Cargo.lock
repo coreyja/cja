@@ -621,6 +621,7 @@ dependencies = [
  "axum",
  "chrono",
  "cja",
+ "cja-build",
  "http 1.3.1",
  "http-body-util",
  "serde",

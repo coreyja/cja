@@ -95,7 +95,9 @@ At module scope, call `cja::include_assets!(site_assets)`. Use
 unknown name panics. Merge
 `cja::assets::router::<AppState>(&[&site_assets::MANIFEST])?` into the root
 Axum router before `.with_state(state)`. The router accepts multiple manifests
-and rejects duplicate served URLs at startup. Call `router()` once with every
+and rejects duplicate served URLs at startup. The macro records the invoking
+crate via `CARGO_PKG_NAME`; collision errors name both owning crates and logical
+names. Call `router()` once with every
 manifest: calling it twice, or defining another `/assets` wildcard, conflicts
 at startup. Unknown `/assets` URLs return 404 even with an app fallback.
 
