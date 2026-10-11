@@ -12,6 +12,7 @@ use tracing::info;
 
 mod routes;
 mod templates;
+cja::include_assets!(site_assets);
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -97,12 +98,10 @@ async fn run_application() -> cja::Result<()> {
 
     if is_feature_enabled("SERVER") {
         info!("Server Enabled");
+        let router = routes::router(app_state.clone())?;
         supervisor.spawn(
             "server",
-            run_server_until(
-                routes::router(app_state.clone()),
-                supervisor.shutdown_token().cancelled_owned(),
-            ),
+            run_server_until(router, supervisor.shutdown_token().cancelled_owned()),
         );
     } else {
         info!("Server Disabled");

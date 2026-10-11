@@ -1,5 +1,9 @@
 # cja frontend asset pipeline: node-free spike (DEV-1652)
 
+> Implementation status (DEV-1651): the static-file core pins Rust 1.99.0 and
+> owns only `OUT_DIR/cja-assets/`, clearing it once per build. The original
+> measurements and toolchain findings below describe the earlier spike.
+
 This records a throwaway experiment on the Lima VM on 2026-10-10. No framework or app code was changed. The scratch crate and raw logs are at `/tmp/mull-scratch/cja-DEV-1652/`; its dedicated Cargo build directory is removed after this evidence is captured.
 
 ## Settled product decisions

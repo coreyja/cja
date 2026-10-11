@@ -1,5 +1,15 @@
 # Architecture
 
+## Embedded static assets
+
+An app's `build.rs` calls `cja-build` with its `assets/` directory. The builder
+hashes final bytes with SHA-256, writes hashed copies under its owned
+`OUT_DIR/cja-assets/`, and generates `OUT_DIR/cja_assets.rs` last. The
+`cja::include_assets!` macro embeds those bytes and exposes a manifest plus
+scoped logical-name lookup. At startup, `cja::assets::router` validates all
+manifest URLs and registers concrete Axum routes. A source change reruns the
+build script; serving never reads an asset from disk.
+
 CJA is organized as three subsystems — Cron, Jobs, and Axum (HTTP server) — plus supporting modules for sessions, tracing, and database management. Everything coordinates through a shared `AppState` trait and `CancellationToken` for graceful shutdown.
 
 ## Crate Structure

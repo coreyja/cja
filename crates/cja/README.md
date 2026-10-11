@@ -1,5 +1,29 @@
 # CJA — Cron, Jobs and Axum
 
+## Embedded static assets
+
+Add `cja-build = { path = "../cja-build" }` under `[build-dependencies]` and
+put files in `assets/`. The build script is:
+
+```rust
+fn main() -> Result<(), cja_build::BuildError> {
+    cja_build::AssetsBuilder::new("assets").build()
+}
+```
+
+At module scope, call `cja::include_assets!(site_assets)`. Use
+`site_assets::asset_url("img/logo.svg")` for a scoped logical-name lookup; an
+unknown name panics. Merge
+`cja::assets::router::<AppState>(&[&site_assets::MANIFEST])?` into the root
+Axum router before `.with_state(state)`. The router accepts multiple manifests
+and rejects duplicate served URLs at startup.
+
+Names may contain ASCII letters, digits, `.`, `_`, `~`, `@`, `+`, `-`, and `/`.
+Files are embedded at `/assets/name.<sha256-8>.ext` with immutable cache headers.
+Root-level `favicon.ico` and `robots.txt` also have one-hour stable aliases.
+Missing directories, unreadable files, invalid names, and collisions fail the
+Cargo build. No asset is read from disk at runtime.
+
 > **ALPHA**: CJA is under active development. APIs may change between releases.
 
 A Rust web framework that combines background job processing, cron scheduling,
