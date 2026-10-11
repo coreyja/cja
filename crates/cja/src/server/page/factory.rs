@@ -21,11 +21,12 @@ impl<A: AppState> Factory<A> {
 impl<A: AppState> FromRequestParts<A> for Factory<A> {
     type Rejection = Response;
 
-    // The trait fixes this signature as `async`; there is nothing to await.
-    #[allow(clippy::unused_async)]
-    async fn from_request_parts(_: &mut Parts, state: &A) -> Result<Self, Self::Rejection> {
-        Ok(Self {
+    fn from_request_parts(
+        _: &mut Parts,
+        state: &A,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> {
+        std::future::ready(Ok(Self {
             state: state.clone(),
-        })
+        }))
     }
 }

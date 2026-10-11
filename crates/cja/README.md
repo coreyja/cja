@@ -5,6 +5,55 @@
 A Rust web framework that combines background job processing, cron scheduling,
 and an HTTP server built on [Axum](https://docs.rs/axum).
 
+## Embedded frontend assets
+
+Add `cja-build = { git = "https://github.com/coreyja/cja", rev = "<same rev as cja>" }` under `[build-dependencies]` and
+put files in `assets/`. Pin `cja-build` and `cja` to the same revision. The build script is:
+
+```rust
+fn main() -> Result<(), cja_build::BuildError> {
+    cja_build::AssetsBuilder::new()
+        .static_dir("assets")
+        .entry(cja_build::Entry::new("src/studio.ts", "studio.js"))
+        .build()
+}
+```
+
+Entries are relative to `frontend/` by default; `.frontend_dir(path)` changes
+that root. A TypeScript entry requires `frontend/tsconfig.json`. Start with
+`{"compilerOptions":{"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true,"allowImportingTsExtensions":true,"lib":["ES2022","DOM"],"types":[]},"include":["src/**/*.ts"]}`.
+Every entry must belong to the tsconfig program. Include each TypeScript entry
+through `include` or `files`; for JavaScript entries, also enable `allowJs`.
+`cja-build` runs native TypeScript 7.0.2 for type checking, then Rolldown for
+minified IIFE bundles and external source maps. No Node installation is needed.
+Imports must be relative and stay inside the frontend directory; `node_modules`, CSS, and
+dynamic imports are rejected. Each ESM entry (`.format(EntryFormat::Esm)`) must
+remain one self-contained chunk. For an IIFE export, set
+`.format(EntryFormat::Iife { global_name: Some("cjaPasskey".into()) })`.
+
+The native tsc resolves through `TSC`, the shared `$XDG_CACHE_HOME/cja` cache
+(or `~/.cache/cja`), then a pinned HTTPS download verified by SHA-256. Set
+`CARGO_NET_OFFLINE=true` only with a verified cache or `TSC` override. Type or
+bundle errors fail `cargo build`. Cargo reruns the build for config, source,
+declaration, and static changes. Source map `sources` are frontend-relative
+labels with embedded `sourcesContent`, not served source URLs.
+
+At module scope, call `cja::include_assets!(site_assets)`. Use
+`site_assets::asset_url("img/logo.svg")` for a scoped logical-name lookup; an
+unknown name panics. Merge
+`cja::assets::router::<AppState>(&[&site_assets::MANIFEST])?` into the root
+Axum router before `.with_state(state)`. The router accepts multiple manifests
+and rejects duplicate served URLs at startup. Call `router()` once with every
+manifest: calling it twice, or defining another `/assets` wildcard, conflicts
+at startup. Unknown `/assets` URLs return 404 even with an app fallback.
+
+Names may contain ASCII letters, digits, `.`, `_`, `~`, `@`, `+`, `-`, and `/`.
+Dot-prefixed files and directories at any depth are skipped. Files are embedded at `/assets/name.<sha256-8>.ext` with immutable cache headers.
+Root-level `favicon.ico` and `robots.txt` also have one-hour stable aliases.
+Missing directories, unreadable files, invalid names, and collisions fail the
+Cargo build. No asset is read from disk at runtime.
+
+
 ## Overview
 
 CJA provides three integrated subsystems:
