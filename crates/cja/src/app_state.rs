@@ -87,6 +87,10 @@ pub trait AppState: Clone + Send + Sync + 'static {
     /// The pool is typically shared across all requests.
     fn db(&self) -> &sqlx::PgPool;
 
+    /// Called after a successful autocommit job enqueue. An override may wake
+    /// a process-local idle poll gate; this is not a transaction-commit hook.
+    fn job_enqueued(&self) {}
+
     /// Returns the cookie encryption key used for secure cookies.
     /// This key should be consistent across application restarts
     /// to maintain session continuity.

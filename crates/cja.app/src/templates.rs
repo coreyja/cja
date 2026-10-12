@@ -13,11 +13,12 @@ fn base_layout(title: &str, content: &Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="description" content="CJA is a Rust web framework with database-backed background jobs, cron scheduling, and a production-ready Axum server.";
                 title { (title) }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
+                link rel="icon" type="image/svg+xml" href=(crate::site_assets::asset_url("favicon.svg"));
                 link rel="preconnect" href="https://fonts.googleapis.com";
                 link rel="preconnect" href="https://fonts.gstatic.com" crossorigin;
                 link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap";
-                link rel="stylesheet" href="/style.css";
+                link rel="stylesheet" href=(crate::site_assets::asset_url("app.css"));
+                script defer src=(crate::site_assets::asset_url("studio.js")) {}
             }
             body {
                 (content)
@@ -39,7 +40,7 @@ fn landing_content() -> Markup {
 fn hero_section() -> Markup {
     html! {
         section class="hero" {
-            div class="container" {
+            div class="site-container" {
                 div class="hero-inner" {
                     h1 class="hero-title" {
                         span class="accent" { "CJA" }
@@ -84,7 +85,7 @@ async fn run() -> Result<()> {
 fn features_section() -> Markup {
     html! {
         section id="features" {
-            div class="container" {
+            div class="site-container" {
                 div class="section-heading" {
                     h2 { "What's in the box" }
                 }
@@ -162,7 +163,7 @@ fn feature_card(title: &str, description: &str, code: &str, icon: &Markup) -> Ma
 fn code_showcase_section() -> Markup {
     html! {
         section class="code-showcase" {
-            div class="container" {
+            div class="site-container" {
                 div class="section-heading" {
                     h2 { "A complete app in 30 lines" }
                 }
@@ -204,7 +205,7 @@ fn routes(app: App) -> Router {
 fn getting_started_section() -> Markup {
     html! {
         section id="getting-started" {
-            div class="container" {
+            div class="site-container" {
                 div class="section-heading" {
                     h2 { "Get started" }
                 }
@@ -244,7 +245,7 @@ fn getting_started_section() -> Markup {
 fn footer_section() -> Markup {
     html! {
         footer class="site-footer" {
-            div class="container" {
+            div class="site-container" {
                 div class="footer-grid" {
                     div class="footer-brand" {
                         h3 { "CJA" }
@@ -266,7 +267,7 @@ fn footer_section() -> Markup {
                         }
                     }
                 }
-                div class="footer-bottom" {
+                div class="footer-bottom md:text-center" {
                     p { "© 2026 CJA" }
                 }
             }
@@ -294,4 +295,47 @@ fn cron_icon() -> Markup {
 
 fn server_icon() -> Markup {
     PreEscaped(r#"<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>"#.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn landing_page_resolves_all_assets() {
+        let html = super::landing_page().into_string();
+        assert!(html.contains(&crate::site_assets::asset_url("app.css")));
+        let css = crate::site_assets::MANIFEST
+            .entries
+            .iter()
+            .find(|asset| asset.logical_name == "app.css")
+            .unwrap();
+        assert_eq!(css.content_type, "text/css");
+        let css_text = std::str::from_utf8(css.bytes).unwrap();
+        assert!(
+            css_text
+                .starts_with("/*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */")
+        );
+        assert!(css_text.contains(".md\\:text-center{"));
+        assert!(html.contains(&crate::site_assets::asset_url("favicon.svg")));
+        assert!(html.contains(&crate::site_assets::asset_url("studio.js")));
+        let js = crate::site_assets::MANIFEST
+            .entries
+            .iter()
+            .find(|asset| asset.logical_name == "studio.js")
+            .unwrap();
+        let map = crate::site_assets::MANIFEST
+            .entries
+            .iter()
+            .find(|asset| asset.logical_name == "studio.js.map")
+            .unwrap();
+        let js_text = std::str::from_utf8(js.bytes).unwrap();
+        assert!(js_text.contains("studio.ts-ready"));
+        assert!(js_text.contains("sourceMappingURL=studio.js."));
+        assert_eq!(map.content_type, "application/json");
+        let map_json: serde_json::Value = serde_json::from_slice(map.bytes).unwrap();
+        assert!(
+            map_json["sourcesContent"]
+                .as_array()
+                .is_some_and(|sources| !sources.is_empty())
+        );
+    }
 }

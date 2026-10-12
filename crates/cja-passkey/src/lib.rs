@@ -6,7 +6,7 @@
 //! 2. Calling [`db::run_migrations`] (after [`cja::db::run_migrations`]).
 //! 3. Mounting [`routes::passkey_router`] on your router.
 //! 4. Adding [`tower_cookies::CookieManagerLayer`] to the router.
-//! 5. Serving (or `<script src=…>`-including) the bundled `/passkey-client.js` asset.
+//! 5. Mounting [`passkey_assets::MANIFEST`] and rendering its hashed client URL.
 //!
 //! Use [`extractors::CurrentUser`] / [`extractors::OptionalUser`] in handlers
 //! to read the authenticated user.
@@ -36,6 +36,13 @@
 //!     fn passkey_config(&self) -> &PasskeyConfig { &self.passkey }
 //! }
 //!
+//! async fn page() -> axum::response::Html<String> {
+//!     axum::response::Html(format!(
+//!         r#"<script src="{}"></script>"#,
+//!         cja_passkey::passkey_assets::asset_url("passkey-client.js"),
+//!     ))
+//! }
+//!
 //! async fn build() -> cja::Result<axum::Router> {
 //!     let db = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //!     cja::db::run_migrations(&db).await?;
@@ -45,16 +52,19 @@
 //!     let state = AppState { db, cookie_key: CookieKey::generate(), passkey };
 //!
 //!     Ok(axum::Router::new()
+//!         .route("/", axum::routing::get(page))
+//!         .merge(cja::assets::router::<AppState>(&[&cja_passkey::passkey_assets::MANIFEST])?)
 //!         .merge(cja_passkey::passkey_router::<AppState>())
 //!         .layer(tower_cookies::CookieManagerLayer::new())
 //!         .with_state(state))
 //! }
 //! ```
 
+cja::include_assets!(passkey_assets);
+
 pub mod config;
 pub mod db;
 pub mod extractors;
-pub mod js;
 pub mod models;
 pub mod routes;
 pub mod session;
@@ -62,7 +72,6 @@ pub mod session;
 pub use config::{HasPasskeyConfig, PasskeyConfig};
 pub use db::run_migrations;
 pub use extractors::{CurrentUser, OptionalUser};
-pub use js::{passkey_js, passkey_js_handler};
 pub use models::user::User;
 pub use routes::passkey_router;
 pub use session::PasskeySession;
