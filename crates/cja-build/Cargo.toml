@@ -6,7 +6,8 @@ authors.workspace = true
 description = "Compile-time embedded asset builder for cja"
 
 [dependencies]
-sha2 = "0.10.9"
+sha2 = "0.11.1"
+hex = "0.4.3"
 mime_guess = "2.0.5"
 thiserror = "2"
 anyhow = "1"

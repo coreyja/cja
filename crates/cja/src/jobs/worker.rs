@@ -249,7 +249,7 @@ pub struct JobFromDB {
 }
 
 #[derive(Debug, Error)]
-#[error("JobError(id:${}) ${1}", self.0.job_id)]
+#[error("JobError(id:${}) ${}", self.0.job_id, self.1)]
 pub(crate) struct JobError(JobFromDB, color_eyre::Report);
 
 struct Worker<AppState: AS, R: JobRegistry<AppState>> {
