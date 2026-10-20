@@ -1037,7 +1037,7 @@ use cja::{
 
     imports.push_str(
         r"    },
-    setup::{setup_sentry, setup_tracing},
+    setup::setup_tracing,
 };
 use maud::html;
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -1086,9 +1086,6 @@ impl cja::app_state::AppState for AppState {
 }
 
 fn main() -> color_eyre::Result<()> {
-    // Initialize Sentry for error tracking
-    let _sentry_guard = setup_sentry();
-
     // Create and run the tokio runtime
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

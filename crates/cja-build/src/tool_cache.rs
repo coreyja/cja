@@ -484,7 +484,7 @@ fn install(
         })?;
     if let Some(executable) = spec.archive_executable {
         unpack_archive(spec, &bytes, stage.path(), executable)?;
-        let staged = stage.into_path();
+        let staged = stage.keep();
         if let Err(e) = fs::rename(&staged, root) {
             fs::remove_dir_all(&staged).map_err(|cleanup| {
                 format!(

@@ -66,11 +66,10 @@
 //! ### 3. Wire Up `main()`
 //!
 //! ```rust,ignore
-//! use cja::setup::{setup_sentry, setup_tracing};
+//! use cja::setup::setup_tracing;
 //! use cja::tasks::{ShutdownBudget, Supervisor};
 //!
 //! fn main() -> cja::Result<()> {
-//!     let _sentry_guard = setup_sentry();
 //!     tokio::runtime::Builder::new_multi_thread()
 //!         .enable_all()
 //!         .build()?
@@ -129,8 +128,6 @@
 //! | `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `2` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked |
 //! | `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `2` | Extra time for tasks to exit after the job drain. Drain + grace must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default) |
 //! | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
-//! | `SENTRY_DSN` | No | — | Enables Sentry error tracking |
-//! | `HONEYCOMB_API_KEY` | No | — | Enables OpenTelemetry export to Honeycomb |
 //! | `EYES_ORG_ID` | No | — | Eyes tracing org ID (both `ORG_ID` and `APP_ID` required) |
 //! | `EYES_APP_ID` | No | — | Eyes tracing app ID |
 //! | `EYES_URL` | No | `https://eyes.coreyja.com` | Eyes server URL |

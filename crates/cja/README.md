@@ -169,11 +169,10 @@ cja::db::run_migrations(&pool).await?;
 ### 3. Wire Up `main()`
 
 ```rust
-use cja::setup::{setup_sentry, setup_tracing};
+use cja::setup::setup_tracing;
 use cja::tasks::{ShutdownBudget, Supervisor};
 
 fn main() -> cja::Result<()> {
-    let _sentry_guard = setup_sentry();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -222,8 +221,6 @@ See `crates/cja.app/` in the repository for a complete working example.
 | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |
 | `RUST_LOG` | No | `info` | Tracing filter directive |
 | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
-| `SENTRY_DSN` | No | — | Enables Sentry error tracking |
-| `HONEYCOMB_API_KEY` | No | — | Enables OpenTelemetry export to Honeycomb |
 | `EYES_ORG_ID` | No | — | Eyes tracing org ID (both `ORG_ID` and `APP_ID` required) |
 | `EYES_APP_ID` | No | — | Eyes tracing app ID |
 | `EYES_URL` | No | `https://eyes.coreyja.com` | Eyes server URL |
@@ -456,9 +453,8 @@ If using this approach, you're responsible for keeping them in sync when upgradi
 ## Tracing & Observability
 
 ```rust
-use cja::setup::{setup_sentry, setup_tracing};
+use cja::setup::setup_tracing;
 
-let _sentry_guard = setup_sentry();
 // Keep the handle alive — dropping it shuts down Eyes
 let _eyes_handle = setup_tracing("my-app")?;
 ```

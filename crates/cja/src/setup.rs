@@ -1,28 +1,19 @@
-//! Application setup: Sentry error tracking and tracing/observability initialization.
+//! Application setup: tracing/observability initialization.
 //!
-//! Call [`setup_sentry`] before building the Tokio runtime, and [`setup_tracing`]
-//! inside the async context. The tracing function returns an optional
+//! Call [`setup_tracing`] inside the async context. It returns an optional
 //! [`EyesShutdownHandle`] — keep it alive in your `main` scope:
 //!
 //! ```rust,ignore
-//! let _sentry_guard = setup_sentry();
 //! let _eyes_handle = setup_tracing("my-app")?;
 //! ```
 //!
 //! # Supported Backends
 //!
 //! - **Console**: Tree-formatted logs (default) or JSON with `JSON_LOGS` env var
-//! - **Sentry**: Error tracking via `SENTRY_DSN`
-//! - **Honeycomb**: OpenTelemetry export via `HONEYCOMB_API_KEY`
 //! - **Eyes**: Distributed tracing via `EYES_ORG_ID` + `EYES_APP_ID` (both required)
-
-use std::{collections::HashMap, time::Duration};
 
 use color_eyre::eyre::Context;
 use eyes_subscriber::{EyesLayer, EyesSubscriberBuilder};
-use opentelemetry_otlp::WithExportConfig;
-use sentry::ClientInitGuard;
-use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{
     EnvFilter, Layer as _, Registry, layer::SubscriberExt as _, util::SubscriberInitExt as _,
 };
@@ -32,31 +23,7 @@ use uuid::Uuid;
 // Re-export for consumers
 pub use eyes_subscriber::EyesShutdownHandle;
 
-pub fn setup_sentry() -> Option<ClientInitGuard> {
-    let git_commit: Option<std::borrow::Cow<_>> =
-        option_env!("VERGEN_GIT_SHA").map(std::convert::Into::into);
-    let release_name =
-        git_commit.unwrap_or_else(|| sentry::release_name!().unwrap_or_else(|| "dev".into()));
-
-    if let Ok(sentry_dsn) = std::env::var("SENTRY_DSN") {
-        println!("Sentry enabled");
-
-        Some(sentry::init((
-            sentry_dsn,
-            sentry::ClientOptions {
-                traces_sample_rate: 0.5,
-                release: Some(release_name),
-                ..Default::default()
-            },
-        )))
-    } else {
-        println!("Sentry not configured in this environment");
-
-        None
-    }
-}
-
-/// Sets up tracing with optional Eyes, Honeycomb, and stdout layers.
+/// Sets up tracing with optional Eyes and stdout layers.
 ///
 /// Returns an optional `EyesShutdownHandle` that should be used for graceful shutdown
 /// when Eyes is configured (via `EYES_ORG_ID` and `EYES_APP_ID` environment variables).
@@ -65,7 +32,6 @@ pub fn setup_sentry() -> Option<ClientInitGuard> {
 ///
 /// - `RUST_LOG`: Log filter (defaults to `info,{crate_name}=trace,tower_http=debug,serenity=error`)
 /// - `JSON_LOGS`: If set, outputs JSON logs instead of hierarchical
-/// - `HONEYCOMB_API_KEY`: Enables Honeycomb tracing
 /// - `EYES_ORG_ID`: Eyes organization ID (UUID)
 /// - `EYES_APP_ID`: Eyes application ID (UUID)
 /// - `EYES_URL`: Eyes server URL (defaults to `https://eyes.coreyja.com`)
@@ -111,32 +77,6 @@ fn initialize_tracing(
         color_eyre::eyre::eyre!("Couldn't create env filter from {}", rust_log)
     })?;
 
-    let opentelemetry_layer = if let Ok(honeycomb_key) = std::env::var("HONEYCOMB_API_KEY") {
-        let mut map = HashMap::<String, String>::new();
-        map.insert("x-honeycomb-team".to_string(), honeycomb_key);
-        map.insert("x-honeycomb-dataset".to_string(), "coreyja.com".to_string());
-
-        let tracer = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .http()
-                    .with_endpoint("https://api.honeycomb.io/v1/traces")
-                    .with_timeout(Duration::from_secs(3))
-                    .with_headers(map),
-            )
-            .install_batch(opentelemetry_sdk::runtime::Tokio)?;
-
-        let opentelemetry_layer = OpenTelemetryLayer::new(tracer);
-        println!("Honeycomb layer configured");
-
-        Some(opentelemetry_layer)
-    } else {
-        println!("Skipping Honeycomb layer");
-
-        None
-    };
-
     // Setup Eyes layer if configured
     let (eyes_layer, eyes_shutdown_handle) = setup_eyes_layer(process)?;
 
@@ -165,7 +105,6 @@ fn initialize_tracing(
 
     Registry::default()
         .with(stdout_layer)
-        .with(opentelemetry_layer)
         .with(eyes_layer)
         .with(env_filter)
         .try_init()?;
