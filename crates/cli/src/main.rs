@@ -580,7 +580,7 @@ fn init_project(
     let cargo_toml_content =
         fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
 
-    let toml_value: toml::Value = cargo_toml_content
+    let toml_value: toml::Table = cargo_toml_content
         .parse()
         .context("Failed to parse Cargo.toml")?;
 
@@ -768,7 +768,7 @@ fn update_cargo_toml_bin(bin_name: &str) -> Result<()> {
         fs::read_to_string(cargo_toml_path).context("Failed to read Cargo.toml")?;
 
     // Parse the Cargo.toml to check for existing [[bin]] sections
-    let toml_check: toml::Value = cargo_toml_content
+    let toml_check: toml::Table = cargo_toml_content
         .parse()
         .context("Failed to parse updated Cargo.toml")?;
 
@@ -1037,7 +1037,7 @@ use cja::{
 
     imports.push_str(
         r"    },
-    setup::{setup_sentry, setup_tracing},
+    setup::setup_tracing,
 };
 use maud::html;
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -1086,9 +1086,6 @@ impl cja::app_state::AppState for AppState {
 }
 
 fn main() -> color_eyre::Result<()> {
-    // Initialize Sentry for error tracking
-    let _sentry_guard = setup_sentry();
-
     // Create and run the tokio runtime
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

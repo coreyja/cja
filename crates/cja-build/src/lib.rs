@@ -841,7 +841,7 @@ fn watch_dir(path: &Path, out_dir: &Path) -> Result<(), BuildError> {
 
 /// The shared content hash for static files and later generated assets.
 pub(crate) fn short_hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))[..8].to_owned()
+    hex::encode(Sha256::digest(bytes))[..8].to_owned()
 }
 
 fn collect_files(

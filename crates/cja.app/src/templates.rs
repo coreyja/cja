@@ -128,7 +128,7 @@ registry.register_with_cron(
                     ))
                     (feature_card(
                         "Production Server",
-                        "Axum-based HTTP server with cookie-based DB-backed sessions, structured tracing with OpenTelemetry and Sentry, and zero-downtime reloading.",
+                        "Axum-based HTTP server with cookie-based DB-backed sessions, structured tracing exported to Eyes, and zero-downtime reloading.",
                         r#"fn routes(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))

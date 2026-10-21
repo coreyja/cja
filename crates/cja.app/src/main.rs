@@ -4,7 +4,7 @@ use cja::{
         eyre::{Context as _, eyre},
     },
     server::{cookies::CookieKey, run_server_until},
-    setup::{setup_sentry, setup_tracing},
+    setup::setup_tracing,
     tasks::{ShutdownBudget, Supervisor},
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -44,8 +44,6 @@ impl cja::app_state::AppState for AppState {
 }
 
 fn main() -> color_eyre::Result<()> {
-    let _sentry_guard = setup_sentry();
-
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

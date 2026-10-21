@@ -52,7 +52,7 @@ migrations/         — Copy of crates/cja/migrations/ for sqlx CLI
 ```
 lib.rs             — Re-exports (sqlx, uuid, color_eyre, maud, chrono, chrono_tz)
 app_state.rs       — AppState trait
-setup.rs           — Sentry + tracing initialization
+setup.rs           — tracing initialization (stdout + Eyes)
 db.rs              — run_migrations() via sqlx::migrate!("./migrations")
 tasks.rs           — Supervisor, ShutdownBudget, NamedTask, wait_for_first_error
 jobs/
