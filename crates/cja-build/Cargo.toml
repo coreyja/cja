@@ -6,12 +6,13 @@ authors.workspace = true
 description = "Compile-time embedded asset builder for cja"
 
 [dependencies]
-sha2 = "0.10.9"
+sha2 = "0.11.1"
+hex = "0.4.3"
 mime_guess = "2.0.5"
 thiserror = "2"
 anyhow = "1"
-rolldown = "=1.2.13"
-rolldown_common = "=1.2.13"
+rolldown = "=1.2.14"
+rolldown_common = "=1.2.14"
 tokio = { version = "1", features = ["rt"] }
 serde_json = "1"
 json5 = "1.3"
