@@ -11,6 +11,12 @@ deny = [
   # openssl is allowed only as a transitive dep of webauthn-rs-core
   # (used internally for attestation verification). Direct use is banned.
   { name = "openssl", wrappers = ["webauthn-attestation-ca", "webauthn-rs-core"] },
+
+  # EOL TLS stacks: rustls < 0.23 and rustls-webpki < 0.103.16 never get the
+  # distrusted-intermediate SPKI checks (rustls/webpki#546). Keep them out of
+  # every app built on cja.
+  { name = "rustls", version = "<0.23" },
+  { name = "rustls-webpki", version = "<0.103.16" },
 ]
 
 [sources.allow-org]

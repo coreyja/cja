@@ -428,7 +428,7 @@ fn valid_file_cache(spec: &ToolSpec, root: &Path) -> Result<bool, String> {
         }
         hasher.update(&buffer[..count]);
     }
-    let valid = format!("{:x}", hasher.finalize()) == spec.digest;
+    let valid = hex::encode(hasher.finalize()) == spec.digest;
     if let (true, Some(stamp)) = (valid, stamp) {
         fs::write(&marker, stamp).map_err(|e| {
             format!(
@@ -453,7 +453,7 @@ fn install(
             root.display()
         )
     })?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
+    let actual = hex::encode(Sha256::digest(&bytes));
     if actual != spec.digest {
         return Err(format!(
             "{} download from {} for cache {} SHA-256 mismatch: expected {}, got {actual}",
@@ -484,7 +484,7 @@ fn install(
         })?;
     if let Some(executable) = spec.archive_executable {
         unpack_archive(spec, &bytes, stage.path(), executable)?;
-        let staged = stage.into_path();
+        let staged = stage.keep();
         if let Err(e) = fs::rename(&staged, root) {
             fs::remove_dir_all(&staged).map_err(|cleanup| {
                 format!(
@@ -754,7 +754,7 @@ mod tests {
             version: "4.3.3",
             platform: "linux-arm64".to_owned(),
             url: "https://example.test/tool".to_owned(),
-            digest: Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str()),
+            digest: Box::leak(hex::encode(Sha256::digest(bytes)).into_boxed_str()),
             archive_executable: None,
             tool: Tool::Tailwind,
             max_bytes: 128 * 1024 * 1024,
@@ -900,7 +900,7 @@ mod tests {
             version: "7.0.2",
             platform: "linux-arm64".to_owned(),
             url: "https://example.test/tsc.tgz".to_owned(),
-            digest: Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str()),
+            digest: Box::leak(hex::encode(Sha256::digest(bytes)).into_boxed_str()),
             archive_executable: Some("package/lib/tsc"),
             tool: Tool::Tsc,
             max_bytes: TSC_MAX_DOWNLOAD,

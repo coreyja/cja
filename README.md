@@ -12,7 +12,7 @@ A Rust web framework for full-stack development that combines background job pro
 - **Cron Scheduling** — Interval-based and cron expression scheduling with timezone support
   - Job crons commit exactly one enqueue per due interval or slot across schedulers sharing a database; callbacks are at-most-once after a committed claim. Job execution remains at-least-once. During rollout, an older scheduler overlapping an upgraded one can double-fire.
 - **HTTP Server** — Axum with encrypted cookies, database-backed sessions, and zero-downtime reload
-- **Integrated Observability** — Structured tracing with Sentry, Honeycomb, and Eyes support
+- **Integrated Observability** — Structured tracing exported to Eyes
 - **Type Safety** — Pedantic Clippy lints, no unsafe code, compile-time SQL checking via SQLx
 
 ## Quick Start
@@ -114,7 +114,7 @@ cargo fmt --check
 - Axum (HTTP framework)
 - Maud (HTML templating)
 - color-eyre (error handling)
-- OpenTelemetry (distributed tracing)
+- Eyes (distributed tracing via `eyes-subscriber`)
 
 ### Eyes process identity
 

@@ -61,5 +61,5 @@ Uses PostgreSQL with SQLx for database operations. Migrations are in `migrations
 - Forbids unsafe code at workspace level
 - Framework supports zero-downtime reloading via systemfd
 - Maud for HTML templating
-- OpenTelemetry tracing integration
+- Eyes tracing integration (`eyes-subscriber`)
 - Color-eyre for error handling

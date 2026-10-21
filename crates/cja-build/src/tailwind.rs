@@ -1314,7 +1314,7 @@ mod tests {
         let portfolio = include_bytes!("../tests/fixtures/eyes/portfolio.css");
         assert_eq!(portfolio.len(), 16_392);
         assert_eq!(
-            format!("{:x}", Sha256::digest(portfolio)),
+            hex::encode(Sha256::digest(portfolio)),
             "caaf47e1ae2d809e1a7b10c04a2b5d97258d164f211662a9cbc631a538553f18"
         );
         let root = tempfile::tempdir().unwrap();
