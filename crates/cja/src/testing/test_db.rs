@@ -517,7 +517,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(dropped.is_empty());
+        assert_eq!(dropped, [] as [std::string::String; 0]);
         assert!(
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"

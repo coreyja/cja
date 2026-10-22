@@ -111,7 +111,7 @@ async fn preserves_live_then_reaps_disconnected_database() {
     )
     .await
     .unwrap();
-    assert!(first.is_empty());
+    assert_eq!(first, [] as [std::string::String; 0]);
     assert!(database_exists(&admin, &name).await);
 
     live.close().await;
@@ -147,7 +147,7 @@ async fn preserves_fresh_and_legacy_databases() {
     )
     .await
     .unwrap();
-    assert!(dropped.is_empty());
+    assert_eq!(dropped, [] as [std::string::String; 0]);
     assert!(database_exists(&admin, &fresh).await);
     assert!(database_exists(&admin, &legacy).await);
     drop_database(&admin, &fresh).await;
@@ -239,7 +239,7 @@ async fn preserves_database_owned_by_another_process() {
         )
         .await
         .unwrap();
-        assert!(dropped.is_empty());
+        assert_eq!(dropped, [] as [std::string::String; 0]);
         std::fs::write(&release, b"release").unwrap();
         let status = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
