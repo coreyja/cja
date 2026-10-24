@@ -16,7 +16,8 @@
 //! }
 //!
 //! // At boot, before building AppState:
-//! let (secrets, refresher) = SecretStore::connect(SetecConfig::from_env()?)?
+//! let (secrets, refresher) = SecretStore::connect(SetecConfig::from_env()?)
+//!     .await?
 //!     .load::<AppSecrets>()
 //!     .await?;
 //!
@@ -30,9 +31,12 @@
 //!
 //! # Reachability
 //!
-//! setec authorizes callers by tailnet identity, so the process must reach the
-//! server over the tailnet: a host `tailscaled`, or a sidecar exposing an
-//! HTTP(S) proxy via `HTTPS_PROXY`.
+//! setec authorizes callers by tailnet identity, so the connection has to come
+//! from a tailnet node. [`Transport::Host`] (the default) uses the host's
+//! network, for hosts running `tailscaled`. With the `tailnet` feature,
+//! [`Transport::Tailnet`] joins the tailnet in-process as an ephemeral node,
+//! keyless via workload identity federation (see `cja-tailnet`), for platforms
+//! like Cloud Run that can't run `tailscaled`.
 
 #[cfg(feature = "testing")]
 use std::collections::HashMap;
@@ -45,8 +49,7 @@ use std::{
     time::Duration,
 };
 
-use reqwest::Url;
-use setec::{SecretBytes, SecretValue, SecretVersion};
+use setec::{SecretBytes, SecretValue, SecretVersion, Url};
 use tokio::{sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -89,6 +92,9 @@ pub enum Error {
     },
     #[error("{} secret(s) failed to refresh", .0.len())]
     Refresh(Vec<Error>),
+    #[cfg(feature = "tailnet")]
+    #[error("could not join the tailnet")]
+    Tailnet(#[source] cja_tailnet::Error),
 }
 
 /// A set of secrets declared together. Derive it; don't implement it by hand.
@@ -136,6 +142,19 @@ pub struct SetecConfig {
     /// How long boot keeps retrying transient failures before giving up.
     /// Permanent failures (not found, access denied) fail immediately.
     pub boot_timeout: Duration,
+    /// How connections reach the tailnet.
+    pub transport: Transport,
+}
+
+/// How connections to setec reach the tailnet.
+#[derive(Debug, Clone, Default)]
+pub enum Transport {
+    /// The host's network. The host must be on the tailnet (`tailscaled`).
+    #[default]
+    Host,
+    /// Join the tailnet in-process as an ephemeral node.
+    #[cfg(feature = "tailnet")]
+    Tailnet(cja_tailnet::TailnetConfig),
 }
 
 impl SetecConfig {
@@ -144,11 +163,13 @@ impl SetecConfig {
             server,
             poll_interval: DEFAULT_POLL_INTERVAL,
             boot_timeout: DEFAULT_BOOT_TIMEOUT,
+            transport: Transport::Host,
         }
     }
 
-    /// Reads `SETEC_SERVER` (required), plus `SETEC_POLL_INTERVAL_SECS` and
-    /// `SETEC_BOOT_TIMEOUT_SECS` (optional).
+    /// Reads `SETEC_SERVER` (required), plus `SETEC_POLL_INTERVAL_SECS`,
+    /// `SETEC_BOOT_TIMEOUT_SECS`, and `SETEC_TRANSPORT` (`host`, the default,
+    /// or `tailnet`, which reads the rest from `TailnetConfig::from_env`).
     pub fn from_env() -> Result<Self, Error> {
         let server = std::env::var("SETEC_SERVER")
             .map_err(|_| Error::Config("SETEC_SERVER must be set".into()))?;
@@ -161,6 +182,18 @@ impl SetecConfig {
         if let Some(secs) = env_secs("SETEC_BOOT_TIMEOUT_SECS")? {
             config.boot_timeout = secs;
         }
+        config.transport = match std::env::var("SETEC_TRANSPORT").as_deref() {
+            Err(_) | Ok("host") => Transport::Host,
+            #[cfg(feature = "tailnet")]
+            Ok("tailnet") => {
+                Transport::Tailnet(cja_tailnet::TailnetConfig::from_env().map_err(Error::Tailnet)?)
+            }
+            Ok(other) => {
+                return Err(Error::Config(format!(
+                    "SETEC_TRANSPORT={other:?} is not supported by this build"
+                )));
+            }
+        };
         Ok(config)
     }
 }
@@ -183,6 +216,8 @@ pub struct SecretStore {
     poll_interval: Duration,
     boot_timeout: Duration,
     tracked: Mutex<Vec<Arc<dyn Tracked>>>,
+    #[cfg(feature = "tailnet")]
+    tailnet: Option<Arc<cja_tailnet::Tailnet>>,
 }
 
 enum Source {
@@ -226,16 +261,44 @@ impl fmt::Debug for SecretStore {
 }
 
 impl SecretStore {
-    /// Builds a store backed by setec. Makes no requests until
-    /// [`SecretStore::load`].
-    pub fn connect(config: SetecConfig) -> Result<Self, Error> {
-        let client = setec::Client::new(config.server)
-            .map_err(|e| Error::Config(format!("building HTTP client: {e}")))?;
-        Ok(Self::from_source(
-            Source::Setec(client),
-            config.poll_interval,
-            config.boot_timeout,
-        ))
+    /// Builds a store backed by setec. With [`Transport::Tailnet`] this joins
+    /// the tailnet first (bounded by the tailnet config's join timeout);
+    /// otherwise it makes no requests until [`SecretStore::load`].
+    #[cfg_attr(
+        not(feature = "tailnet"),
+        expect(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "joining the tailnet awaits"
+        )
+    )]
+    pub async fn connect(config: SetecConfig) -> Result<Self, Error> {
+        let client = |dialer: Arc<dyn setec::Dialer>| {
+            setec::Client::new(config.server.clone(), dialer)
+                .map_err(|e| Error::Config(format!("setec client: {e}")))
+        };
+        match config.transport {
+            Transport::Host => Ok(Self::from_source(
+                Source::Setec(client(Arc::new(setec::TcpDialer))?),
+                config.poll_interval,
+                config.boot_timeout,
+            )),
+            #[cfg(feature = "tailnet")]
+            Transport::Tailnet(tailnet_config) => {
+                let tailnet = Arc::new(
+                    cja_tailnet::Tailnet::join(tailnet_config)
+                        .await
+                        .map_err(Error::Tailnet)?,
+                );
+                let mut store = Self::from_source(
+                    Source::Setec(client(tailnet.clone())?),
+                    config.poll_interval,
+                    config.boot_timeout,
+                );
+                store.tailnet = Some(tailnet);
+                Ok(store)
+            }
+        }
     }
 
     fn from_source(source: Source, poll_interval: Duration, boot_timeout: Duration) -> Self {
@@ -244,6 +307,8 @@ impl SecretStore {
             poll_interval,
             boot_timeout,
             tracked: Mutex::new(Vec::new()),
+            #[cfg(feature = "tailnet")]
+            tailnet: None,
         }
     }
 
@@ -259,6 +324,8 @@ impl SecretStore {
                 source: self.source,
                 poll_interval: self.poll_interval,
                 tracked,
+                #[cfg(feature = "tailnet")]
+                tailnet: self.tailnet,
             }),
         };
         Ok((secrets, refresher))
@@ -332,6 +399,9 @@ struct RefresherInner {
     source: Arc<Source>,
     poll_interval: Duration,
     tracked: Vec<Arc<dyn Tracked>>,
+    /// Kept alive for the refresher's connections; left on shutdown.
+    #[cfg(feature = "tailnet")]
+    tailnet: Option<Arc<cja_tailnet::Tailnet>>,
 }
 
 impl fmt::Debug for Refresher {
@@ -345,14 +415,22 @@ impl fmt::Debug for Refresher {
 
 impl Refresher {
     /// Refreshes every `poll_interval` until `shutdown` is cancelled. Shaped
-    /// for `Supervisor::spawn`; it only returns once shutdown starts.
+    /// for `Supervisor::spawn`; it only returns once shutdown starts. With
+    /// [`Transport::Tailnet`] it then leaves the tailnet, so the ephemeral node
+    /// goes away promptly.
     pub async fn run(self, shutdown: CancellationToken) -> cja::Result<()> {
         let poll_interval = self.inner.poll_interval;
         let mut ticker = tokio::time::interval_at(Instant::now() + poll_interval, poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                () = shutdown.cancelled() => return Ok(()),
+                () = shutdown.cancelled() => {
+                    #[cfg(feature = "tailnet")]
+                    if let Some(tailnet) = &self.inner.tailnet {
+                        tailnet.shutdown().await;
+                    }
+                    return Ok(());
+                }
                 _ = ticker.tick() => {
                     // Failures are logged inside refresh and never stop the loop.
                     let _ = self.refresh().await;
