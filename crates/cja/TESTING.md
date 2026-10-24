@@ -12,14 +12,22 @@ This document outlines the comprehensive testing approach for the CJA meta-frame
 
 ### Database Management
 
-- Each test suite creates isolated PostgreSQL test databases
-- Automatic cleanup after tests complete
+- Each test suite creates an isolated PostgreSQL test database named
+  `<prefix><unix_seconds>_<uuid-simple>`
+- Guard-based cleanup removes databases promptly after clean test completion
+- The first creation for each literal prefix in a process reaps disconnected
+  timestamped databases older than one hour. Set `CJA_TEST_DB_MAX_AGE_SECS` to
+  override the threshold; invalid values warn and use the default.
+- Every live pool retains an idle connection, so concurrent test processes remain
+  visible in `pg_stat_activity` and are never force-dropped by startup reaping.
+- Reaping failures warn and allow creation to continue. Reaping is a backstop and
+  runs only when a later test process starts.
 - Connection pooling for efficient resource usage
 - Migrations are automatically run for each test database
 
 ### Test Helpers (`tests/common/`)
 
-- `mod.rs`: Core test utilities and database lifecycle management
+- `mod.rs`: Test module declarations
 - `db.rs`: Database helpers for seeding test data
 - `app.rs`: Test application state and HTTP client utilities
 
@@ -56,24 +64,29 @@ inherit the `DATABASE_URL` environment variable. Use `--lib --test lib` instead.
 
 ### Unix Socket Database (Linux / Lima VM)
 
-If PostgreSQL uses Unix sockets, two different `DATABASE_URL` formats are needed:
+If PostgreSQL uses Unix sockets, one `PgConnectOptions`-compatible URL works for
+both compile-time and runtime access:
 
 ```bash
-# Compile-time (query! macro validation):
-DATABASE_URL="postgres:///cja_dev?host=/var/run/postgresql" cargo test --package cja --no-run
-
-# Runtime (test execution):
-DATABASE_URL="postgres://%2Fvar%2Frun%2Fpostgresql/postgres" cargo test --package cja --lib --test lib -- --test-threads=1
+DATABASE_URL="postgres:///cja_dev?host=/var/run/postgresql" cargo test --package cja --lib --test lib
 ```
 
-The two formats are needed because the test infrastructure's URL parser (`rfind('/')`)
-breaks on `?host=` query parameters at runtime.
+Parallel test execution is supported; no `--test-threads=1` workaround is needed.
 
 ## Test Database Configuration
 
-Tests will use the `DATABASE_URL` environment variable if set, otherwise default to `postgres://localhost/postgres`.
+Tests use `DATABASE_URL` when set and otherwise default to `postgres:///postgres`.
 
-Each test creates a unique database with the pattern `cja_test_<uuid>` to avoid conflicts.
+Prefixes are nonempty lowercase ASCII identifier fragments ending in `_`. They
+must leave 43 bytes for the epoch separator and simple UUID within PostgreSQL's
+63-byte identifier limit. All producers for a prefix must use the timestamped
+format before stale growth is globally bounded.
+
+Legacy UUID-only `cja_test_*` and `cja_passkey_test_*` databases are deliberately
+not reaped because their age cannot be derived safely. During rollout, perform the
+existing manual sweep: select only names matching the exact legacy patterns, verify
+zero matching sessions in `pg_stat_activity` immediately before each ordinary
+`DROP DATABASE`, and never terminate sessions for the sweep.
 
 ## Future Testing Areas
 
