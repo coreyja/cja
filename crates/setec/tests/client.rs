@@ -236,3 +236,15 @@ async fn missing_header_is_rejected_by_mock_so_header_is_always_sent() {
 
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn list_with_nothing_visible_is_empty_not_an_error() {
+    // Observed against a live setec: Go encodes the empty result as `null`.
+    let (server, client) = setup().await;
+    api("list")
+        .respond_with(ResponseTemplate::new(200).set_body_string("null"))
+        .mount(&server)
+        .await;
+
+    assert_eq!(client.list().await.unwrap(), vec![]);
+}

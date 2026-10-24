@@ -164,7 +164,9 @@ impl Client {
 
     /// Lists metadata for every secret the caller has `info` access to.
     pub async fn list(&self) -> Result<Vec<SecretInfo>> {
-        self.call_ok("list", &serde_json::json!({})).await
+        // setec is Go: an empty result is a nil slice, encoded as `null`.
+        let infos: Option<Vec<SecretInfo>> = self.call_ok("list", &serde_json::json!({})).await?;
+        Ok(infos.unwrap_or_default())
     }
 
     /// Stores a new version of `name` and returns its version number. It does
