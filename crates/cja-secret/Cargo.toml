@@ -20,6 +20,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+cja = { path = "../cja", default-features = false }
 cja-secret = { path = ".", features = ["testing"] }
 base64.workspace = true
 serde_json.workspace = true

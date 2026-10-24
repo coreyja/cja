@@ -15,11 +15,17 @@
 //!     stripe: Secret<String>,
 //! }
 //!
-//! let store = SecretStore::connect(SetecConfig::from_env()?)?;
-//! let secrets: AppSecrets = store.load().await?;
-//! store.supervise(&mut supervisor);
+//! // At boot, before building AppState:
+//! let (secrets, refresher) = SecretStore::connect(SetecConfig::from_env()?)?
+//!     .load::<AppSecrets>()
+//!     .await?;
 //!
-//! let key = secrets.stripe.current(); // Arc<String>
+//! // Alongside the server, jobs, and cron:
+//! let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
+//! supervisor.spawn("secret-refresh", refresher.run(supervisor.shutdown_token()));
+//!
+//! // In a handler:
+//! let key = state.secrets.stripe.current(); // Arc<String>
 //! ```
 //!
 //! # Reachability
@@ -39,7 +45,6 @@ use std::{
     time::Duration,
 };
 
-use cja::tasks::Supervisor;
 use reqwest::Url;
 use setec::{SecretBytes, SecretValue, SecretVersion};
 use tokio::{sync::watch, time::Instant};
@@ -170,14 +175,11 @@ fn env_secs(var: &str) -> Result<Option<Duration>, Error> {
     }
 }
 
-/// Fetches secrets and keeps declared handles current. Cheap to clone.
-#[derive(Clone)]
+/// A boot-time connection to setec. Declare secrets with
+/// [`SecretStore::load`], which consumes the store and hands back the secrets
+/// plus a [`Refresher`] to run under the app's supervisor.
 pub struct SecretStore {
-    inner: Arc<StoreInner>,
-}
-
-struct StoreInner {
-    source: Source,
+    source: Arc<Source>,
     poll_interval: Duration,
     boot_timeout: Duration,
     tracked: Mutex<Vec<Arc<dyn Tracked>>>,
@@ -186,7 +188,7 @@ struct StoreInner {
 enum Source {
     Setec(setec::Client),
     #[cfg(feature = "testing")]
-    Fake(Mutex<HashMap<String, SecretValue>>),
+    Fake(FakeSetec),
 }
 
 impl Source {
@@ -194,12 +196,7 @@ impl Source {
         match self {
             Self::Setec(client) => client.get(name).await,
             #[cfg(feature = "testing")]
-            Self::Fake(values) => values
-                .lock()
-                .expect("fake secrets lock")
-                .get(name)
-                .cloned()
-                .ok_or(setec::Error::NotFound),
+            Self::Fake(fake) => fake.get(name),
         }
     }
 
@@ -211,8 +208,8 @@ impl Source {
         match self {
             Self::Setec(client) => client.get_if_changed(name, known).await,
             #[cfg(feature = "testing")]
-            Self::Fake(_) => {
-                let current = self.get(name).await?;
+            Self::Fake(fake) => {
+                let current = fake.get(name)?;
                 Ok((current.version != known).then_some(current))
             }
         }
@@ -222,15 +219,15 @@ impl Source {
 impl fmt::Debug for SecretStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretStore")
-            .field("poll_interval", &self.inner.poll_interval)
-            .field("boot_timeout", &self.inner.boot_timeout)
+            .field("poll_interval", &self.poll_interval)
+            .field("boot_timeout", &self.boot_timeout)
             .finish_non_exhaustive()
     }
 }
 
 impl SecretStore {
-    /// Builds a store backed by setec. Makes no requests until secrets are
-    /// declared.
+    /// Builds a store backed by setec. Makes no requests until
+    /// [`SecretStore::load`].
     pub fn connect(config: SetecConfig) -> Result<Self, Error> {
         let client = setec::Client::new(config.server)
             .map_err(|e| Error::Config(format!("building HTTP client: {e}")))?;
@@ -241,66 +238,35 @@ impl SecretStore {
         ))
     }
 
-    /// An in-memory store for tests. Values start at version 1; use
-    /// [`SecretStore::rotate`] to simulate activating a new version.
-    #[cfg(feature = "testing")]
-    pub fn fake<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Self {
-        let values = secrets
-            .into_iter()
-            .map(|(name, value)| {
-                (
-                    name.to_owned(),
-                    SecretValue {
-                        value: SecretBytes::new(value.to_vec()),
-                        version: 1,
-                    },
-                )
-            })
-            .collect();
-        Self::from_source(
-            Source::Fake(Mutex::new(values)),
-            DEFAULT_POLL_INTERVAL,
-            DEFAULT_BOOT_TIMEOUT,
-        )
-    }
-
-    /// Activates a new version of `name` in a fake store. The new value
-    /// reaches handles on the next [`SecretStore::refresh`].
-    #[cfg(feature = "testing")]
-    pub fn rotate(&self, name: &str, value: &[u8]) {
-        let Source::Fake(values) = &self.inner.source else {
-            panic!("rotate is only supported on SecretStore::fake");
-        };
-        let mut values = values.lock().expect("fake secrets lock");
-        let version = values.get(name).map_or(1, |v| v.version + 1);
-        values.insert(
-            name.to_owned(),
-            SecretValue {
-                value: SecretBytes::new(value.to_vec()),
-                version,
-            },
-        );
-    }
-
     fn from_source(source: Source, poll_interval: Duration, boot_timeout: Duration) -> Self {
         Self {
-            inner: Arc::new(StoreInner {
-                source,
-                poll_interval,
-                boot_timeout,
-                tracked: Mutex::new(Vec::new()),
-            }),
+            source: Arc::new(source),
+            poll_interval,
+            boot_timeout,
+            tracked: Mutex::new(Vec::new()),
         }
     }
 
     /// Fetches every secret declared by `S`. Fails if any secret is missing,
     /// denied, unparseable, or unreachable for longer than the boot timeout.
-    pub async fn load<S: Secrets>(&self) -> Result<S, Error> {
-        S::declare(self).await
+    ///
+    /// Returns the secrets and the [`Refresher`] that keeps them current.
+    pub async fn load<S: Secrets>(self) -> Result<(S, Refresher), Error> {
+        let secrets = S::declare(&self).await?;
+        let tracked = self.tracked.into_inner().expect("tracked secrets lock");
+        let refresher = Refresher {
+            inner: Arc::new(RefresherInner {
+                source: self.source,
+                poll_interval: self.poll_interval,
+                tracked,
+            }),
+        };
+        Ok((secrets, refresher))
     }
 
-    /// Fetches one secret and tracks it for refresh. Prefer
-    /// `#[derive(Secrets)]` + [`SecretStore::load`].
+    /// Fetches one secret and tracks it for refresh. Called by
+    /// `#[derive(Secrets)]`.
+    #[doc(hidden)]
     pub async fn declare<T: FromSecret>(&self, name: &'static str) -> Result<Secret<T>, Error> {
         let fetched = self.fetch_at_boot(name).await?;
         let value = parse::<T>(name, &fetched)?;
@@ -310,8 +276,7 @@ impl SecretStore {
             checked_at: Mutex::new(Instant::now()),
             tx: watch::Sender::new(Arc::new(value)),
         });
-        self.inner
-            .tracked
+        self.tracked
             .lock()
             .expect("tracked secrets lock")
             .push(entry.clone());
@@ -320,11 +285,11 @@ impl SecretStore {
     }
 
     async fn fetch_at_boot(&self, name: &'static str) -> Result<SecretValue, Error> {
-        let timeout = self.inner.boot_timeout;
+        let timeout = self.boot_timeout;
         let deadline = Instant::now() + timeout;
         let mut wait = INITIAL_RETRY_WAIT;
         loop {
-            let attempt = tokio::time::timeout_at(deadline, self.inner.source.get(name)).await;
+            let attempt = tokio::time::timeout_at(deadline, self.source.get(name)).await;
             let error = match attempt {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(error)) if !error.is_retryable() => {
@@ -354,19 +319,54 @@ impl SecretStore {
             wait = (wait * 2).min(MAX_RETRY_WAIT);
         }
     }
+}
 
-    /// Checks every tracked secret for a newly activated version once. Failures
-    /// keep the last good value and are logged; they're also returned so a
-    /// caller (or a test) can act on them.
+/// Keeps loaded secrets current by polling setec for newly activated
+/// versions. Cheap to clone.
+#[derive(Clone)]
+pub struct Refresher {
+    inner: Arc<RefresherInner>,
+}
+
+struct RefresherInner {
+    source: Arc<Source>,
+    poll_interval: Duration,
+    tracked: Vec<Arc<dyn Tracked>>,
+}
+
+impl fmt::Debug for Refresher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Refresher")
+            .field("poll_interval", &self.inner.poll_interval)
+            .field("secrets", &self.inner.tracked.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Refresher {
+    /// Refreshes every `poll_interval` until `shutdown` is cancelled. Shaped
+    /// for `Supervisor::spawn`; it only returns once shutdown starts.
+    pub async fn run(self, shutdown: CancellationToken) -> cja::Result<()> {
+        let poll_interval = self.inner.poll_interval;
+        let mut ticker = tokio::time::interval_at(Instant::now() + poll_interval, poll_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                _ = ticker.tick() => {
+                    // Failures are logged inside refresh and never stop the loop.
+                    let _ = self.refresh().await;
+                }
+            }
+        }
+    }
+
+    /// Checks every secret for a newly activated version once. Failures keep
+    /// the last good value and are logged; they're also returned so a caller
+    /// (or a test) can act on them.
     pub async fn refresh(&self) -> Result<(), Error> {
-        let tracked = self
-            .inner
-            .tracked
-            .lock()
-            .expect("tracked secrets lock")
-            .clone();
         let mut failures = Vec::new();
-        for entry in tracked {
+        for entry in &self.inner.tracked {
             if let Err(error) = self.refresh_one(entry.as_ref()).await {
                 match &error {
                     Error::Setec {
@@ -411,45 +411,55 @@ impl SecretStore {
         entry.mark_checked(Instant::now());
         Ok(())
     }
+}
 
-    /// Refreshes every `poll_interval` until `shutdown` is cancelled.
-    pub async fn refresh_until(self, shutdown: CancellationToken) {
-        let mut ticker = tokio::time::interval_at(
-            Instant::now() + self.inner.poll_interval,
-            self.inner.poll_interval,
-        );
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                _ = ticker.tick() => {
-                    // Failures are logged inside refresh and never stop the loop.
-                    let _ = self.refresh().await;
-                }
-            }
+/// An in-memory stand-in for setec, for tests. Values start at version 1.
+#[cfg(feature = "testing")]
+#[derive(Clone, Default)]
+pub struct FakeSetec {
+    values: Arc<Mutex<HashMap<String, SecretValue>>>,
+}
+
+#[cfg(feature = "testing")]
+impl FakeSetec {
+    pub fn new<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Self {
+        let fake = Self::default();
+        for (name, value) in secrets {
+            fake.rotate(name, value);
         }
+        fake
     }
 
-    /// Runs [`SecretStore::refresh_until`] as a supervised cja task.
-    pub fn supervise(&self, supervisor: &mut Supervisor) {
-        let store = self.clone();
-        let shutdown = supervisor.shutdown_token();
-        supervisor.spawn("secret-refresh", async move {
-            store.refresh_until(shutdown).await;
-            Ok(())
-        });
+    /// A store reading from this fake, with the default timings.
+    pub fn store(&self) -> SecretStore {
+        SecretStore::from_source(
+            Source::Fake(self.clone()),
+            DEFAULT_POLL_INTERVAL,
+            DEFAULT_BOOT_TIMEOUT,
+        )
     }
 
-    /// The oldest successful check across all tracked secrets, or `None` if
-    /// nothing is declared. Useful for a staleness health check.
-    pub fn last_refreshed(&self) -> Option<Instant> {
-        self.inner
-            .tracked
+    /// Activates a new version of `name`. Loaded handles see it after the
+    /// next [`Refresher::refresh`].
+    pub fn rotate(&self, name: &str, value: &[u8]) {
+        let mut values = self.values.lock().expect("fake secrets lock");
+        let version = values.get(name).map_or(1, |v| v.version + 1);
+        values.insert(
+            name.to_owned(),
+            SecretValue {
+                value: SecretBytes::new(value.to_vec()),
+                version,
+            },
+        );
+    }
+
+    fn get(&self, name: &str) -> Result<SecretValue, setec::Error> {
+        self.values
             .lock()
-            .expect("tracked secrets lock")
-            .iter()
-            .map(|entry| entry.checked_at())
-            .min()
+            .expect("fake secrets lock")
+            .get(name)
+            .cloned()
+            .ok_or(setec::Error::NotFound)
     }
 }
 
@@ -503,6 +513,12 @@ impl<T> Secret<T> {
     pub fn watch(&self) -> watch::Receiver<Arc<T>> {
         self.entry.tx.subscribe()
     }
+
+    /// When setec last confirmed this value was current (boot or the latest
+    /// successful refresh). Useful for a staleness health check.
+    pub fn last_refreshed(&self) -> Instant {
+        *self.entry.checked_at.lock().expect("checked_at lock")
+    }
 }
 
 struct Entry<T> {
@@ -518,7 +534,6 @@ trait Tracked: Send + Sync {
     fn version(&self) -> SecretVersion;
     fn apply(&self, value: &SecretValue) -> Result<(), Error>;
     fn mark_checked(&self, at: Instant);
-    fn checked_at(&self) -> Instant;
 }
 
 impl<T: FromSecret> Tracked for Entry<T> {
@@ -539,9 +554,5 @@ impl<T: FromSecret> Tracked for Entry<T> {
 
     fn mark_checked(&self, at: Instant) {
         *self.checked_at.lock().expect("checked_at lock") = at;
-    }
-
-    fn checked_at(&self) -> Instant {
-        *self.checked_at.lock().expect("checked_at lock")
     }
 }

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use cja_secret::{Error, Secret, SecretStore, Secrets, SetecConfig, setec};
+use cja_secret::{Error, FakeSetec, Refresher, Secret, SecretStore, Secrets, SetecConfig, setec};
 use reqwest::Url;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -17,8 +17,8 @@ struct AppSecrets {
     signing: Secret<setec::SecretBytes>,
 }
 
-fn fake() -> SecretStore {
-    SecretStore::fake([
+fn fake() -> FakeSetec {
+    FakeSetec::new([
         ("attic/app/api-key", b"key-v1".as_slice()),
         ("attic/app/signing", b"\x00\xffsig".as_slice()),
     ])
@@ -34,7 +34,7 @@ fn derive_lists_names_in_field_order() {
 
 #[tokio::test]
 async fn load_fetches_every_declared_secret() {
-    let secrets: AppSecrets = fake().load().await.unwrap();
+    let (secrets, _refresher) = fake().store().load::<AppSecrets>().await.unwrap();
 
     assert_eq!(*secrets.api_key.current(), "key-v1");
     assert_eq!(secrets.api_key.version(), 1);
@@ -43,8 +43,8 @@ async fn load_fetches_every_declared_secret() {
 
 #[tokio::test]
 async fn debug_never_prints_values() {
-    let secrets: AppSecrets = fake().load().await.unwrap();
-    let debug = format!("{secrets:?}");
+    let (secrets, refresher) = fake().store().load::<AppSecrets>().await.unwrap();
+    let debug = format!("{secrets:?} {refresher:?}");
 
     assert!(!debug.contains("key-v1"), "{debug}");
     assert!(debug.contains("attic/app/api-key"), "{debug}");
@@ -52,9 +52,9 @@ async fn debug_never_prints_values() {
 
 #[tokio::test]
 async fn missing_secret_fails_load() {
-    let store = SecretStore::fake([("attic/app/api-key", b"k".as_slice())]);
+    let fake = FakeSetec::new([("attic/app/api-key", b"k".as_slice())]);
 
-    let err = store.load::<AppSecrets>().await.unwrap_err();
+    let err = fake.store().load::<AppSecrets>().await.unwrap_err();
 
     assert!(
         matches!(
@@ -70,12 +70,12 @@ async fn missing_secret_fails_load() {
 
 #[tokio::test]
 async fn unparseable_secret_fails_load() {
-    let store = SecretStore::fake([
+    let fake = FakeSetec::new([
         ("attic/app/api-key", b"\xff\xfe".as_slice()),
         ("attic/app/signing", b"s".as_slice()),
     ]);
 
-    let err = store.load::<AppSecrets>().await.unwrap_err();
+    let err = fake.store().load::<AppSecrets>().await.unwrap_err();
 
     assert!(
         matches!(
@@ -92,13 +92,13 @@ async fn unparseable_secret_fails_load() {
 
 #[tokio::test]
 async fn refresh_delivers_rotated_value_to_every_clone_and_watcher() {
-    let store = fake();
-    let secrets: AppSecrets = store.load().await.unwrap();
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
     let clone = secrets.clone();
     let mut watcher = secrets.api_key.watch();
 
-    store.rotate("attic/app/api-key", b"key-v2");
-    store.refresh().await.unwrap();
+    fake.rotate("attic/app/api-key", b"key-v2");
+    refresher.refresh().await.unwrap();
 
     assert!(watcher.has_changed().unwrap());
     assert_eq!(**watcher.borrow_and_update(), "key-v2");
@@ -108,11 +108,11 @@ async fn refresh_delivers_rotated_value_to_every_clone_and_watcher() {
 
 #[tokio::test]
 async fn unchanged_refresh_does_not_wake_watchers() {
-    let store = fake();
-    let secrets: AppSecrets = store.load().await.unwrap();
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
     let watcher = secrets.api_key.watch();
 
-    store.refresh().await.unwrap();
+    refresher.refresh().await.unwrap();
 
     assert!(!watcher.has_changed().unwrap());
     assert_eq!(secrets.api_key.version(), 1);
@@ -120,11 +120,11 @@ async fn unchanged_refresh_does_not_wake_watchers() {
 
 #[tokio::test]
 async fn unparseable_rotation_keeps_last_good_value() {
-    let store = fake();
-    let secrets: AppSecrets = store.load().await.unwrap();
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
 
-    store.rotate("attic/app/api-key", b"\xff\xfe");
-    let err = store.refresh().await.unwrap_err();
+    fake.rotate("attic/app/api-key", b"\xff\xfe");
+    let err = refresher.refresh().await.unwrap_err();
 
     let Error::Refresh(failures) = err else {
         panic!("expected Refresh, got {err:?}");
@@ -145,15 +145,15 @@ async fn unparseable_rotation_keeps_last_good_value() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn refresh_until_polls_on_interval_and_stops_on_cancel() {
-    let store = fake();
-    let secrets: AppSecrets = store.load().await.unwrap();
+async fn run_polls_on_interval_and_stops_on_cancel() {
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
     let mut watcher = secrets.api_key.watch();
     let shutdown = CancellationToken::new();
-    let task = tokio::spawn(store.clone().refresh_until(shutdown.clone()));
+    let task = tokio::spawn(refresher.run(shutdown.clone()));
     tokio::task::yield_now().await; // let the refresher arm its interval at t=0
 
-    store.rotate("attic/app/api-key", b"key-v2");
+    fake.rotate("attic/app/api-key", b"key-v2");
     tokio::time::advance(Duration::from_mins(30)).await;
     assert!(
         !watcher.has_changed().unwrap(),
@@ -167,21 +167,27 @@ async fn refresh_until_polls_on_interval_and_stops_on_cancel() {
     assert_eq!(*secrets.api_key.current(), "key-v2");
 
     shutdown.cancel();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
-async fn last_refreshed_tracks_the_oldest_check() {
-    let store = fake();
-    assert!(store.last_refreshed().is_none());
-    let _secrets: AppSecrets = store.load().await.unwrap();
-    let loaded = store.last_refreshed().unwrap();
+async fn last_refreshed_advances_on_successful_refresh_only() {
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    let loaded = secrets.api_key.last_refreshed();
 
     tokio::time::advance(Duration::from_secs(10)).await;
-    store.refresh().await.unwrap();
-
+    refresher.refresh().await.unwrap();
     assert_eq!(
-        store.last_refreshed().unwrap() - loaded,
+        secrets.api_key.last_refreshed() - loaded,
+        Duration::from_secs(10)
+    );
+
+    fake.rotate("attic/app/api-key", b"\xff\xfe");
+    tokio::time::advance(Duration::from_secs(10)).await;
+    refresher.refresh().await.unwrap_err();
+    assert_eq!(
+        secrets.api_key.last_refreshed() - loaded,
         Duration::from_secs(10)
     );
 }
@@ -250,8 +256,8 @@ async fn transient_failure_at_boot_is_retried() {
         .mount(&server)
         .await;
 
-    let secrets: OneSecret = setec_store(&server, Duration::from_secs(30))
-        .load()
+    let (secrets, _refresher) = setec_store(&server, Duration::from_secs(30))
+        .load::<OneSecret>()
         .await
         .unwrap();
 
@@ -318,13 +324,16 @@ async fn refresh_sends_conditional_get_with_known_version() {
         .mount(&server)
         .await;
 
-    let store = setec_store(&server, Duration::from_secs(30));
-    let secrets: OneSecret = store.load().await.unwrap();
+    let (secrets, refresher): (OneSecret, Refresher) =
+        setec_store(&server, Duration::from_secs(30))
+            .load()
+            .await
+            .unwrap();
 
-    store.refresh().await.unwrap();
+    refresher.refresh().await.unwrap();
     assert_eq!(*secrets.token.current(), "t1");
 
-    store.refresh().await.unwrap();
+    refresher.refresh().await.unwrap();
     assert_eq!(*secrets.token.current(), "t2");
     assert_eq!(secrets.token.version(), 8);
 }
@@ -345,10 +354,13 @@ async fn refresh_failure_keeps_value_and_reports_error() {
         .mount(&server)
         .await;
 
-    let store = setec_store(&server, Duration::from_secs(30));
-    let secrets: OneSecret = store.load().await.unwrap();
+    let (secrets, refresher): (OneSecret, Refresher) =
+        setec_store(&server, Duration::from_secs(30))
+            .load()
+            .await
+            .unwrap();
 
-    let err = store.refresh().await.unwrap_err();
+    let err = refresher.refresh().await.unwrap_err();
 
     assert!(
         matches!(
@@ -361,4 +373,17 @@ async fn refresh_failure_keeps_value_and_reports_error() {
         "{err:?}"
     );
     assert_eq!(*secrets.token.current(), "t1");
+}
+
+/// Compile-level check that `Refresher::run` is the shape `Supervisor::spawn`
+/// takes. Driving `Supervisor::run` needs a real signal, so behaviour is
+/// covered by `run_polls_on_interval_and_stops_on_cancel` instead.
+#[tokio::test]
+async fn refresher_run_fits_supervisor_spawn() {
+    use cja::tasks::{ShutdownBudget, Supervisor};
+
+    let (_secrets, refresher) = fake().store().load::<AppSecrets>().await.unwrap();
+    let mut supervisor = Supervisor::new(ShutdownBudget::from_env()).unwrap();
+
+    supervisor.spawn("secret-refresh", refresher.run(supervisor.shutdown_token()));
 }
