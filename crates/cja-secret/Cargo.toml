@@ -1,0 +1,30 @@
+[package]
+name = "cja-secret"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Typed, in-memory secrets from setec for cja apps"
+publish = false
+
+[features]
+testing = []
+
+[dependencies]
+cja = { path = "../cja", default-features = false }
+cja-secret-macros = { path = "../cja-secret-macros" }
+setec = { path = "../setec" }
+reqwest.workspace = true
+thiserror = "2"
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cja-secret = { path = ".", features = ["testing"] }
+base64.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+wiremock = "0.6"
+
+[lints]
+workspace = true
