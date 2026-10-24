@@ -14,83 +14,12 @@ use cja_passkey::{PasskeyConfig, models};
 use http::Request;
 use http_body_util::BodyExt;
 use sqlx::Row;
-use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
 
-fn base_url() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres:///postgres".to_string())
-}
-
-fn admin_url() -> String {
-    let url = base_url();
-    if let Some(idx) = url.rfind('/') {
-        format!("{}/postgres", &url[..idx])
-    } else {
-        url
-    }
-}
-
-fn db_url(db_name: &str) -> String {
-    let url = base_url();
-    if let Some(idx) = url.rfind('/') {
-        format!("{}/{db_name}", &url[..idx])
-    } else {
-        format!("{url}/{db_name}")
-    }
-}
-
-struct TestDbGuard {
-    db_name: String,
-}
-
-impl Drop for TestDbGuard {
-    fn drop(&mut self) {
-        let db_name = self.db_name.clone();
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let admin = admin_url();
-                if let Ok(pool) = PgPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&admin)
-                    .await
-                {
-                    let _ = sqlx::query(&format!(
-                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                         WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
-                    ))
-                    .execute(&pool)
-                    .await;
-                    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
-                        .execute(&pool)
-                        .await;
-                    pool.close().await;
-                }
-            });
-        })
-        .join();
-    }
-}
-
-async fn setup_test_db() -> (sqlx::PgPool, TestDbGuard) {
-    let db_name = format!("cja_passkey_test_{}", Uuid::new_v4().simple());
-    let admin = admin_url();
-    let admin_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&admin)
-        .await
-        .unwrap();
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
-    admin_pool.close().await;
-
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url(&db_name))
+async fn setup_test_db() -> (sqlx::PgPool, cja::testing::test_db::TestDatabaseGuard) {
+    let (pool, guard) = cja::testing::test_db::create_test_database("cja_passkey_test_")
         .await
         .unwrap();
 
@@ -100,7 +29,7 @@ async fn setup_test_db() -> (sqlx::PgPool, TestDbGuard) {
         .unwrap();
     cja_passkey::run_migrations(&pool).await.unwrap();
 
-    (pool, TestDbGuard { db_name })
+    (pool, guard)
 }
 
 #[derive(Clone)]
