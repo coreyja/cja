@@ -671,28 +671,15 @@ where
         // Lost the race (row no longer waiting under us).
         return Err(RunError::NotWaiting(run, RunStatus::Running));
     }
-    if let Err(error) = db::insert_messages(&mut tx, run.0, &new_messages).await {
-        return Err(answer_unstorable(state, run, error).await);
-    }
+    // The answer text is sanitized at entry, so a rejected write here is
+    // corruption or version skew, not payload: propagate the storage
+    // error — the transaction rolls back and the run stays `waiting`, so
+    // the app can retry (or investigate) rather than losing the question.
+    db::insert_messages(&mut tx, run.0, &new_messages).await?;
     enqueue_on_tx::<S>(&mut tx, run.0, format!("agent-run:{kind_name}")).await?;
     tx.commit().await?;
     state.job_enqueued();
     Ok(())
-}
-
-/// A write inside [`answer`] was rejected because its content cannot be
-/// stored (SQLSTATE 22P05/22021/54000 — a U+0000): fail the run
-/// permanently (`waiting -> failed`, pending columns cleared) and surface
-/// the storage error. The answer text is sanitized at entry, so this is
-/// unreachable short of corruption or version skew — but a run must never
-/// stay parked on a payload this database cannot store.
-async fn answer_unstorable<S: HasDurable>(state: &S, run: RunId, error: sqlx::Error) -> RunError {
-    if db::unstorable_content(&error) {
-        // Best-effort: the transaction has already aborted; if this write
-        // fails too, the caller still sees the storage error.
-        let _ = db::fail_unstorable_waiting(state.db(), run.0).await;
-    }
-    RunError::Storage(error)
 }
 
 /// Cancel a run. `queued`/`waiting` (and `running` under a dead lease — the

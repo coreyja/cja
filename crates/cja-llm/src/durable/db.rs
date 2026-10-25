@@ -81,31 +81,6 @@ where
         > 0)
 }
 
-/// The `answer`-path variant: mark a `waiting` run `failed` with
-/// `unstorable_content` (pending columns cleared — the CHECK requires
-/// it). Best-effort; the caller surfaces the original storage error either
-/// way.
-pub(super) async fn fail_unstorable_waiting<'e, E>(db: E, run_id: Uuid) -> sqlx::Result<bool>
-where
-    E: Executor<'e, Database = sqlx::Postgres>,
-{
-    Ok(sqlx::query(
-        "UPDATE agent_runs
-         SET status = $2, fail_reason = $3, error = $4,
-             pending_call_id = NULL, pending_question = NULL, finished_at = NOW()
-         WHERE id = $1 AND status = $5",
-    )
-    .bind(run_id)
-    .bind(RunStatus::Failed.as_str())
-    .bind(FailReason::UnstorableContent.as_str())
-    .bind("run content cannot be stored: it contains a NUL (U+0000)")
-    .bind(RunStatus::Waiting.as_str())
-    .execute(db)
-    .await?
-    .rows_affected()
-        > 0)
-}
-
 /// Claim `run_id` for advancement: `queued`, or `running` with a dead lease
 /// (NULL or older than `takeover`), transitions to `running` leased by `me`.
 /// `me` is fresh per attempt, so a self-claim branch could never match.
