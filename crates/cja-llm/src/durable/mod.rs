@@ -642,7 +642,7 @@ where
     let run_state = serde_json::to_value(&agent_run)
         .map_err(|_| RunError::Corrupt("run state failed to serialize", 0, 0))?;
     let mut new_messages = Vec::new();
-    for (i, message) in agent_run.messages().iter().enumerate().skip(before) {
+    for (i, message) in agent_run.messages().iter().skip(before).enumerate() {
         let body = serde_json::to_value(&**message)
             .map_err(|_| RunError::Corrupt("transcript message failed to serialize", 0, 0))?;
         let role = match &**message {

@@ -187,19 +187,20 @@ pub(super) async fn persist_step(
 }
 
 /// Transition `running` (owned by `me`) to `waiting`, recording the suspended
-/// ask relationally and clearing the lease in the same UPDATE. `false` =
-/// lease lost.
-pub(super) async fn set_waiting<'e, E>(
-    db: E,
+/// ask relationally, clearing the lease, and projecting any not-yet-written
+/// transcript rows (rig commits a turn inside `next_step`, so the suspension
+/// is the first write after that commit) — one transaction. `false` = lease
+/// lost.
+pub(super) async fn set_waiting(
+    db: &sqlx::PgPool,
     run_id: Uuid,
     me: &str,
     run_state_json: &serde_json::Value,
     pending_call_id: &str,
     pending_question: &str,
-) -> sqlx::Result<bool>
-where
-    E: Executor<'e, Database = sqlx::Postgres>,
-{
+    new_messages: &[(i64, String, serde_json::Value)],
+) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
     let rows = sqlx::query(
         "UPDATE agent_runs
          SET status = $3, run_state = $4, pending_call_id = $5, pending_question = $6,
@@ -213,18 +214,24 @@ where
     .bind(pending_call_id)
     .bind(pending_question)
     .bind(RunStatus::Running.as_str())
-    .execute(db)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
-    Ok(rows > 0)
+    if rows == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    insert_messages(&mut tx, run_id, new_messages).await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Transition `running` (owned by `me`) to a terminal status, recording the
 /// typed failure, the final output, and the preserved transcript state.
 /// `false` = lease lost.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn finish<'e, E>(
-    db: E,
+pub(super) async fn finish(
+    db: &sqlx::PgPool,
     run_id: Uuid,
     me: &str,
     status: RunStatus,
@@ -235,10 +242,9 @@ pub(super) async fn finish<'e, E>(
     turns: i32,
     input_tokens: i64,
     output_tokens: i64,
-) -> sqlx::Result<bool>
-where
-    E: Executor<'e, Database = sqlx::Postgres>,
-{
+    new_messages: &[(i64, String, serde_json::Value)],
+) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
     let rows = sqlx::query(
         "UPDATE agent_runs
          SET status = $3, fail_reason = $4, output = $5, error = $6, run_state = $7,
@@ -257,10 +263,16 @@ where
     .bind(input_tokens)
     .bind(output_tokens)
     .bind(RunStatus::Running.as_str())
-    .execute(db)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
-    Ok(rows > 0)
+    if rows == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    insert_messages(&mut tx, run_id, new_messages).await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// `answer`'s transition: `waiting` to `running` with the answered run state,

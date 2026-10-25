@@ -144,6 +144,35 @@ fn message_role(message: &Message) -> &'static str {
     }
 }
 
+/// Compute the transcript rows not yet written for `run`: everything from
+/// the stored high-water mark on. Cheap (one indexed MAX) and idempotent.
+async fn project_messages(
+    db: &sqlx::PgPool,
+    run_id: Uuid,
+    run: &AgentRun,
+) -> cja::color_eyre::Result<Vec<(i64, String, serde_json::Value)>> {
+    let written: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq) + 1, 0) FROM agent_messages WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await
+    .map_err(cja::color_eyre::Report::from)?;
+    let mut new_messages = Vec::new();
+    for (i, message) in run
+        .messages()
+        .iter()
+        .skip(usize::try_from(written).unwrap_or(usize::MAX))
+        .enumerate()
+    {
+        let body = serde_json::to_value(&**message).map_err(|e| {
+            cja::color_eyre::eyre::eyre!("failed to serialize transcript message: {e}")
+        })?;
+        new_messages.push((written + i as i64, message_role(message).to_owned(), body));
+    }
+    Ok(new_messages)
+}
+
 /// Everything one attempt's step helpers need, built once per attempt.
 struct Attempt<'a> {
     durable: &'a Durable,
@@ -201,7 +230,7 @@ impl Durable {
         // cancelled without advancing, preserving the transcript.
         if row.cancel_requested {
             let snap = RunSnapshot::from_row(&row);
-            self.finish_run(db, run_id, &me, RunStatus::Cancelled, None, None, Some("cancelled by request".to_owned()), snap)
+            self.finish_run(db, run_id, &me, RunStatus::Cancelled, None, None, Some("cancelled by request".to_owned()), snap, None)
                 .await?;
             return Ok(());
         }
@@ -220,6 +249,7 @@ impl Durable {
                 None,
                 Some(format!("unknown agent kind `{}`", row.kind)),
                 snap,
+                None,
             )
             .await?;
             return Ok(());
@@ -246,6 +276,7 @@ impl Durable {
                     None,
                     Some(message.to_owned()),
                     snap,
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -256,28 +287,7 @@ impl Durable {
         // Rebuild the per-attempt artifacts from the kind. The model id
         // comes from the ROW (written by `start` from `kind.model`), so the
         // builder and the wire call can never disagree.
-        let agent = (kind.build)(&self.llm, &row.model).build();
-        let mut spec = agent.run_spec();
-        // The AgentBuilder has no setter for this (rig exposes one only on
-        // the runner); the durable engine applies the kind's policy over
-        // the built spec, exactly as `start` does.
-        spec.unhandled_invalid_tool_call = kind.unhandled_invalid_tool_call;
-        let toolset = agent.tool_server_handle().toolset();
-        let model = self.llm.client().completion(row.model.clone());
-        let capabilities = model.capabilities().completion;
-        let attempt = Attempt {
-            durable: self,
-            db,
-            run_id,
-            me: me.clone(),
-            kind,
-            model_name: row.model.clone(),
-            spec,
-            toolset,
-            model,
-            capabilities,
-            shutdown,
-        };
+        let attempt = self.attempt(db, run_id, &me, kind, &row.model, shutdown);
 
         loop {
             // Between-steps shutdown boundary (deploy): abort, release, Err
@@ -311,6 +321,22 @@ impl Durable {
                 } => attempt.call_model_step(&mut run, prompt, history, turn).await,
                 AgentRunStep::CallTools { calls } => attempt.call_tools_step(&mut run, calls).await,
                 AgentRunStep::Done(response) => {
+                    // The final assistant message is committed by `next_step`'s
+                    // turn processing — after the step-level persist — so the
+                    // transcript projection needs one more pass here before
+                    // the terminal write.
+                    match attempt.persist(&run).await {
+                        StepOutcome::Continue => {}
+                        other => return match other {
+                            StepOutcome::Done => Ok(()),
+                            StepOutcome::Retry(error) => {
+                                self.fail_retryable(db, run_id, &me, error).await
+                            }
+                            #[cfg(feature = "testing")]
+                            StepOutcome::Injected(error) => Err(error),
+                            StepOutcome::Continue => unreachable!(),
+                        },
+                    }
                     let snap = RunSnapshot::of(&run)?;
                     self.finish_run(
                         db,
@@ -321,6 +347,7 @@ impl Durable {
                         Some(response.output()),
                         None,
                         snap,
+                        Some(&run),
                     )
                     .await?;
                     return Ok(());
@@ -335,6 +362,42 @@ impl Durable {
                 #[cfg(feature = "testing")]
                 StepOutcome::Injected(error) => return Err(error),
             }
+        }
+    }
+
+    /// Build the per-attempt artifacts from the kind. The model id comes
+    /// from the row (written by `start` from `kind.model`), so the builder
+    /// and the wire call can never disagree.
+    fn attempt<'a>(
+        &'a self,
+        db: &'a sqlx::PgPool,
+        run_id: Uuid,
+        me: &str,
+        kind: &'static AgentKind,
+        model_name: &str,
+        shutdown: CancellationToken,
+    ) -> Attempt<'a> {
+        let agent = (kind.build)(&self.llm, model_name).build();
+        let mut spec = agent.run_spec();
+        // The AgentBuilder has no setter for this (rig exposes one only on
+        // the runner); the durable engine applies the kind's policy over
+        // the built spec, exactly as `start` does.
+        spec.unhandled_invalid_tool_call = kind.unhandled_invalid_tool_call;
+        let toolset = agent.tool_server_handle().toolset();
+        let model = self.llm.client().completion(model_name.to_owned());
+        let capabilities = model.capabilities().completion;
+        Attempt {
+            durable: self,
+            db,
+            run_id,
+            me: me.to_owned(),
+            kind,
+            model_name: model_name.to_owned(),
+            spec,
+            toolset,
+            model,
+            capabilities,
+            shutdown,
         }
     }
 
@@ -365,7 +428,14 @@ impl Durable {
         output: Option<String>,
         error: Option<String>,
         snap: RunSnapshot,
+        run: Option<&AgentRun>,
     ) -> cja::color_eyre::Result<()> {
+        // rig commits turns inside `next_step`, so a terminal write can be
+        // the first write after a commit: project what is missing.
+        let new_messages = match run {
+            Some(run) => project_messages(db, run_id, run).await?,
+            None => Vec::new(),
+        };
         let wrote = tokio::time::timeout(
             WRITE_BOUND,
             db::finish(
@@ -380,6 +450,7 @@ impl Durable {
                 snap.turns,
                 snap.input_tokens,
                 snap.output_tokens,
+                &new_messages,
             ),
         )
         .await
@@ -408,6 +479,7 @@ impl Attempt<'_> {
                 None,
                 Some(message.to_owned()),
                 snap,
+                Some(run),
             )
             .await
         {
@@ -423,41 +495,10 @@ impl Attempt<'_> {
             Ok(snap) => snap,
             Err(e) => return StepOutcome::Retry(e),
         };
-        let written = match tokio::time::timeout(
-            WRITE_BOUND,
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(MAX(seq) + 1, 0) FROM agent_messages WHERE run_id = $1",
-            )
-            .bind(self.run_id)
-            .fetch_one(self.db),
-        )
-        .await
-        {
-            Err(_) => {
-                return StepOutcome::Retry(cja::color_eyre::eyre::eyre!(
-                    "transcript projection read timed out"
-                ))
-            }
-            Ok(Err(e)) => return StepOutcome::Retry(e.into()),
-            Ok(Ok(written)) => written,
+        let new_messages = match project_messages(self.db, self.run_id, run).await {
+            Ok(messages) => messages,
+            Err(e) => return StepOutcome::Retry(e),
         };
-        let mut new_messages = Vec::new();
-        for (i, message) in run
-            .messages()
-            .iter()
-            .enumerate()
-            .skip(usize::try_from(written).unwrap_or(usize::MAX))
-        {
-            let body = match serde_json::to_value(&**message) {
-                Ok(body) => body,
-                Err(e) => {
-                    return StepOutcome::Retry(cja::color_eyre::eyre::eyre!(
-                        "failed to serialize transcript message {i}: {e}"
-                    ))
-                }
-            };
-            new_messages.push((written + i as i64, message_role(message).to_owned(), body));
-        }
         let wrote = match tokio::time::timeout(
             WRITE_BOUND,
             db::persist_step(
@@ -497,6 +538,7 @@ impl Attempt<'_> {
                         None,
                         Some("cancelled by request".to_owned()),
                         snap,
+                        Some(run),
                     )
                     .await
                 {
@@ -508,7 +550,10 @@ impl Attempt<'_> {
                 #[cfg(feature = "testing")]
                 {
                     let count = self.durable.persist_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    if self.durable.fail_after_persist.load(Ordering::SeqCst) == count {
+                    if self.durable.fail_after_persist.swap(0, Ordering::SeqCst) == count {
+                        // One-shot: re-armed only by the test. Without the
+                        // reset, a crash before the model call would loop
+                        // forever (every resume repeats that same persist).
                         return StepOutcome::Injected(cja::color_eyre::eyre::eyre!(
                             "injected failure after persist"
                         ));
@@ -747,6 +792,10 @@ impl Attempt<'_> {
                     Ok(snap) => snap,
                     Err(e) => return StepOutcome::Retry(e),
                 };
+                let new_messages = match project_messages(self.db, self.run_id, run).await {
+                    Ok(messages) => messages,
+                    Err(e) => return StepOutcome::Retry(e),
+                };
                 let wrote = match tokio::time::timeout(
                     WRITE_BOUND,
                     db::set_waiting(
@@ -756,6 +805,7 @@ impl Attempt<'_> {
                         &snap.run_state,
                         &exec.id().wire(),
                         &args.question,
+                        &new_messages,
                     ),
                 )
                 .await
@@ -832,6 +882,7 @@ impl Attempt<'_> {
                                     None,
                                     Some("cancelled by request".to_owned()),
                                     snap,
+                                    Some(run),
                                 )
                                 .await?;
                             return Ok(Guarded::Stop);
