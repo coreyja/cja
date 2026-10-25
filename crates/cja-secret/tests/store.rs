@@ -1,0 +1,395 @@
+use std::time::Duration;
+
+use cja_secret::{
+    Error, FakeSetec, Refresher, Secret, SecretStore, Secrets, SetecConfig, setec, setec::Url,
+};
+use serde_json::json;
+use tokio_util::sync::CancellationToken;
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{body_partial_json, method, path},
+};
+
+#[derive(Clone, Debug, Secrets)]
+struct AppSecrets {
+    #[secret("attic/app/api-key")]
+    api_key: Secret<String>,
+    #[secret("attic/app/signing")]
+    signing: Secret<setec::SecretBytes>,
+}
+
+fn fake() -> FakeSetec {
+    FakeSetec::new([
+        ("attic/app/api-key", b"key-v1".as_slice()),
+        ("attic/app/signing", b"\x00\xffsig".as_slice()),
+    ])
+}
+
+#[test]
+fn derive_lists_names_in_field_order() {
+    assert_eq!(
+        AppSecrets::NAMES,
+        ["attic/app/api-key", "attic/app/signing"]
+    );
+}
+
+#[tokio::test]
+async fn load_fetches_every_declared_secret() {
+    let (secrets, _refresher) = fake().store().load::<AppSecrets>().await.unwrap();
+
+    assert_eq!(*secrets.api_key.current(), "key-v1");
+    assert_eq!(secrets.api_key.version(), 1);
+    assert_eq!(secrets.signing.current().expose(), b"\x00\xffsig");
+}
+
+#[tokio::test]
+async fn debug_never_prints_values() {
+    let (secrets, refresher) = fake().store().load::<AppSecrets>().await.unwrap();
+    let debug = format!("{secrets:?} {refresher:?}");
+
+    assert!(!debug.contains("key-v1"), "{debug}");
+    assert!(debug.contains("attic/app/api-key"), "{debug}");
+}
+
+#[tokio::test]
+async fn missing_secret_fails_load() {
+    let fake = FakeSetec::new([("attic/app/api-key", b"k".as_slice())]);
+
+    let err = fake.store().load::<AppSecrets>().await.unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            Error::Setec {
+                name: "attic/app/signing",
+                source: setec::Error::NotFound
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn unparseable_secret_fails_load() {
+    let fake = FakeSetec::new([
+        ("attic/app/api-key", b"\xff\xfe".as_slice()),
+        ("attic/app/signing", b"s".as_slice()),
+    ]);
+
+    let err = fake.store().load::<AppSecrets>().await.unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            Error::Parse {
+                name: "attic/app/api-key",
+                version: 1,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_delivers_rotated_value_to_every_clone_and_watcher() {
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    let clone = secrets.clone();
+    let mut watcher = secrets.api_key.watch();
+
+    fake.rotate("attic/app/api-key", b"key-v2");
+    refresher.refresh().await.unwrap();
+
+    assert!(watcher.has_changed().unwrap());
+    assert_eq!(**watcher.borrow_and_update(), "key-v2");
+    assert_eq!(*clone.api_key.current(), "key-v2");
+    assert_eq!(clone.api_key.version(), 2);
+}
+
+#[tokio::test]
+async fn unchanged_refresh_does_not_wake_watchers() {
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    let watcher = secrets.api_key.watch();
+
+    refresher.refresh().await.unwrap();
+
+    assert!(!watcher.has_changed().unwrap());
+    assert_eq!(secrets.api_key.version(), 1);
+}
+
+#[tokio::test]
+async fn unparseable_rotation_keeps_last_good_value() {
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+
+    fake.rotate("attic/app/api-key", b"\xff\xfe");
+    let err = refresher.refresh().await.unwrap_err();
+
+    let Error::Refresh(failures) = err else {
+        panic!("expected Refresh, got {err:?}");
+    };
+    assert!(
+        matches!(
+            failures.as_slice(),
+            [Error::Parse {
+                name: "attic/app/api-key",
+                version: 2,
+                ..
+            }]
+        ),
+        "{failures:?}"
+    );
+    assert_eq!(*secrets.api_key.current(), "key-v1");
+    assert_eq!(secrets.api_key.version(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_polls_on_interval_and_stops_on_cancel() {
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    let mut watcher = secrets.api_key.watch();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(refresher.run(shutdown.clone()));
+    tokio::task::yield_now().await; // let the refresher arm its interval at t=0
+
+    fake.rotate("attic/app/api-key", b"key-v2");
+    tokio::time::advance(Duration::from_mins(30)).await;
+    assert!(
+        !watcher.has_changed().unwrap(),
+        "polled before the interval"
+    );
+
+    tokio::time::timeout(Duration::from_mins(31), watcher.changed())
+        .await
+        .expect("refresher never delivered the rotation")
+        .unwrap();
+    assert_eq!(*secrets.api_key.current(), "key-v2");
+
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn last_refreshed_advances_on_successful_refresh_only() {
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    let loaded = secrets.api_key.last_refreshed();
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    refresher.refresh().await.unwrap();
+    assert_eq!(
+        secrets.api_key.last_refreshed() - loaded,
+        Duration::from_secs(10)
+    );
+
+    fake.rotate("attic/app/api-key", b"\xff\xfe");
+    tokio::time::advance(Duration::from_secs(10)).await;
+    refresher.refresh().await.unwrap_err();
+    assert_eq!(
+        secrets.api_key.last_refreshed() - loaded,
+        Duration::from_secs(10)
+    );
+}
+
+// --- Against a fake setec HTTP server ---------------------------------------
+
+#[derive(Debug, Secrets)]
+struct OneSecret {
+    #[secret("attic/app/token")]
+    token: Secret<String>,
+}
+
+async fn setec_store(server: &MockServer, boot_timeout: Duration) -> SecretStore {
+    let mut config = SetecConfig::new(Url::parse(&server.uri()).unwrap());
+    config.boot_timeout = boot_timeout;
+    SecretStore::connect(config).await.unwrap()
+}
+
+fn value(v: &str, version: u32) -> ResponseTemplate {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(v);
+    ResponseTemplate::new(200).set_body_json(json!({"Value": encoded, "Version": version}))
+}
+
+#[tokio::test]
+async fn access_denied_at_boot_fails_without_retrying() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = setec_store(&server, Duration::from_secs(30))
+        .await
+        .load::<OneSecret>()
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            Error::Setec {
+                source: setec::Error::AccessDenied,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn transient_failure_at_boot_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .respond_with(value("t1", 7))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (secrets, _refresher) = setec_store(&server, Duration::from_secs(30))
+        .await
+        .load::<OneSecret>()
+        .await
+        .unwrap();
+
+    assert_eq!(*secrets.token.current(), "t1");
+    assert_eq!(secrets.token.version(), 7);
+}
+
+#[tokio::test]
+async fn persistent_outage_at_boot_times_out_with_last_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let started = std::time::Instant::now();
+    let err = setec_store(&server, Duration::from_millis(600))
+        .await
+        .load::<OneSecret>()
+        .await
+        .unwrap_err();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        matches!(
+            err,
+            Error::BootTimeout {
+                name: "attic/app/token",
+                last: Some(setec::Error::Server { .. }),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_sends_conditional_get_with_known_version() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .and(body_partial_json(json!({"UpdateIfChanged": false})))
+        .respond_with(value("t1", 7))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .and(body_partial_json(
+            json!({"Version": 7, "UpdateIfChanged": true}),
+        ))
+        .respond_with(ResponseTemplate::new(304))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .and(body_partial_json(
+            json!({"Version": 7, "UpdateIfChanged": true}),
+        ))
+        .respond_with(value("t2", 8))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (secrets, refresher): (OneSecret, Refresher) =
+        setec_store(&server, Duration::from_secs(30))
+            .await
+            .load()
+            .await
+            .unwrap();
+
+    refresher.refresh().await.unwrap();
+    assert_eq!(*secrets.token.current(), "t1");
+
+    refresher.refresh().await.unwrap();
+    assert_eq!(*secrets.token.current(), "t2");
+    assert_eq!(secrets.token.version(), 8);
+}
+
+#[tokio::test]
+async fn refresh_failure_keeps_value_and_reports_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .and(body_partial_json(json!({"UpdateIfChanged": false})))
+        .respond_with(value("t1", 7))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/get"))
+        .and(body_partial_json(json!({"UpdateIfChanged": true})))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let (secrets, refresher): (OneSecret, Refresher) =
+        setec_store(&server, Duration::from_secs(30))
+            .await
+            .load()
+            .await
+            .unwrap();
+
+    let err = refresher.refresh().await.unwrap_err();
+
+    assert!(
+        matches!(
+            &err,
+            Error::Refresh(f) if matches!(
+                f.as_slice(),
+                [Error::Setec { source: setec::Error::AccessDenied, .. }]
+            )
+        ),
+        "{err:?}"
+    );
+    assert_eq!(*secrets.token.current(), "t1");
+}
+
+/// Compile-level check that `Refresher::run` is the shape `Supervisor::spawn`
+/// takes. Driving `Supervisor::run` needs a real signal, so behaviour is
+/// covered by `run_polls_on_interval_and_stops_on_cancel` instead.
+#[tokio::test]
+async fn refresher_run_fits_supervisor_spawn() {
+    use cja::tasks::{ShutdownBudget, Supervisor};
+
+    let (_secrets, refresher) = fake().store().load::<AppSecrets>().await.unwrap();
+    let mut supervisor = Supervisor::new(ShutdownBudget::from_env()).unwrap();
+
+    supervisor.spawn("secret-refresh", refresher.run(supervisor.shutdown_token()));
+}

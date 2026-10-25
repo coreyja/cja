@@ -21,4 +21,4 @@ deny = [
 
 [sources.allow-org]
 # 1 or more github.com organizations to allow git sources for
-github = ["coreyja"]
+github = ["coreyja", "coreyja-studio"]

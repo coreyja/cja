@@ -11,6 +11,9 @@ CJA (Cron, Jobs and Axum) is a Rust web framework for full-stack development tha
 The project uses a Cargo workspace with these main crates:
 - `crates/cja/` - Core framework library providing jobs, cron, server, and session management
 - `crates/cja.app/` - Example application demonstrating the framework
+- `crates/setec/` - Standalone HTTP client for Tailscale's setec secrets server (no cja dependency); transport is a pluggable `Dialer` (`TcpDialer` for hosts running tailscaled)
+- `crates/cja-secret/` (+ `cja-secret-macros`) - `#[derive(Secrets)]` typed handles loaded from setec at boot, kept in memory only, refreshed by a supervised task. `tailnet` feature joins the tailnet in-process via `cja-tailnet`
+- `crates/cja-tailnet/` - In-process ephemeral tailnet node (tailscale-rs fork, pinned) with keyless join via workload identity federation (GCP today); implements `setec::Dialer`
 
 ### Key Components
 
