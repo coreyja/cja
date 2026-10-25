@@ -7,6 +7,7 @@
 
 pub(crate) mod ask;
 pub(crate) mod db;
+pub(crate) mod worker;
 
 pub use db::run_migrations;
 
@@ -181,9 +182,9 @@ pub struct Durable {
     kinds: Vec<&'static AgentKind>,
     lease_takeover: Duration,
     #[cfg(feature = "testing")]
-    fail_after_persist: std::sync::atomic::AtomicUsize,
+    fail_after_persist: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(feature = "testing")]
-    persist_count: std::sync::atomic::AtomicUsize,
+    persist_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Durable {
@@ -201,9 +202,9 @@ impl Durable {
             kinds: Vec::new(),
             lease_takeover: takeover,
             #[cfg(feature = "testing")]
-            fail_after_persist: std::sync::atomic::AtomicUsize::new(0),
+            fail_after_persist: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "testing")]
-            persist_count: std::sync::atomic::AtomicUsize::new(0),
+            persist_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 

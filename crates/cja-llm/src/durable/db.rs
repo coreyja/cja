@@ -17,11 +17,12 @@ use super::RunStatus;
 pub(super) struct ClaimedRun {
     pub run_id: Uuid,
     pub kind: String,
-    pub input: String,
     pub model: String,
-    pub app: String,
     pub run_state: serde_json::Value,
     pub cancel_requested: bool,
+    pub turns: i32,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
 }
 
 /// The outcome of attempting to claim a run for advancement.
@@ -64,14 +65,14 @@ where
 {
     let takeover_micros = i64::try_from(takeover.as_micros()).unwrap_or(i64::MAX);
 
-    sqlx::query_as::<_, (Uuid, String, String, String, String, serde_json::Value, bool)>(
+    sqlx::query_as::<_, (Uuid, String, String, serde_json::Value, bool, i32, i64, i64)>(
         "UPDATE agent_runs
          SET status = $4, locked_by = $2, locked_at = NOW(), started_at = COALESCE(started_at, NOW())
          WHERE id = $1
            AND (status = $5
                 OR (status = $4
                     AND (locked_by IS NULL OR locked_at < NOW() - $3::bigint * interval '1 microsecond')))
-         RETURNING id, kind, input, model, app, run_state, cancel_requested",
+         RETURNING id, kind, model, run_state, cancel_requested, turns, input_tokens, output_tokens",
     )
     .bind(run_id)
     .bind(me)
@@ -81,15 +82,20 @@ where
     .fetch_optional(db)
     .await
     .map(|row| {
-        row.map(|(run_id, kind, input, model, app, run_state, cancel_requested)| ClaimedRun {
-            run_id,
-            kind,
-            input,
-            model,
-            app,
-            run_state,
-            cancel_requested,
-        })
+        row.map(
+            |(run_id, kind, model, run_state, cancel_requested, turns, input_tokens, output_tokens)| {
+                ClaimedRun {
+                    run_id,
+                    kind,
+                    model,
+                    run_state,
+                    cancel_requested,
+                    turns,
+                    input_tokens,
+                    output_tokens,
+                }
+            },
+        )
     })
 }
 
