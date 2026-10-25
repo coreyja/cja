@@ -1,0 +1,1 @@
+//! Gateway-aware error taxonomy.

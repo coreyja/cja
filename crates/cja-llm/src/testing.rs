@@ -1,0 +1,1 @@
+//! Fake gateway for tests.
