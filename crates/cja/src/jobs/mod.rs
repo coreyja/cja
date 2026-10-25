@@ -436,6 +436,44 @@ pub trait Job<AppState: AS>:
             .await
     }
 
+    /// Enqueue this job on a caller-owned connection — for example inside a
+    /// caller-managed transaction, so the job row commits atomically with the
+    /// caller's own writes.
+    ///
+    /// Creates the same `jobs.enqueue` span and emits the same
+    /// `enqueue_receipt` as [`Job::enqueue`], and performs the same single
+    /// INSERT. It does NOT call [`AppState::job_enqueued`]: that is not a
+    /// transaction-commit hook. The caller MUST call
+    /// `state.job_enqueued()` on its `AppState` after its transaction
+    /// commits, so an idle worker is woken for the new row.
+    async fn enqueue_on(
+        self,
+        conn: &mut sqlx::PgConnection,
+        context: String,
+        priority: Option<i32>,
+    ) -> Result<uuid::Uuid, EnqueueError> {
+        let job_id = uuid::Uuid::new_v4();
+        let created_at = chrono::Utc::now();
+        // Eyes captures fields at span creation; same constructor as `enqueue`
+        // so an enqueue stays linkable to its worker attempts.
+        let span = enqueue_span::<AppState, Self>(&self, &context, priority, created_at, job_id);
+        async move {
+            let result = enqueue_on_connection::<AppState, Self>(
+                &mut *conn, self, &context, priority, created_at, job_id,
+            )
+            .await;
+            match &result {
+                Ok(id) => {
+                    enqueue_receipt(*id, Self::NAME);
+                }
+                Err(error) => enqueue_failure(job_id, error),
+            }
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
     /// Enqueue this job for asynchronous execution.
     ///
     /// The job will be persisted to the database and picked up by a worker process.
@@ -481,33 +519,94 @@ pub trait Job<AppState: AS>:
         context: String,
         priority: Option<i32>,
     ) -> Result<(), EnqueueError> {
-        let job_id = uuid::Uuid::new_v4();
-        let created_at = chrono::Utc::now();
-        // Eyes captures fields at span creation. Recording the id after the
-        // insert would leave the enqueue disconnected from worker attempts.
-        let span = enqueue_span::<AppState, Self>(&self, &context, priority, created_at, job_id);
-        async move {
-            let result = async {
-                let mut conn = app_state.db().acquire().await?;
-                enqueue_on_connection::<AppState, Self>(
-                    &mut conn, self, &context, priority, created_at, job_id,
-                )
-                .await?;
-                Ok::<_, EnqueueError>(())
-            }
-            .await;
-            match &result {
-                Ok(()) => {
-                    enqueue_receipt(job_id, Self::NAME);
-                    app_state.job_enqueued();
-                }
-                Err(error) => enqueue_failure(job_id, error),
-            }
-            result
-        }
-        .instrument(span)
-        .await
+        // One deliberate micro-delta from the pre-refactor body: a pool-acquire
+        // failure now happens before span creation and does not pass through
+        // `enqueue_failure` (sqlx logs the acquire error itself).
+        let mut conn = app_state.db().acquire().await?;
+        self.enqueue_on(&mut conn, context, priority)
+            .await
+            .map(|_| ())?;
+        app_state.job_enqueued();
+        Ok(())
     }
 }
 
 pub mod worker;
+
+#[cfg(test)]
+mod enqueue_on_tests {
+    use super::*;
+    use crate::app_state::AppState;
+    use crate::server::cookies::CookieKey;
+
+    #[derive(Clone)]
+    struct TestAppState {
+        db: sqlx::PgPool,
+        cookie_key: CookieKey,
+    }
+
+    impl AppState for TestAppState {
+        fn db(&self) -> &sqlx::PgPool {
+            &self.db
+        }
+
+        fn version(&self) -> &str {
+            "test"
+        }
+
+        fn cookie_key(&self) -> &CookieKey {
+            &self.cookie_key
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+    struct EnqueueOnJob {
+        value: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for EnqueueOnJob {
+        const NAME: &'static str = "EnqueueOnJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[sqlx::test]
+    async fn enqueue_on_is_transaction_scoped(db: sqlx::PgPool) {
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut tx = state.db().begin().await.unwrap();
+
+        let job_id = EnqueueOnJob { value: 7 }
+            .enqueue_on(&mut *tx, "tx-test".to_string(), None)
+            .await
+            .unwrap();
+
+        // Outside the transaction: nothing committed yet.
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            before, 0,
+            "job row must not be visible before the transaction commits"
+        );
+
+        tx.commit().await.unwrap();
+
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, 1,
+            "job row must be committed with the caller's transaction"
+        );
+    }
+}
