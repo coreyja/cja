@@ -362,58 +362,97 @@ pub(super) fn project_rows(
     Ok(rows)
 }
 
-/// Directly transition `run_id` to `cancelled` if its current status is one
-/// of `statuses` (queued/waiting, or running under a dead lease), clearing
-/// the suspended ask columns and the lease. Returns the status it moved
-/// FROM, or `None` when no row matched.
-pub(super) async fn cancel_now<'e, E>(
+/// The decision [`cancel_run`] reached under the row lock.
+#[derive(Debug)]
+pub(super) enum CancelOutcome {
+    /// Transitioned to `cancelled` directly (queued/waiting, or `running`
+    /// under a dead lease — the orphaned-run escape hatch), clearing the
+    /// suspended ask columns and the lease.
+    Cancelled,
+    /// Flagged `cancel_requested` on a live `running` run; its owner marks
+    /// it `cancelled` at the next step boundary (claim/persist/heartbeat
+    /// `RETURNING`).
+    Requested,
+    /// Already `cancelled` — idempotent success (the row is rewritten
+    /// with its own values).
+    AlreadyCancelled,
+    /// Terminal (`succeeded`/`failed`); carries the raw status text for the
+    /// caller to parse and reject with `InvalidTransition`.
+    Terminal(String),
+}
+
+/// Cancel (or request cancellation of) a run in ONE row-locked statement:
+/// classify the row under `FOR UPDATE`, then apply the matching action, so
+/// a concurrent claim between a read and a conditional write can neither
+/// lose the cancellation nor report an existing run as missing — a run
+/// claimed while we cancel it is flagged `cancel_requested` for its new
+/// owner. `None` = the run does not exist.
+pub(super) async fn cancel_run<'e, E>(
     db: E,
     run_id: Uuid,
-    statuses: &[RunStatus],
-) -> sqlx::Result<Option<RunStatus>>
+    takeover: Duration,
+) -> sqlx::Result<Option<CancelOutcome>>
 where
     E: Executor<'e, Database = sqlx::Postgres>,
 {
-    let wanted: Vec<String> = statuses
+    let takeover_micros = i64::try_from(takeover.as_micros()).unwrap_or(i64::MAX);
+    let direct: Vec<String> = [RunStatus::Queued, RunStatus::Waiting]
         .iter()
         .map(RunStatus::as_str)
         .map(str::to_owned)
         .collect();
-    let from = sqlx::query_scalar::<_, String>(
+    // The `noop`/`terminal` arms rewrite the row's own values (every SET is
+    // CASE-guarded), so the single RETURNING row reports every existing-row
+    // outcome — no follow-up read, no second race window.
+    let row = sqlx::query_as::<_, (String, String)>(
         "WITH target AS (
-             SELECT id, status FROM agent_runs
-             WHERE id = $1 AND status = ANY($2)
+             SELECT id, status, locked_by, locked_at
+             FROM agent_runs
+             WHERE id = $1
              FOR UPDATE
+         ),
+         decision AS (
+             SELECT id, status,
+                 CASE
+                     WHEN status = ANY($2) THEN 'cancel_now'
+                     WHEN status = $3
+                          AND (locked_by IS NULL OR locked_at IS NULL
+                               OR locked_at < NOW() - $4::bigint * interval '1 microsecond')
+                         THEN 'cancel_now'
+                     WHEN status = $3 THEN 'request'
+                     WHEN status = $5 THEN 'noop'
+                     ELSE 'terminal'
+                 END AS action
+             FROM target
          )
          UPDATE agent_runs r
-         SET status = $3, pending_call_id = NULL, pending_question = NULL,
-             locked_by = NULL, locked_at = NULL, finished_at = NOW()
-         FROM target
-         WHERE r.id = target.id
-         RETURNING target.status",
+         SET status = CASE WHEN d.action = 'cancel_now' THEN $5 ELSE r.status END,
+             pending_call_id =
+                 CASE WHEN d.action = 'cancel_now' THEN NULL ELSE r.pending_call_id END,
+             pending_question =
+                 CASE WHEN d.action = 'cancel_now' THEN NULL ELSE r.pending_question END,
+             locked_by = CASE WHEN d.action = 'cancel_now' THEN NULL ELSE r.locked_by END,
+             locked_at = CASE WHEN d.action = 'cancel_now' THEN NULL ELSE r.locked_at END,
+             cancel_requested =
+                 CASE WHEN d.action = 'request' THEN TRUE ELSE r.cancel_requested END,
+             finished_at = CASE WHEN d.action = 'cancel_now' THEN NOW() ELSE r.finished_at END
+         FROM decision d
+         WHERE r.id = d.id
+         RETURNING d.action, d.status",
     )
     .bind(run_id)
-    .bind(&wanted)
+    .bind(&direct)
+    .bind(RunStatus::Running.as_str())
+    .bind(takeover_micros)
     .bind(RunStatus::Cancelled.as_str())
     .fetch_optional(db)
     .await?;
-    Ok(from.and_then(|s| s.parse().ok()))
-}
-
-/// Flag a live `running` run for cancellation; the owner notices at its next
-/// step boundary (claim/persist/heartbeat `RETURNING`). `false` = not running.
-pub(super) async fn request_cancel<'e, E>(db: E, run_id: Uuid) -> sqlx::Result<bool>
-where
-    E: Executor<'e, Database = sqlx::Postgres>,
-{
-    let rows =
-        sqlx::query("UPDATE agent_runs SET cancel_requested = TRUE WHERE id = $1 AND status = $2")
-            .bind(run_id)
-            .bind(RunStatus::Running.as_str())
-            .execute(db)
-            .await?
-            .rows_affected();
-    Ok(rows > 0)
+    Ok(row.map(|(action, status)| match action.as_str() {
+        "cancel_now" => CancelOutcome::Cancelled,
+        "request" => CancelOutcome::Requested,
+        "noop" => CancelOutcome::AlreadyCancelled,
+        _ => CancelOutcome::Terminal(status),
+    }))
 }
 
 #[cfg(all(test, feature = "durable"))]

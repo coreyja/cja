@@ -658,56 +658,31 @@ where
 /// `running` run is flagged and its owner marks it `cancelled` at the next
 /// step boundary, keeping the transcript. Cancelling an already-cancelled
 /// run is `Ok`; other terminal statuses are [`RunError::InvalidTransition`].
+///
+/// The whole decision runs under one row lock ([`db::cancel_run`]): a run
+/// claimed concurrently is flagged `cancel_requested` for its new owner
+/// instead of slipping between the read and the write, so an existing run
+/// is never reported missing.
 pub async fn cancel<S>(state: &S, run: RunId) -> Result<(), RunError>
 where
     S: HasDurable,
 {
-    let row = sqlx::query_as::<
-        _,
-        (
-            String,
-            Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        ),
-    >("SELECT status, locked_by, locked_at FROM agent_runs WHERE id = $1")
-    .bind(run.0)
-    .fetch_optional(state.db())
-    .await?;
-    let Some((status, locked_by, locked_at)) = row else {
-        return Err(RunError::NotFound(run));
-    };
-    let status = RunStatus::from_str(&status).map_err(|_| decode_error("status", &status))?;
-    match status {
-        RunStatus::Queued | RunStatus::Waiting => {
-            db::cancel_now(state.db(), run.0, &[status])
-                .await?
-                .ok_or(RunError::NotFound(run))?;
-            Ok(())
+    let takeover = state.durable().lease_takeover_window();
+    match db::cancel_run(state.db(), run.0, takeover).await? {
+        Some(
+            db::CancelOutcome::Cancelled
+            | db::CancelOutcome::Requested
+            | db::CancelOutcome::AlreadyCancelled,
+        ) => Ok(()),
+        Some(db::CancelOutcome::Terminal(raw)) => {
+            let from = RunStatus::from_str(&raw).map_err(|_| decode_error("status", &raw))?;
+            Err(RunError::InvalidTransition {
+                run,
+                from,
+                to: RunStatus::Cancelled,
+            })
         }
-        RunStatus::Running => {
-            let takeover = state.durable().lease_takeover_window();
-            let dead_lease = match (locked_by.as_deref(), locked_at) {
-                (None, _) | (Some(_), None) => true,
-                (Some(_), Some(at)) => at < chrono::Utc::now() - takeover,
-            };
-            if dead_lease {
-                // Orphaned (dead-lettered job, crashed worker, lost
-                // release): cancel directly; a zombie owner's next
-                // conditional write fails and it stops silently.
-                db::cancel_now(state.db(), run.0, &[RunStatus::Running])
-                    .await?
-                    .ok_or(RunError::NotFound(run))?;
-            } else {
-                db::request_cancel(state.db(), run.0).await?;
-            }
-            Ok(())
-        }
-        RunStatus::Cancelled => Ok(()),
-        RunStatus::Succeeded | RunStatus::Failed => Err(RunError::InvalidTransition {
-            run,
-            from: status,
-            to: RunStatus::Cancelled,
-        }),
+        None => Err(RunError::NotFound(run)),
     }
 }
 
