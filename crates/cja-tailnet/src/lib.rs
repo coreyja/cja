@@ -85,23 +85,56 @@ impl TailnetConfig {
         }
     }
 
-    /// Reads `TS_HOSTNAME`, `TS_TAG`, `TS_WIF_PROVIDER` (`gcp`),
-    /// `TS_WIF_CLIENT_ID`, `TS_WIF_AUDIENCE`, and optionally
-    /// `TS_JOIN_TIMEOUT_SECS`. None of these are secrets.
+    /// Reads the tailnet config from the environment. None of it is secret.
+    ///
+    /// | Variable | Default |
+    /// |---|---|
+    /// | `TS_TAG` | required |
+    /// | `TS_WIF_CLIENT_ID` | required |
+    /// | `TS_WIF_AUDIENCE` | `api.tailscale.com/<client ID>`, the audience Tailscale generates |
+    /// | `TS_WIF_PROVIDER` | `gcp` on Cloud Run (`K_SERVICE` set), otherwise required |
+    /// | `TS_HOSTNAME` | the Cloud Run service name (`K_SERVICE`), otherwise required |
+    /// | `TS_JOIN_TIMEOUT_SECS` | 30 |
     pub fn from_env() -> Result<Self, Error> {
-        let identity = match required("TS_WIF_PROVIDER")?.as_str() {
-            "gcp" => Identity::Gcp {
-                client_id: required("TS_WIF_CLIENT_ID")?,
-                audience: required("TS_WIF_AUDIENCE")?,
-            },
+        Self::from_lookup(|var| std::env::var(var).ok())
+    }
+
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
+        let required =
+            |var: &str| get(var).ok_or_else(|| Error::Config(format!("{var} must be set")));
+        let cloud_run_service = get("K_SERVICE");
+
+        let provider = match (get("TS_WIF_PROVIDER"), &cloud_run_service) {
+            (Some(provider), _) => provider,
+            (None, Some(_)) => "gcp".to_owned(),
+            (None, None) => {
+                return Err(Error::Config(
+                    "TS_WIF_PROVIDER must be set outside Cloud Run".into(),
+                ));
+            }
+        };
+        let identity = match provider.as_str() {
+            "gcp" => {
+                let client_id = required("TS_WIF_CLIENT_ID")?;
+                let audience = get("TS_WIF_AUDIENCE")
+                    .unwrap_or_else(|| format!("api.tailscale.com/{client_id}"));
+                Identity::Gcp {
+                    client_id,
+                    audience,
+                }
+            }
             other => {
                 return Err(Error::Config(format!(
                     "TS_WIF_PROVIDER={other:?} is not supported (expected \"gcp\")"
                 )));
             }
         };
-        let mut config = Self::new(required("TS_HOSTNAME")?, required("TS_TAG")?, identity);
-        if let Ok(secs) = std::env::var("TS_JOIN_TIMEOUT_SECS") {
+        let hostname = get("TS_HOSTNAME")
+            .or(cloud_run_service)
+            .ok_or_else(|| Error::Config("TS_HOSTNAME must be set outside Cloud Run".into()))?;
+
+        let mut config = Self::new(hostname, required("TS_TAG")?, identity);
+        if let Some(secs) = get("TS_JOIN_TIMEOUT_SECS") {
             let secs = secs.parse().map_err(|e| {
                 Error::Config(format!(
                     "TS_JOIN_TIMEOUT_SECS is not a whole number of seconds: {e}"
@@ -111,10 +144,6 @@ impl TailnetConfig {
         }
         Ok(config)
     }
-}
-
-fn required(var: &str) -> Result<String, Error> {
-    std::env::var(var).map_err(|_| Error::Config(format!("{var} must be set")))
 }
 
 /// A running in-process tailnet node.
@@ -411,6 +440,78 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |var| map.get(var).cloned()
+    }
+
+    #[test]
+    fn cloud_run_needs_only_the_client_id_and_tag() {
+        let config = TailnetConfig::from_lookup(lookup(&[
+            ("K_SERVICE", "tf-arena"),
+            ("TS_WIF_CLIENT_ID", "kAbc123CNTRL"),
+            ("TS_TAG", "tag:arena"),
+        ]))
+        .unwrap();
+
+        assert_eq!(config.hostname, "tf-arena");
+        assert_eq!(config.tag, "tag:arena");
+        assert_eq!(config.join_timeout, DEFAULT_JOIN_TIMEOUT);
+        let Identity::Gcp {
+            client_id,
+            audience,
+        } = config.identity;
+        assert_eq!(client_id, "kAbc123CNTRL");
+        assert_eq!(audience, "api.tailscale.com/kAbc123CNTRL");
+    }
+
+    #[test]
+    fn explicit_values_override_the_defaults() {
+        let config = TailnetConfig::from_lookup(lookup(&[
+            ("K_SERVICE", "tf-arena"),
+            ("TS_WIF_PROVIDER", "gcp"),
+            ("TS_WIF_CLIENT_ID", "kAbc123CNTRL"),
+            ("TS_WIF_AUDIENCE", "custom-audience"),
+            ("TS_HOSTNAME", "arena"),
+            ("TS_TAG", "tag:arena"),
+            ("TS_JOIN_TIMEOUT_SECS", "5"),
+        ]))
+        .unwrap();
+
+        assert_eq!(config.hostname, "arena");
+        assert_eq!(config.join_timeout, Duration::from_secs(5));
+        let Identity::Gcp { audience, .. } = config.identity;
+        assert_eq!(audience, "custom-audience");
+    }
+
+    #[test]
+    fn outside_cloud_run_provider_and_hostname_are_required() {
+        let base = [("TS_WIF_CLIENT_ID", "k"), ("TS_TAG", "tag:x")];
+
+        let err = TailnetConfig::from_lookup(lookup(&base)).unwrap_err();
+        assert!(err.to_string().contains("TS_WIF_PROVIDER"), "{err}");
+
+        let mut with_provider = base.to_vec();
+        with_provider.push(("TS_WIF_PROVIDER", "gcp"));
+        let err = TailnetConfig::from_lookup(lookup(&with_provider)).unwrap_err();
+        assert!(err.to_string().contains("TS_HOSTNAME"), "{err}");
+    }
+
+    #[test]
+    fn tag_and_client_id_are_always_required() {
+        let err = TailnetConfig::from_lookup(lookup(&[("K_SERVICE", "s"), ("TS_TAG", "tag:x")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("TS_WIF_CLIENT_ID"), "{err}");
+
+        let err =
+            TailnetConfig::from_lookup(lookup(&[("K_SERVICE", "s"), ("TS_WIF_CLIENT_ID", "k")]))
+                .unwrap_err();
+        assert!(err.to_string().contains("TS_TAG"), "{err}");
     }
 
     #[tokio::test]
