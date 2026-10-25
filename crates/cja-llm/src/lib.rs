@@ -250,6 +250,52 @@ mod tests {
         );
     }
 
+    /// The no-key/`X-App` guarantees hold on the retry path and the
+    /// streaming path too — every recorded request, not just the first
+    /// unary one. The config's tiny backoffs keep the 429 retry fast.
+    #[tokio::test]
+    async fn no_key_leaves_the_process_on_stream_and_retry() {
+        let fake = FakeGateway::start().await;
+        fake.status(429, r#"{"type":"rate_limit_exceeded"}"#);
+        fake.chat_completion(MODEL, "second try");
+        let llm = Llm::new(&config(&fake.url())).unwrap();
+        assert_eq!(
+            llm.complete(MODEL, "ping").await.unwrap(),
+            "second try",
+            "the 429 must retry (two requests so far)"
+        );
+
+        fake.chat_stream(MODEL, &["a", "b"]);
+        let joined: String = llm
+            .stream(MODEL, "ping")
+            .map(|delta| delta.unwrap())
+            .collect::<Vec<String>>()
+            .await
+            .concat();
+        assert_eq!(joined, "ab");
+
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 3, "429 + retry, then the stream");
+        for request in &requests {
+            for stripped in ["authorization", "x-api-key", "api-key", "x-goog-api-key"] {
+                assert!(
+                    request.headers.get(stripped).is_none(),
+                    "{stripped} must never leave the process on {}",
+                    request.path
+                );
+            }
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-app")
+                    .and_then(|value| value.to_str().ok()),
+                Some("fake-test"),
+                "X-App on {}",
+                request.path
+            );
+        }
+    }
+
     /// A trailing `/` on the gateway URL (the `CJA_LLM_URL` hazard) must not
     /// produce `//v1` on the wire: the gateway 400s non-canonical paths.
     #[tokio::test]
