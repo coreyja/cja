@@ -7,8 +7,9 @@ use syn::{Data, DeriveInput, Fields, LitStr, parse_macro_input, spanned::Spanned
 
 /// Declares every field of a struct as a setec secret.
 ///
-/// Each field must be a `cja_secret::Secret<T>` annotated with
-/// `#[secret("<consumer>/<app>/<name>")]`.
+/// Each field must be a `cja_secret::Secret<T>` (required) or an
+/// `Option<cja_secret::Secret<T>>` (`None` when the secret doesn't exist),
+/// annotated with `#[secret("<consumer>/<app>/<name>")]`.
 #[proc_macro_derive(Secrets, attributes(secret))]
 pub fn derive_secrets(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -39,9 +40,16 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     let mut idents = Vec::new();
     let mut names = Vec::new();
+    let mut declares = Vec::new();
     for field in &fields.named {
+        let name = secret_name(field)?;
+        declares.push(if is_option(&field.ty) {
+            quote! { store.declare_optional(#name) }
+        } else {
+            quote! { store.declare(#name) }
+        });
         idents.push(field.ident.clone().expect("named field"));
-        names.push(secret_name(field)?);
+        names.push(name);
     }
 
     let ident = &input.ident;
@@ -58,13 +66,27 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             > + ::core::marker::Send {
                 async move {
                     let (#(#idents,)*) = ::cja_secret::__private::try_join!(
-                        #(store.declare(#names)),*
+                        #(#declares),*
                     )?;
                     ::core::result::Result::Ok(Self { #(#idents),* })
                 }
             }
         }
     })
+}
+
+/// Whether the field's type is spelled `Option<...>` (any path ending in
+/// `Option`, so `std::option::Option` works too).
+fn is_option(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    path.qself.is_none()
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Option")
 }
 
 fn secret_name(field: &syn::Field) -> syn::Result<LitStr> {

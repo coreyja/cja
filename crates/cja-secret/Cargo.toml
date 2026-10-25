@@ -27,6 +27,7 @@ cja-secret = { path = ".", features = ["testing"] }
 base64.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
 wiremock = "0.6"
 
 [lints]

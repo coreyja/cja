@@ -216,6 +216,10 @@ pub struct SecretStore {
     poll_interval: Duration,
     boot_timeout: Duration,
     tracked: Mutex<Vec<Arc<dyn Tracked>>>,
+    /// Optional secrets that didn't exist at boot.
+    absent: Mutex<Vec<&'static str>>,
+    /// `host`, `tailnet`, or `fake`; reported in boot events.
+    transport: &'static str,
     #[cfg(feature = "tailnet")]
     tailnet: Option<Arc<cja_tailnet::Tailnet>>,
 }
@@ -280,6 +284,7 @@ impl SecretStore {
         match config.transport {
             Transport::Host => Ok(Self::from_source(
                 Source::Setec(client(Arc::new(setec::TcpDialer))?),
+                "host",
                 config.poll_interval,
                 config.boot_timeout,
             )),
@@ -292,6 +297,7 @@ impl SecretStore {
                 );
                 let mut store = Self::from_source(
                     Source::Setec(client(tailnet.clone())?),
+                    "tailnet",
                     config.poll_interval,
                     config.boot_timeout,
                 );
@@ -301,24 +307,41 @@ impl SecretStore {
         }
     }
 
-    fn from_source(source: Source, poll_interval: Duration, boot_timeout: Duration) -> Self {
+    fn from_source(
+        source: Source,
+        transport: &'static str,
+        poll_interval: Duration,
+        boot_timeout: Duration,
+    ) -> Self {
         Self {
             source: Arc::new(source),
             poll_interval,
             boot_timeout,
             tracked: Mutex::new(Vec::new()),
+            absent: Mutex::new(Vec::new()),
+            transport,
             #[cfg(feature = "tailnet")]
             tailnet: None,
         }
     }
 
-    /// Fetches every secret declared by `S`. Fails if any secret is missing,
-    /// denied, unparseable, or unreachable for longer than the boot timeout.
+    /// Fetches every secret declared by `S`. Fails if a required secret is
+    /// missing, or any secret is denied, unparseable, or unreachable for longer
+    /// than the boot timeout. An `Option<Secret<T>>` field that doesn't exist
+    /// is `None`.
     ///
     /// Returns the secrets and the [`Refresher`] that keeps them current.
     pub async fn load<S: Secrets>(self) -> Result<(S, Refresher), Error> {
         let secrets = S::declare(&self).await?;
         let tracked = self.tracked.into_inner().expect("tracked secrets lock");
+        let absent = self.absent.into_inner().expect("absent secrets lock");
+        tracing::info!(
+            event_type = "secrets_loaded",
+            secrets.loaded = tracked.len(),
+            secrets.absent = absent.len(),
+            setec.transport = self.transport,
+            "Secrets loaded"
+        );
         let refresher = Refresher {
             inner: Arc::new(RefresherInner {
                 source: self.source,
@@ -331,12 +354,48 @@ impl SecretStore {
         Ok((secrets, refresher))
     }
 
-    /// Fetches one secret and tracks it for refresh. Called by
+    /// Fetches one required secret and tracks it for refresh. Called by
     /// `#[derive(Secrets)]`.
     #[doc(hidden)]
     pub async fn declare<T: FromSecret>(&self, name: &'static str) -> Result<Secret<T>, Error> {
         let fetched = self.fetch_at_boot(name).await?;
-        let value = parse::<T>(name, &fetched)?;
+        self.track(name, &fetched, false)
+    }
+
+    /// Like [`SecretStore::declare`], but a secret that doesn't exist is
+    /// `None`. Only "not found" counts: denied, unreachable, or unparseable
+    /// still fail, so a missing grant can't pass for a disabled feature.
+    /// Called by `#[derive(Secrets)]` for `Option<Secret<T>>` fields.
+    #[doc(hidden)]
+    pub async fn declare_optional<T: FromSecret>(
+        &self,
+        name: &'static str,
+    ) -> Result<Option<Secret<T>>, Error> {
+        match self.fetch_at_boot(name).await {
+            Ok(fetched) => self.track(name, &fetched, true).map(Some),
+            Err(Error::Setec {
+                source: setec::Error::NotFound,
+                ..
+            }) => {
+                tracing::info!(
+                    event_type = "secret_absent",
+                    secret.name = name,
+                    "Optional secret not found"
+                );
+                self.absent.lock().expect("absent secrets lock").push(name);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn track<T: FromSecret>(
+        &self,
+        name: &'static str,
+        fetched: &SecretValue,
+        optional: bool,
+    ) -> Result<Secret<T>, Error> {
+        let value = parse::<T>(name, fetched)?;
         let entry = Arc::new(Entry {
             name,
             version: AtomicU32::new(fetched.version),
@@ -347,7 +406,13 @@ impl SecretStore {
             .lock()
             .expect("tracked secrets lock")
             .push(entry.clone());
-        tracing::info!(secret = name, version = fetched.version, "Loaded secret");
+        tracing::info!(
+            event_type = "secret_loaded",
+            secret.name = name,
+            secret.version = fetched.version,
+            secret.optional = optional,
+            "Secret loaded"
+        );
         Ok(Secret { entry })
     }
 
@@ -381,7 +446,13 @@ impl SecretStore {
                     last: Some(error),
                 });
             }
-            tracing::warn!(secret = name, error = ?error, retry_in = ?wait, "setec unavailable at boot; retrying");
+            tracing::warn!(
+                event_type = "secret_boot_retry",
+                secret.name = name,
+                error = ?error,
+                retry_in = ?wait,
+                "setec unavailable at boot; retrying"
+            );
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(MAX_RETRY_WAIT);
         }
@@ -452,10 +523,22 @@ impl Refresher {
                         ..
                     }
                     | Error::Parse { .. } => {
-                        tracing::error!(secret = entry.name(), error = ?error, "Secret refresh failed; keeping last good value");
+                        tracing::error!(
+                            event_type = "secret_refresh_failed",
+                            secret.name = entry.name(),
+                            secret.version = entry.version(),
+                            error = ?error,
+                            "Secret refresh failed; keeping last good value"
+                        );
                     }
                     _ => {
-                        tracing::warn!(secret = entry.name(), error = ?error, "Secret refresh failed; keeping last good value");
+                        tracing::warn!(
+                            event_type = "secret_refresh_failed",
+                            secret.name = entry.name(),
+                            secret.version = entry.version(),
+                            error = ?error,
+                            "Secret refresh failed; keeping last good value"
+                        );
                     }
                 }
                 failures.push(error);
@@ -480,9 +563,10 @@ impl Refresher {
         if let Some(value) = changed {
             entry.apply(&value)?;
             tracing::info!(
-                secret = name,
-                from = known,
-                to = value.version,
+                event_type = "secret_rotated",
+                secret.name = name,
+                secret.from_version = known,
+                secret.version = value.version,
                 "Secret rotated"
             );
         }
@@ -512,6 +596,7 @@ impl FakeSetec {
     pub fn store(&self) -> SecretStore {
         SecretStore::from_source(
             Source::Fake(self.clone()),
+            "fake",
             DEFAULT_POLL_INTERVAL,
             DEFAULT_BOOT_TIMEOUT,
         )
