@@ -1880,3 +1880,102 @@ async fn spans_carry_metadata_never_content() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR review pins (round 1)
+// ---------------------------------------------------------------------------
+
+/// `answer()` commits the ask's tool-result message into the run (a
+/// single-ask batch completes on answer) and must project it into
+/// `agent_messages` in the same transaction (plan step 7: "project any newly
+/// committed messages"). If the projection uses the wrong `seq`, the row is
+/// silently dropped by `ON CONFLICT DO NOTHING`; a `cancel()` before the
+/// worker's next persist then loses the human's answer from the transcript
+/// permanently.
+#[tokio::test]
+async fn answer_projects_tool_result_into_transcript() {
+    let env = setup(&[&COUNTER]).await;
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_ask",
+        "ask",
+        &serde_json::json!({"question": "continue?"}),
+    );
+    let run = durable::start(&env.state, "counter", "go")
+        .await
+        .expect("start");
+    drive(&env.state, run).await.expect("drive to suspension");
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Waiting);
+    let before = transcript_rows(&env.db, run).await;
+    assert_eq!(before.len(), 2, "user prompt + assistant ask call");
+
+    durable::answer(&env.state, run, "yes").await.expect("answer");
+
+    let after = transcript_rows(&env.db, run).await;
+    assert_eq!(
+        after.len(),
+        3,
+        "answer() must project the committed tool-result message: {after:?}"
+    );
+    assert_eq!(after[2].0, 2, "tool result lands at the next seq");
+    assert_eq!(after[2].1, "user");
+    assert!(
+        serde_json::to_string(&after[2].2)
+            .expect("json")
+            .contains("call_ask"),
+        "the projected message is the ask's tool result"
+    );
+
+    // Cancelling before any worker persists must keep the answer.
+    durable::cancel(&env.state, run).await.expect("cancel");
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Cancelled);
+    assert_eq!(
+        transcript_rows(&env.db, run).await.len(),
+        3,
+        "a cancelled run's transcript keeps the human's answer"
+    );
+}
+
+/// Plan Decision 4: every way an attempt can end leaves the run finished or
+/// re-claimable by the next cja job attempt. A transient DB error on the
+/// heartbeat is not proof of a lost lease; returning `Ok` there makes cja
+/// delete the only job row while the run is still `running`, orphaning it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_db_error_does_not_complete_the_job() {
+    let env = setup_with(&[&COUNTER], Duration::from_millis(300)).await;
+    env.fake.delay(Duration::from_secs(3));
+    env.fake.chat_completion(models::DEFAULT, "5");
+    let run = durable::start(&env.state, "counter", "x")
+        .await
+        .expect("start");
+
+    let state = env.state.clone();
+    let task = tokio::spawn(async move {
+        AdvanceRunJob { run_id: run.0 }
+            .run_with_cancellation(state, CancellationToken::new())
+            .await
+    });
+    wait_until(|| async { (env.fake.requests().len() == 1).then_some(()) }).await;
+
+    // Make the next heartbeat UPDATE fail with a DB error (not "zero rows").
+    sqlx::query("ALTER TABLE agent_runs RENAME TO agent_runs_hidden")
+        .execute(&env.db)
+        .await
+        .expect("hide table");
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("attempt returned")
+        .expect("join");
+    sqlx::query("ALTER TABLE agent_runs_hidden RENAME TO agent_runs")
+        .execute(&env.db)
+        .await
+        .expect("restore table");
+
+    let status = status_of(&env.db, run).await;
+    assert!(
+        result.is_err() || status != RunStatus::Running,
+        "attempt returned Ok (cja deletes the job) while the run is still \
+         `running` under our lease: orphaned run (status {status:?}, locked_by {:?})",
+        locked_by_of(&env.db, run).await
+    );
+}
