@@ -684,10 +684,14 @@ impl Attempt<'_> {
     /// message is committed by `next_step`'s turn processing, after the
     /// step-level persist), then the terminal `succeeded` write. Split from
     /// the driver loop to keep `advance_run` small; a failed terminal write
-    /// is a `Retry` so the caller routes it through `fail_retryable`
-    /// (release + Err) instead of deleting the only job row.
+    /// is a `Retry` so the caller routes it through `retry_or_requeue`
+    /// (fresh row after progress this attempt, else release + Err) instead
+    /// of deleting the only job row. The persist here is NOT progress: a
+    /// requeued attempt resuming at `Done` re-persists the SAME state, and
+    /// counting that would let a persistently-failing `finish_run` loop on
+    /// fresh rows with no backoff forever.
     async fn done_step(&self, run: &AgentRun, output: String) -> StepOutcome {
-        match self.persist(run, true).await {
+        match self.persist(run, false).await {
             StepOutcome::Continue => {}
             other => return other,
         }
