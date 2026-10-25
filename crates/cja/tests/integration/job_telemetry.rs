@@ -173,3 +173,36 @@ async fn a_failed_enqueue_has_an_identity_and_error_but_no_commit_receipt() {
     assert_eq!(failure.fields["job_id"], span.fields["job.id"]);
     assert_eq!(failure.span_id, span.span_id);
 }
+
+/// The documented micro-delta of the `enqueue` → `enqueue_on` delegation:
+/// a pool-acquire failure happens BEFORE span creation, so the failed
+/// attempt produces no `jobs.enqueue` span at all — and therefore no
+/// receipt and no `enqueue_failure` event (events are only recorded inside
+/// a `jobs.enqueue` span). sqlx logs the acquire error itself. Pins that
+/// behavior so it cannot silently change.
+#[tokio::test]
+async fn a_pool_acquire_failure_produces_no_enqueue_telemetry() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+    pool.close().await;
+    let state = crate::common::app::TestAppState::new(pool);
+    let capture = capture();
+    let job = super::jobs::TestJob {
+        id: "game-789".into(),
+        value: 42,
+    };
+    // A unique context: a span created before the acquire would carry it,
+    // making this assertion fail in BOTH directions (never vacuous).
+    let context = format!("closed pool {}", uuid::Uuid::new_v4());
+    assert!(
+        job.enqueue(state, context.clone(), None).await.is_err(),
+        "enqueue on a closed pool must fail"
+    );
+    let records = capture.0.lock().unwrap();
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.fields.get("job.context") == Some(&json!(context))),
+        "a pool-acquire failure must not create a `jobs.enqueue` span \
+         (or its receipt/failure events)"
+    );
+}

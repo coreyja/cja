@@ -149,43 +149,19 @@ fn is_retryable(error: &crate::Error) -> bool {
     }
 }
 
-/// The transcript role of a rig message (its serde tag is `role`).
-fn message_role(message: &Message) -> &'static str {
-    match message {
-        Message::System { .. } => "system",
-        Message::User { .. } => "user",
-        Message::Assistant(_) => "assistant",
-    }
-}
-
 /// Compute the transcript rows not yet written for `run`: everything from
-/// the stored high-water mark on. Cheap (one indexed MAX) and idempotent.
+/// the stored high-water mark on, via the one shared projection
+/// ([`db::project_rows`]) so the worker's persists and `answer`'s write
+/// cannot drift apart.
 async fn project_messages(
     db: &sqlx::PgPool,
     run_id: Uuid,
     run: &AgentRun,
 ) -> cja::color_eyre::Result<Vec<(i64, String, serde_json::Value)>> {
-    let written: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq) + 1, 0) FROM agent_messages WHERE run_id = $1",
-    )
-    .bind(run_id)
-    .fetch_one(db)
-    .await
-    .map_err(cja::color_eyre::Report::from)?;
-    let mut new_messages = Vec::new();
-    for (i, message) in run
-        .messages()
-        .iter()
-        .skip(usize::try_from(written).unwrap_or(usize::MAX))
-        .enumerate()
-    {
-        let body = serde_json::to_value(&**message).map_err(|e| {
-            cja::color_eyre::eyre::eyre!("failed to serialize transcript message: {e}")
-        })?;
-        let seq = written + i64::try_from(i).unwrap_or(i64::MAX);
-        new_messages.push((seq, message_role(message).to_owned(), body));
-    }
-    Ok(new_messages)
+    let written = db::next_message_seq(db, run_id)
+        .await
+        .map_err(cja::color_eyre::Report::from)?;
+    db::project_rows(written, run).map_err(cja::color_eyre::Report::from)
 }
 
 /// Everything one attempt's step helpers need, built once per attempt.
@@ -330,21 +306,24 @@ impl Durable {
         shutdown: CancellationToken,
     ) -> cja::color_eyre::Result<()> {
         let me = Uuid::new_v4().to_string();
-        let (row, run, kind) = match self.claim_and_validate(db, run_id, &me).await? {
-            Claim::Nothing {
+        // Every Err exit from claim validation releases the lease first: the
+        // terminal writes inside it run under our fresh lease and can fail.
+        let (row, run, kind) = match self.claim_and_validate(db, run_id, &me).await {
+            Ok(Claim::Nothing {
                 leased_by_other: true,
-            } => {
+            }) => {
                 // Back off (Err), so a duplicate job can never delete the
-                // job the live owner depends on.
+                // job the live owner depends on. No lease is held here.
                 return Err(cja::color_eyre::eyre::eyre!(
                     "run {run_id} leased by another worker; backing off"
                 ));
             }
             // Missing, terminal, or waiting: nothing to advance.
-            Claim::Nothing {
+            Ok(Claim::Nothing {
                 leased_by_other: false,
-            } => return Ok(()),
-            Claim::Ready { row, run, kind } => (row, run, kind),
+            }) => return Ok(()),
+            Ok(Claim::Ready { row, run, kind }) => (row, run, kind),
+            Err(e) => return self.fail_retryable(db, run_id, &me, e).await,
         };
         let mut run = run;
 
@@ -372,8 +351,16 @@ impl Durable {
                 Ok(step) => step,
                 Err(error) => {
                     let (reason, message) = sanitize_prompt_error(&error);
-                    attempt.fail_terminal(&run, reason, message).await;
-                    return Ok(());
+                    match attempt.fail_terminal(&run, reason, message).await {
+                        // The terminal write failed: release and let cja
+                        // retry — returning Ok would delete the only job
+                        // row while the run is still `running` under our
+                        // lease.
+                        StepOutcome::Retry(e) => {
+                            return self.fail_retryable(db, run_id, &me, e).await;
+                        }
+                        _ => return Ok(()),
+                    }
                 }
             };
 
@@ -387,41 +374,25 @@ impl Durable {
                         .call_model_step(&mut run, prompt, history, turn)
                         .await
                 }
-                AgentRunStep::CallTools { calls } => attempt.call_tools_step(&mut run, calls).await,
-                AgentRunStep::Done(response) => {
-                    // The final assistant message is committed by `next_step`'s
-                    // turn processing — after the step-level persist — so the
-                    // transcript projection needs one more pass here before
-                    // the terminal write.
-                    match attempt.persist(&run).await {
-                        StepOutcome::Continue => {}
-                        other => {
-                            return match other {
-                                StepOutcome::Done => Ok(()),
-                                StepOutcome::Retry(error) => {
-                                    self.fail_retryable(db, run_id, &me, error).await
-                                }
-                                #[cfg(feature = "testing")]
-                                StepOutcome::Injected(error) => Err(error),
-                                StepOutcome::Continue => unreachable!(),
-                            };
-                        }
-                    }
-                    let snap = RunSnapshot::of(&run)?;
-                    self.finish_run(
-                        db,
-                        run_id,
-                        &me,
-                        RunStatus::Succeeded,
-                        None,
-                        Some(response.output()),
-                        None,
-                        snap,
-                        Some(&run),
-                    )
-                    .await?;
-                    return Ok(());
+                AgentRunStep::CallTools { calls } => {
+                    // One span per run step — tool executions and ask
+                    // suspensions included — with the same content-free
+                    // fields as the model steps.
+                    let usage = run.usage();
+                    let span = tracing::info_span!(
+                        "agent_run.step",
+                        run.id = %run_id,
+                        run.kind = kind.name,
+                        run.turn = run.turn(),
+                        run.input_tokens = usage.input_tokens.unwrap_or(0),
+                        run.output_tokens = usage.output_tokens.unwrap_or(0),
+                    );
+                    attempt
+                        .call_tools_step(&mut run, calls)
+                        .instrument(span)
+                        .await
                 }
+                AgentRunStep::Done(response) => attempt.done_step(&run, response.output()).await,
             };
             match outcome {
                 StepOutcome::Continue => {}
@@ -531,6 +502,41 @@ impl Durable {
 }
 
 impl Attempt<'_> {
+    /// The `Done` step: one final projection pass (the last assistant
+    /// message is committed by `next_step`'s turn processing, after the
+    /// step-level persist), then the terminal `succeeded` write. Split from
+    /// the driver loop to keep `advance_run` small; a failed terminal write
+    /// is a `Retry` so the caller routes it through `fail_retryable`
+    /// (release + Err) instead of deleting the only job row.
+    async fn done_step(&self, run: &AgentRun, output: String) -> StepOutcome {
+        match self.persist(run).await {
+            StepOutcome::Continue => {}
+            other => return other,
+        }
+        let snap = match RunSnapshot::of(run) {
+            Ok(snap) => snap,
+            Err(e) => return StepOutcome::Retry(e),
+        };
+        match self
+            .durable
+            .finish_run(
+                self.db,
+                self.run_id,
+                &self.me,
+                RunStatus::Succeeded,
+                None,
+                Some(output),
+                None,
+                snap,
+                Some(run),
+            )
+            .await
+        {
+            Ok(()) => StepOutcome::Done,
+            Err(e) => StepOutcome::Retry(e),
+        }
+    }
+
     /// Fail the run terminally (no retry) with a typed reason; the attempt
     /// then ends Ok so the job completes instead of storming retries.
     async fn fail_terminal(
@@ -939,10 +945,17 @@ impl Attempt<'_> {
                     )
                     .await
                     {
-                        // A heartbeat timeout means ownership cannot be
-                        // proven: abandon the step and return Ok, never
-                        // write again. Same for a failed or lost heartbeat.
-                        Err(_) | Ok(Err(_) | Ok(None)) => return Ok(Guarded::Stop),
+                        // A heartbeat timeout (ownership cannot be proven)
+                        // or a lost heartbeat (zero rows): abandon the step
+                        // and return Ok, never write again (plan-specified
+                        // for both).
+                        Err(_) | Ok(Ok(None)) => return Ok(Guarded::Stop),
+                        // A DB error is NOT proof of a lost lease: return Err
+                        // (the caller routes through `fail_retryable`:
+                        // release + cja backoff). Completing the job here
+                        // would delete the only job row while the run is
+                        // still `running` under our lease — an orphan.
+                        Ok(Err(e)) => return Err(cja::color_eyre::Report::from(e)),
                         Ok(Ok(Some(true))) => {
                             // User cancel mid-step: finish cancelled, keep
                             // the transcript.

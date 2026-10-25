@@ -1909,7 +1909,9 @@ async fn answer_projects_tool_result_into_transcript() {
     let before = transcript_rows(&env.db, run).await;
     assert_eq!(before.len(), 2, "user prompt + assistant ask call");
 
-    durable::answer(&env.state, run, "yes").await.expect("answer");
+    durable::answer(&env.state, run, "yes")
+        .await
+        .expect("answer");
 
     let after = transcript_rows(&env.db, run).await;
     assert_eq!(

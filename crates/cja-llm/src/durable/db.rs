@@ -8,10 +8,12 @@
 
 use std::time::Duration;
 
+use rig_agent::run::AgentRun;
+use rig_core::completion::Message;
 use sqlx::Executor;
 use uuid::Uuid;
 
-use super::RunStatus;
+use super::{RunError, RunStatus};
 
 /// Row data returned by a successful claim.
 pub(super) struct ClaimedRun {
@@ -313,6 +315,51 @@ pub(super) async fn insert_messages(
         .await?;
     }
     Ok(())
+}
+
+/// The transcript role of a rig message (its serde tag is `role`).
+pub(super) fn message_role(message: &Message) -> &'static str {
+    match message {
+        Message::System { .. } => "system",
+        Message::User { .. } => "user",
+        Message::Assistant(_) => "assistant",
+    }
+}
+
+/// The next free transcript `seq` for `run_id` (`0` when nothing is written
+/// yet). One indexed MAX; safe to call inside an open transaction (the
+/// caller's row lock orders it against concurrent projections).
+pub(super) async fn next_message_seq<'e, E>(db: E, run_id: Uuid) -> sqlx::Result<i64>
+where
+    E: Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_scalar("SELECT COALESCE(MAX(seq) + 1, 0) FROM agent_messages WHERE run_id = $1")
+        .bind(run_id)
+        .fetch_one(db)
+        .await
+}
+
+/// Compute the transcript rows not yet written for `run`, numbering from
+/// the stored high-water mark `written` (see [`next_message_seq`]). Shared
+/// by the worker's persists and `answer`'s projection so the two paths
+/// cannot drift: same role mapping, same seq arithmetic.
+pub(super) fn project_rows(
+    written: i64,
+    run: &AgentRun,
+) -> Result<Vec<(i64, String, serde_json::Value)>, RunError> {
+    let mut rows = Vec::new();
+    for (i, message) in run
+        .messages()
+        .iter()
+        .skip(usize::try_from(written).unwrap_or(usize::MAX))
+        .enumerate()
+    {
+        let body = serde_json::to_value(&**message)
+            .map_err(|_| RunError::Corrupt("transcript message failed to serialize", 0, 0))?;
+        let seq = written + i64::try_from(i).unwrap_or(i64::MAX);
+        rows.push((seq, message_role(message).to_owned(), body));
+    }
+    Ok(rows)
 }
 
 /// Directly transition `run_id` to `cancelled` if its current status is one

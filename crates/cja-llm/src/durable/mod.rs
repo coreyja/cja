@@ -603,7 +603,6 @@ where
     // between the columns and the run state is corruption, never a guess.
     let answer = answer.into();
     let mut resolved = false;
-    let before = agent_run.messages().len();
     for call in calls {
         let rig_agent::run::PendingToolCall::Execute(exec) = call else {
             continue;
@@ -636,18 +635,13 @@ where
 
     let run_state = serde_json::to_value(&agent_run)
         .map_err(|_| RunError::Corrupt("run state failed to serialize", 0, 0))?;
-    let mut new_messages = Vec::new();
-    for (i, message) in agent_run.messages().iter().skip(before).enumerate() {
-        let body = serde_json::to_value(&**message)
-            .map_err(|_| RunError::Corrupt("transcript message failed to serialize", 0, 0))?;
-        let role = match &**message {
-            rig_core::completion::Message::System { .. } => "system",
-            rig_core::completion::Message::User { .. } => "user",
-            rig_core::completion::Message::Assistant(_) => "assistant",
-        };
-        let seq = i64::try_from(i).unwrap_or(i64::MAX);
-        new_messages.push((seq, role.to_owned(), body));
-    }
+    // Project the newly committed messages (a single-ask batch completes
+    // on `run.answer`, committing the tool-result user message) from the
+    // stored high-water mark — the same shared projection the worker's
+    // persists use (`db::project_rows`), so the seq numbering cannot drift
+    // and the human's answer is never silently dropped by a seq conflict.
+    let written = db::next_message_seq(&mut *tx, run.0).await?;
+    let new_messages = db::project_rows(written, &agent_run)?;
     if !db::answer_waiting(&mut *tx, run.0, &run_state).await? {
         // Lost the race (row no longer waiting under us).
         return Err(RunError::NotWaiting(run, RunStatus::Running));
