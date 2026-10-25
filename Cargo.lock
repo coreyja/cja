@@ -785,6 +785,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cja-llm-app-fixture"
+version = "0.0.0"
+dependencies = [
+ "cja-llm",
+ "rig-agent",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "cja-passkey"
 version = "0.0.0"
 dependencies = [
