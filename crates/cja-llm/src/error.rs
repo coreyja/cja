@@ -14,6 +14,8 @@
 //! adapter) it holds the `ErrorReport`'s `message` plus `source_chain`
 //! strings. Either way `source()` keeps walking to the underlying error.
 
+use std::fmt;
+
 use rig_agent::completion::{PromptError, StructuredOutputError};
 use rig_core::error::ProviderError;
 
@@ -26,7 +28,7 @@ const ADMIN_403_BODY: &str = "admin only";
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Everything cja-llm can fail with, classified from the gateway's contract.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// Gateway `403 {"error":"forbidden: caller identity could not be
@@ -120,6 +122,89 @@ pub enum Error {
 impl From<PromptError> for Error {
     fn from(err: PromptError) -> Self {
         Self::from_prompt_error(err)
+    }
+}
+
+/// [`fmt::Debug`] never prints content. The `raw`/`body` fields print as
+/// byte lengths only, and every boxed [`PromptError`] source prints through
+/// its `Display` with this variant's own content redacted out of it —
+/// `PromptError::MaxTurns`'s derived `Debug` would print the whole
+/// conversation, and a provider-response `PromptError`'s `Display` prints
+/// the reply body (`ProviderResponseError: status ..: {body}`). Apps
+/// return `cja_llm::Result` from `main`, whose failure path prints
+/// `Error: {:?}`, so a derived `Debug` would leak model output and reply
+/// bodies into logs.
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        /// A content-bearing string printed as its byte length only.
+        struct Redacted<'a>(&'a str);
+
+        impl fmt::Debug for Redacted<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "<{} bytes>", self.0.len())
+            }
+        }
+
+        /// The source rendered through its `Display` (never its `Debug`),
+        /// with `redact`'s strings replaced by byte-length markers so a
+        /// provider-response body cannot ride along in the chain.
+        fn source_field(source: &PromptError, redact: &[&str]) -> String {
+            let mut text = source.to_string();
+            for secret in redact {
+                if !secret.is_empty() {
+                    text = text.replace(secret, &format!("<redacted {} bytes>", secret.len()));
+                }
+            }
+            text
+        }
+
+        match self {
+            Self::IdentityRejected { body, source } => f
+                .debug_struct("IdentityRejected")
+                .field("body", &Redacted(body))
+                .field("source", &source_field(source, &[body.as_str()]))
+                .finish(),
+            Self::BudgetExceeded { body, source } => f
+                .debug_struct("BudgetExceeded")
+                .field("body", &Redacted(body))
+                .field("source", &source_field(source, &[body.as_str()]))
+                .finish(),
+            Self::AdminOnly { body, source } => f
+                .debug_struct("AdminOnly")
+                .field("body", &Redacted(body))
+                .field("source", &source_field(source, &[body.as_str()]))
+                .finish(),
+            Self::Upstream {
+                status,
+                body,
+                source,
+            } => f
+                .debug_struct("Upstream")
+                .field("status", status)
+                .field("body", &Redacted(body))
+                .field("source", &source_field(source, &[body.as_str()]))
+                .finish(),
+            Self::Timeout { source } => f
+                .debug_struct("Timeout")
+                .field("source", &source_field(source, &[]))
+                .finish(),
+            Self::Connect { source } => f
+                .debug_struct("Connect")
+                .field("source", &source_field(source, &[]))
+                .finish(),
+            Self::SchemaParse { raw, error } => f
+                .debug_struct("SchemaParse")
+                .field("raw", &Redacted(raw))
+                // The serde error carries only a message plus line/column.
+                .field("error", error)
+                .finish(),
+            Self::EmptyStructuredOutput => f.write_str("EmptyStructuredOutput"),
+            Self::Rig { source } => f
+                .debug_struct("Rig")
+                .field("source", &source_field(source, &[]))
+                .finish(),
+            Self::Config(message) => f.debug_tuple("Config").field(message).finish(),
+        }
     }
 }
 
@@ -424,5 +509,76 @@ mod tests {
             Error::from_provider_error(provider),
             Error::BudgetExceeded { .. }
         ));
+    }
+
+    const DEBUG_SENTINEL: &str = "SENTINEL-DEBUG-LEAK-6f1c";
+
+    /// `Debug` and `Display` never print content, but the `raw`/`body`
+    /// fields still carry it. All three cases use the realistic
+    /// constructions: `SchemaParse` from a real parse failure, `Upstream`
+    /// from a real provider reply (whose source `Display` prints the body
+    /// — so the redaction is load-bearing, not decorative), and `Rig`
+    /// wrapping a `MaxTurns` whose history holds the sentinel.
+    ///
+    /// Mutation-checked: restoring `#[derive(Debug)]` fails this test
+    /// (the derived `Debug` prints `raw`, `body`, and the whole
+    /// conversation).
+    #[test]
+    fn debug_and_display_never_print_content() {
+        // SchemaParse: raw = the model's output text.
+        let error = Error::from(StructuredOutputError::Deserialization {
+            output: DEBUG_SENTINEL.to_owned(),
+            error: serde_json::from_str::<serde_json::Value>(DEBUG_SENTINEL).unwrap_err(),
+        });
+        let Error::SchemaParse { raw, .. } = &error else {
+            panic!("expected SchemaParse");
+        };
+        assert_eq!(raw, DEBUG_SENTINEL, "the field still carries the raw text");
+        assert!(
+            !format!("{error:?}").contains(DEBUG_SENTINEL),
+            "Debug leaked: {error:?}"
+        );
+        assert!(
+            !format!("{error}").contains(DEBUG_SENTINEL),
+            "Display leaked: {error}"
+        );
+
+        // Upstream: body = the reply body, and the source's Display prints
+        // that same body (ProviderResponseError: status ..: {body}).
+        let error = Error::from_prompt_error(provider_with_response(500, DEBUG_SENTINEL));
+        let Error::Upstream {
+            status: 500, body, ..
+        } = &error
+        else {
+            panic!("expected Upstream, got {error:?}");
+        };
+        assert_eq!(body, DEBUG_SENTINEL, "the field still carries the body");
+        assert!(
+            !format!("{error:?}").contains(DEBUG_SENTINEL),
+            "Debug leaked: {error:?}"
+        );
+        assert!(
+            !format!("{error}").contains(DEBUG_SENTINEL),
+            "Display leaked: {error}"
+        );
+
+        // Rig wrapping MaxTurns: the derived Debug would print the whole
+        // conversation (chat_history and prompt); Display does not.
+        let inner = PromptError::MaxTurns {
+            max_turns: 8,
+            chat_history: vec![rig_core::completion::Message::user(DEBUG_SENTINEL)],
+            prompt: rig_core::completion::Message::user(DEBUG_SENTINEL),
+        };
+        let error = Error::Rig {
+            source: Box::new(inner),
+        };
+        assert!(
+            !format!("{error:?}").contains(DEBUG_SENTINEL),
+            "Debug leaked: {error:?}"
+        );
+        assert!(
+            !format!("{error}").contains(DEBUG_SENTINEL),
+            "Display leaked: {error}"
+        );
     }
 }
