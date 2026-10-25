@@ -192,14 +192,18 @@ agent (`?` does it for you):
 * `SchemaParse` — structured output failed to parse; carries the raw text.
 
 The retry policy (`LlmConfig::retries`, default 3 attempts): connect-phase
-failures (nothing sent), 429s, 5xx replies, and the gateway's two 502 bodies
-(`gateway budget/key provisioning failed`, `upstream unavailable` — both mean
-no upstream call was made, so retrying can't double-bill) retry with
-exponential backoff, jitter, and a clamped seconds-form `Retry-After`. A
-stale Bifrost virtual key (401 `access_not_found` / 403 `access_blocked`)
-gets exactly one ordinary, attempt-consuming retry. Everything else — 402,
-the wrapper 403s, other 4xx, and any failure after the request reached the
-connection — never retries, because the gateway may have billed the attempt.
+failures (nothing sent) and 429s retry with exponential backoff, jitter,
+and a seconds-form `Retry-After` honored as a floor (clamped to the
+backoff ceiling). 5xx *replies* retry too, per the DEV-1923 policy: the
+gateway's two 502 bodies (`gateway budget/key provisioning failed`,
+`upstream unavailable`) mean no upstream call was made, so retrying them
+can't double-bill — but any other 5xx (500/503/504 from Bifrost or a
+provider) may follow upstream work, so a retry can double-bill. A stale
+Bifrost virtual key (401 `access_not_found` / 403 `access_blocked`) gets
+exactly one ordinary, attempt-consuming retry. Everything else — 402,
+the wrapper 403s, other 4xx — never retries. Transport failures after
+the request reached the connection (timeouts, resets) never retry either,
+because the gateway may have billed the attempt.
 
 Budgets have no in-flight reservation: N concurrent requests can each pass
 the accrued-spend check before any settles. cja-llm adds no client-side
@@ -212,11 +216,24 @@ status, latency, and token counts — plus a completion event. **Prompt and
 response content is never recorded**: `Llm::agent` pins rig's content
 telemetry off, and a test enforces it. Do not enable it.
 
-One caveat: rig itself, when a subscriber enables `TRACE` for the
-`rig::completions` or `rig::streaming` targets, dumps raw request and reply
-JSON as wire-debug events — that is rig's behavior, not cja-llm's, and no
-library can gate it. Keep those targets below `TRACE` (e.g. an env-filter
-directive like `rig::completions=debug`).
+One more thing: rig 0.45 logs raw content on three targets regardless of
+the content-telemetry setting — whole request/reply wire JSON at `TRACE`
+on `rig::completions` and `rig::streaming`, and the raw structured-output
+text at `WARN` on `rig_agent::agent::typed`. cja's tracing setup
+(`cja::setup`) always caps those targets (`rig::completions` and
+`rig::streaming` at DEBUG, `rig_agent::agent::typed` at ERROR), so an app
+using `cja::setup` is covered. An app that builds its own subscriber must
+add the same three directives:
+
+```rust,ignore
+filter
+    .add_directive("rig::completions=debug".parse()?)
+    .add_directive("rig::streaming=debug".parse()?)
+    .add_directive("rig_agent::agent::typed=error".parse()?);
+```
+
+`cja_llm::Error`'s `Debug` and `Display` never print content, but its
+`raw` and `body` fields carry it — don't log those fields.
 
 No secret is read, stored, or logged by this crate. The placeholder
 credential rig requires never leaves the process: the transport middleware
