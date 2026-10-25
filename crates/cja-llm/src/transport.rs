@@ -1025,16 +1025,15 @@ fn retryable_delay(
     retry_after: Option<Duration>,
     deadline: tokio::time::Instant,
 ) -> Option<Duration> {
-    let delay = match retry_after {
-        Some(after) => after.min(policy.max_backoff),
-        None => {
-            let base = policy
-                .initial_backoff
-                .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
-                .min(policy.max_backoff);
-            // Full jitter: uniform in [0, base].
-            Duration::from_secs_f64(base.as_secs_f64() * fastrand::f64())
-        }
+    let delay = if let Some(after) = retry_after {
+        after.min(policy.max_backoff)
+    } else {
+        let base = policy
+            .initial_backoff
+            .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+            .min(policy.max_backoff);
+        // Full jitter: uniform in [0, base].
+        Duration::from_secs_f64(base.as_secs_f64() * fastrand::f64())
     };
     let now = tokio::time::Instant::now();
     (now + delay < deadline).then_some(delay)
