@@ -337,13 +337,20 @@ async fn connect_phase(
     Ok((sender, AbortOnDrop(Some(tokio::spawn(connection)))))
 }
 
+/// The error body did not complete before the call's total deadline.
+/// The request was queued, so the attempt is a terminal timeout — never
+/// reinterpreted as an HTTP status (the reply was incomplete) or retried.
+struct DeadlineElapsed;
+
 /// Reads a non-success reply's body — capped at [`MAX_ERROR_BODY`] bytes
 /// *while reading*, so a huge error envelope is never buffered unbounded —
 /// and its seconds-form `Retry-After`, for status classification.
+/// `Err(DeadlineElapsed)` when the total deadline expires first: the
+/// status head alone is not a complete reply.
 async fn read_error_body(
     response: http::Response<Incoming>,
     deadline: tokio::time::Instant,
-) -> (String, http::HeaderMap, Option<Duration>) {
+) -> Result<(String, http::HeaderMap, Option<Duration>), DeadlineElapsed> {
     let (parts, body) = response.into_parts();
     let retry_after = parts
         .headers
@@ -356,16 +363,24 @@ async fn read_error_body(
     // `String::truncate` at a non-char boundary does. The first 64 KiB
     // carries every discriminator the classifier needs (`error`/`type` are
     // top-level fields of the gateway and Bifrost envelopes).
-    let text = String::from_utf8_lossy(&read_capped(body, deadline).await).into_owned();
-    (text, parts.headers, retry_after)
+    let (bytes, timed_out) = read_capped(body, deadline).await;
+    if timed_out {
+        return Err(DeadlineElapsed);
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok((text, parts.headers, retry_after))
 }
 
 /// Reads up to [`MAX_ERROR_BODY`] bytes of a body, stopping at the cap.
-/// Errors and deadline elapses keep whatever arrived; the connection is
-/// torn down by the caller either way, so not draining it is fine.
-async fn read_capped(body: Incoming, deadline: tokio::time::Instant) -> Bytes {
+/// Returns the bytes read and whether the deadline elapsed before the body
+/// ended. Body end and read errors both count as ended: the connection is
+/// torn down by the caller either way, so not draining it is fine — a
+/// read-failure body is still classified by the status head that arrived,
+/// while a deadline expiry is the caller's timeout instead.
+async fn read_capped(body: Incoming, deadline: tokio::time::Instant) -> (Bytes, bool) {
     let mut stream = http_body_util::BodyStream::new(body);
     let mut buf: Vec<u8> = Vec::new();
+    let mut timed_out = false;
     while buf.len() < MAX_ERROR_BODY {
         match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(Ok(frame))) => {
@@ -375,98 +390,180 @@ async fn read_capped(body: Incoming, deadline: tokio::time::Instant) -> Bytes {
                 let remaining = MAX_ERROR_BODY - buf.len();
                 buf.extend_from_slice(&data[..data.len().min(remaining)]);
             }
-            Ok(Some(Err(_)) | None) | Err(_) => break,
+            Ok(Some(Err(_)) | None) => break,
+            Err(_elapsed) => {
+                timed_out = true;
+                break;
+            }
         }
     }
-    Bytes::from(buf)
+    (Bytes::from(buf), timed_out)
 }
 
 /// The gateway body for a streamed 2xx reply, as rig's `BoxedStream`: each
 /// frame bounded by the idle timeout; a timeout ends the stream with
 /// [`TransportError::Timeout`]; dropping the stream aborts the connection
 /// driver, which cancels the request.
+///
+/// The call's completion event is deferred to the body's end (or error):
+/// usage only arrives in the final SSE chunks, so a response-head event
+/// would report a false zero. When the body ends — normally, on a read
+/// error, or on the idle timeout — the event fires once, with the usage the
+/// scanner accumulated. A caller that drops the stream cancels the call;
+/// no completion event fires for it.
 fn into_boxed_stream(
     response: http::Response<Incoming>,
     driver: Driver,
     idle_timeout: Duration,
     span: tracing::Span,
+    started: std::time::Instant,
 ) -> StreamingResponse {
-    struct StreamGuard(Option<Driver>);
-    impl Drop for StreamGuard {
-        fn drop(&mut self) {
-            if let Some(driver) = self.0.take() {
-                driver.abort();
-            }
-        }
-    }
-
-    struct StreamState {
-        body: http_body_util::BodyStream<Incoming>,
-        _guard: StreamGuard,
-        scanner: UsageScanner,
-        span: tracing::Span,
-        ended: bool,
-    }
-
-    type NextItem = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<(HttpResult<Bytes>, StreamState)>> + Send>,
-    >;
-
-    fn next_item(mut state: StreamState, idle_timeout: Duration) -> NextItem {
-        Box::pin(async move {
-            loop {
-                if state.ended {
-                    return None;
-                }
-                match tokio::time::timeout(idle_timeout, state.body.next()).await {
-                    Ok(Some(Ok(frame))) => match frame.into_data() {
-                        Ok(bytes) => {
-                            if let Some((input, output)) = state.scanner.scan(&bytes) {
-                                state.span.record("input_tokens", input);
-                                state.span.record("output_tokens", output);
-                            }
-                            return Some((Ok(bytes), state));
-                        }
-                        // Trailers and other non-data frames never reach
-                        // rig.
-                        Err(_frame) => {}
-                    },
-                    Ok(Some(Err(error))) => {
-                        state.ended = true;
-                        return Some((Err(HttpError::instance(error)), state));
-                    }
-                    Ok(None) => return None,
-                    Err(_elapsed) => {
-                        state.ended = true;
-                        let error = TransportError::Timeout(idle_timeout);
-                        return Some((Err(HttpError::instance(error)), state));
-                    }
-                }
-            }
-        })
-    }
-
     let (parts, body) = response.into_parts();
+    let status = parts.status.as_u16();
     let state = StreamState {
         body: http_body_util::BodyStream::new(body),
         _guard: StreamGuard(Some(driver)),
         scanner: UsageScanner::default(),
         span,
+        started,
+        status,
         ended: false,
+        emitted: false,
     };
     let boxed: BoxedStream = Box::pin(futures::stream::unfold(state, move |state| {
-        next_item(state, idle_timeout)
+        stream_next_item(state, idle_timeout)
     }));
     http::Response::from_parts(parts, boxed)
 }
 
+/// Aborts the spawned hyper connection driver when dropped, keeping the
+/// connection from outliving the stream the consumer holds.
+struct StreamGuard(Option<Driver>);
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if let Some(driver) = self.0.take() {
+            driver.abort();
+        }
+    }
+}
+
+/// The unfold state of a streamed 2xx body: frames under the idle timeout,
+/// usage scanned for the deferred completion event, and the connection
+/// driver guarded so dropping the stream cancels the request.
+struct StreamState {
+    body: http_body_util::BodyStream<Incoming>,
+    _guard: StreamGuard,
+    scanner: UsageScanner,
+    span: tracing::Span,
+    started: std::time::Instant,
+    status: u16,
+    ended: bool,
+    emitted: bool,
+}
+
+impl StreamState {
+    /// Fires the deferred completion event, exactly once, with the
+    /// final latency and whatever usage the scanner saw. Mirrors
+    /// `emit_completion_event` for the loop-driven (unary) outcomes.
+    fn emit_completion(&mut self) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        let usage = self.scanner.last_usage();
+        let latency_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.span.record("latency_ms", latency_ms);
+        if let Some((input, output)) = usage {
+            self.span.record("input_tokens", input);
+            self.span.record("output_tokens", output);
+        }
+        self.span.in_scope(|| {
+            tracing::info!(
+                target: "cja_llm::http",
+                status = self.status,
+                latency_ms,
+                input_tokens = usage.map_or(0, |usage| usage.0),
+                output_tokens = usage.map_or(0, |usage| usage.1),
+                "gateway http call finished"
+            );
+        });
+    }
+}
+
+impl Drop for StreamState {
+    /// rig's decoder stops at the `[DONE]` sentinel and drops the body
+    /// without draining it (`Flow::Ended` breaks the read loop), so the
+    /// normal-completion path usually ends here rather than at body
+    /// end. A drop *without* the sentinel is a consumer cancellation:
+    /// no completion event fires for it — a cancelled call has no final
+    /// usage, and a zero-token "finished" record is exactly the false
+    /// telemetry this deferral exists to avoid.
+    fn drop(&mut self) {
+        if self.scanner.saw_done() {
+            self.emit_completion();
+        }
+    }
+}
+
+/// One unfold step of the streamed body: the next frame under the idle
+/// timeout, or the end/error transition — each terminal transition fires
+/// the deferred completion event.
+type NextItem = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Option<(HttpResult<Bytes>, StreamState)>> + Send>,
+>;
+
+fn stream_next_item(mut state: StreamState, idle_timeout: Duration) -> NextItem {
+    Box::pin(async move {
+        loop {
+            if state.ended {
+                return None;
+            }
+            match tokio::time::timeout(idle_timeout, state.body.next()).await {
+                Ok(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(bytes) => {
+                        if let Some((input, output)) = state.scanner.scan(&bytes) {
+                            state.span.record("input_tokens", input);
+                            state.span.record("output_tokens", output);
+                        }
+                        return Some((Ok(bytes), state));
+                    }
+                    // Trailers and other non-data frames never reach
+                    // rig.
+                    Err(_frame) => {}
+                },
+                Ok(Some(Err(error))) => {
+                    state.ended = true;
+                    state.emit_completion();
+                    return Some((Err(HttpError::instance(error)), state));
+                }
+                Ok(None) => {
+                    state.emit_completion();
+                    return None;
+                }
+                Err(_elapsed) => {
+                    state.ended = true;
+                    state.emit_completion();
+                    let error = TransportError::Timeout(idle_timeout);
+                    return Some((Err(HttpError::instance(error)), state));
+                }
+            }
+        }
+    })
+}
+
 /// Scans SSE-ish byte chunks for a chat-completions usage object, for the
-/// tracing span only. Never blocks the stream: incomplete lines buffer until
-/// a newline arrives; the buffer resets past 64 KiB so a pathological stream
-/// cannot grow it without bound.
+/// tracing span and the deferred stream completion event. Never blocks the
+/// stream: incomplete lines buffer until a newline arrives; the buffer
+/// resets past 64 KiB so a pathological stream cannot grow it without
+/// bound. Also remembers the `[DONE]` sentinel: rig's decoder stops there
+/// and drops the body without draining it, so the sentinel is what tells a
+/// drop apart from a cancellation.
 #[derive(Default)]
 struct UsageScanner {
     buf: Vec<u8>,
+    last: Option<(u64, u64)>,
+    done: bool,
 }
 
 impl UsageScanner {
@@ -481,6 +578,7 @@ impl UsageScanner {
                 continue;
             };
             if payload == "[DONE]" {
+                self.done = true;
                 continue;
             }
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
@@ -492,7 +590,22 @@ impl UsageScanner {
         if self.buf.len() > MAX_ERROR_BODY {
             self.buf.clear();
         }
+        if let Some(found) = usage {
+            self.last = Some(found);
+        }
         usage
+    }
+
+    /// The most recent usage the stream reported, if any — the SSE final
+    /// usage chunk arrives after the deltas, so this is what the deferred
+    /// completion event reports.
+    fn last_usage(&self) -> Option<(u64, u64)> {
+        self.last
+    }
+
+    /// Whether the wire's `[DONE]` sentinel arrived.
+    fn saw_done(&self) -> bool {
+        self.done
     }
 }
 
@@ -607,6 +720,18 @@ async fn run_loop(
         .instrument(span.clone())
         .await;
         record_completion(&span, result.data());
+        // A streamed outcome is not finished: its body still has to flow.
+        // Defer the completion event to the body's end (or error), where
+        // the SSE usage chunk is known — see `into_boxed_stream`.
+        if !matches!(
+            &result,
+            AttemptResult::Done {
+                outcome: LoopOutcome::Streamed(_),
+                ..
+            }
+        ) {
+            emit_completion_event(&span, result.data());
+        }
         match result {
             AttemptResult::Done { outcome, .. } => return Ok(outcome),
             AttemptResult::Retry {
@@ -693,17 +818,27 @@ async fn run_attempt(
     };
 
     if !status.is_success() {
-        let (text, headers, retry_after) = read_error_body(response, deadline).await;
+        if let Ok((text, headers, retry_after)) = read_error_body(response, deadline).await {
+            drop(sender);
+            let error = HttpError::non_success_with_details(status, headers, text.clone());
+            return classify_status(
+                status,
+                &text,
+                retry_after,
+                stale_key_available,
+                error,
+                data_with_status,
+            );
+        }
+        // The total deadline expired mid-error-body: the reply was
+        // incomplete, so its status must not be surfaced as a
+        // classification (and 429 must not be retried). The request was
+        // queued, so this is the terminal post-queue timeout.
         drop(sender);
-        let error = HttpError::non_success_with_details(status, headers, text.clone());
-        return classify_status(
-            status,
-            &text,
-            retry_after,
-            stale_key_available,
-            error,
-            data_with_status,
-        );
+        return AttemptResult::Terminal {
+            error: HttpError::instance(TransportError::Timeout(inner.request_timeout)),
+            data: data_with_status,
+        };
     }
 
     finish_success(
@@ -776,6 +911,7 @@ async fn finish_success(
                     driver.disarm(),
                     inner.stream_idle_timeout,
                     span,
+                    started,
                 )),
                 data,
             }
@@ -901,9 +1037,8 @@ fn retryable_delay(
     (now + delay < deadline).then_some(delay)
 }
 
-/// Records the completion data on the attempt's span and emits the
-/// completion event inside it, both ways carrying status, latency, and —
-/// when the response reported them — token counts. Content is never
+/// Records the completion data on the attempt's span: status, latency,
+/// and — when the response reported them — token counts. Content is never
 /// recorded.
 fn record_completion(span: &tracing::Span, data: &AttemptData) {
     let AttemptData {
@@ -920,6 +1055,22 @@ fn record_completion(span: &tracing::Span, data: &AttemptData) {
         span.record("input_tokens", input);
         span.record("output_tokens", output);
     }
+}
+
+/// Emits the completion event inside the span. Events carry their own
+/// fields for every subscriber (Eyes sees events, not `record()`ed span
+/// fields), so this is the Eyes-visible record of a finished call — and it
+/// must fire exactly once per logical call, when its outcome is final.
+/// Unary calls emit here from the loop; streamed calls emit when their
+/// body ends or errors (see `into_boxed_stream`), so the usage the SSE
+/// body reports is in the event instead of a false zero.
+fn emit_completion_event(span: &tracing::Span, data: &AttemptData) {
+    let AttemptData {
+        status,
+        latency,
+        usage,
+    } = data;
+    let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
     span.in_scope(|| {
         tracing::info!(
             target: "cja_llm::http",
@@ -1056,5 +1207,13 @@ mod tests {
         assert_eq!(scanner.scan(chunk), None);
         let rest = b"ens\":3,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
         assert_eq!(scanner.scan(rest), Some((3, 2)));
+        // The deferred stream completion event reports the retained usage,
+        // which only arrives with the final chunks.
+        assert_eq!(scanner.last_usage(), Some((3, 2)));
+        assert_eq!(UsageScanner::default().last_usage(), None);
+        // The sentinel tells a normal completion (rig drops the body at
+        // `[DONE]`) apart from a consumer cancellation.
+        assert!(scanner.saw_done());
+        assert!(!UsageScanner::default().saw_done());
     }
 }

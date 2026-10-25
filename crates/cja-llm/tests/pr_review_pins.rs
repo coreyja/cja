@@ -56,7 +56,8 @@ async fn stalled_error_body_reports_the_request_timeout() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
-        socket.read(&mut request).await.unwrap();
+        let read = socket.read(&mut request).await.unwrap();
+        assert!(read > 0, "the client sent its request");
         socket
             .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n")
             .await
