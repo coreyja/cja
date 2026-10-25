@@ -1981,3 +1981,57 @@ async fn heartbeat_db_error_does_not_complete_the_job() {
         locked_by_of(&env.db, run).await
     );
 }
+
+/// A concurrent queued -> running transition must not turn a valid run into
+/// `NotFound`. The row remains present and cancellation is valid in both
+/// states; `NotFound` is reserved for a missing run id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_racing_claim_never_reports_existing_run_as_not_found() {
+    let env = setup(&[&COUNTER]).await;
+    let run = durable::start(&env.state, "counter", "go")
+        .await
+        .expect("start");
+
+    let mut tx = env.db.begin().await.expect("begin claim transaction");
+    sqlx::query("SELECT id FROM agent_runs WHERE id = $1 FOR UPDATE")
+        .bind(run.0)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("lock run row");
+
+    let state = env.state.clone();
+    let cancel_task = tokio::spawn(async move { durable::cancel(&state, run).await });
+    wait_until(|| async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+             AND query LIKE '%WITH target AS%')",
+        )
+        .fetch_one(&env.db)
+        .await
+        .expect("inspect blocked cancellation")
+        .then_some(())
+    })
+    .await;
+
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'running', locked_by = 'other', locked_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(run.0)
+    .execute(&mut *tx)
+    .await
+    .expect("claim run");
+    tx.commit().await.expect("commit claim");
+
+    let result = cancel_task.await.expect("join cancellation");
+    assert!(result.is_ok(), "cancel() lost a valid run: {result:?}");
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Running);
+    let requested: bool =
+        sqlx::query_scalar("SELECT cancel_requested FROM agent_runs WHERE id = $1")
+            .bind(run.0)
+            .fetch_one(&env.db)
+            .await
+            .expect("existing run");
+    assert!(requested, "the live worker must receive the cancellation");
+}
