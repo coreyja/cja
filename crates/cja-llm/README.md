@@ -307,7 +307,16 @@ a path must enqueue.
 Per-kind caps: `RunLimits { max_turns: 20, max_total_tokens: 200_000 }` by
 default; exceeding one fails the run with `fail_reason` `turn_budget` /
 `token_budget`, transcript preserved. `fail_reason` values: `turn_budget`,
-`token_budget`, `unknown_kind`, `corrupt_state`, `gateway`, `protocol`.
+`token_budget`, `unknown_kind`, `corrupt_state`, `gateway`, `protocol`,
+`unstorable_content`.
+
+**Unstorable content (U+0000)**: Postgres cannot store a NUL (JSONB
+rejects the `\u0000` escape, TEXT the byte). Tool, question, and answer
+text is sanitized to U+FFFD *before* it enters the run, so the in-memory
+run and the stored transcript stay identical. Model-produced text cannot
+be rewritten that way, so a NUL there fails the run permanently
+(`unstorable_content`), keeping the last good state and transcript — the
+job completes instead of retrying a poison payload into dead-letter.
 
 - **Retried by cja backoff** (lease released, job errors — or, once the
   attempt has persisted a step, re-enqueued on a fresh row with

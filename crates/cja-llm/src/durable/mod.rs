@@ -113,6 +113,12 @@ pub enum FailReason {
     CorruptState,
     Gateway,
     Protocol,
+    /// The run produced content Postgres cannot store (a U+0000: JSONB
+    /// rejects the `\u0000` escape, TEXT rejects the byte). Tool, question,
+    /// and answer text is sanitized to U+FFFD before entering the run, so
+    /// this marks NULs in MODEL-produced text, which cannot be sanitized
+    /// without rewriting the conversation.
+    UnstorableContent,
 }
 
 impl FailReason {
@@ -125,6 +131,7 @@ impl FailReason {
             Self::CorruptState => "corrupt_state",
             Self::Gateway => "gateway",
             Self::Protocol => "protocol",
+            Self::UnstorableContent => "unstorable_content",
         }
     }
 }
@@ -158,6 +165,7 @@ impl FromStr for FailReason {
             "corrupt_state" => Ok(Self::CorruptState),
             "gateway" => Ok(Self::Gateway),
             "protocol" => Ok(Self::Protocol),
+            "unstorable_content" => Ok(Self::UnstorableContent),
             _ => Err(FailReasonParseError),
         }
     }
@@ -341,6 +349,21 @@ pub struct ToolCallKey {
 
 impl rig_core::tool::ContextValue for ToolCallKey {
     const KEY: &'static str = "durable_tool_call_key";
+}
+
+/// Postgres cannot store U+0000: JSONB rejects the `\u0000` escape
+/// (SQLSTATE 22P05) and TEXT rejects the byte (22021). Replace NULs with
+/// U+FFFD in tool, question, and answer text BEFORE it enters the rig
+/// run, so the in-memory run and the stored transcript stay identical —
+/// crash-resume identity depends on that. Model-produced text cannot be
+/// sanitized this way (it is the conversation itself); a NUL there fails
+/// the run permanently with [`FailReason::UnstorableContent`].
+pub(crate) fn replace_nuls(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\0') {
+        std::borrow::Cow::Owned(text.replace('\0', "\u{FFFD}"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 /// Everything the durable engine can go wrong with, for app code.
@@ -601,7 +624,9 @@ where
 
     // Resolve exactly the recorded ask: same call id, same tool. A mismatch
     // between the columns and the run state is corruption, never a guess.
-    let answer = answer.into();
+    // The answer text is NUL-sanitized at entry (see [`replace_nuls`]): the
+    // human's answer must be storable wherever the run is.
+    let answer = replace_nuls(&answer.into()).into_owned();
     let mut resolved = false;
     for call in calls {
         let rig_agent::run::PendingToolCall::Execute(exec) = call else {
@@ -646,11 +671,28 @@ where
         // Lost the race (row no longer waiting under us).
         return Err(RunError::NotWaiting(run, RunStatus::Running));
     }
-    db::insert_messages(&mut tx, run.0, &new_messages).await?;
+    if let Err(error) = db::insert_messages(&mut tx, run.0, &new_messages).await {
+        return Err(answer_unstorable(state, run, error).await);
+    }
     enqueue_on_tx::<S>(&mut tx, run.0, format!("agent-run:{kind_name}")).await?;
     tx.commit().await?;
     state.job_enqueued();
     Ok(())
+}
+
+/// A write inside [`answer`] was rejected because its content cannot be
+/// stored (SQLSTATE 22P05/22021/54000 — a U+0000): fail the run
+/// permanently (`waiting -> failed`, pending columns cleared) and surface
+/// the storage error. The answer text is sanitized at entry, so this is
+/// unreachable short of corruption or version skew — but a run must never
+/// stay parked on a payload this database cannot store.
+async fn answer_unstorable<S: HasDurable>(state: &S, run: RunId, error: sqlx::Error) -> RunError {
+    if db::unstorable_content(&error) {
+        // Best-effort: the transaction has already aborted; if this write
+        // fails too, the caller still sees the storage error.
+        let _ = db::fail_unstorable_waiting(state.db(), run.0).await;
+    }
+    RunError::Storage(error)
 }
 
 /// Cancel a run. `queued`/`waiting` (and `running` under a dead lease — the

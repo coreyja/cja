@@ -115,6 +115,24 @@ static IGNORE_BAD_TOOLS: AgentKind = AgentKind {
     build: |llm, model| llm.agent(model).tool(Ask).tool(Add),
 };
 
+/// A tool whose output carries a U+0000 — Postgres cannot store it, so the
+/// worker must sanitize it to U+FFFD before the result enters the run.
+#[rig_tool(description = "Return a string containing a NUL byte")]
+async fn nul_text() -> Result<String, rig_core::tool::ToolExecutionError> {
+    Ok("a\0b".to_owned())
+}
+
+static NUL_TOOL: AgentKind = AgentKind {
+    name: "nul_tool",
+    model: models::DEFAULT,
+    limits: RunLimits {
+        max_turns: 20,
+        max_total_tokens: 200_000,
+    },
+    unhandled_invalid_tool_call: UnhandledInvalidToolCall::Fail,
+    build: |llm, model| llm.agent(model).tool(Ask).tool(NulText),
+};
+
 #[derive(Clone)]
 struct TestState {
     db: sqlx::PgPool,
@@ -531,6 +549,154 @@ async fn two_workers_one_run_no_duplicate_transcript() {
     assert_eq!(rows, reference, "no duplicated or lost transcript rows");
     // (run_id, seq) is the primary key, so uniqueness is structural; the
     // equality above is the stronger claim.
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Unstorable content (U+0000): sanitize tool output, fail model NULs
+// ---------------------------------------------------------------------------
+
+/// A tool output containing U+0000 is sanitized to U+FFFD BEFORE it enters
+/// the run: the run succeeds, the stored tool-result row carries the
+/// replacement, and a crash between the tool's execution and its persisted
+/// result resumes to an IDENTICAL transcript (the re-executed tool gets
+/// the same sanitized output — the in-memory run and the stored transcript
+/// never diverge). On the pre-fix code the persist of the NUL payload
+/// failed as retryable, the tool re-executed forever, and the job
+/// dead-lettered, orphaning the run.
+#[tokio::test]
+async fn tool_output_nul_is_sanitized_and_crash_resume_identical() {
+    // Reference: one uninterrupted run.
+    let reference_env = setup(&[&NUL_TOOL]).await;
+    reference_env.fake.tool_call(
+        models::DEFAULT,
+        "call_1",
+        "nul_text",
+        &serde_json::json!({}),
+    );
+    reference_env.fake.chat_completion(models::DEFAULT, "done");
+    let reference_run = durable::start(&reference_env.state, "nul_tool", "give me a nul")
+        .await
+        .expect("start reference");
+    drive(&reference_env.state, reference_run)
+        .await
+        .expect("reference drive");
+    assert_eq!(
+        status_of(&reference_env.db, reference_run).await,
+        RunStatus::Succeeded
+    );
+    let reference = transcript_rows(&reference_env.db, reference_run).await;
+
+    // The stored tool-result row contains U+FFFD, never a NUL escape.
+    let result_json = serde_json::to_string(&reference[2].2).expect("tool result json");
+    assert!(result_json.contains('\u{FFFD}'), "sanitized: {result_json}");
+    assert!(
+        !result_json.contains("\\u0000"),
+        "no NUL escape: {result_json}"
+    );
+
+    // Crash after the tool executed but before its result persisted (the
+    // persist right after `run.answer` — persist 3 of the reference
+    // rhythm), then resume: the tool re-executes and the final transcript
+    // is identical to the reference.
+    let env = setup_with(&[&NUL_TOOL], Duration::from_millis(1)).await;
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_1",
+        "nul_text",
+        &serde_json::json!({}),
+    );
+    env.fake.chat_completion(models::DEFAULT, "done");
+    let run = durable::start(&env.state, "nul_tool", "give me a nul")
+        .await
+        .expect("start");
+    env.state.durable.fail_after_persist(3);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 20, "crash variant did not complete");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        if drive(&env.state, run).await.is_ok()
+            && status_of(&env.db, run).await == RunStatus::Succeeded
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        transcript_rows(&env.db, run).await,
+        reference,
+        "crash-resume transcript identical to the uninterrupted run's"
+    );
+}
+
+/// Model-produced content containing a U+0000 cannot be sanitized (it IS
+/// the conversation): the run fails permanently with
+/// `unstorable_content`, keeping the last good `run_state` and transcript;
+/// the job completes (row deleted, no retry), and the tool before the
+/// poisoned reply is NOT re-executed. On the pre-fix code the persist
+/// failure was classified retryable: every resume re-ran the tool and
+/// re-committed the same NUL until dead-letter orphaned the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_content_nul_fails_the_run_unstorable() {
+    SEEN_KEYS.lock().expect("key log").clear();
+    let env = setup(&[&KEYED]).await;
+    // The tool call, then the model's reply carrying a NUL in its text.
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_1",
+        "keyed_add",
+        &serde_json::json!({"a": 2, "b": 3}),
+    );
+    env.fake.chat_completion(models::DEFAULT, "a\u{0}b");
+    let run = durable::start(&env.state, "keyed", "poison me")
+        .await
+        .expect("start");
+
+    let (worker, token) = spawn_worker(&env.state, Duration::from_millis(10)).await;
+    wait_until(|| async {
+        let status = status_of(&env.db, run).await;
+        (status == RunStatus::Failed).then_some(status)
+    })
+    .await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _ = worker.await;
+    })
+    .await
+    .expect("worker exited");
+
+    let view = view_of(&env.db, run).await;
+    assert_eq!(view.status, RunStatus::Failed);
+    assert_eq!(view.fail_reason, Some(FailReason::UnstorableContent));
+    assert_eq!(
+        jobs_for(&env.db, run).await,
+        0,
+        "job completed, not retried"
+    );
+    assert_eq!(
+        env.fake.requests().len(),
+        2,
+        "the poisoned reply was never re-requested"
+    );
+    assert_eq!(
+        SEEN_KEYS.lock().expect("key log").len(),
+        1,
+        "the tool executed exactly once — never re-executed"
+    );
+
+    // Only the rows written before the failure: user prompt, assistant
+    // tool call, user tool result — and none contains a NUL escape.
+    let rows = transcript_rows(&env.db, run).await;
+    assert_eq!(
+        rows.len(),
+        3,
+        "no writes after the unstorable one: {rows:?}"
+    );
+    let roles: Vec<_> = rows.iter().map(|(_, role, _)| role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user"]);
+    for (_, _, message) in &rows {
+        let text = serde_json::to_string(message).unwrap_or_default();
+        assert!(!text.contains("\\u0000"), "no NUL stored: {text}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,6 +1465,7 @@ async fn read_api_and_parsing_round_trips() {
         FailReason::CorruptState,
         FailReason::Gateway,
         FailReason::Protocol,
+        FailReason::UnstorableContent,
     ] {
         let text = reason.as_str();
         assert_eq!(text.parse::<FailReason>().expect(text), reason);

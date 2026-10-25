@@ -13,7 +13,7 @@ use rig_core::completion::Message;
 use sqlx::Executor;
 use uuid::Uuid;
 
-use super::{RunError, RunStatus};
+use super::{FailReason, RunError, RunStatus};
 
 /// Row data returned by a successful claim.
 pub(super) struct ClaimedRun {
@@ -39,6 +39,71 @@ pub async fn run_migrations(pool: &sqlx::PgPool) -> cja::Result<()> {
     migrator.set_ignore_missing(true);
     migrator.run(pool).await?;
     Ok(())
+}
+
+/// The SQLSTATE family Postgres uses to reject a U+0000 (verified against
+/// a real server): JSONB rejects the `\u0000` escape (22P05 `unsupported
+/// Unicode escape sequence`), TEXT rejects the byte (22021 `invalid byte
+/// sequence for encoding "UTF8": 0x00`), and NULs produced server-side
+/// surface as 54000. Matched from the real sqlx error's
+/// `DatabaseError::code()`, never from message text.
+pub(super) fn unstorable_content(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| matches!(code.as_ref(), "22P05" | "22021" | "54000"))
+}
+
+/// Mark a `running` run `failed` with `unstorable_content` after a write
+/// was rejected because its content cannot be stored. Deliberately writes
+/// NEITHER `run_state` NOR transcript rows: the failing transaction rolled
+/// back, so the row keeps its last good persisted state. Returns `false`
+/// when the lease was already lost.
+pub(super) async fn fail_unstorable<'e, E>(db: E, run_id: Uuid, me: &str) -> sqlx::Result<bool>
+where
+    E: Executor<'e, Database = sqlx::Postgres>,
+{
+    Ok(sqlx::query(
+        "UPDATE agent_runs
+         SET status = $3, fail_reason = $4, error = $5,
+             locked_by = NULL, locked_at = NULL, finished_at = NOW()
+         WHERE id = $1 AND locked_by = $2 AND status = $6",
+    )
+    .bind(run_id)
+    .bind(me)
+    .bind(RunStatus::Failed.as_str())
+    .bind(FailReason::UnstorableContent.as_str())
+    .bind("run content cannot be stored: it contains a NUL (U+0000)")
+    .bind(RunStatus::Running.as_str())
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// The `answer`-path variant: mark a `waiting` run `failed` with
+/// `unstorable_content` (pending columns cleared — the CHECK requires
+/// it). Best-effort; the caller surfaces the original storage error either
+/// way.
+pub(super) async fn fail_unstorable_waiting<'e, E>(db: E, run_id: Uuid) -> sqlx::Result<bool>
+where
+    E: Executor<'e, Database = sqlx::Postgres>,
+{
+    Ok(sqlx::query(
+        "UPDATE agent_runs
+         SET status = $2, fail_reason = $3, error = $4,
+             pending_call_id = NULL, pending_question = NULL, finished_at = NOW()
+         WHERE id = $1 AND status = $5",
+    )
+    .bind(run_id)
+    .bind(RunStatus::Failed.as_str())
+    .bind(FailReason::UnstorableContent.as_str())
+    .bind("run content cannot be stored: it contains a NUL (U+0000)")
+    .bind(RunStatus::Waiting.as_str())
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
 }
 
 /// Claim `run_id` for advancement: `queued`, or `running` with a dead lease

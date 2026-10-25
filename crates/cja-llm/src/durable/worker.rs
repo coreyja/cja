@@ -25,13 +25,13 @@ use rig_core::completion::Message;
 use rig_core::completion::ModelRef;
 use rig_core::completion::request::ProviderCapabilities;
 use rig_core::providers::openai::wire::OpenAiWire;
-use rig_core::tool::{Tool as _, ToolContext, ToolExecutionError, ToolResult};
+use rig_core::tool::{Tool as _, ToolContext, ToolExecutionError, ToolOutput, ToolResult};
 use tracing::Instrument;
 use uuid::Uuid;
 
 use super::ask::{Ask, AskArgs};
 use super::db::{self, ClaimedRun};
-use super::{AgentKind, Durable, FailReason, RunId, RunStatus, ToolCallKey};
+use super::{AgentKind, Durable, FailReason, RunId, RunStatus, ToolCallKey, replace_nuls};
 
 /// How long any single lease-holding DB write may take before ownership is
 /// treated as unprovable (an operator transaction holding the `agent_runs`
@@ -146,6 +146,66 @@ fn is_retryable(error: &crate::Error) -> bool {
         crate::Error::Connect { .. } => true,
         crate::Error::Upstream { status, .. } => *status == 429 || *status >= 500,
         _ => false,
+    }
+}
+
+/// Whether any string in a JSON tool output carries a NUL.
+fn json_has_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(json_has_nul),
+        serde_json::Value::Object(map) => {
+            map.keys().any(|key| key.contains('\0')) || map.values().any(json_has_nul)
+        }
+        _ => false,
+    }
+}
+
+fn sanitize_json_nuls(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(replace_nuls(&text).into_owned())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sanitize_json_nuls).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (replace_nuls(&key).into_owned(), sanitize_json_nuls(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Replace U+0000 with U+FFFD in a tool result BEFORE it enters the run
+/// (`run.answer`): Postgres cannot store a NUL (JSONB rejects the escape,
+/// TEXT the byte), so an unsanitized NUL would make the run's state
+/// unstorable — and because a tool whose result was not persisted
+/// re-executes on every resume, the job would retry the same poison
+/// payload into dead-letter and orphan the run. Sanitizing before the
+/// result enters the run keeps the in-memory run and the stored transcript
+/// identical, which crash-resume identity depends on. Single text and
+/// single JSON blocks cover every ordinary tool output; multimodal /
+/// multi-block outputs pass through, and a NUL there fails the run
+/// `unstorable_content` at the next persist instead.
+fn sanitize_tool_result(result: ToolResult) -> ToolResult {
+    // Decide first (the borrows end here), then rebuild: `with_output`
+    // consumes the result.
+    let replacement = if let Some(text) = result.output().as_text() {
+        if text.contains('\0') {
+            Some(ToolOutput::text(replace_nuls(text).into_owned()))
+        } else {
+            None
+        }
+    } else if let Some(json) = result.output().as_json() {
+        json_has_nul(json).then(|| ToolOutput::json(sanitize_json_nuls(json.clone())))
+    } else {
+        None
+    };
+    match replacement {
+        Some(output) => result.with_output(output),
+        None => result,
     }
 }
 
@@ -532,6 +592,29 @@ impl Durable {
         Err(error)
     }
 
+    /// Fail a run whose persisted state cannot be stored (SQLSTATE
+    /// 22P05/22021/54000 — a U+0000 in content the sanitizers cannot
+    /// rewrite): keep the last good `run_state` and transcript (the
+    /// failing write already rolled back; this writes neither) and mark
+    /// the run `failed` with `unstorable_content`. Permanent by design:
+    /// the attempt then ends `Ok`, so the job completes instead of
+    /// retrying a poison payload into dead-letter and orphaning the run.
+    /// `Ok(false)` (lease lost) is a silent stop, as everywhere.
+    async fn fail_unstorable(
+        &self,
+        db: &sqlx::PgPool,
+        run_id: Uuid,
+        me: &str,
+    ) -> cja::color_eyre::Result<()> {
+        match tokio::time::timeout(WRITE_BOUND, db::fail_unstorable(db, run_id, me)).await {
+            Err(_) => Err(cja::color_eyre::eyre::eyre!(
+                "unstorable-content failure write timed out"
+            )),
+            Ok(Err(e)) => Err(e.into()),
+            Ok(Ok(_)) => Ok(()),
+        }
+    }
+
     /// Terminal status write from `running` under our lease; bounded, and
     /// `Ok(false)` (lease lost) is a silent stop, not an error.
     #[allow(clippy::too_many_arguments)]
@@ -553,7 +636,7 @@ impl Durable {
             Some(run) => project_messages(db, run_id, run).await?,
             None => Vec::new(),
         };
-        let wrote = tokio::time::timeout(
+        let wrote = match tokio::time::timeout(
             WRITE_BOUND,
             db::finish(
                 db,
@@ -571,7 +654,21 @@ impl Durable {
             ),
         )
         .await
-        .map_err(|_| cja::color_eyre::eyre::eyre!("run finish timed out"))??;
+        {
+            Err(_) => {
+                return Err(cja::color_eyre::eyre::eyre!("run finish timed out"));
+            }
+            Ok(Err(e)) => {
+                // The finish's own payload can be unstorable too (e.g. a
+                // model output carrying a NUL in the TEXT `output`
+                // column): permanent — keep the last good state.
+                if db::unstorable_content(&e) {
+                    return self.fail_unstorable(db, run_id, me).await;
+                }
+                return Err(e.into());
+            }
+            Ok(Ok(wrote)) => wrote,
+        };
         // `false` = lease lost: the run moved on without us — a silent stop,
         // never an error. Safe by the same orphan invariant as `persist`:
         // the taker needed a job row to claim through. A future path that
@@ -700,7 +797,25 @@ impl Attempt<'_> {
             Err(_) => {
                 return StepOutcome::Retry(cja::color_eyre::eyre::eyre!("run persist timed out"));
             }
-            Ok(Err(e)) => return StepOutcome::Retry(e.into()),
+            Ok(Err(e)) => {
+                // A NUL in committed content the sanitizers cannot rewrite
+                // (model-produced text) is PERMANENT: fail the run keeping
+                // the last good state, and complete the job. A retryable
+                // classification here would re-run tools and re-commit the
+                // same unstorable payload until dead-letter, orphaning the
+                // run.
+                if db::unstorable_content(&e) {
+                    return match self
+                        .durable
+                        .fail_unstorable(self.db, self.run_id, &self.me)
+                        .await
+                    {
+                        Ok(()) => StepOutcome::Done,
+                        Err(e) => StepOutcome::Retry(e),
+                    };
+                }
+                return StepOutcome::Retry(e.into());
+            }
             Ok(Ok(outcome)) => outcome,
         };
         match wrote {
@@ -918,7 +1033,11 @@ impl Attempt<'_> {
                         Ok(Guarded::Done(result)) => {
                             // `ToolSet::execute` is infallible: an unknown
                             // tool is a failed ToolResult fed back to the
-                            // model, and the run continues.
+                            // model, and the run continues. NULs in the
+                            // output are sanitized BEFORE the result enters
+                            // the run, so the run stays storable and
+                            // crash-resume identity holds.
+                            let result = sanitize_tool_result(result);
                             if let Err(error) = run.answer(exec.answer(result)) {
                                 let (reason, message) = sanitize_prompt_error(&error);
                                 return self.fail_terminal(run, reason, message).await;
@@ -981,6 +1100,11 @@ impl Attempt<'_> {
             Ok(messages) => messages,
             Err(e) => return StepOutcome::Retry(e),
         };
+        // Belt and braces: the question lives inside the already-committed
+        // assistant message (a NUL there fails the run `unstorable_content`
+        // below), so a storable message implies a storable question — but
+        // the TEXT column is bound directly, so sanitize anyway.
+        let question = replace_nuls(&args.question).into_owned();
         let wrote = match tokio::time::timeout(
             WRITE_BOUND,
             db::set_waiting(
@@ -989,7 +1113,7 @@ impl Attempt<'_> {
                 &self.me,
                 &snap.run_state,
                 &exec.id().wire(),
-                &args.question,
+                &question,
                 &new_messages,
             ),
         )
@@ -1000,7 +1124,22 @@ impl Attempt<'_> {
                     "suspension write timed out"
                 ));
             }
-            Ok(Err(e)) => return StepOutcome::Retry(e.into()),
+            Ok(Err(e)) => {
+                // Unstorable suspension payload (a NUL in the assistant
+                // message's projection): permanent, like every
+                // unstorable write — never park on a poison payload.
+                if db::unstorable_content(&e) {
+                    return match self
+                        .durable
+                        .fail_unstorable(self.db, self.run_id, &self.me)
+                        .await
+                    {
+                        Ok(()) => StepOutcome::Done,
+                        Err(e) => StepOutcome::Retry(e),
+                    };
+                }
+                return StepOutcome::Retry(e.into());
+            }
             Ok(Ok(wrote)) => wrote,
         };
         // `false` = lease lost: the thief continues the run; either way this
