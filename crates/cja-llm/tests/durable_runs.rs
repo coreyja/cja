@@ -1000,6 +1000,85 @@ async fn cancel_paths() {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Cancel during an in-flight ask reply (operator review round 3, item 3)
+// ---------------------------------------------------------------------------
+
+/// A `cancel()` that lands while the ask-returning model reply is in
+/// flight must not be lost: the run ends `cancelled` (never parked in
+/// `waiting` behind the question), both pending columns are NULL, the
+/// transcript is kept, and no job remains. The review's requested
+/// end-to-end scenario: usually the cancel is caught by the post-response
+/// persist's `cancel_requested` RETURNING (one step earlier — the same
+/// user-visible contract); the narrow window between that persist and the
+/// suspension write is pinned deterministically by the in-module
+/// `set_waiting_with_cancel_requested_finishes_cancelled` test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_during_in_flight_ask_reply_cancels_the_run() {
+    let env = setup(&[&COUNTER]).await;
+    env.fake.delay(Duration::from_secs(3));
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_ask",
+        "ask",
+        &serde_json::json!({"question": "continue?"}),
+    );
+    env.fake.chat_completion(models::DEFAULT, "never reached");
+    let run = durable::start(&env.state, "counter", "go")
+        .await
+        .expect("start");
+
+    // A real worker, but with a reclaim window comfortably larger than the
+    // 3s in-flight reply: the default test worker's 150ms reclaim would
+    // re-claim (and charge) the job while its handler is legitimately
+    // parked on the delayed reply.
+    let token = CancellationToken::new();
+    let worker = tokio::spawn(job_worker(
+        env.state.clone(),
+        Jobs,
+        Duration::from_millis(10),
+        20,
+        token.clone(),
+        JobWorkerConfig {
+            heartbeat_interval: Duration::from_millis(100),
+            reclaim_window: Duration::from_secs(10),
+            shutdown_drain_timeout: Duration::from_secs(2),
+            idle_poll_gate: None,
+        },
+    ));
+    wait_until(|| async { (env.fake.requests().len() == 1).then_some(()) }).await;
+    durable::cancel(&env.state, run)
+        .await
+        .expect("cancel while the ask reply is in flight returns Ok");
+    wait_until(|| async {
+        let status = status_of(&env.db, run).await;
+        (status == RunStatus::Cancelled).then_some(status)
+    })
+    .await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _ = worker.await;
+    })
+    .await
+    .expect("worker exited");
+
+    let view = view_of(&env.db, run).await;
+    assert_eq!(view.status, RunStatus::Cancelled);
+    assert_eq!(view.error.as_deref(), Some("cancelled by request"));
+    assert_eq!(view.pending_ask, None, "pending columns cleared");
+    assert_eq!(jobs_for(&env.db, run).await, 0, "no job remains");
+    // The transcript keeps everything committed before the cancel: rig
+    // exposes the reply's assistant message to `messages()` only at the
+    // next `next_step`, so the post-response persist boundary — where this
+    // cancel is caught — has exactly the pre-call projection. The turn and
+    // token counters DO carry the reply (it was processed), and the
+    // suspended-ask columns stay empty: the run never parked.
+    assert_eq!(view.turns, 1, "the reply was processed before cancelling");
+    let rows = transcript_rows(&env.db, run).await;
+    assert_eq!(rows.len(), 1, "committed transcript kept: {rows:?}");
+    assert_eq!(rows[0].1, "user");
+}
+
+// ---------------------------------------------------------------------------
 // 7. Limits
 // ---------------------------------------------------------------------------
 

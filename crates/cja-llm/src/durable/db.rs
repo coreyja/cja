@@ -244,8 +244,15 @@ pub(super) async fn persist_step(
 /// Transition `running` (owned by `me`) to `waiting`, recording the suspended
 /// ask relationally, clearing the lease, and projecting any not-yet-written
 /// transcript rows (rig commits a turn inside `next_step`, so the suspension
-/// is the first write after that commit) — one transaction. `false` = lease
-/// lost.
+/// is the first write after that commit) — one transaction. The
+/// `cancel_requested` check and the write are the SAME statement under the
+/// row lock (`FOR UPDATE`): a `cancel()` that commits between this
+/// attempt's last persist and this write can never slip through and park
+/// behind a question — the row finishes `cancelled` instead (pending
+/// columns cleared, transcript kept: the projected rows are inserted in
+/// the same transaction either way), exactly like a cancel noticed at a
+/// step boundary. `Ok(None)` = lease lost (nothing written);
+/// `Ok(Some(true))` = cancelled (never parked).
 pub(super) async fn set_waiting(
     db: &sqlx::PgPool,
     run_id: Uuid,
@@ -254,13 +261,24 @@ pub(super) async fn set_waiting(
     pending_call_id: &str,
     pending_question: &str,
     new_messages: &[(i64, String, serde_json::Value)],
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<Option<bool>> {
     let mut tx = db.begin().await?;
-    let rows = sqlx::query(
-        "UPDATE agent_runs
-         SET status = $3, run_state = $4, pending_call_id = $5, pending_question = $6,
-             locked_by = NULL, locked_at = NULL
-         WHERE id = $1 AND locked_by = $2 AND status = $7",
+    let parked = sqlx::query_scalar::<_, bool>(
+        "WITH decision AS (
+             SELECT id, cancel_requested FROM agent_runs
+             WHERE id = $1 AND locked_by = $2 AND status = $7
+             FOR UPDATE
+         )
+         UPDATE agent_runs r
+         SET status = CASE WHEN d.cancel_requested THEN $8 ELSE $3 END,
+             run_state = $4,
+             pending_call_id = CASE WHEN d.cancel_requested THEN NULL ELSE $5 END,
+             pending_question = CASE WHEN d.cancel_requested THEN NULL ELSE $6 END,
+             locked_by = NULL, locked_at = NULL,
+             finished_at = CASE WHEN d.cancel_requested THEN NOW() ELSE r.finished_at END
+         FROM decision d
+         WHERE r.id = d.id
+         RETURNING d.cancel_requested",
     )
     .bind(run_id)
     .bind(me)
@@ -269,16 +287,16 @@ pub(super) async fn set_waiting(
     .bind(pending_call_id)
     .bind(pending_question)
     .bind(RunStatus::Running.as_str())
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if rows == 0 {
+    .bind(RunStatus::Cancelled.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(cancelled) = parked else {
         tx.rollback().await?;
-        return Ok(false);
-    }
+        return Ok(None);
+    };
     insert_messages(&mut tx, run_id, new_messages).await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Some(cancelled))
 }
 
 /// Transition `running` (owned by `me`) to a terminal status, recording the
@@ -762,6 +780,79 @@ mod tests {
             current_status(&db, id).await.expect("row"),
             Some("running".to_owned())
         );
+    }
+
+    /// A `cancel()` that lands between the attempt's last persist and the
+    /// suspension write must never be parked behind the question:
+    /// `set_waiting` checks `cancel_requested` under the row lock and
+    /// finishes the run `cancelled` (pending columns cleared) instead.
+    /// This is the deterministic pin for that race — end-to-end, the
+    /// cancel is usually caught one persist earlier, so this in-module
+    /// test is what discriminates.
+    #[tokio::test]
+    async fn set_waiting_with_cancel_requested_finishes_cancelled() {
+        let db = test_db().await;
+        let id = insert_run(&db, "running").await;
+        sqlx::query("UPDATE agent_runs SET locked_by = 'me', locked_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .expect("lease");
+        sqlx::query("UPDATE agent_runs SET cancel_requested = TRUE WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .expect("cancel requested");
+
+        let outcome = set_waiting(
+            &db,
+            id,
+            "me",
+            &serde_json::json!({}),
+            "call_1",
+            "the question?",
+            &[],
+        )
+        .await
+        .expect("suspension write");
+        assert_eq!(outcome, Some(true), "cancel wins over parking");
+        let (status, pending_call, pending_question, locked_by): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, pending_call_id, pending_question, locked_by FROM agent_runs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .expect("row");
+        assert_eq!(status, "cancelled", "never parked in waiting");
+        assert_eq!(pending_call, None, "pending columns cleared");
+        assert_eq!(pending_question, None, "pending columns cleared");
+        assert_eq!(locked_by, None, "lease cleared");
+
+        // The healthy path still parks.
+        let healthy = insert_run(&db, "running").await;
+        sqlx::query("UPDATE agent_runs SET locked_by = 'me', locked_at = NOW() WHERE id = $1")
+            .bind(healthy)
+            .execute(&db)
+            .await
+            .expect("lease");
+        let outcome = set_waiting(
+            &db,
+            healthy,
+            "me",
+            &serde_json::json!({}),
+            "call_2",
+            "another question?",
+            &[],
+        )
+        .await
+        .expect("suspension write");
+        assert_eq!(outcome, Some(false), "no cancel: parks in waiting");
+        assert_eq!(status_of(&db, healthy).await, "waiting");
     }
 
     /// `waiting -> cancelled` without clearing both pending columns violates

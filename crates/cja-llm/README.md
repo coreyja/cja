@@ -288,8 +288,11 @@ a path must enqueue.
 - **User `cancel(run_id)`** marks a queued/waiting run (or a `running` run
   under a dead lease — the orphaned-run escape hatch) `cancelled` directly;
   a live `running` run is flagged and its owner marks it `cancelled` at the
-  next step boundary. The transcript is preserved in every case. Cancelling
-  an already-`cancelled` run is `Ok`; other terminal statuses are rejected.
+  next step boundary — including the suspension write, which checks
+  `cancel_requested` under the row lock and finishes `cancelled` instead of
+  parking the question: a cancel is never lost behind an unanswered ask.
+  The transcript is preserved in every case. Cancelling an
+  already-`cancelled` run is `Ok`; other terminal statuses are rejected.
 - **Deploy shutdown never terminates a run.** The worker's shutdown token
   aborts the in-flight step and releases the run lease within cja's
   `shutdown_drain_timeout` (default 2s; keep any custom drain ≥ the 1s

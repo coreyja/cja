@@ -1142,8 +1142,10 @@ impl Attempt<'_> {
             }
             Ok(Ok(wrote)) => wrote,
         };
-        // `false` = lease lost: the thief continues the run; either way this
-        // attempt may not write again. A suspension always ends the attempt.
+        // `None` = lease lost (the thief continues the run), `Some(true)` =
+        // cancelled by request (never parked behind the question): either
+        // way this attempt may not write again, and a suspension always
+        // ends the attempt.
         let _ = wrote;
         StepOutcome::Done
     }
