@@ -835,7 +835,14 @@ mod tracing_tests {
         let writer = capture();
 
         let fake = FakeGateway::start().await;
-        let llm = Llm::new(&test_config(fake.url())).unwrap();
+        // A distinct app name: the capture buffer is global and tests run
+        // in parallel, so this test's completion events must be
+        // attributable — other tests' `app=fake-test` events land in the
+        // same buffer and would otherwise break the one-event-per-call
+        // count below.
+        let app = "tracing-test";
+        let app_field = format!("app={app}");
+        let llm = Llm::new(&test_config(fake.url()).app_name(app)).unwrap();
 
         // (1) An agent tool round-trip with a sentinel in every content
         // position: preamble, prompt, tool arguments, tool result, reply.
@@ -910,10 +917,12 @@ mod tracing_tests {
         // Exactly one completion event per HTTP call, and the asserted
         // fields come from cja-llm's own event — target `cja_llm::http`
         // on the same line — so rig's `gen_ai.usage.*` fields on other
-        // lines cannot satisfy these assertions.
+        // lines cannot satisfy these assertions. Filtering on this
+        // test's app name keeps the count exact despite the global
+        // capture and parallel tests.
         let finished: Vec<&str> = checked
             .lines()
-            .filter(|line| line.contains("gateway http call finished"))
+            .filter(|line| line.contains("gateway http call finished") && line.contains(&app_field))
             .collect();
         assert_eq!(
             finished.len(),
@@ -925,7 +934,7 @@ mod tracing_tests {
                 line.contains("cja_llm::http"),
                 "cja-llm's own event: {line}"
             );
-            assert!(line.contains("app=fake-test"), "the app name: {line}");
+            assert!(line.contains(&app_field), "the app name: {line}");
             assert!(
                 line.contains("model=anthropic/claude-haiku-5-5"),
                 "the model: {line}"
