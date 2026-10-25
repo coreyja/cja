@@ -485,6 +485,17 @@ impl fmt::Debug for Refresher {
 }
 
 impl Refresher {
+    /// The in-process tailnet node this refresher keeps alive, when the store
+    /// joined one ([`Transport::Tailnet`]). Borrow it for other tailnet
+    /// clients (e.g. `cja-llm`'s `LlmConfig::tailnet`) instead of joining a
+    /// second node. cja-secret owns the node's shutdown
+    /// ([`Refresher::run`](Self::run) leaves the tailnet on cancel);
+    /// borrowers must treat post-shutdown dial failures as expected.
+    #[cfg(feature = "tailnet")]
+    pub fn tailnet(&self) -> Option<std::sync::Arc<cja_tailnet::Tailnet>> {
+        self.inner.tailnet.clone()
+    }
+
     /// Refreshes every `poll_interval` until `shutdown` is cancelled. Shaped
     /// for `Supervisor::spawn`; it only returns once shutdown starts. With
     /// [`Transport::Tailnet`] it then leaves the tailnet, so the ephemeral node
@@ -717,5 +728,36 @@ impl<T: FromSecret> Tracked for Entry<T> {
 
     fn mark_checked(&self, at: Instant) {
         *self.checked_at.lock().expect("checked_at lock") = at;
+    }
+}
+
+#[cfg(all(test, feature = "tailnet"))]
+mod tailnet_accessor_tests {
+    use super::*;
+
+    /// `Refresher::tailnet` lends the joined node to other tailnet clients
+    /// (e.g. cja-llm) instead of each crate joining its own. Without a join
+    /// there is nothing to lend; building the `Some` path needs a real
+    /// tailnet join, so this checks the accessor's contract on the `None`
+    /// side and its handle type.
+    #[test]
+    fn tailnet_is_none_without_a_joined_node() {
+        let refresher = Refresher {
+            inner: Arc::new(RefresherInner {
+                source: Arc::new(Source::Setec(
+                    setec::Client::new(
+                        Url::parse("https://setec.example.ts.net").unwrap(),
+                        Arc::new(setec::TcpDialer),
+                    )
+                    .unwrap(),
+                )),
+                poll_interval: DEFAULT_POLL_INTERVAL,
+                tracked: Vec::new(),
+                tailnet: None,
+            }),
+        };
+        assert!(refresher.tailnet().is_none());
+        let borrowed = refresher.tailnet();
+        let _cheap_clone: Option<std::sync::Arc<cja_tailnet::Tailnet>> = borrowed.clone();
     }
 }

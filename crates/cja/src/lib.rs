@@ -124,7 +124,7 @@
 //! | `SERVER_DISABLED` | No | `false` | Set to `"true"` to skip starting the HTTP server |
 //! | `JOBS_DISABLED` | No | `false` | Set to `"true"` to skip starting the job worker |
 //! | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |
-//! | `RUST_LOG` | No | `info` | Tracing filter directive |
+//! | `RUST_LOG` | No | `info` | Tracing filter directive. rig's content-bearing targets are always capped: `rig::completions`/`rig::streaming` at DEBUG, `rig_agent::agent::typed` at ERROR |
 //! | `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `2` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked |
 //! | `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `2` | Extra time for tasks to exit after the job drain. Drain + grace must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default) |
 //! | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
