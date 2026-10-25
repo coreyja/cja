@@ -556,8 +556,8 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
-    struct Answer {
-        answer: u32,
+    pub(crate) struct Answer {
+        pub(crate) answer: u32,
     }
 
     #[tokio::test]
@@ -700,7 +700,7 @@ mod tracing_tests {
     use tracing_subscriber::fmt::MakeWriter;
     use tracing_subscriber::fmt::format::FmtSpan;
 
-    use super::tests::Echo;
+    use super::tests::{Answer, Echo};
     use super::*;
     use crate::testing::{FakeGateway, Ran, test_config};
 
@@ -711,6 +711,7 @@ mod tracing_tests {
     const SENTINEL_REPLY: &str = "SENTINEL-REPLY-8c9d";
     const SENTINEL_COMPLETE: &str = "SENTINEL-COMPLETE-1a2b";
     const SENTINEL_STREAM: &str = "SENTINEL-STREAM-3c4d";
+    const SENTINEL_EXTRACT: &str = "SENTINEL-EXTRACT-5e6f";
 
     /// A `MakeWriter` capturing everything the subscriber prints into a
     /// shared buffer.
@@ -829,28 +830,64 @@ mod tracing_tests {
             .concat();
         assert_eq!(joined, SENTINEL_STREAM);
 
-        let text = writer.text();
+        // (4) extract(), against a JSON reply carrying its own sentinel.
+        fake.chat_json(
+            MODEL,
+            &serde_json::json!({ "answer": 42, "note": SENTINEL_EXTRACT }),
+        );
+        let answer: Answer = llm.extract(MODEL, SENTINEL_PROMPT).await.unwrap();
+        assert_eq!(answer.answer, 42);
 
-        // Positive assertions: the capture works and the metadata is there.
+        let text = writer.text();
+        // Every positive assertion runs on `checked` — the capture after
+        // dropping rig's raw-wire TRACE records — so none of them can be
+        // satisfied by the very records the strip removes.
+        let checked = strip_raw_wire_trace_records(&text);
+
+        // Positive assertions: the capture works and the metadata is
+        // there, from cja-llm's own records.
+        //
+        // Agent runs open rig's `rig::agent_chat` span (rig-agent-0.45.0
+        // src/agent/telemetry.rs:15: `completion_parent_span!(target:
+        // "rig::agent_chat", ..)`) — the span an agent run actually
+        // opens, unlike the TRACE wire dumps on `rig::completions` that
+        // the strip removes. Its lifecycle line proves rig's telemetry
+        // was captured at all.
         assert!(
-            text.contains("rig::completions"),
-            "rig's chat span; capture {} bytes, {} lines; head: {}",
-            text.len(),
-            text.lines().count(),
-            text.lines().take(3).collect::<Vec<_>>().join(" | ")
+            checked.contains(" rig::agent_chat: new")
+                || checked.contains(" rig::agent_chat: close"),
+            "rig's agent-chat span lifecycle line; capture {} bytes, {} lines; head: {}",
+            checked.len(),
+            checked.lines().count(),
+            checked.lines().take(3).collect::<Vec<_>>().join(" | ")
         );
-        assert!(text.contains("cja_llm.http"), "cja-llm's transport span");
-        assert!(text.contains("app=fake-test"), "the app name on the span");
-        assert!(
-            text.contains("model=anthropic/claude-haiku-5-5"),
-            "the model on the span: {}",
-            text.lines().take(5).collect::<Vec<_>>().join("\n")
+        // Exactly one completion event per HTTP call, and the asserted
+        // fields come from cja-llm's own event — target `cja_llm::http`
+        // on the same line — so rig's `gen_ai.usage.*` fields on other
+        // lines cannot satisfy these assertions.
+        let finished: Vec<&str> = checked
+            .lines()
+            .filter(|line| line.contains("gateway http call finished"))
+            .collect();
+        assert_eq!(
+            finished.len(),
+            fake.requests().len(),
+            "exactly one completion event per HTTP call"
         );
-        assert!(text.contains("status=200"), "the recorded status");
-        assert!(
-            text.contains("input_tokens=3") && text.contains("output_tokens=2"),
-            "token counts on the span and the completion event"
-        );
+        for line in &finished {
+            assert!(
+                line.contains("cja_llm::http"),
+                "cja-llm's own event: {line}"
+            );
+            assert!(line.contains("app=fake-test"), "the app name: {line}");
+            assert!(
+                line.contains("model=anthropic/claude-haiku-5-5"),
+                "the model: {line}"
+            );
+            assert!(line.contains("status=200"), "the status: {line}");
+            assert!(line.contains("input_tokens=3"), "input tokens: {line}");
+            assert!(line.contains("output_tokens=2"), "output tokens: {line}");
+        }
 
         // Negative assertion: no content sentinel anywhere except rig's
         // raw-wire TRACE dumps. rig 0.45 unconditionally logs the whole
@@ -859,9 +896,9 @@ mod tracing_tests {
         // (`providers::internal::trace_json`) — wire debugging, not GenAI
         // telemetry, and nothing a library can gate from inside. Every
         // span and every other event stays in the capture, so flipping the
-        // content-telemetry gate still fails this test; the README tells
-        // apps to keep those two targets below TRACE.
-        let checked = strip_raw_wire_trace_records(&text);
+        // content-telemetry gate still fails this test; cja's tracing
+        // setup caps those targets in production (see `cja::setup`), and
+        // the README tells apps with their own subscriber to do the same.
         for sentinel in [
             SENTINEL_PREAMBLE,
             SENTINEL_PROMPT,
@@ -869,6 +906,7 @@ mod tracing_tests {
             SENTINEL_REPLY,
             SENTINEL_COMPLETE,
             SENTINEL_STREAM,
+            SENTINEL_EXTRACT,
         ] {
             assert!(
                 !checked.contains(sentinel),
