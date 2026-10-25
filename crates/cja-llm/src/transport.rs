@@ -253,17 +253,16 @@ fn build_request(
     inner: &Inner,
     parts: &http::request::Parts,
     body: Bytes,
-) -> Result<http::Request<Full<Bytes>>, HttpError> {
+) -> Result<http::Request<Full<Bytes>>, http::Error> {
     let path_and_query = parts
         .uri
         .path_and_query()
-        .map(|pq| pq.as_str().to_owned())
-        .unwrap_or_else(|| "/".to_owned());
+        .map_or_else(|| "/".to_owned(), |pq| pq.as_str().to_owned());
     let mut builder = http::Request::builder()
         .method(parts.method.clone())
         .uri(path_and_query)
         .version(parts.version);
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         if STRIPPED_HEADERS.contains(&name.as_str()) {
             continue;
         }
@@ -272,7 +271,7 @@ fn build_request(
     builder = builder
         .header(http::header::HOST, &inner.host_header)
         .header(http::header::USER_AGENT, &inner.user_agent);
-    builder.body(Full::new(body)).map_err(HttpError::from)
+    builder.body(Full::new(body))
 }
 
 /// Dial + TLS + HTTP/1 handshake + driver spawn, bounded by the connect
@@ -382,12 +381,11 @@ fn into_boxed_stream(
         ended: bool,
     }
 
-    fn next_item(
-        mut state: StreamState,
-        idle_timeout: Duration,
-    ) -> std::pin::Pin<
+    type NextItem = std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<(HttpResult<Bytes>, StreamState)>> + Send>,
-    > {
+    >;
+
+    fn next_item(mut state: StreamState, idle_timeout: Duration) -> NextItem {
         Box::pin(async move {
             loop {
                 if state.ended {
@@ -402,8 +400,9 @@ fn into_boxed_stream(
                             }
                             return Some((Ok(bytes), state));
                         }
-                        // Trailers and other non-data frames never reach rig.
-                        Err(_frame) => continue,
+                        // Trailers and other non-data frames never reach
+                        // rig.
+                        Err(_frame) => {}
                     },
                     Ok(Some(Err(error))) => {
                         state.ended = true;
@@ -536,6 +535,10 @@ impl AttemptResult {
 /// send (terminal once queued), status classification (429/5xx and the
 /// once-only stale-key retry retry; 402, the wrapper 403s, and every other
 /// 4xx do not), all under one total deadline that also caps the backoff.
+#[expect(
+    clippy::result_large_err,
+    reason = "rig's HttpClientExt fixes the error type"
+)]
 async fn run_loop(
     inner: Arc<Inner>,
     parts: http::request::Parts,
@@ -611,7 +614,6 @@ async fn run_loop(
 /// `try_send_request`, so a queue reject is distinguishable from a
 /// post-queue failure), then either buffer the body, hand back a live
 /// stream, or classify a non-success status.
-#[expect(clippy::too_many_arguments, reason = "attempt state the loop owns")]
 async fn run_attempt(
     inner: &Inner,
     parts: &http::request::Parts,
@@ -645,44 +647,15 @@ async fn run_attempt(
         Err(error) => {
             drop(sender);
             return AttemptResult::Terminal {
-                error,
+                error: HttpError::from(error),
                 data: data_no_status(None),
             };
         }
     };
 
-    // try_send_request's future resolves with the response head, a protocol
-    // error after the request was queued (`message()` is None), or a queue
-    // reject with the request recovered (`message()` is Some) — the one
-    // post-handshake failure that may be retried.
-    let response = match tokio::time::timeout_at(deadline, sender.try_send_request(request)).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(e)) => {
-            let recovered = should_retry_queue_reject(e.message());
-            let error = HttpError::instance(std::io::Error::other(e.into_error()));
-            drop(sender);
-            let data = data_no_status(None);
-            return if recovered {
-                // Queue reject with the request recovered: hyper's documented
-                // "never fully sent" guarantee — nothing to bill.
-                AttemptResult::Retry {
-                    error,
-                    retry_after: None,
-                    stale_key: false,
-                    data,
-                }
-            } else {
-                // Queued, maybe written: the gateway may bill it.
-                AttemptResult::Terminal { error, data }
-            };
-        }
-        Err(_elapsed) => {
-            drop(sender);
-            return AttemptResult::Terminal {
-                error: HttpError::instance(TransportError::Timeout(inner.request_timeout)),
-                data: data_no_status(None),
-            };
-        }
+    let response = match send_and_await(inner, &mut sender, request, deadline).await {
+        Ok(response) => response,
+        Err(result) => return result,
     };
 
     let status = response.status();
@@ -706,6 +679,31 @@ async fn run_attempt(
         );
     }
 
+    finish_success(
+        inner, mode, response, sender, driver, deadline, status, started, span,
+    )
+    .await
+}
+
+/// The success half of an attempt: buffer the body (unary) under the
+/// deadline, or hand the live stream back (streaming).
+#[expect(clippy::too_many_arguments, reason = "attempt state run_attempt owns")]
+async fn finish_success(
+    inner: &Inner,
+    mode: Mode,
+    response: http::Response<Incoming>,
+    sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    driver: AbortOnDrop,
+    deadline: tokio::time::Instant,
+    status: http::StatusCode,
+    started: std::time::Instant,
+    span: tracing::Span,
+) -> AttemptResult {
+    let data = AttemptData {
+        status: Some(status.as_u16()),
+        latency: started.elapsed(),
+        usage: None,
+    };
     match mode {
         Mode::Unary => {
             let (response_parts, incoming) = response.into_parts();
@@ -731,14 +729,14 @@ async fn run_attempt(
                     drop(sender);
                     AttemptResult::Terminal {
                         error: HttpError::instance(error),
-                        data: data_with_status,
+                        data,
                     }
                 }
                 Err(_elapsed) => {
                     drop(sender);
                     AttemptResult::Terminal {
                         error: HttpError::instance(TransportError::Timeout(inner.request_timeout)),
-                        data: data_with_status,
+                        data,
                     }
                 }
             }
@@ -752,9 +750,58 @@ async fn run_attempt(
                     inner.stream_idle_timeout,
                     span,
                 )),
-                data: data_with_status,
+                data,
             }
         }
+    }
+}
+
+/// Queues the request and awaits the response head. `try_send_request`'s
+/// future resolves with the head, a protocol error after the request was
+/// queued (`message()` is None — terminal, the gateway may bill it), or a
+/// queue reject with the request recovered (`message()` is Some — the one
+/// post-handshake failure that may be retried).
+#[expect(
+    clippy::result_large_err,
+    reason = "rig's HttpClientExt fixes the error type"
+)]
+async fn send_and_await(
+    inner: &Inner,
+    sender: &mut hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+    request: http::Request<Full<Bytes>>,
+    deadline: tokio::time::Instant,
+) -> Result<http::Response<Incoming>, AttemptResult> {
+    let data = || AttemptData {
+        status: None,
+        latency: std::time::Duration::ZERO,
+        usage: None,
+    };
+    match tokio::time::timeout_at(deadline, sender.try_send_request(request)).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => {
+            let recovered = should_retry_queue_reject(e.message());
+            let error = HttpError::instance(std::io::Error::other(e.into_error()));
+            Err(if recovered {
+                // Queue reject with the request recovered: hyper's documented
+                // "never fully sent" guarantee — nothing to bill.
+                AttemptResult::Retry {
+                    error,
+                    retry_after: None,
+                    stale_key: false,
+                    data: data(),
+                }
+            } else {
+                // Queued, maybe written: the gateway may bill it.
+                AttemptResult::Terminal {
+                    error,
+                    data: data(),
+                }
+            })
+        }
+        Err(_elapsed) => Err(AttemptResult::Terminal {
+            error: HttpError::instance(TransportError::Timeout(inner.request_timeout)),
+            data: data(),
+        }),
     }
 }
 
@@ -851,8 +898,8 @@ fn record_completion(span: &tracing::Span, data: &AttemptData) {
             target: "cja_llm::http",
             status = status.unwrap_or(0),
             latency_ms,
-            input_tokens = usage.map(|usage| usage.0).unwrap_or(0),
-            output_tokens = usage.map(|usage| usage.1).unwrap_or(0),
+            input_tokens = usage.map_or(0, |usage| usage.0),
+            output_tokens = usage.map_or(0, |usage| usage.1),
             "gateway http call finished"
         );
     });

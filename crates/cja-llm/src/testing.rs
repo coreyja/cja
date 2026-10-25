@@ -1,7 +1,7 @@
-//! Fake gateway for tests: an in-process scripted OpenAI chat-completions
+//! Fake gateway for tests: an in-process scripted `OpenAI` chat-completions
 //! server.
 //!
-//! Requests flow through a real HTTP server (hyper, loopback) and are meant
+//! Requests flow through a real HTTP server (`hyper`, loopback) and are meant
 //! to be driven through the real [`crate::transport`] over the host dialer,
 //! so header stripping, staged retries, timeouts, and SSE parsing behave
 //! exactly as they do against the live gateway — with no network, gateway,
@@ -24,7 +24,7 @@
 //!     .connect_timeout(Duration::from_millis(250))
 //!     .request_timeout(Duration::from_millis(250))
 //!     .retries(RetryPolicy { max_attempts: 3, initial_backoff: Duration::from_millis(10), ..RetryPolicy::default() });
-//! let llm = Llm::new(config)?;
+//! let llm = Llm::new(&config)?;
 //! let text = llm.complete(cja_llm::models::DEFAULT, "hi").await?;
 //! # Ok(())
 //! # }
@@ -185,7 +185,7 @@ impl FakeGateway {
 
     /// Scripts a 200 whose content is `json` serialized to a string — the
     /// shape structured-output extraction parses.
-    pub fn chat_json(&self, model: &str, json: serde_json::Value) {
+    pub fn chat_json(&self, model: &str, json: &serde_json::Value) {
         self.chat_completion(model, &json.to_string());
     }
 
@@ -215,7 +215,7 @@ impl FakeGateway {
 
     /// Scripts a 200 whose assistant message is a single tool call, with
     /// `finish_reason: "tool_calls"`.
-    pub fn tool_call(&self, model: &str, call_id: &str, name: &str, args: serde_json::Value) {
+    pub fn tool_call(&self, model: &str, call_id: &str, name: &str, args: &serde_json::Value) {
         let body = serde_json::json!({
             "id": "fake",
             "object": "chat.completion",
@@ -409,7 +409,7 @@ async fn serve(stream: tokio::net::TcpStream, shared: Arc<Shared>) {
                 tracing::debug!(%error, "fake gateway connection ended with an error");
             }
         }
-        _ = kill.notified() => {
+        () = kill.notified() => {
             // Dropping the connection closes the socket without a reply.
         }
     }
@@ -469,30 +469,31 @@ impl setec::Dialer for CountingDialer {
     }
 }
 
+/// A config pointing at `url` with the tiny timeouts the crate's fake-gateway
+/// tests use. Test-only, shared across this crate's test modules.
+#[cfg(test)]
+pub(crate) fn test_config(url: Url) -> crate::LlmConfig {
+    crate::LlmConfig::new(url)
+        .app_name("fake-test")
+        .connect_timeout(Duration::from_millis(250))
+        .request_timeout(Duration::from_millis(2000))
+        .stream_idle_timeout(Duration::from_millis(250))
+        .retries(crate::config::RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(10),
+            ..crate::config::RetryPolicy::default()
+        })
+        .dialer(Arc::new(setec::TcpDialer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::GatewayHttp;
-    use crate::{DialerChoice, LlmConfig};
+
     use rig_core::http_client::HttpClientExt as _;
 
-    fn test_config(url: Url) -> LlmConfig {
-        LlmConfig::new(url)
-            .app_name("fake-test")
-            .connect_timeout(Duration::from_millis(250))
-            .request_timeout(Duration::from_millis(2000))
-            .stream_idle_timeout(Duration::from_millis(250))
-            .retries(crate::config::RetryPolicy {
-                max_attempts: 3,
-                initial_backoff: Duration::from_millis(10),
-                ..crate::config::RetryPolicy::default()
-            })
-            .dialer(Arc::new(setec::TcpDialer))
-    }
-
     /// The raw transport round-trips a request against the fake: no
-    /// key-shaped header leaves the process, the wire path is exact, and
-    /// status + body come back intact.
     #[tokio::test]
     async fn raw_transport_round_trips_against_the_fake() {
         let fake = FakeGateway::start().await;
@@ -566,11 +567,30 @@ mod tests {
         let request = http::Request::post("/v1/chat/completions")
             .body(Bytes::from_static(b"{}"))
             .unwrap();
-        let error = match http.send::<_, Bytes>(request).await {
-            Err(error) => error,
-            Ok(_) => panic!("the refusing dialer must fail"),
+        let Err(error) = http.send::<_, Bytes>(request).await else {
+            panic!("the refusing dialer must fail");
         };
         assert!(error.to_string().contains("cja-llm transport connect:"));
         assert_eq!(dialer.dials(), 3, "every attempt dials once");
+    }
+}
+
+#[cfg(test)]
+mod smoke {
+    use super::*;
+    use crate::{Llm, models};
+
+    #[tokio::test]
+    async fn llm_complete_round_trips_through_the_middleware() {
+        let fake = FakeGateway::start().await;
+        fake.chat_completion(models::DEFAULT, "pong");
+        let config = test_config(fake.url());
+        let llm = Llm::new(&config).unwrap();
+        let text = llm.complete(models::DEFAULT, "ping").await.unwrap();
+        assert_eq!(text, "pong");
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("x-app").is_some());
+        assert!(requests[0].headers.get("authorization").is_none());
     }
 }

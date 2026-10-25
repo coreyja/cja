@@ -190,30 +190,35 @@ impl LlmConfig {
     }
 
     /// Override the `X-App` value.
+    #[must_use]
     pub fn app_name(mut self, app_name: impl Into<String>) -> Self {
         self.app_name = app_name.into();
         self
     }
 
     /// Override the per-attempt connect budget (dial + TLS + handshake).
+    #[must_use]
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
     /// Override the total request deadline.
+    #[must_use]
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
     }
 
     /// Override the per-chunk stream idle timeout.
+    #[must_use]
     pub fn stream_idle_timeout(mut self, timeout: Duration) -> Self {
         self.stream_idle_timeout = timeout;
         self
     }
 
     /// Override the retry policy.
+    #[must_use]
     pub fn retries(mut self, retries: RetryPolicy) -> Self {
         self.retries = retries;
         self
@@ -221,12 +226,14 @@ impl LlmConfig {
 
     /// Dial through an already-joined in-process tailnet node.
     #[cfg(feature = "tailnet")]
+    #[must_use]
     pub fn tailnet(mut self, tailnet: Arc<cja_tailnet::Tailnet>) -> Self {
         self.dialer = DialerChoice::Tailnet(tailnet);
         self
     }
 
     /// Dial through a custom [`setec::Dialer`].
+    #[must_use]
     pub fn dialer(mut self, dialer: Arc<dyn setec::Dialer>) -> Self {
         self.dialer = DialerChoice::Custom(dialer);
         self
@@ -267,7 +274,7 @@ mod tests {
         assert_eq!(config.stream_idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT);
         assert_eq!(config.retries.max_attempts, 3);
         assert!(matches!(config.dialer, DialerChoice::Host));
-        assert!(!config.app_name.is_empty());
+        assert_ne!(config.app_name, "");
     }
 
     #[test]
@@ -305,7 +312,7 @@ mod tests {
 
         // Neither set: the executable's file stem, never empty.
         let config = LlmConfig::from_lookup(lookup(&[])).unwrap();
-        assert!(!config.app_name.is_empty());
+        assert_ne!(config.app_name, "");
 
         // An explicitly empty CJA_LLM_APP is rejected, not silently defaulted.
         let err = LlmConfig::from_lookup(lookup(&[("CJA_LLM_APP", "")])).unwrap_err();
