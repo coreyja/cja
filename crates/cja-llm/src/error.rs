@@ -169,8 +169,12 @@ pub enum Error {
     /// determined"}`: tailnet `WhoIs` failed, so no upstream call was made.
     /// Check the tailnet policy grant that lets this node reach `llm:443`
     /// (e.g. a grant to `tag:llm` on port 443).
+    ///
+    /// `body` is deliberately not interpolated here: the classifier only
+    /// checks the fixed `error` field, so any other field in the reply
+    /// body (server-controlled text) must not reach `Display`.
     #[error(
-        "gateway could not identify this node's tailnet identity; check the tailnet policy grant that lets this node reach llm:443 (e.g. a grant to tag:llm on port 443): {body}"
+        "gateway could not identify this node's tailnet identity; check the tailnet policy grant that lets this node reach llm:443 (e.g. a grant to tag:llm on port 443)"
     )]
     IdentityRejected {
         /// The gateway's reply body.
@@ -191,7 +195,11 @@ pub enum Error {
     },
     /// Gateway `403 {"error":"admin only"}` — a programming error (wrong
     /// route); cja-llm only uses `POST /v1/chat/completions`.
-    #[error("admin-only gateway route; cja-llm only uses POST /v1/chat/completions: {body}")]
+    ///
+    /// `body` is deliberately not interpolated here: the classifier only
+    /// checks the fixed `error` field, so any other field in the reply
+    /// body (server-controlled text) must not reach `Display`.
+    #[error("admin-only gateway route; cja-llm only uses POST /v1/chat/completions")]
     AdminOnly {
         /// The gateway's reply body.
         body: String,
@@ -717,23 +725,33 @@ mod tests {
     /// Mutation-checked: restoring `#[source] source: Box<PromptError>` on
     /// `Upstream` fails this test (the chain-walk link's `Display` prints
     /// the reply body). See the commit that introduced it.
+    /// No `Display` or `Debug` of any link of the error's `source()` chain
+    /// contains the sentinel.
+    fn assert_chain_is_sanitized(error: &Error) {
+        let mut current: Option<&dyn std::error::Error> = Some(error);
+        while let Some(link) = current {
+            assert!(
+                !link.to_string().contains(DEBUG_SENTINEL),
+                "Display leaked: {link}"
+            );
+            assert!(
+                !format!("{link:?}").contains(DEBUG_SENTINEL),
+                "Debug leaked: {link:?}"
+            );
+            current = link.source();
+        }
+    }
+
+    /// `color_eyre`'s report — which walks the source chain — is sentinel-free.
+    fn assert_color_eyre_sanitized(error: Error) {
+        assert!(
+            !format!("{:?}", color_eyre::Report::from(error)).contains(DEBUG_SENTINEL),
+            "color_eyre leaked"
+        );
+    }
+
     #[test]
     fn debug_and_display_never_print_content() {
-        fn assert_chain_is_sanitized(error: &Error) {
-            let mut current: Option<&dyn std::error::Error> = Some(error);
-            while let Some(link) = current {
-                assert!(
-                    !link.to_string().contains(DEBUG_SENTINEL),
-                    "Display leaked: {link}"
-                );
-                assert!(
-                    !format!("{link:?}").contains(DEBUG_SENTINEL),
-                    "Debug leaked: {link:?}"
-                );
-                current = link.source();
-            }
-        }
-
         // SchemaParse: raw = the model's output text, error = a real type
         // mismatch whose Display carries the sentinel value fragment.
         let output = format!(r#"{{"n":"{DEBUG_SENTINEL}"}}"#);
@@ -821,5 +839,63 @@ mod tests {
             !format!("{:?}", color_eyre::Report::from(error)).contains(DEBUG_SENTINEL),
             "color_eyre leaked"
         );
+    }
+
+    /// `IdentityRejected` and `AdminOnly` classify from a real 403 whose
+    /// body carries an extra `detail` field beyond the fixed `error`
+    /// string, and neither the body nor the detail reaches `Display`,
+    /// `Debug`, the source chain, or a `color_eyre` report. The body stays
+    /// in the field.
+    #[test]
+    fn identity_and_admin_only_display_never_print_the_body() {
+        // IdentityRejected.
+        let error = Error::from_prompt_error(provider_with_response(
+            403,
+            &format!(
+                "{{\"error\":\"forbidden: caller identity could not be determined\",\"detail\":\"{DEBUG_SENTINEL}\"}}"
+            ),
+        ));
+        let Error::IdentityRejected { body, .. } = &error else {
+            panic!("expected IdentityRejected, got {error:?}");
+        };
+        assert!(
+            body.contains(DEBUG_SENTINEL),
+            "the field still carries the body"
+        );
+        assert!(
+            error.prompt_error().is_some(),
+            "the original PromptError stays reachable"
+        );
+        assert!(
+            !error.to_string().contains("determined"),
+            "the body's error field must not reach Display: {error}"
+        );
+        assert!(!error.to_string().contains(DEBUG_SENTINEL), "{error}");
+        assert_chain_is_sanitized(&error);
+        assert_color_eyre_sanitized(error);
+
+        // AdminOnly.
+        let error = Error::from_prompt_error(provider_with_response(
+            403,
+            &format!("{{\"error\":\"admin only\",\"detail\":\"{DEBUG_SENTINEL}\"}}"),
+        ));
+        let Error::AdminOnly { body, .. } = &error else {
+            panic!("expected AdminOnly, got {error:?}");
+        };
+        assert!(
+            body.contains(DEBUG_SENTINEL),
+            "the field still carries the body"
+        );
+        assert!(
+            error.prompt_error().is_some(),
+            "the original PromptError stays reachable"
+        );
+        assert!(
+            !error.to_string().contains("admin only"),
+            "the body's error field must not reach Display: {error}"
+        );
+        assert!(!error.to_string().contains(DEBUG_SENTINEL), "{error}");
+        assert_chain_is_sanitized(&error);
+        assert_color_eyre_sanitized(error);
     }
 }
