@@ -262,7 +262,14 @@ async fn spawn_worker(
         token.clone(),
         JobWorkerConfig {
             heartbeat_interval: Duration::from_millis(50),
-            reclaim_window: Duration::from_millis(150),
+            // 20 heartbeats of slack, not cja's bare 3-heartbeat minimum:
+            // under full-suite load a 150ms window lets the worker reclaim
+            // its OWN in-flight job (charging an attempt and parking the
+            // run behind `Leased` backoff) — harness noise the tests do
+            // not intend to exercise, and in the retry-budget test an
+            // actual false `error_count` violation. No assertion depends
+            // on a short reclaim; nothing here recovers via reclaim.
+            reclaim_window: Duration::from_secs(1),
             shutdown_drain_timeout: Duration::ZERO,
             idle_poll_gate: None,
         },
