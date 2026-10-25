@@ -1208,6 +1208,69 @@ async fn identity_rejection_fails_the_run_with_gateway_reason() {
 }
 
 // ---------------------------------------------------------------------------
+// 8b. Gateway Timeout fails the run (no retry — double-billing guard)
+// ---------------------------------------------------------------------------
+
+/// A gateway request that outlives `request_timeout` is classified
+/// `Error::Timeout`, which is deliberately NON-retryable (the attempt may
+/// have been billed upstream; re-calling would double-bill and fork the
+/// transcript): the run fails immediately with the gateway reason and its
+/// detail, the job completes (row deleted, exactly one request), and no
+/// retry ever re-issues the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_timeout_fails_the_run_without_retry() {
+    let env = setup_full(&[&COUNTER], Duration::from_secs(90), |config| {
+        *config = config
+            .clone()
+            .request_timeout(Duration::from_millis(300))
+            .retries(RetryPolicy {
+                max_attempts: 1,
+                initial_backoff: Duration::from_millis(10),
+                ..RetryPolicy::default()
+            });
+    })
+    .await;
+    // The reply would land at 2s — far past the 300ms request timeout.
+    env.fake.delay(Duration::from_secs(2));
+    env.fake.chat_completion(models::DEFAULT, "too late");
+    let run = durable::start(&env.state, "counter", "x")
+        .await
+        .expect("start");
+
+    let (worker, token) = spawn_worker(&env.state, Duration::from_millis(10)).await;
+    wait_until(|| async {
+        let status = status_of(&env.db, run).await;
+        (status == RunStatus::Failed).then_some(status)
+    })
+    .await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _ = worker.await;
+    })
+    .await
+    .expect("worker exited");
+
+    let view = view_of(&env.db, run).await;
+    assert_eq!(view.status, RunStatus::Failed);
+    assert_eq!(view.fail_reason, Some(FailReason::Gateway));
+    assert!(
+        view.error.as_deref().unwrap_or("").contains("timed out"),
+        "the timeout detail is stored: {:?}",
+        view.error
+    );
+    assert_eq!(jobs_for(&env.db, run).await, 0, "job row gone: no retry");
+    assert_eq!(
+        env.fake.requests().len(),
+        1,
+        "the call was issued exactly once — never re-issued"
+    );
+    assert!(
+        !transcript_rows(&env.db, run).await.is_empty(),
+        "transcript kept"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 9. Retryable error and shutdown release the lease (the regression test)
 // ---------------------------------------------------------------------------
 

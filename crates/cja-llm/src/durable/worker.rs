@@ -1199,14 +1199,6 @@ impl Attempt<'_> {
                         // would delete the only job row while the run may
                         // still be `running` under our lease — an orphan.
                         // No further writes after this.
-                        // A heartbeat TIMEOUT is not proof of a lost lease
-                        // (e.g. an operator transaction holding the row
-                        // lock past WRITE_BOUND): error the attempt so the
-                        // caller routes it through `fail_retryable` (bounded
-                        // release + cja backoff). Completing the job here
-                        // would delete the only job row while the run may
-                        // still be `running` under our lease — an orphan.
-                        // No further writes after this.
                         Err(_) => {
                             return Err(cja::color_eyre::eyre::eyre!(
                                 "lease heartbeat timed out; ownership unproven",
