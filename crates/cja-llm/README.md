@@ -257,8 +257,16 @@ heartbeats every `lease_takeover / 3` (default 90s window, so 30s
 heartbeats) while a model call or tool runs. `lease_takeover` **must stay
 below cja's `reclaim_window`** (default 120s), or a legitimately retried
 job cannot re-claim its run after an ungraceful death. Every retryable
-error releases the lease before returning, so cja's backoff re-claims
-immediately. A duplicate job that finds the row leased by a live owner
+error releases the lease before returning. **Errors separated by progress
+never use up the retry budget**: an attempt that has committed at least
+one step (a model response or tool answer) and then hits a retryable
+error hands the run to a *fresh* `AdvanceRunJob` (release + enqueue in one
+transaction, then `Ok`), so cja deletes the errored row and the fresh row
+starts at `error_count = 0` — a long run that hits a transient blip per
+step never escalates the `2^(n+1)`s backoff and can never dead-letter its
+only job row. Zero-progress failures keep the plain `Err` path, so only
+*consecutive* failures escalate (first retry at ~2s). A duplicate job
+that finds the row leased by a live owner
 errors (backoff) instead of completing — it can never delete the job the
 live owner depends on. A worker that loses its lease mid-run stops
 silently; the current owner continues.
@@ -283,11 +291,14 @@ a path must enqueue.
   next step boundary. The transcript is preserved in every case. Cancelling
   an already-`cancelled` run is `Ok`; other terminal statuses are rejected.
 - **Deploy shutdown never terminates a run.** The worker's shutdown token
-  aborts the in-flight step, releases the run lease within cja's
+  aborts the in-flight step and releases the run lease within cja's
   `shutdown_drain_timeout` (default 2s; keep any custom drain ≥ the 1s
-  release bound), and errors the job attempt so cja retries at ~2s backoff;
-  the post-deploy worker claims the unleased row and resumes at the last
-  persist. If the handler is dropped anyway or the process is `SIGKILL`ed,
+  release bound). The run is then handed back the same way any retryable
+  error is: after persisted progress, via a fresh job row picked up
+  immediately; otherwise by erroring the job attempt so cja's backoff
+  retries it (first retry at ~2s). In both cases the post-deploy worker
+  claims the unleased row and resumes at the last persist. If the handler
+  is dropped anyway or the process is `SIGKILL`ed,
   recovery falls back to lease expiry (90s) / cja reclaim (~120s) — delayed,
   never lost.
 
@@ -298,8 +309,10 @@ default; exceeding one fails the run with `fail_reason` `turn_budget` /
 `token_budget`, transcript preserved. `fail_reason` values: `turn_budget`,
 `token_budget`, `unknown_kind`, `corrupt_state`, `gateway`, `protocol`.
 
-- **Retried by cja backoff** (lease released, job errors): connection
-  failures, 429, 5xx.
+- **Retried by cja backoff** (lease released, job errors — or, once the
+  attempt has persisted a step, re-enqueued on a fresh row with
+  `error_count = 0` so progress-separated blips never accumulate):
+  connection failures, 429, 5xx.
 - **Failed immediately** (job completes, no retry storm): gateway identity
   rejection, budget exceeded (HTTP 402), admin-only route, schema failures,
   timeouts (the attempt may have been billed; re-calling would double-bill
@@ -335,7 +348,8 @@ someone re-enqueues or `cancel()`s it.
 - **Ops sizing**: a long agent run occupies one worker slot for its
   duration — size worker count accordingly. Worst-case resume delay after
   an ungraceful death is cja's reclaim window (~120s), not the run lease;
-  after a graceful shutdown it is cja's retry backoff (~2s).
+  after a graceful shutdown it is ~2s (a fresh job row when the attempt
+  had made progress, otherwise cja's first backoff retry).
 - **Tool authority**: app tools run in-process with the app's full
   authority, driven by model output — file-style tools must validate paths
   (reject absolute and `..`); execution-style tools need a subprocess

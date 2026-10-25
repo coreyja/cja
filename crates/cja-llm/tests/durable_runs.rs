@@ -1110,6 +1110,158 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
 }
 
 // ---------------------------------------------------------------------------
+// 9b. Retry-budget accounting (operator review round 3, item 1)
+// ---------------------------------------------------------------------------
+
+/// Errors separated by persisted progress must never add up on the run's
+/// only job row: an attempt that has advanced the run and then hit a
+/// retryable error hands the run to a FRESH `AdvanceRunJob` (release +
+/// enqueue in one transaction, `Ok` return), so cja deletes the errored
+/// row and the fresh row starts at `error_count = 0`. Driving through a
+/// real worker makes `error_count` real; the test polls it after every
+/// attempt. On the pre-fix design every error charged the same row, so its
+/// `error_count` reached 2 here (2^(n+1)s backoff; 20 would dead-letter
+/// the run's only job).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn progress_separated_errors_requeue_on_a_fresh_job_row() {
+    // Reference transcript for the identical-run assertion.
+    let reference_env = setup(&[&COUNTER]).await;
+    script_happy(&reference_env.fake);
+    let reference_run = durable::start(&reference_env.state, "counter", "add 2 and 3")
+        .await
+        .expect("start reference");
+    drive(&reference_env.state, reference_run)
+        .await
+        .expect("reference drive");
+    let reference = transcript_rows(&reference_env.db, reference_run).await;
+
+    // Each model call succeeds only after one retryable failure: 503,
+    // tool-call reply, 503, final completion. The first 503 hits an
+    // attempt with NO completed step (only the pre-call checkpoint), so it
+    // keeps the plain Err path (error_count 1 on the original row); the
+    // second 503 hits an attempt that has committed the tool turn, so it
+    // must requeue on a fresh row instead of charging error_count 2.
+    let env = setup(&[&COUNTER]).await;
+    env.fake.status(503, r#"{"error":"upstream down"}"#);
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_1",
+        "add",
+        &serde_json::json!({"a": 2, "b": 3}),
+    );
+    env.fake.status(503, r#"{"error":"upstream down"}"#);
+    env.fake.chat_completion(models::DEFAULT, "5");
+    let run = durable::start(&env.state, "counter", "add 2 and 3")
+        .await
+        .expect("start");
+
+    let (worker, token) = spawn_worker(&env.state, Duration::from_millis(10)).await;
+    let mut max_error_count = 0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < deadline, "run did not succeed in time");
+        let counts: Vec<i32> = sqlx::query_scalar(
+            "SELECT error_count FROM jobs WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+        )
+        .bind(run.0.to_string())
+        .fetch_all(&env.db)
+        .await
+        .expect("read job rows");
+        max_error_count = max_error_count.max(counts.iter().copied().max().unwrap_or(0));
+        if status_of(&env.db, run).await == RunStatus::Succeeded {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _ = worker.await;
+    })
+    .await
+    .expect("worker exited");
+
+    assert!(
+        max_error_count <= 1,
+        "no job row may carry error_count > 1 when errors are separated by \
+         progress (max observed: {max_error_count})"
+    );
+    assert_eq!(
+        transcript_rows(&env.db, run).await,
+        reference,
+        "the run reaches the reference transcript"
+    );
+    assert_eq!(
+        env.fake.requests().len(),
+        4,
+        "exactly the four scripted requests (no retry storm)"
+    );
+    assert_eq!(
+        jobs_for(&env.db, run).await,
+        0,
+        "job row deleted on success"
+    );
+}
+
+/// The complement: repeated failures with ZERO progress keep the plain
+/// Err path, and cja's backoff charges the SAME row — consecutive
+/// no-progress failures still escalate toward dead-letter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_progress_failures_share_one_backing_off_row() {
+    let env = setup(&[&COUNTER]).await;
+    for _ in 0..5 {
+        env.fake.status(503, r#"{"error":"upstream down"}"#);
+    }
+    let run = durable::start(&env.state, "counter", "x")
+        .await
+        .expect("start");
+
+    let (worker, token) = spawn_worker(&env.state, Duration::from_millis(10)).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut first_job_id: Option<uuid::Uuid> = None;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "error_count never escalated on the same row"
+        );
+        let rows: Vec<(uuid::Uuid, i32)> = sqlx::query_as(
+            "SELECT job_id, error_count FROM jobs WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+        )
+        .bind(run.0.to_string())
+        .fetch_all(&env.db)
+        .await
+        .expect("read job rows");
+        if let Some((job_id, _)) = rows.first() {
+            if first_job_id.is_none() {
+                first_job_id = Some(*job_id);
+            }
+            assert_eq!(
+                rows.len(),
+                1,
+                "zero-progress failures never requeue: {rows:?}"
+            );
+            assert_eq!(Some(*job_id), first_job_id, "the same row is retried");
+            if rows[0].1 >= 3 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _ = worker.await;
+    })
+    .await
+    .expect("worker exited");
+
+    assert_eq!(
+        status_of(&env.db, run).await,
+        RunStatus::Running,
+        "not failed"
+    );
+    assert_eq!(locked_by_of(&env.db, run).await, None, "lease released");
+}
+
+// ---------------------------------------------------------------------------
 // 10. Read API
 // ---------------------------------------------------------------------------
 

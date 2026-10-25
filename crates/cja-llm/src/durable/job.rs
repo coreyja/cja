@@ -47,7 +47,7 @@ impl<S: HasDurable> Job<S> for AdvanceRunJob {
     ) -> cja::color_eyre::Result<()> {
         state
             .durable()
-            .advance_run(state.db(), self.run_id, cancellation_token)
+            .advance_run(&state, self.run_id, cancellation_token)
             .await
     }
 }
