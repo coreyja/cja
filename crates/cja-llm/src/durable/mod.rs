@@ -113,11 +113,13 @@ pub enum FailReason {
     CorruptState,
     Gateway,
     Protocol,
-    /// The run produced content Postgres cannot store (a U+0000: JSONB
-    /// rejects the `\u0000` escape, TEXT rejects the byte). Tool, question,
+    /// The run produced content Postgres cannot store (a U+0000 — JSONB
+    /// rejects the `\u0000` escape, TEXT rejects the byte — or a size
+    /// limit, SQLSTATE 54000 `program_limit_exceeded`). Tool, question,
     /// and answer text is sanitized to U+FFFD before entering the run, so
-    /// this marks NULs in MODEL-produced text, which cannot be sanitized
-    /// without rewriting the conversation.
+    /// this marks MODEL-produced text, which cannot be sanitized without
+    /// rewriting the conversation. The stored error is neutral and names
+    /// the SQLSTATE, because the family spans more than NULs.
     UnstorableContent,
 }
 

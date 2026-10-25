@@ -594,20 +594,27 @@ impl Durable {
     }
 
     /// Fail a run whose persisted state cannot be stored (SQLSTATE
-    /// 22P05/22021/54000 — a U+0000 in content the sanitizers cannot
-    /// rewrite): keep the last good `run_state` and transcript (the
-    /// failing write already rolled back; this writes neither) and mark
-    /// the run `failed` with `unstorable_content`. Permanent by design:
-    /// the attempt then ends `Ok`, so the job completes instead of
-    /// retrying a poison payload into dead-letter and orphaning the run.
-    /// `Ok(false)` (lease lost) is a silent stop, as everywhere.
+    /// 22P05/22021 — a U+0000 — or 54000, a Postgres size limit, in content
+    /// the sanitizers cannot rewrite): keep the last good `run_state` and
+    /// transcript (the failing write already rolled back; this writes
+    /// neither) and mark the run `failed` with `unstorable_content`, a
+    /// neutral error naming the SQLSTATE (the family spans more than NULs,
+    /// so the text must not claim one). Permanent by design: the attempt
+    /// then ends `Ok`, so the job completes instead of retrying a poison
+    /// payload into dead-letter and orphaning the run. `Ok(false)` (lease
+    /// lost) is a silent stop, as everywhere.
     async fn fail_unstorable(
         &self,
         db: &sqlx::PgPool,
         run_id: Uuid,
         me: &str,
+        error: &sqlx::Error,
     ) -> cja::color_eyre::Result<()> {
-        match tokio::time::timeout(WRITE_BOUND, db::fail_unstorable(db, run_id, me)).await {
+        let code = error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("unknown"));
+        match tokio::time::timeout(WRITE_BOUND, db::fail_unstorable(db, run_id, me, &code)).await {
             Err(_) => Err(cja::color_eyre::eyre::eyre!(
                 "unstorable-content failure write timed out"
             )),
@@ -664,7 +671,7 @@ impl Durable {
                 // model output carrying a NUL in the TEXT `output`
                 // column): permanent — keep the last good state.
                 if db::unstorable_content(&e) {
-                    return self.fail_unstorable(db, run_id, me).await;
+                    return self.fail_unstorable(db, run_id, me, &e).await;
                 }
                 return Err(e.into());
             }
@@ -812,7 +819,7 @@ impl Attempt<'_> {
                 if db::unstorable_content(&e) {
                     return match self
                         .durable
-                        .fail_unstorable(self.db, self.run_id, &self.me)
+                        .fail_unstorable(self.db, self.run_id, &self.me, &e)
                         .await
                     {
                         Ok(()) => StepOutcome::Done,
@@ -1136,7 +1143,7 @@ impl Attempt<'_> {
                 if db::unstorable_content(&e) {
                     return match self
                         .durable
-                        .fail_unstorable(self.db, self.run_id, &self.me)
+                        .fail_unstorable(self.db, self.run_id, &self.me, &e)
                         .await
                     {
                         Ok(()) => StepOutcome::Done,

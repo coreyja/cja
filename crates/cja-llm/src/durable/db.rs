@@ -41,12 +41,14 @@ pub async fn run_migrations(pool: &sqlx::PgPool) -> cja::Result<()> {
     Ok(())
 }
 
-/// The SQLSTATE family Postgres uses to reject a U+0000 (verified against
-/// a real server): JSONB rejects the `\u0000` escape (22P05 `unsupported
-/// Unicode escape sequence`), TEXT rejects the byte (22021 `invalid byte
-/// sequence for encoding "UTF8": 0x00`), and NULs produced server-side
-/// surface as 54000. Matched from the real sqlx error's
-/// `DatabaseError::code()`, never from message text.
+/// The SQLSTATE family for content Postgres cannot store (verified against
+/// a real server): a U+0000 makes JSONB reject the `\u0000` escape (22P05
+/// `unsupported Unicode escape sequence`) and TEXT reject the byte (22021
+/// `invalid byte sequence for encoding "UTF8": 0x00`), while 54000 is
+/// Postgres's generic `program_limit_exceeded` (e.g. a jsonb value over
+/// 256MB) — a size limit, not a NUL. All are permanent for this payload,
+/// which is why they share one classification. Matched from the real
+/// sqlx error's `DatabaseError::code()`, never from message text.
 pub(super) fn unstorable_content(error: &sqlx::Error) -> bool {
     error
         .as_database_error()
@@ -55,11 +57,18 @@ pub(super) fn unstorable_content(error: &sqlx::Error) -> bool {
 }
 
 /// Mark a `running` run `failed` with `unstorable_content` after a write
-/// was rejected because its content cannot be stored. Deliberately writes
-/// NEITHER `run_state` NOR transcript rows: the failing transaction rolled
-/// back, so the row keeps its last good persisted state. Returns `false`
-/// when the lease was already lost.
-pub(super) async fn fail_unstorable<'e, E>(db: E, run_id: Uuid, me: &str) -> sqlx::Result<bool>
+/// was rejected because its content cannot be stored (`code` is the
+/// rejected write's SQLSTATE — the stored error stays neutral because the
+/// family spans more than NULs). Deliberately writes NEITHER `run_state`
+/// NOR transcript rows: the failing transaction rolled back, so the row
+/// keeps its last good persisted state. Returns `false` when the lease was
+/// already lost.
+pub(super) async fn fail_unstorable<'e, E>(
+    db: E,
+    run_id: Uuid,
+    me: &str,
+    code: &str,
+) -> sqlx::Result<bool>
 where
     E: Executor<'e, Database = sqlx::Postgres>,
 {
@@ -73,7 +82,7 @@ where
     .bind(me)
     .bind(RunStatus::Failed.as_str())
     .bind(FailReason::UnstorableContent.as_str())
-    .bind("run content cannot be stored: it contains a NUL (U+0000)")
+    .bind(format!("run content cannot be stored (SQLSTATE {code})"))
     .bind(RunStatus::Running.as_str())
     .execute(db)
     .await?

@@ -313,12 +313,16 @@ default; exceeding one fails the run with `fail_reason` `turn_budget` /
 `token_budget`, `unknown_kind`, `corrupt_state`, `gateway`, `protocol`,
 `unstorable_content`.
 
-**Unstorable content (U+0000)**: Postgres cannot store a NUL (JSONB
-rejects the `\u0000` escape, TEXT the byte). Tool, question, and answer
+**Unstorable content (a U+0000, or a size limit)**: Postgres cannot
+store a NUL (JSONB rejects the `\u0000` escape, TEXT the byte), and its
+54000 `program_limit_exceeded` rejects oversized values (e.g. jsonb over
+256MB). Tool, question, and answer
 text is sanitized to U+FFFD *before* it enters the run, so the in-memory
 run and the stored transcript stay identical. Model-produced text cannot
-be rewritten that way, so a NUL there fails the run permanently
-(`unstorable_content`), keeping the last good state and transcript — the
+be rewritten that way, so unstorable content there fails the run
+permanently (`unstorable_content`, error text naming the SQLSTATE —
+neutral, since the family spans more than NULs), keeping the last good
+state and transcript — the
 job completes instead of retrying a poison payload into dead-letter.
 
 - **Retried by cja backoff** (lease released, job errors — or, once the
