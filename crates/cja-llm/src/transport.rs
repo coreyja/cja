@@ -18,6 +18,7 @@ use rig_core::http_client::{
     StreamingResponse,
 };
 use tokio_rustls::TlsConnector;
+use tracing::Instrument as _;
 
 use crate::Error;
 use crate::config::{DialerChoice, LlmConfig, RetryPolicy};
@@ -476,110 +477,385 @@ fn usage_from(usage: &serde_json::Value) -> Option<(u64, u64)> {
     ))
 }
 
-/// Executes one request attempt to a buffered 2xx reply. The staged retry
-/// loop lands with the retry policy; this is the connection core it drives.
-async fn execute(
-    inner: Arc<Inner>,
-    parts: http::request::Parts,
-    body: Bytes,
-) -> Result<http::Response<Bytes>, HttpError> {
-    let deadline = tokio::time::Instant::now() + inner.request_timeout;
-    let (mut sender, driver) = connect(&inner).await.map_err(HttpError::instance)?;
-    let request = build_request(&inner, &parts, body)?;
-
-    // try_send_request's future resolves with the response head, a protocol
-    // error after the request was queued (message() is None), or a queue
-    // reject with the request recovered (message() is Some) — the one
-    // post-handshake failure the retry loop may retry.
-    let response = match tokio::time::timeout_at(deadline, sender.try_send_request(request)).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(e)) => {
-            let recovered = e.message().is_some();
-            let error = HttpError::instance(std::io::Error::other(e.into_error()));
-            drop(sender);
-            if recovered {
-                // Queue reject: retryable once the loop lands. Single attempt
-                // here.
-                return Err(error);
-            }
-            // Queued, maybe written: terminal — the gateway may bill it.
-            return Err(error);
-        }
-        Err(_elapsed) => {
-            drop(sender);
-            return Err(HttpError::instance(TransportError::Timeout(
-                inner.request_timeout,
-            )));
-        }
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        let (text, headers, _retry_after) = read_error_body(response, deadline).await;
-        drop(sender);
-        return Err(HttpError::non_success_with_details(status, headers, text));
-    }
-
-    let (response_parts, incoming) = response.into_parts();
-    let bytes = match tokio::time::timeout_at(deadline, incoming.collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(e)) => {
-            drop(sender);
-            return Err(HttpError::instance(e));
-        }
-        Err(_elapsed) => {
-            drop(sender);
-            return Err(HttpError::instance(TransportError::Timeout(
-                inner.request_timeout,
-            )));
-        }
-    };
-    drop(sender);
-    drop(driver);
-    Ok(http::Response::from_parts(response_parts, bytes))
+/// Which end state an attempt drives to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Buffer the whole 2xx body before returning (rig's unary path).
+    Unary,
+    /// Stop at the 2xx response head; the body then streams (rig's
+    /// streaming path).
+    Streaming,
 }
 
-/// Executes one request attempt to a 2xx response head, leaving the body
-/// streaming under the idle timeout. Dropping the returned stream cancels
-/// the request (the connection driver is aborted).
-async fn execute_streaming(
+/// What the attempt loop hands back to the `HttpClientExt` methods.
+enum LoopOutcome {
+    Unary(http::Response<Bytes>),
+    Streamed(StreamingResponse),
+}
+
+/// Tracing data for one attempt: the model/app/attempt fields are on the
+/// span already; these complete when the attempt ends. Never request or
+/// response content.
+struct AttemptData {
+    status: Option<u16>,
+    latency: std::time::Duration,
+    usage: Option<(u64, u64)>,
+}
+
+/// What one attempt produced, for the loop to act on.
+enum AttemptResult {
+    Done {
+        outcome: LoopOutcome,
+        data: AttemptData,
+    },
+    /// Nothing was sent (connect-phase or queue-reject failure), or the
+    /// status was retryable (429, 5xx, or the once-only stale virtual
+    /// key): retry when attempts and deadline allow.
+    Retry {
+        error: HttpError,
+        retry_after: Option<Duration>,
+        stale_key: bool,
+        data: AttemptData,
+    },
+    /// Never retry: the request may have reached the gateway and been
+    /// billed (post-queue failure, timeout, non-retryable status).
+    Terminal { error: HttpError, data: AttemptData },
+}
+
+impl AttemptResult {
+    fn data(&self) -> &AttemptData {
+        match self {
+            Self::Done { data, .. } | Self::Retry { data, .. } | Self::Terminal { data, .. } => {
+                data
+            }
+        }
+    }
+}
+
+/// The staged attempt loop every cja-llm request runs: connect (retryable),
+/// send (terminal once queued), status classification (429/5xx and the
+/// once-only stale-key retry retry; 402, the wrapper 403s, and every other
+/// 4xx do not), all under one total deadline that also caps the backoff.
+async fn run_loop(
     inner: Arc<Inner>,
     parts: http::request::Parts,
     body: Bytes,
-) -> Result<StreamingResponse, HttpError> {
+    mode: Mode,
+) -> Result<LoopOutcome, HttpError> {
     let deadline = tokio::time::Instant::now() + inner.request_timeout;
-    let (mut sender, driver) = connect(&inner).await.map_err(HttpError::instance)?;
-    let request = build_request(&inner, &parts, body)?;
+    let model = request_model(&body).unwrap_or_else(|| "unknown".to_owned());
+    let app = inner.app.clone();
+    let max_attempts = inner.retries.max_attempts.max(1);
+    let mut stale_key_used = false;
+    let mut last_error: Option<HttpError> = None;
 
+    for attempt in 1..=max_attempts {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let span = tracing::info_span!(
+            "cja_llm.http",
+            app = %app,
+            model = %model,
+            attempt,
+            status = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            input_tokens = tracing::field::Empty,
+            output_tokens = tracing::field::Empty,
+        );
+        let attempts_remain = attempt < max_attempts;
+        let stale_key_available = !stale_key_used && attempts_remain;
+        let result = run_attempt(
+            inner.as_ref(),
+            &parts,
+            &body,
+            deadline,
+            mode,
+            span.clone(),
+            stale_key_available,
+        )
+        .instrument(span.clone())
+        .await;
+        record_completion(&span, result.data());
+        match result {
+            AttemptResult::Done { outcome, .. } => return Ok(outcome),
+            AttemptResult::Retry {
+                error,
+                retry_after,
+                stale_key,
+                ..
+            } => {
+                last_error = Some(error);
+                if stale_key {
+                    stale_key_used = true;
+                }
+                let Some(delay) = retryable_delay(&inner.retries, attempt, retry_after, deadline)
+                else {
+                    break;
+                };
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            AttemptResult::Terminal { error, .. } => {
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| HttpError::instance(TransportError::Timeout(inner.request_timeout))))
+}
+
+/// One attempt: connect (bounded by the connect timeout), send (hyper's
+/// `try_send_request`, so a queue reject is distinguishable from a
+/// post-queue failure), then either buffer the body, hand back a live
+/// stream, or classify a non-success status.
+#[expect(clippy::too_many_arguments, reason = "attempt state the loop owns")]
+async fn run_attempt(
+    inner: &Inner,
+    parts: &http::request::Parts,
+    body: &Bytes,
+    deadline: tokio::time::Instant,
+    mode: Mode,
+    span: tracing::Span,
+    stale_key_available: bool,
+) -> AttemptResult {
+    let started = std::time::Instant::now();
+    let data_no_status = |usage| AttemptData {
+        status: None,
+        latency: started.elapsed(),
+        usage,
+    };
+
+    let (mut sender, driver) = match connect(inner).await {
+        Ok(pair) => pair,
+        Err(transport_error) => {
+            // Nothing was sent: retryable, with the grant hint in the marker.
+            return AttemptResult::Retry {
+                error: HttpError::instance(transport_error),
+                retry_after: None,
+                stale_key: false,
+                data: data_no_status(None),
+            };
+        }
+    };
+    let request = match build_request(inner, parts, body.clone()) {
+        Ok(request) => request,
+        Err(error) => {
+            drop(sender);
+            return AttemptResult::Terminal {
+                error,
+                data: data_no_status(None),
+            };
+        }
+    };
+
+    // try_send_request's future resolves with the response head, a protocol
+    // error after the request was queued (`message()` is None), or a queue
+    // reject with the request recovered (`message()` is Some) — the one
+    // post-handshake failure that may be retried.
     let response = match tokio::time::timeout_at(deadline, sender.try_send_request(request)).await {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => {
+            let recovered = should_retry_queue_reject(e.message());
             let error = HttpError::instance(std::io::Error::other(e.into_error()));
             drop(sender);
-            return Err(error);
+            let data = data_no_status(None);
+            return if recovered {
+                // Queue reject with the request recovered: hyper's documented
+                // "never fully sent" guarantee — nothing to bill.
+                AttemptResult::Retry {
+                    error,
+                    retry_after: None,
+                    stale_key: false,
+                    data,
+                }
+            } else {
+                // Queued, maybe written: the gateway may bill it.
+                AttemptResult::Terminal { error, data }
+            };
         }
         Err(_elapsed) => {
             drop(sender);
-            return Err(HttpError::instance(TransportError::Timeout(
-                inner.request_timeout,
-            )));
+            return AttemptResult::Terminal {
+                error: HttpError::instance(TransportError::Timeout(inner.request_timeout)),
+                data: data_no_status(None),
+            };
         }
     };
 
     let status = response.status();
+    let data_with_status = AttemptData {
+        status: Some(status.as_u16()),
+        latency: started.elapsed(),
+        usage: None,
+    };
+
     if !status.is_success() {
-        let (text, headers, _retry_after) = read_error_body(response, deadline).await;
+        let (text, headers, retry_after) = read_error_body(response, deadline).await;
         drop(sender);
-        return Err(HttpError::non_success_with_details(status, headers, text));
+        let error = HttpError::non_success_with_details(status, headers, text.clone());
+        return classify_status(
+            status,
+            &text,
+            retry_after,
+            stale_key_available,
+            error,
+            data_with_status,
+        );
     }
 
-    drop(sender);
-    Ok(into_boxed_stream(
-        response,
-        driver.disarm(),
-        inner.stream_idle_timeout,
-        tracing::Span::none(),
-    ))
+    match mode {
+        Mode::Unary => {
+            let (response_parts, incoming) = response.into_parts();
+            match tokio::time::timeout_at(deadline, incoming.collect()).await {
+                Ok(Ok(collected)) => {
+                    let bytes = collected.to_bytes();
+                    let usage = response_usage(&bytes);
+                    drop(sender);
+                    drop(driver);
+                    AttemptResult::Done {
+                        outcome: LoopOutcome::Unary(http::Response::from_parts(
+                            response_parts,
+                            bytes,
+                        )),
+                        data: AttemptData {
+                            status: Some(status.as_u16()),
+                            latency: started.elapsed(),
+                            usage,
+                        },
+                    }
+                }
+                Ok(Err(error)) => {
+                    drop(sender);
+                    AttemptResult::Terminal {
+                        error: HttpError::instance(error),
+                        data: data_with_status,
+                    }
+                }
+                Err(_elapsed) => {
+                    drop(sender);
+                    AttemptResult::Terminal {
+                        error: HttpError::instance(TransportError::Timeout(inner.request_timeout)),
+                        data: data_with_status,
+                    }
+                }
+            }
+        }
+        Mode::Streaming => {
+            drop(sender);
+            AttemptResult::Done {
+                outcome: LoopOutcome::Streamed(into_boxed_stream(
+                    response,
+                    driver.disarm(),
+                    inner.stream_idle_timeout,
+                    span,
+                )),
+                data: data_with_status,
+            }
+        }
+    }
+}
+
+/// Status classification for a non-success reply: 429 and 5xx retry with
+/// backoff (the gateway's two 502 bodies mean no upstream call was made);
+/// the stale-virtual-key bodies get exactly one ordinary, attempt-consuming
+/// retry when the gateway may self-heal; everything else — 402, the
+/// wrapper 403s, other 4xx — is terminal.
+fn classify_status(
+    status: http::StatusCode,
+    body: &str,
+    retry_after: Option<Duration>,
+    stale_key_available: bool,
+    error: HttpError,
+    data: AttemptData,
+) -> AttemptResult {
+    if status == http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return AttemptResult::Retry {
+            error,
+            retry_after,
+            stale_key: false,
+            data,
+        };
+    }
+    if stale_key_available && is_stale_virtual_key(status, body) {
+        return AttemptResult::Retry {
+            error,
+            retry_after: None,
+            stale_key: true,
+            data,
+        };
+    }
+    AttemptResult::Terminal { error, data }
+}
+
+/// Bifrost's stale-virtual-key bodies: 401 `access_not_found` or 403
+/// `access_blocked`, classified by body `type` so they are never confused
+/// with the gateway wrapper's identity 403.
+fn is_stale_virtual_key(status: http::StatusCode, body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(body_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    (status == http::StatusCode::UNAUTHORIZED && body_type == "access_not_found")
+        || (status == http::StatusCode::FORBIDDEN && body_type == "access_blocked")
+}
+
+/// The delay before the next attempt: a seconds-form `Retry-After` clamped
+/// to the ceiling when present, else exponential backoff from the initial
+/// delay, with full jitter. `None` when the deadline leaves no room, ending
+/// the loop with the last failure.
+fn retryable_delay(
+    policy: &RetryPolicy,
+    attempt: u32,
+    retry_after: Option<Duration>,
+    deadline: tokio::time::Instant,
+) -> Option<Duration> {
+    let base = match retry_after {
+        Some(after) => after.min(policy.max_backoff),
+        None => policy
+            .initial_backoff
+            .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+            .min(policy.max_backoff),
+    };
+    // Full jitter: uniform in [0, base].
+    let delay = Duration::from_secs_f64(base.as_secs_f64() * fastrand::f64());
+    let now = tokio::time::Instant::now();
+    (now + delay < deadline).then_some(delay)
+}
+
+/// Records the completion data on the attempt's span and emits the
+/// completion event inside it, both ways carrying status, latency, and —
+/// when the response reported them — token counts. Content is never
+/// recorded.
+fn record_completion(span: &tracing::Span, data: &AttemptData) {
+    let AttemptData {
+        status,
+        latency,
+        usage,
+    } = data;
+    if let Some(status) = status {
+        span.record("status", *status);
+    }
+    let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+    span.record("latency_ms", latency_ms);
+    if let Some((input, output)) = usage {
+        span.record("input_tokens", input);
+        span.record("output_tokens", output);
+    }
+    span.in_scope(|| {
+        tracing::info!(
+            target: "cja_llm::http",
+            status = status.unwrap_or(0),
+            latency_ms,
+            input_tokens = usage.map(|usage| usage.0).unwrap_or(0),
+            output_tokens = usage.map(|usage| usage.1).unwrap_or(0),
+            "gateway http call finished"
+        );
+    });
 }
 
 impl HttpClientExt for GatewayHttp {
@@ -597,7 +873,10 @@ impl HttpClientExt for GatewayHttp {
         let (parts, body) = req.into_parts();
         let body = body.into();
         async move {
-            let response = execute(inner, parts, body).await?;
+            let LoopOutcome::Unary(response) = run_loop(inner, parts, body, Mode::Unary).await?
+            else {
+                unreachable!("the unary loop never returns a live stream");
+            };
             Ok(response.map(|bytes| {
                 let lazy: LazyBody<U> = Box::pin(async move { Ok(U::from(bytes)) });
                 lazy
@@ -621,7 +900,10 @@ impl HttpClientExt for GatewayHttp {
         }
         let inner = self.inner.clone();
         async move {
-            let response = execute(inner, parts, body).await?;
+            let LoopOutcome::Unary(response) = run_loop(inner, parts, body, Mode::Unary).await?
+            else {
+                unreachable!("the unary loop never returns a live stream");
+            };
             Ok(response.map(|bytes| {
                 let lazy: LazyBody<U> = Box::pin(async move { Ok(U::from(bytes)) });
                 lazy
@@ -642,7 +924,14 @@ impl HttpClientExt for GatewayHttp {
         let inner = self.inner.clone();
         let (parts, body) = req.into_parts();
         let body = body.into();
-        async move { execute_streaming(inner, parts, body).await }
+        async move {
+            let LoopOutcome::Streamed(response) =
+                run_loop(inner, parts, body, Mode::Streaming).await?
+            else {
+                unreachable!("the streaming loop never returns a buffered body");
+            };
+            Ok(response)
+        }
     }
 }
 
