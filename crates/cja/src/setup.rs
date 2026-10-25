@@ -30,7 +30,10 @@ pub use eyes_subscriber::EyesShutdownHandle;
 ///
 /// # Environment Variables
 ///
-/// - `RUST_LOG`: Log filter (defaults to `info,{crate_name}=trace,tower_http=debug,serenity=error`)
+/// - `RUST_LOG`: Log filter (defaults to `info,{crate_name}=trace,tower_http=debug,serenity=error`).
+///   rig's content-bearing targets are always capped regardless of this
+///   value: `rig::completions` and `rig::streaming` at DEBUG,
+///   `rig_agent::agent::typed` at ERROR (see [`env_filter`]).
 /// - `JSON_LOGS`: If set, outputs JSON logs instead of hierarchical
 /// - `EYES_ORG_ID`: Eyes organization ID (UUID)
 /// - `EYES_APP_ID`: Eyes application ID (UUID)
@@ -73,9 +76,7 @@ fn initialize_tracing(
     let rust_log = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| format!("info,{crate_name}=trace,tower_http=debug,serenity=error"));
 
-    let env_filter = EnvFilter::builder().parse(&rust_log).wrap_err_with(|| {
-        color_eyre::eyre::eyre!("Couldn't create env filter from {}", rust_log)
-    })?;
+    let env_filter = env_filter(&rust_log)?;
 
     // Setup Eyes layer if configured
     let (eyes_layer, eyes_shutdown_handle) = setup_eyes_layer(process)?;
@@ -110,6 +111,51 @@ fn initialize_tracing(
         .try_init()?;
 
     Ok(eyes_shutdown_handle)
+}
+
+/// Builds the [`EnvFilter`] for a `RUST_LOG` string, parsed as usual, then
+/// always caps rig's content-bearing targets: `rig::completions` and
+/// `rig::streaming` at DEBUG, `rig_agent::agent::typed` at ERROR.
+///
+/// rig 0.45 logs raw model content outside its content-telemetry gate
+/// (`record_content_telemetry(false)` does not cover these):
+/// - whole request/reply wire JSON at TRACE on `rig::completions`
+///   (rig-core-0.45.0 `src/providers/openai/wire/chat.rs:778-782` for the
+///   request, `src/driver.rs:563-570` for the reply; the emitter is gated
+///   only by `tracing::enabled!(.., TRACE)` — `src/providers/internal/mod.rs:78-90`),
+/// - the same on `rig::streaming`,
+/// - the raw structured-output text at WARN on `rig_agent::agent::typed`
+///   (rig-agent-0.45.0 `src/agent/typed.rs:191-193`: `warn!("... {err:?}")`
+///   on a `StructuredOutputError` whose `Deserialization { output }` is the
+///   model's raw output).
+///
+/// `EnvFilter::add_directive` REPLACES a same-target directive, because
+/// `Directive`'s `Ord` ignores the level (tracing-subscriber 0.3
+/// `filter/env/directive.rs:278-306`, `filter/directive.rs:84-98`), so even
+/// an explicit `RUST_LOG=rig::completions=trace` gets capped. The `GenAI`
+/// span is an `info_span!` on `rig::completions` (rig-core
+/// `src/telemetry/mod.rs:44,68`), so it stays enabled.
+fn env_filter(rust_log: &str) -> color_eyre::Result<EnvFilter> {
+    let filter = EnvFilter::builder()
+        .parse(rust_log)
+        .wrap_err_with(|| color_eyre::eyre::eyre!("Couldn't create env filter from {rust_log}"))?;
+
+    Ok(filter
+        .add_directive(
+            "rig::completions=debug"
+                .parse()
+                .wrap_err("couldn't parse the rig::completions cap")?,
+        )
+        .add_directive(
+            "rig::streaming=debug"
+                .parse()
+                .wrap_err("couldn't parse the rig::streaming cap")?,
+        )
+        .add_directive(
+            "rig_agent::agent::typed=error"
+                .parse()
+                .wrap_err("couldn't parse the rig_agent::agent::typed cap")?,
+        ))
 }
 
 /// Sets up the Eyes tracing layer if `EYES_ORG_ID` and `EYES_APP_ID` are configured.
@@ -152,5 +198,58 @@ fn setup_eyes_layer(
             println!("Skipping Eyes layer");
             Ok((None, None))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+
+    use super::*;
+
+    /// For every one of these `RUST_LOG` values, rig's content-bearing
+    /// targets must be capped: no TRACE on the wire-dump targets, no WARN
+    /// on the typed-extraction target (its ERROR level stays enabled).
+    #[test]
+    fn rig_content_targets_are_always_capped() -> color_eyre::Result<()> {
+        for rust_log in [
+            "trace",
+            "info",
+            "rig::completions=trace,rig::streaming=trace,rig_agent::agent::typed=trace",
+        ] {
+            let subscriber = tracing_subscriber::Registry::default().with(env_filter(rust_log)?);
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    !tracing::enabled!(target: "rig::completions", Level::TRACE),
+                    "raw wire JSON must stay off for RUST_LOG={rust_log}"
+                );
+                assert!(
+                    !tracing::enabled!(target: "rig::streaming", Level::TRACE),
+                    "raw stream wire JSON must stay off for RUST_LOG={rust_log}"
+                );
+                assert!(
+                    !tracing::enabled!(target: "rig_agent::agent::typed", Level::WARN),
+                    "the raw-output warn must stay off for RUST_LOG={rust_log}"
+                );
+                assert!(
+                    tracing::enabled!(target: "rig_agent::agent::typed", Level::ERROR),
+                    "ERROR stays enabled for RUST_LOG={rust_log}"
+                );
+            });
+        }
+        Ok(())
+    }
+
+    /// The cap is narrow: with `RUST_LOG=trace` everything else stays at
+    /// TRACE, and the capped targets still pass DEBUG (rig's `GenAI` span on
+    /// `rig::completions` is an `info_span!`).
+    #[test]
+    fn the_cap_is_narrow() -> color_eyre::Result<()> {
+        let subscriber = tracing_subscriber::Registry::default().with(env_filter("trace")?);
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "rig::completions", Level::DEBUG));
+            assert!(tracing::enabled!(target: "other_crate", Level::TRACE));
+        });
+        Ok(())
     }
 }
