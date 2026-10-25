@@ -6,8 +6,10 @@
 //! `rig-agent/src/agent/engine.rs`): `next_step()` → `CallModel` (prepare,
 //! advertise, `model.call`, `model_response`) → `CallTools` (execute via the
 //! built agent's toolset, `run.answer`) → `Done`. Every `Err` return from the
-//! job goes through [`Durable::fail_retryable`] so the lease is released and
-//! cja's backoff can retry immediately.
+//! job goes through [`Durable::retry_or_requeue`]: after persisted progress
+//! it hands the run to a fresh job row, otherwise it releases the lease
+//! (via [`Durable::fail_retryable`]) so cja's backoff can retry
+//! immediately.
 //!
 //! No panics or unwraps anywhere on this path: a panic is caught by cja's
 //! worker and retried 20× into dead-letter on a permanent condition,
