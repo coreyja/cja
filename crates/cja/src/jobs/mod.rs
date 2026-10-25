@@ -189,6 +189,30 @@ pub(crate) fn enqueue_failure(job_id: uuid::Uuid, error: &EnqueueError) {
     tracing::error!(job_id = %job_id, %error, "Job enqueue failed");
 }
 
+/// The shared enqueue core: the single INSERT plus its receipt (or failure
+/// event). The caller wraps this in its `jobs.enqueue` span, so span
+/// construction (`enqueue_span`), the INSERT (`enqueue_on_connection`),
+/// and the receipt/failure events each live in exactly one place.
+async fn enqueue_core<AppState: AS, J: Job<AppState>>(
+    conn: &mut sqlx::PgConnection,
+    job: J,
+    context: &str,
+    priority: Option<i32>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    job_id: uuid::Uuid,
+) -> Result<uuid::Uuid, EnqueueError> {
+    let result =
+        enqueue_on_connection::<AppState, J>(conn, job, context, priority, created_at, job_id)
+            .await;
+    match &result {
+        Ok(id) => {
+            enqueue_receipt(*id, J::NAME);
+        }
+        Err(error) => enqueue_failure(job_id, error),
+    }
+    result
+}
+
 pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
@@ -442,8 +466,10 @@ pub trait Job<AppState: AS>:
     ///
     /// Creates the same `jobs.enqueue` span and emits the same
     /// `enqueue_receipt` as [`Job::enqueue`], and performs the same single
-    /// INSERT. It does NOT call [`AppState::job_enqueued`]: that is not a
-    /// transaction-commit hook. The caller MUST call
+    /// INSERT. The receipt (and the span) mark the INSERT, not the commit:
+    /// if the caller's transaction rolls back afterward, the receipt
+    /// remains in telemetry. It does NOT call [`AppState::job_enqueued`]:
+    /// that is not a transaction-commit hook. The caller MUST call
     /// `state.job_enqueued()` on its `AppState` after its transaction
     /// commits, so an idle worker is woken for the new row.
     async fn enqueue_on(
@@ -457,21 +483,9 @@ pub trait Job<AppState: AS>:
         // Eyes captures fields at span creation; same constructor as `enqueue`
         // so an enqueue stays linkable to its worker attempts.
         let span = enqueue_span::<AppState, Self>(&self, &context, priority, created_at, job_id);
-        async move {
-            let result = enqueue_on_connection::<AppState, Self>(
-                &mut *conn, self, &context, priority, created_at, job_id,
-            )
-            .await;
-            match &result {
-                Ok(id) => {
-                    enqueue_receipt(*id, Self::NAME);
-                }
-                Err(error) => enqueue_failure(job_id, error),
-            }
-            result
-        }
-        .instrument(span)
-        .await
+        enqueue_core::<AppState, Self>(conn, self, &context, priority, created_at, job_id)
+            .instrument(span)
+            .await
     }
 
     /// Enqueue this job for asynchronous execution.
@@ -519,15 +533,32 @@ pub trait Job<AppState: AS>:
         context: String,
         priority: Option<i32>,
     ) -> Result<(), EnqueueError> {
-        // One deliberate micro-delta from the pre-refactor body: a pool-acquire
-        // failure now happens before span creation and does not pass through
-        // `enqueue_failure` (sqlx logs the acquire error itself).
-        let mut conn = app_state.db().acquire().await?;
-        self.enqueue_on(&mut conn, context, priority)
-            .await
-            .map(|_| ())?;
-        app_state.job_enqueued();
-        Ok(())
+        let job_id = uuid::Uuid::new_v4();
+        let created_at = chrono::Utc::now();
+        // Same span (same field list) as `enqueue_on`: a pool-acquire
+        // failure is an enqueue failure and is recorded inside the span
+        // through `enqueue_failure`, exactly like an insert failure — the
+        // pre-refactor behavior. (sqlx does not log pool-acquire errors
+        // itself: `PoolTimedOut`/`PoolClosed` surface only as the returned
+        // error.)
+        let span = enqueue_span::<AppState, Self>(&self, &context, priority, created_at, job_id);
+        async move {
+            let mut conn = match app_state.db().acquire().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    let error = EnqueueError::from(error);
+                    enqueue_failure(job_id, &error);
+                    return Err(error);
+                }
+            };
+            enqueue_core::<AppState, Self>(&mut conn, self, &context, priority, created_at, job_id)
+                .await
+                .map(|_| ())?;
+            app_state.job_enqueued();
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -607,6 +638,78 @@ mod enqueue_on_tests {
         assert_eq!(
             after, 1,
             "job row must be committed with the caller's transaction"
+        );
+    }
+
+    /// A pool-acquire failure is an enqueue failure: it must be recorded
+    /// inside a `jobs.enqueue` span through `enqueue_failure`, exactly like
+    /// an insert failure (pre-refactor parity — sqlx does not log
+    /// `PoolTimedOut`/`PoolClosed` itself).
+    #[sqlx::test]
+    async fn enqueue_acquire_failure_is_recorded_like_an_insert_failure(db: sqlx::PgPool) {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+        #[derive(Clone)]
+        struct SharedWrite(Arc<Mutex<Vec<u8>>>);
+
+        impl MakeWriter<'_> for SharedWriter {
+            type Writer = SharedWrite;
+
+            fn make_writer(&self) -> Self::Writer {
+                SharedWrite(self.0.clone())
+            }
+        }
+
+        impl io::Write for SharedWrite {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // A pool whose single connection is held for the whole call, with a
+        // 50ms acquire timeout: `enqueue` can never get one.
+        let starving = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_with((*db.connect_options().clone()).clone())
+            .await
+            .unwrap();
+        let _held = starving.acquire().await.unwrap();
+        let state = TestAppState {
+            db: starving.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+
+        let result = EnqueueOnJob { value: 9 }
+            .enqueue(state, "acquire-test".to_string(), None)
+            .await;
+        assert!(result.is_err(), "the pool never yields a connection");
+
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let failure_line = text
+            .lines()
+            .find(|line| line.contains("Job enqueue failed"))
+            .unwrap_or_else(|| panic!("enqueue_failure fired, but got: {text}"));
+        assert!(
+            failure_line.contains("jobs.enqueue"),
+            "the failure is recorded inside the jobs.enqueue span: {failure_line}"
         );
     }
 }
