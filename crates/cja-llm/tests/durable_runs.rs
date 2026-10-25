@@ -1035,8 +1035,8 @@ async fn cancel_during_in_flight_ask_reply_cancels_the_run() {
         .expect("start");
 
     // A real worker, but with a reclaim window comfortably larger than the
-    // 3s in-flight reply: the default test worker's 150ms reclaim would
-    // re-claim (and charge) the job while its handler is legitimately
+    // 3s in-flight reply: the shared `spawn_worker` helper's 1s reclaim
+    // would re-claim (and charge) the job while its handler is legitimately
     // parked on the delayed reply.
     let token = CancellationToken::new();
     let worker = tokio::spawn(job_worker(

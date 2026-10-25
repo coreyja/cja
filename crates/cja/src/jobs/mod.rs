@@ -554,6 +554,10 @@ pub trait Job<AppState: AS>:
             enqueue_core::<AppState, Self>(&mut conn, self, &context, priority, created_at, job_id)
                 .await
                 .map(|_| ())?;
+            // Return the connection to the pool before waking a worker —
+            // exact parity with main's enqueue, which releases `conn` at
+            // the end of its inner async block before `job_enqueued()`.
+            drop(conn);
             app_state.job_enqueued();
             Ok(())
         }

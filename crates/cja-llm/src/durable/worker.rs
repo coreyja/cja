@@ -573,7 +573,24 @@ impl Durable {
                 state.job_enqueued();
                 true
             }
-            _ => false,
+            Ok(Err(error)) => {
+                // DB-infrastructure error only — never prompt/response
+                // content. Visible so a silently-failing requeue (which
+                // degrades recovery to cja backoff) is not invisible.
+                tracing::warn!(
+                    run.id = %run_id,
+                    %error,
+                    "requeue on a fresh job row failed; falling back to release + Err"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    run.id = %run_id,
+                    "requeue on a fresh job row timed out; falling back to release + Err"
+                );
+                false
+            }
         }
     }
 
