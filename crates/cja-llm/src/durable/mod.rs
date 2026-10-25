@@ -252,8 +252,8 @@ impl Durable {
     }
 
     /// One-shot crash injection for the durability test: the `n`-th persist
-    /// call fails AFTER writing (simulating process death — no lease
-    /// release, no error return).
+    /// call fails BEFORE writing (simulating process death between persists
+    /// — no lease release, no error return).
     #[cfg(feature = "testing")]
     pub fn fail_after_persist(&self, n: usize) {
         self.fail_after_persist

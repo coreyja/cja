@@ -26,18 +26,6 @@ pub(super) struct ClaimedRun {
     pub output_tokens: i64,
 }
 
-/// The outcome of attempting to claim a run for advancement.
-pub(super) enum ClaimOutcome {
-    /// The caller now owns the run (`running`, leased to `me`).
-    Claimed(ClaimedRun),
-    /// The row is missing, terminal, or `waiting`: nothing to advance.
-    NothingToDo,
-    /// The row is `running` under a fresh foreign lease: back off and
-    /// let cja retry, so a duplicate job can never delete the job the
-    /// live owner depends on.
-    Leased,
-}
-
 /// Run cja-llm durable-run migrations.
 ///
 /// Must be called AFTER `cja::db::run_migrations`: both migrators share the

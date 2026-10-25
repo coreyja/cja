@@ -491,6 +491,25 @@ impl Attempt<'_> {
     /// Persist the run after a state transition, projecting any newly
     /// committed messages, then check for user cancellation.
     async fn persist(&self, run: &AgentRun) -> StepOutcome {
+        // Crash injection (testing only): die at persist ENTRY, before the
+        // DB write — simulating process death between persists, so the
+        // on-disk state is exactly the previous persist's. One-shot: re-armed
+        // only by the test. Without the reset, a crash before the model call
+        // would loop forever (every resume repeats that same persist).
+        #[cfg(feature = "testing")]
+        {
+            let count = self.durable.persist_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let armed = self.durable.fail_after_persist.load(Ordering::SeqCst);
+            if armed != 0 && armed == count {
+                // Disarm only on fire (one-shot): a `swap` here would
+                // disarm on the first non-matching check and the injection
+                // would never fire for n > 1.
+                self.durable.fail_after_persist.store(0, Ordering::SeqCst);
+                return StepOutcome::Injected(cja::color_eyre::eyre::eyre!(
+                    "injected failure before persist"
+                ));
+            }
+        }
         let snap = match RunSnapshot::of(run) {
             Ok(snap) => snap,
             Err(e) => return StepOutcome::Retry(e),
@@ -546,21 +565,7 @@ impl Attempt<'_> {
                     Err(e) => StepOutcome::Retry(e),
                 }
             }
-            Some(false) => {
-                #[cfg(feature = "testing")]
-                {
-                    let count = self.durable.persist_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    if self.durable.fail_after_persist.swap(0, Ordering::SeqCst) == count {
-                        // One-shot: re-armed only by the test. Without the
-                        // reset, a crash before the model call would loop
-                        // forever (every resume repeats that same persist).
-                        return StepOutcome::Injected(cja::color_eyre::eyre::eyre!(
-                            "injected failure after persist"
-                        ));
-                    }
-                }
-                StepOutcome::Continue
-            }
+            Some(false) => StepOutcome::Continue,
         }
     }
 

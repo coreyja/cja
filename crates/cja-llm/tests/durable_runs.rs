@@ -8,6 +8,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::error::Error as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -25,7 +26,6 @@ use cja_llm::rig::rig_agent::rig_tool;
 use cja_llm::rig::rig_agent::run::UnhandledInvalidToolCall;
 use cja_llm::testing::FakeGateway;
 use cja_llm::{LlmConfig, models};
-use sqlx::Row;
 
 cja::impl_job_registry!(TestState, AdvanceRunJob);
 
@@ -307,6 +307,17 @@ fn script_happy(fake: &FakeGateway) {
     fake.chat_completion(models::DEFAULT, "5");
 }
 
+/// The happy path against the `keyed` kind, whose tool is `keyed_add`.
+fn script_keyed(fake: &FakeGateway) {
+    fake.tool_call(
+        models::DEFAULT,
+        "call_1",
+        "keyed_add",
+        &serde_json::json!({"a": 2, "b": 3}),
+    );
+    fake.chat_completion(models::DEFAULT, "5");
+}
+
 // ---------------------------------------------------------------------------
 // 1. Happy path round trip
 // ---------------------------------------------------------------------------
@@ -343,6 +354,27 @@ async fn happy_path_round_trip() {
 // 2. Crash at every step resumes identically
 // ---------------------------------------------------------------------------
 
+/// The happy-path script for a crash injected at the ENTRY of persist call
+/// `n` (so on disk is everything persist `n - 1` wrote). The fake is FIFO,
+/// and a resume re-issues any model call whose reply straddled the death
+/// window — so that reply must appear again, in position:
+/// * `n == 2`: death between pre-call t0 (1) and post-response t0 (2) —
+///   the tool-call reply is served twice.
+/// * `n == 5`: death between pre-call t1 (4) and post-response t1 (5) —
+///   the final completion is served twice.
+fn script_crash(fake: &FakeGateway, n: usize) {
+    let tool_call_reply =
+        |fake: &FakeGateway| fake.tool_call(models::DEFAULT, "call_1", "add", &serde_json::json!({"a": 2, "b": 3}));
+    tool_call_reply(fake);
+    if n == 2 {
+        tool_call_reply(fake);
+    }
+    fake.chat_completion(models::DEFAULT, "5");
+    if n == 5 {
+        fake.chat_completion(models::DEFAULT, "5");
+    }
+}
+
 #[tokio::test]
 async fn crash_at_every_step_resumes_identically() {
     // Reference: one uninterrupted attempt.
@@ -357,15 +389,17 @@ async fn crash_at_every_step_resumes_identically() {
     let reference = transcript_rows(&reference_env.db, reference_run).await;
     let reference_requests = reference_env.fake.requests().len();
     let k = reference_env.state.durable.persist_count();
-    // Two model turns x (persist-before-call + persist-after-response) +
-    // persist-after-tool-result. K counts persist calls, not messages: some
-    // persists project zero new rows by design (rig commits a tool batch's
-    // results only when the batch completes).
-    assert!(k >= 5, "expected at least 5 persists, got {k}");
+    // The reference flow's persist rhythm, in order:
+    //   1 pre-call t0, 2 post-response t0, 3 post-tool-result,
+    //   4 pre-call t1, 5 post-response t1, 6 done-path.
+    // `script_crash` below maps crash positions onto re-issued model calls
+    // in terms of these exact boundaries, so pin the count: if rig's commit
+    // rhythm ever changes, the mapping must be revisited with it.
+    assert_eq!(k, 6, "reference persist rhythm changed");
 
     for n in 1..=k {
         let env = setup_with(&[&COUNTER], Duration::from_millis(1)).await;
-        script_happy(&env.fake);
+        script_crash(&env.fake, n);
         env.state.durable.fail_after_persist(n);
         let run = durable::start(&env.state, "counter", "add 2 and 3")
             .await
@@ -694,7 +728,6 @@ async fn cancel_paths() {
     env.fake.delay(Duration::from_secs(3));
     env.fake.chat_completion(models::DEFAULT, "late");
     let state = env.state.clone();
-    let db = env.db.clone();
     let live_run = live;
     let driver = tokio::spawn(async move { drive(&state, live_run).await });
     // One request came from the `waiting` part; the live run's model call is
@@ -1032,4 +1065,572 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
         let _ = drive(&env.state, run).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 10. Read API
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_api_and_parsing_round_trips() {
+    let env = setup(&[&COUNTER]).await;
+    script_happy(&env.fake);
+    let run = durable::start(&env.state, "counter", "read me")
+        .await
+        .expect("start");
+    drive(&env.state, run).await.expect("drive");
+
+    let view = durable::get_run(&env.db, run).await.expect("view");
+    assert!(view.created_at <= chrono::Utc::now());
+    assert!(view.started_at.is_some());
+    assert!(view.finished_at.is_some());
+
+    let transcript = durable::transcript(&env.db, run).await.expect("transcript");
+    let seqs: Vec<i64> = transcript.iter().map(|m| m.seq).collect();
+    let mut sorted = seqs.clone();
+    sorted.sort();
+    assert_eq!(seqs, sorted, "ordered by seq");
+    assert_eq!(transcript.len(), 4);
+
+    assert!(matches!(
+        durable::get_run(&env.db, RunId(uuid::Uuid::new_v4())).await,
+        Err(RunError::NotFound(_))
+    ));
+
+    // FailReason round-trips every variant.
+    for reason in [
+        FailReason::TurnBudget,
+        FailReason::TokenBudget,
+        FailReason::UnknownKind,
+        FailReason::CorruptState,
+        FailReason::Gateway,
+        FailReason::Protocol,
+    ] {
+        let text = reason.as_str();
+        assert_eq!(text.parse::<FailReason>().expect(text), reason);
+    }
+    for status in [
+        RunStatus::Queued,
+        RunStatus::Running,
+        RunStatus::Waiting,
+        RunStatus::Succeeded,
+        RunStatus::Failed,
+        RunStatus::Cancelled,
+    ] {
+        let text = status.as_str();
+        assert_eq!(text.parse::<RunStatus>().expect(text), status);
+    }
+    assert!("Running".parse::<RunStatus>().is_err(), "wrong case rejected");
+    assert!("nope".parse::<RunStatus>().is_err(), "unknown rejected");
+
+    // A manually stored unknown status or fail_reason fails the read: the
+    // manual FromRow's parse failure, one decoding path. The status CHECK
+    // prevents this via ordinary writes, so drop it first — the case being
+    // pinned is corruption / forward-version skew (a newer cja-llm wrote a
+    // status this binary doesn't know).
+    sqlx::query("ALTER TABLE agent_runs DROP CONSTRAINT agent_runs_status_check")
+        .execute(&env.db)
+        .await
+        .expect("drop status check");
+    sqlx::query("UPDATE agent_runs SET status = 'QUEUED' WHERE id = $1")
+        .bind(run.0)
+        .execute(&env.db)
+        .await
+        .expect("corrupt status");
+    assert!(matches!(
+        durable::get_run(&env.db, run).await,
+        Err(RunError::Storage(_))
+    ));
+    sqlx::query("UPDATE agent_runs SET status = 'succeeded', fail_reason = 'boom' WHERE id = $1")
+        .bind(run.0)
+        .execute(&env.db)
+        .await
+        .expect("corrupt fail_reason");
+    assert!(matches!(
+        durable::get_run(&env.db, run).await,
+        Err(RunError::Storage(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// 13. Stored errors are content-free
+// ---------------------------------------------------------------------------
+
+const PROMPT_SENTINEL: &str = "SENTINEL_PROMPT_9f2a";
+const REPLY_SENTINEL: &str = "SENTINEL_REPLY_7c1b";
+
+#[tokio::test]
+async fn stored_errors_are_content_free() {
+    // (a) turn budget with sentinels in the prompt and replies.
+    let env = setup(&[&TWO_TURNS]).await;
+    for _ in 0..2 {
+        env.fake.tool_call(
+            models::DEFAULT,
+            "c",
+            "add",
+            &serde_json::json!({"a": 1, "b": 1}),
+        );
+    }
+    let run = durable::start(&env.state, "two_turns", PROMPT_SENTINEL)
+        .await
+        .expect("start");
+    drive(&env.state, run).await.expect("job Ok");
+    let view = view_of(&env.db, run).await;
+    assert_eq!(view.status, RunStatus::Failed);
+    assert!(view.error.as_deref().unwrap_or("").find(PROMPT_SENTINEL).is_none());
+    assert!(view.error.as_deref().unwrap_or("").find(REPLY_SENTINEL).is_none());
+
+    // The stored run_state DOES contain the prompt (it must, to resume);
+    // only the error/detail surfaces must be content-free.
+    let state_text: String = sqlx::query_scalar(
+        "SELECT run_state::text FROM agent_runs WHERE id = $1",
+    )
+    .bind(run.0)
+    .fetch_one(&env.db)
+    .await
+    .expect("run_state");
+    assert!(state_text.contains(PROMPT_SENTINEL), "run_state keeps the conversation");
+
+    // (b) a 402 whose body carries a sentinel.
+    let env2 = setup(&[&COUNTER]).await;
+    env2.fake.status(402, &format!("{{\"note\":\"{REPLY_SENTINEL}\"}}"));
+    let run2 = durable::start(&env2.state, "counter", PROMPT_SENTINEL)
+        .await
+        .expect("start");
+    drive(&env2.state, run2).await.expect("job Ok");
+    let view2 = view_of(&env2.db, run2).await;
+    assert_eq!(view2.status, RunStatus::Failed);
+    let err_text = view2.error.unwrap_or_default();
+    assert!(!err_text.contains(REPLY_SENTINEL), "error column: {err_text}");
+    assert!(!err_text.contains(PROMPT_SENTINEL), "error column: {err_text}");
+
+    // Walk the whole RunError chain: no link carries a sentinel.
+    fn assert_chain_content_free(error: &(dyn std::error::Error + 'static)) {
+        let mut cur: Option<&dyn std::error::Error> = Some(error);
+        while let Some(e) = cur {
+            let display = e.to_string();
+            let debug = format!("{e:?}");
+            assert!(!display.contains(REPLY_SENTINEL), "chain Display: {display}");
+            assert!(!display.contains(PROMPT_SENTINEL), "chain Display: {display}");
+            assert!(!debug.contains(REPLY_SENTINEL), "chain Debug: {debug}");
+            cur = e.source();
+        }
+    }
+    let corrupt_error = durable::answer(&env2.state, run2, "x").await.expect_err("not waiting");
+    assert_chain_content_free(&corrupt_error);
+    let _ = &corrupt_error;
+
+    // (c) corrupted run_state: the Corrupt variant renders only the serde
+    // classification + position (no source that quotes the value).
+    sqlx::query("UPDATE agent_runs SET status = 'waiting', pending_call_id = 'x', \
+                 pending_question = 'y', run_state = '{\"format\": 999}' WHERE id = $1")
+        .bind(run2.0)
+        .execute(&env2.db)
+        .await
+        .expect("corrupt run_state");
+    let _ = env2.fake.chat_completion(models::DEFAULT, REPLY_SENTINEL);
+    let bad = durable::answer(&env2.state, run2, "z").await;
+    match bad {
+        Err(err @ RunError::Corrupt(..)) => {
+            let display = err.to_string();
+            assert!(!display.contains(REPLY_SENTINEL), "Corrupt Display: {display}");
+            assert!(err.source().is_none(), "Corrupt carries no source");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. ToolCallKey idempotency
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_call_key_idempotency() {
+    SEEN_KEYS.lock().expect("key log").clear();
+
+    // Reference: one tool call, key matches the scripted call id.
+    let env = setup(&[&KEYED]).await;
+    script_keyed(&env.fake);
+    let run = durable::start(&env.state, "keyed", "add 2 and 3")
+        .await
+        .expect("start");
+    drive(&env.state, run).await.expect("drive");
+    let keys = SEEN_KEYS.lock().expect("key log").clone();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].run_id, run);
+    assert_eq!(keys[0].call_id, "call_1");
+
+    // Crash variant: crash after the tool executed but before its result
+    // persisted (the persist right after run.answer). The reference run's
+    // persist order: pre-call(1), post-response(2), post-answer(3) —
+    // crashing at 3 leaves the tool executed with no result row.
+    let env2 = setup_with(&[&KEYED], Duration::from_millis(1)).await;
+    script_keyed(&env2.fake);
+    let run2 = durable::start(&env2.state, "keyed", "add 2 and 3")
+        .await
+        .expect("start");
+    SEEN_KEYS.lock().expect("key log").clear();
+    env2.state.durable.fail_after_persist(3);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 20, "crash variant did not complete");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        if drive(&env2.state, run2).await.is_ok() {
+            break;
+        }
+    }
+    let keys = SEEN_KEYS.lock().expect("key log").clone();
+    assert!(
+        keys.len() >= 2,
+        "the tool re-executed after the crash (at-least-once): {keys:?}"
+    );
+    for key in &keys {
+        assert_eq!(key.run_id, run2);
+        assert_eq!(key.call_id, "call_1", "identical key on every execution");
+    }
+
+    // Final transcript identical to the reference shape.
+    let rows = transcript_rows(&env2.db, run2).await;
+    let roles: Vec<_> = rows.iter().map(|(_, role, _)| role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+}
+
+// ---------------------------------------------------------------------------
+// 15. Invalid tool call policy
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn invalid_tool_call_policy() {
+    // Default (Fail): the run fails with protocol, transcript preserved.
+    let env = setup(&[&COUNTER]).await;
+    env.fake.tool_call(
+        models::DEFAULT,
+        "c1",
+        "no_such_tool",
+        &serde_json::json!({"x": 1}),
+    );
+    let run = durable::start(&env.state, "counter", "x")
+        .await
+        .expect("start");
+    drive(&env.state, run).await.expect("job Ok");
+    let view = view_of(&env.db, run).await;
+    assert_eq!(view.status, RunStatus::Failed);
+    assert_eq!(view.fail_reason, Some(FailReason::Protocol));
+    assert!(!transcript_rows(&env.db, run).await.is_empty());
+
+    // Ignore: the call is dropped, the run proceeds.
+    let env2 = setup(&[&IGNORE_BAD_TOOLS]).await;
+    env2.fake.tool_call(
+        models::DEFAULT,
+        "c1",
+        "no_such_tool",
+        &serde_json::json!({"x": 1}),
+    );
+    env2.fake.chat_completion(models::DEFAULT, "recovered");
+    let run2 = durable::start(&env2.state, "ignore_bad_tools", "x")
+        .await
+        .expect("start");
+    drive(&env2.state, run2).await.expect("drive to completion");
+    assert_eq!(status_of(&env2.db, run2).await, RunStatus::Succeeded);
+}
+
+// ---------------------------------------------------------------------------
+// 16. Multiple asks suspend sequentially
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_asks_suspend_sequentially() {
+    let env = setup(&[&COUNTER]).await;
+    let q1 = serde_json::json!({"question": "first question?"});
+    let q2 = serde_json::json!({"question": "second question?"});
+    env.fake.tool_calls(
+        models::DEFAULT,
+        &[("call_a", "ask", &q1), ("call_b", "ask", &q2)],
+    );
+    env.fake.chat_completion(models::DEFAULT, "done");
+
+    let run = durable::start(&env.state, "counter", "two questions")
+        .await
+        .expect("start");
+    let (worker, token) = spawn_worker(&env.state, Duration::from_millis(10)).await;
+
+    wait_until(|| async {
+        let view = view_of(&env.db, run).await;
+        match view.status {
+            RunStatus::Waiting => view.pending_ask,
+            _ => None,
+        }
+    })
+    .await;
+    let view = view_of(&env.db, run).await;
+    assert_eq!(
+        view.pending_ask.as_ref().map(|a| a.call_id.as_str()),
+        Some("call_a"),
+        "first ask in call order suspends first"
+    );
+    assert_eq!(
+        view.pending_ask.as_ref().map(|a| a.question.as_str()),
+        Some("first question?")
+    );
+
+    durable::answer(&env.state, run, "first answer")
+        .await
+        .expect("answer first");
+    wait_until(|| async {
+        let view = view_of(&env.db, run).await;
+        match view.status {
+            RunStatus::Waiting => view.pending_ask,
+            _ => None,
+        }
+    })
+    .await;
+    let view = view_of(&env.db, run).await;
+    assert_eq!(
+        view.pending_ask.as_ref().map(|a| a.call_id.as_str()),
+        Some("call_b"),
+        "the sibling ask re-suspends with its own columns"
+    );
+    assert_eq!(
+        view.pending_ask.as_ref().map(|a| a.question.as_str()),
+        Some("second question?")
+    );
+
+    durable::answer(&env.state, run, "second answer")
+        .await
+        .expect("answer second");
+    wait_until(|| async {
+        let status = status_of(&env.db, run).await;
+        (status == RunStatus::Succeeded).then_some(status)
+    })
+    .await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _ = worker.await;
+    })
+    .await
+    .expect("worker exited");
+
+    // Tool results for BOTH call ids, in call order. rig commits a whole
+    // tool batch as ONE user message with one content item per result, so
+    // flatten the content items rather than counting messages.
+    let rows = transcript_rows(&env.db, run).await;
+    let result_call_ids: Vec<String> = rows
+        .iter()
+        .filter(|(_, role, _)| role == "user")
+        .flat_map(|(_, _, msg)| {
+            msg["content"]
+                .as_array()
+                .expect("user message content array")
+                .iter()
+                .filter(|item| item["type"] == "toolresult")
+                .map(|item| {
+                    serde_json::to_string(&item["call"]).expect("call id json")
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(result_call_ids.len(), 2, "{result_call_ids:?}");
+    assert!(result_call_ids[0].contains("call_a"), "{result_call_ids:?}");
+    assert!(result_call_ids[1].contains("call_b"), "{result_call_ids:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 19. Ask with invalid arguments never suspends
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ask_with_invalid_args_fails_and_continues() {
+    let env = setup(&[&COUNTER]).await;
+    env.fake.tool_call(models::DEFAULT, "call_bad", "ask", &serde_json::json!({}));
+    env.fake.chat_completion(models::DEFAULT, "recovered");
+
+    let run = durable::start(&env.state, "counter", "bad ask")
+        .await
+        .expect("start");
+    drive(&env.state, run).await.expect("drive");
+
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
+    let rows = transcript_rows(&env.db, run).await;
+    let result_row = rows
+        .iter()
+        .find(|(_, role, msg)| {
+            *role == "user" && serde_json::to_string(msg).unwrap_or_default().contains("call_bad")
+        })
+        .expect("corrective tool result for call_bad");
+    let text = serde_json::to_string(&result_row.2).unwrap_or_default();
+    assert!(
+        text.contains("ask requires a string `question`"),
+        "corrective failure text: {text}"
+    );
+    let result_pos = rows.iter().position(|(_, _, msg)| {
+        serde_json::to_string(msg).unwrap_or_default().contains("call_bad")
+    });
+    let last_role = rows.last().map(|(_, role, _)| role.as_str());
+    assert_eq!(last_role, Some("assistant"), "model recovered after the failure");
+    assert!(result_pos.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// 20. Enqueue wakes once, after commit
+// ---------------------------------------------------------------------------
+
+/// Run `op` (a `start`/`answer` call) with the parking hook installed, on a
+/// dedicated OS thread with its own single-threaded runtime and a lazy
+/// second pool into the same test DB. The hook signals arrival post-commit
+/// and parks that thread; while it stays parked, `mid_park` runs on the
+/// MAIN runtime and asserts what a fresh worker would see through its own
+/// connection. A dedicated thread is required: blocking a worker of the
+/// shared runtime stalls its I/O driver — mid_park's queries (even a
+/// `sleep`) would deadlock — while blocking the dedicated thread parks only
+/// that thread's own runtime, which has nothing else to do.
+async fn parked_op<O, F, Fut, M>(
+    template: &TestState,
+    park: Arc<(Mutex<bool>, Condvar)>,
+    op: F,
+    mid_park: M,
+) -> O
+where
+    O: Send + 'static,
+    F: FnOnce(TestState) -> Fut + Send + 'static,
+    Fut: Future<Output = O> + Send + 'static,
+    M: Future<Output = ()>,
+{
+    // The op's own pool: connections are established lazily on the dedicated
+    // runtime, so they bind to it (sharing the main pool across runtimes
+    // would leave socket readiness registered with the wrong reactor).
+    let state = TestState {
+        db: sqlx::postgres::PgPoolOptions::new().connect_lazy_with(
+            (*template.db.connect_options().clone()).clone(),
+        ),
+        cookie_key: template.cookie_key.clone(),
+        durable: template.durable.clone(),
+        wakes: template.wakes.clone(),
+        park: Some(park.clone()),
+    };
+    *park.0.lock().expect("park lock") = false;
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("dedicated runtime");
+        rt.block_on(op(state))
+    });
+    // Wait for the hook's arrival signal without blocking anything.
+    loop {
+        if *park.0.lock().expect("park lock") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // Parked, and — if the wake-after-commit contract holds — committed:
+    // this is the moment a worker would be woken into. Had `job_enqueued`
+    // fired inside the transaction, the op would be parked holding it open
+    // and neither row would be visible from this fresh connection.
+    mid_park.await;
+    {
+        let mut guard = park.0.lock().expect("park lock");
+        *guard = false;
+        park.1.notify_all();
+    }
+    thread.join().expect("op thread join")
+}
+
+async fn count_rows(db: &sqlx::PgPool, what: &str) -> i64 {
+    let sql = match what {
+        "runs" => "SELECT count(*) FROM agent_runs",
+        "jobs" => "SELECT count(*) FROM jobs WHERE name = 'AdvanceRunJob'",
+        other => panic!("unknown count target {other}"),
+    };
+    sqlx::query_scalar(sql).fetch_one(db).await.expect("count")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enqueue_wakes_once_after_commit() {
+    let env = setup(&[&COUNTER]).await;
+    let park = Arc::new((Mutex::new(false), Condvar::new()));
+
+    // start: while its wake hook is parked, the run row AND its
+    // AdvanceRunJob row must already be committed and visible. This run is
+    // never driven, so it needs no scripted replies (start never calls the
+    // model).
+    let db = env.db.clone();
+    let run = parked_op(
+        &env.state,
+        park.clone(),
+        |state| async move { durable::start(&state, "counter", "x").await },
+        async {
+            assert_eq!(count_rows(&db, "runs").await, 1, "run row committed before wake");
+            assert_eq!(count_rows(&db, "jobs").await, 1, "job row committed before wake");
+        },
+    )
+    .await
+    .expect("start");
+    let _ = run;
+    assert_eq!(env.state.wakes.load(Ordering::SeqCst), 1, "exactly one wake");
+
+    // answer: suspend a second run, then park through answer's wake and
+    // check its enqueued job is committed before the wake too.
+    env.state.wakes.store(0, Ordering::SeqCst);
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_a",
+        "ask",
+        &serde_json::json!({"question": "q?"}),
+    );
+    let db = env.db.clone();
+    let suspended = parked_op(
+        &env.state,
+        park.clone(),
+        |state| async move { durable::start(&state, "counter", "y").await },
+        async {
+            assert_eq!(count_rows(&db, "runs").await, 2);
+            assert_eq!(count_rows(&db, "jobs").await, 2);
+        },
+    )
+    .await
+    .expect("start suspended run");
+    drive(&env.state, suspended).await.expect("suspend");
+    assert_eq!(status_of(&env.db, suspended).await, RunStatus::Waiting);
+
+    env.state.wakes.store(0, Ordering::SeqCst);
+    let db = env.db.clone();
+    let suspended_answer = suspended;
+    parked_op(
+        &env.state,
+        park.clone(),
+        move |state| async move {
+            durable::answer(&state, suspended_answer, "yes").await
+        },
+        async {
+            assert_eq!(count_rows(&db, "runs").await, 2);
+            assert_eq!(
+                count_rows(&db, "jobs").await,
+                3,
+                "answer's fresh AdvanceRunJob committed before its wake"
+            );
+        },
+    )
+    .await
+    .expect("answer");
+    assert_eq!(env.state.wakes.load(Ordering::SeqCst), 1);
+
+    // Negative cases with a plain (non-parking) state.
+    let plain_env = setup(&[&COUNTER]).await;
+    assert!(matches!(
+        durable::start(&plain_env.state, "no_such_kind", "x").await,
+        Err(RunError::UnknownKind(_))
+    ));
+    let run = durable::start(&plain_env.state, "counter", "x")
+        .await
+        .expect("start");
+    assert!(matches!(
+        durable::answer(&plain_env.state, run, "no").await,
+        Err(RunError::NotWaiting(..))
+    ));
+    assert_eq!(
+        plain_env.state.wakes.load(Ordering::SeqCst),
+        1,
+        "only the successful start woke the worker"
+    );
 }
