@@ -75,11 +75,11 @@ impl Llm {
                  Refresher::tailnet() to LlmConfig::tailnet"
             );
         }
-        let http = DynHttpClient::new(transport::GatewayHttp::new(config)?).with_middleware(
-            transport::GatewayHeaders {
-                app: config.app_header_value()?,
-            },
-        );
+        // Validated first, so an empty app name can never reach the wire or
+        // a span: the X-App fallback is never empty, by contract.
+        let app = config.app_header_value()?;
+        let http = DynHttpClient::new(transport::GatewayHttp::new(config)?)
+            .with_middleware(transport::GatewayHeaders { app });
         let openai = rig_core::providers::openai::OpenAIConfig::new(PLACEHOLDER_KEY)
             .with_base_url(config.openai_base_url())
             .with_route(Route::Chat)
@@ -432,6 +432,35 @@ mod tests {
         assert_eq!(dialer.dials(), 2, "every attempt dials once, then stops");
     }
 
+    /// The total request deadline also bounds the connect phase: a short
+    /// `request_timeout` cannot be overrun by a long `connect_timeout` on a
+    /// hanging dialer. The deadline-clamped failure is still pre-send, so it
+    /// stays a Connect-class error (never Timeout's "may have billed"
+    /// wording).
+    #[tokio::test]
+    async fn connect_is_bounded_by_the_request_deadline() {
+        let dialer = crate::testing::CountingDialer::never_completes();
+        let config = config(&url::Url::parse("https://llm.rooster-mermaid.ts.net").unwrap())
+            .connect_timeout(Duration::from_secs(10))
+            .request_timeout(Duration::from_millis(250))
+            .retries(RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            })
+            .dialer(dialer.clone());
+        let llm = Llm::new(&config).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = llm.complete(MODEL, "ping").await.unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(error, Error::Connect { .. }), "{error:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the request deadline, not the 10s connect timeout, bounded the call: {elapsed:?}"
+        );
+    }
+
     /// Idle between stream chunks ends the stream with a timeout; nothing
     /// retries after the first byte.
     #[tokio::test]
@@ -452,11 +481,15 @@ mod tests {
     /// Dropping the stream cancels the request: the fake observes the
     /// disconnect in a bounded window.
     ///
-    /// Mutation-checked: with the stream guard's abort disabled the test
-    /// still passes, because hyper 1.12 also closes an http/1.1 connection
-    /// when the response body is dropped mid-stream — the observable
-    /// disconnect holds either way. The guard stays for determinism (an
-    /// immediate abort rather than hyper's lazy close).
+    /// Mutation-checked (PR review round 1, both directions): with the
+    /// stream guard's abort disabled this test still passes, and so does a
+    /// stream consumed fully to its end — hyper 1.12 closes the http/1.1
+    /// connection itself when the response body is dropped (mid-stream) or
+    /// completes with the sender already dropped. No wire-observable
+    /// behavior distinguishes the guard, which stays as defense in depth
+    /// for determinism (an immediate abort rather than hyper's lazy close);
+    /// this test pins the observable contract (prompt disconnect), not the
+    /// guard's internals.
     #[tokio::test]
     async fn dropping_stream_cancels() {
         let fake = FakeGateway::start().await;
@@ -470,9 +503,57 @@ mod tests {
         fake.wait_until_disconnected().await;
     }
 
+    /// A stream consumed fully to its end must not leak its connection
+    /// either: after the last chunk the socket must close promptly (the
+    /// guard aborts the driver at end-of-stream), not sit idle in
+    /// keep-alive — see `dropping_stream_cancels`' mutation note for why
+    /// hyper alone usually closes it too.
+    #[tokio::test]
+    async fn ended_stream_does_not_leak_the_connection() {
+        let fake = FakeGateway::start().await;
+        fake.chat_stream(MODEL, &["a", "b"]);
+        let llm = Llm::new(&config(&fake.url())).unwrap();
+
+        let mut stream = llm.stream(MODEL, "ping");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        fake.wait_until_disconnected().await;
+    }
+
     // ------------------------------------------------------------------
     // Opinionated-rig criteria
     // ------------------------------------------------------------------
+
+    /// The mandated rig-agent end-to-end test: a tool call round-trips
+    /// through the fake — the model calls `add`, rig executes it, and the
+    /// final reply reports the result. Its app-shaped twin (macro expansion
+    /// without rig-core in the manifest) lives in cja-llm-app-fixture.
+    #[tokio::test]
+    async fn agent_round_trips_a_tool_call() {
+        let fake = FakeGateway::start().await;
+        fake.tool_call(MODEL, "call-1", "add", &serde_json::json!({"a": 2, "b": 3}));
+        fake.chat_completion(MODEL, "5");
+        let llm = Llm::new(&config(&fake.url())).unwrap();
+        let ran = Arc::new(Ran(tokio::sync::Mutex::new(false)));
+
+        let reply = llm
+            .agent(MODEL)
+            .tool(Add)
+            .build()
+            .prompt("add 2 and 3")
+            .tool_context(rig_core::tool::ToolContext::default().with_scope(ran.clone()))
+            .await
+            .unwrap();
+
+        assert!(reply.output().contains('5'), "{}", reply.output());
+        assert!(*ran.0.lock().await, "the tool ran");
+        assert_eq!(
+            fake.requests().len(),
+            2,
+            "the tool call, then the final reply"
+        );
+    }
 
     #[derive(Debug, Deserialize, schemars::JsonSchema)]
     struct Answer {

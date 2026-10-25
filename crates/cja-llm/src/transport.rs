@@ -275,10 +275,13 @@ fn build_request(
 }
 
 /// Dial + TLS + HTTP/1 handshake + driver spawn, bounded by the connect
-/// timeout. Nothing has been sent when this fails, so failures here are
-/// retryable [`TransportError::Connect*`]s.
+/// timeout — which is itself clamped to the call's total request deadline,
+/// so a short `request_timeout` cannot be overrun by a long connect phase.
+/// Nothing has been sent when this fails, so failures here — deadline
+/// elapse included — are retryable [`TransportError::Connect*`]s.
 async fn connect(
     inner: &Inner,
+    deadline: tokio::time::Instant,
 ) -> Result<
     (
         hyper::client::conn::http1::SendRequest<Full<Bytes>>,
@@ -286,11 +289,13 @@ async fn connect(
     ),
     TransportError,
 > {
-    let timeout = inner.connect_timeout;
-    match tokio::time::timeout(timeout, connect_phase(inner)).await {
+    let now = tokio::time::Instant::now();
+    let connect_deadline = deadline.min(now + inner.connect_timeout);
+    let budget = connect_deadline.saturating_duration_since(now);
+    match tokio::time::timeout_at(connect_deadline, connect_phase(inner)).await {
         Ok(Ok(pair)) => Ok(pair),
         Ok(Err(transport_error)) => Err(transport_error),
-        Err(_elapsed) => Err(TransportError::ConnectTimeout(timeout)),
+        Err(_elapsed) => Err(TransportError::ConnectTimeout(budget)),
     }
 }
 
@@ -332,8 +337,9 @@ async fn connect_phase(
     Ok((sender, AbortOnDrop(Some(tokio::spawn(connection)))))
 }
 
-/// Reads a non-success reply's body (bounded by the deadline, capped) and its
-/// seconds-form `Retry-After`, for status classification.
+/// Reads a non-success reply's body — capped at [`MAX_ERROR_BODY`] bytes
+/// *while reading*, so a huge error envelope is never buffered unbounded —
+/// and its seconds-form `Retry-After`, for status classification.
 async fn read_error_body(
     response: http::Response<Incoming>,
     deadline: tokio::time::Instant,
@@ -345,13 +351,34 @@ async fn read_error_body(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(Duration::from_secs);
-    let bytes = match tokio::time::timeout_at(deadline, body.collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(_)) | Err(_) => Bytes::new(),
-    };
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    text.truncate(MAX_ERROR_BODY);
+    // The bytes are capped *before* lossy decoding: a cut mid-way through a
+    // multi-byte character decodes to U+FFFD instead of panicking the way
+    // `String::truncate` at a non-char boundary does. The first 64 KiB
+    // carries every discriminator the classifier needs (`error`/`type` are
+    // top-level fields of the gateway and Bifrost envelopes).
+    let text = String::from_utf8_lossy(&read_capped(body, deadline).await).into_owned();
     (text, parts.headers, retry_after)
+}
+
+/// Reads up to [`MAX_ERROR_BODY`] bytes of a body, stopping at the cap.
+/// Errors and deadline elapses keep whatever arrived; the connection is
+/// torn down by the caller either way, so not draining it is fine.
+async fn read_capped(body: Incoming, deadline: tokio::time::Instant) -> Bytes {
+    let mut stream = http_body_util::BodyStream::new(body);
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < MAX_ERROR_BODY {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(frame))) => {
+                let Ok(data) = frame.into_data() else {
+                    continue; // trailers carry no classification content
+                };
+                let remaining = MAX_ERROR_BODY - buf.len();
+                buf.extend_from_slice(&data[..data.len().min(remaining)]);
+            }
+            Ok(Some(Err(_)) | None) | Err(_) => break,
+        }
+    }
+    Bytes::from(buf)
 }
 
 /// The gateway body for a streamed 2xx reply, as rig's `BoxedStream`: each
@@ -630,7 +657,7 @@ async fn run_attempt(
         usage,
     };
 
-    let (mut sender, driver) = match connect(inner).await {
+    let (mut sender, driver) = match connect(inner, deadline).await {
         Ok(pair) => pair,
         Err(transport_error) => {
             // Nothing was sent: retryable, with the grant hint in the marker.

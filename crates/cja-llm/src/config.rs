@@ -163,7 +163,9 @@ impl LlmConfig {
                 }
                 name
             }
-            None => get("K_SERVICE").unwrap_or_else(default_app_name),
+            None => get("K_SERVICE")
+                .filter(|service| !service.trim().is_empty())
+                .unwrap_or_else(default_app_name),
         };
 
         let mut config = Self::new(gateway);
@@ -179,8 +181,15 @@ impl LlmConfig {
         format!("{}/v1", self.gateway.origin().ascii_serialization())
     }
 
-    /// The configured app name as an `X-App` header value.
+    /// The configured app name as an `X-App` header value. The `X-App`
+    /// fallback is never empty, so an empty or whitespace-only name — an
+    /// empty builder value or pub-field write — is a config error.
     pub(crate) fn app_header_value(&self) -> Result<http::HeaderValue, Error> {
+        if self.app_name.trim().is_empty() {
+            return Err(Error::Config(
+                "app name must not be empty; set CJA_LLM_APP or call LlmConfig::app_name".into(),
+            ));
+        }
         http::HeaderValue::from_str(&self.app_name).map_err(|e| {
             Error::Config(format!(
                 "app name {:?} is not a valid header value: {e}",
@@ -253,6 +262,7 @@ fn default_app_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Llm;
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: std::collections::HashMap<String, String> = pairs
@@ -310,6 +320,13 @@ mod tests {
         let config = LlmConfig::from_lookup(lookup(&[("K_SERVICE", "tf-arena")])).unwrap();
         assert_eq!(config.app_name, "tf-arena");
 
+        // An empty K_SERVICE falls through to the next fallback (the
+        // executable's file stem), never an empty X-App.
+        let config = LlmConfig::from_lookup(lookup(&[("K_SERVICE", "")])).unwrap();
+        assert_ne!(config.app_name, "");
+        let config = LlmConfig::from_lookup(lookup(&[("K_SERVICE", "  ")])).unwrap();
+        assert_ne!(config.app_name, "");
+
         // Neither set: the executable's file stem, never empty.
         let config = LlmConfig::from_lookup(lookup(&[])).unwrap();
         assert_ne!(config.app_name, "");
@@ -349,5 +366,20 @@ mod tests {
     fn header_value_rejects_control_characters() {
         let config = LlmConfig::new(Url::parse(DEFAULT_GATEWAY_URL).unwrap()).app_name("bad\napp");
         assert!(config.app_header_value().is_err());
+    }
+
+    #[test]
+    fn header_value_rejects_an_empty_app_name() {
+        // The builder accepts any string; Llm::new is where emptiness must
+        // fail, so the header value is where the check lives.
+        let config = LlmConfig::new(Url::parse(DEFAULT_GATEWAY_URL).unwrap()).app_name("");
+        let err = config.app_header_value().unwrap_err();
+        assert!(err.to_string().contains("app name"), "{err}");
+
+        let config = config.app_name("   ");
+        assert!(config.app_header_value().is_err());
+
+        // And the built client rejects it too.
+        assert!(Llm::new(&config).is_err());
     }
 }
