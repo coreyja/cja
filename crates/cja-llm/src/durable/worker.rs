@@ -630,7 +630,7 @@ impl Durable {
         let code = error
             .as_database_error()
             .and_then(sqlx::error::DatabaseError::code)
-            .unwrap_or_else(|| std::borrow::Cow::Borrowed("unknown"));
+            .unwrap_or(std::borrow::Cow::Borrowed("unknown"));
         match tokio::time::timeout(WRITE_BOUND, db::fail_unstorable(db, run_id, me, &code)).await {
             Err(_) => Err(cja::color_eyre::eyre::eyre!(
                 "unstorable-content failure write timed out"

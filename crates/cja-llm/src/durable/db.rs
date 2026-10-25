@@ -808,16 +808,13 @@ mod tests {
         .await
         .expect("suspension write");
         assert_eq!(outcome, Some(true), "cancel wins over parking");
-        let (status, pending_call, pending_question, locked_by, error, finished_at): (
+        let (status, pending_call, pending_question, locked_by): (
             String,
             Option<String>,
             Option<String>,
             Option<String>,
-            Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
         ) = sqlx::query_as(
-            "SELECT status, pending_call_id, pending_question, locked_by, error, finished_at \
-             FROM agent_runs WHERE id = $1",
+            "SELECT status, pending_call_id, pending_question, locked_by FROM agent_runs WHERE id = $1",
         )
         .bind(id)
         .fetch_one(&db)
@@ -827,6 +824,12 @@ mod tests {
         assert_eq!(pending_call, None, "pending columns cleared");
         assert_eq!(pending_question, None, "pending columns cleared");
         assert_eq!(locked_by, None, "lease cleared");
+        let (error, finished_at): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT error, finished_at FROM agent_runs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .expect("row");
         assert_eq!(error.as_deref(), Some("cancelled by request"));
         assert!(finished_at.is_some(), "the cancel branch finishes the run");
         let inserted: i64 =
