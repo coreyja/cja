@@ -13,7 +13,6 @@
 //! worker and retried 20× into dead-letter on a permanent condition,
 //! orphaning the run.
 
-#[cfg(feature = "testing")]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
