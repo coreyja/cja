@@ -34,12 +34,12 @@ pub mod rig {
 pub mod config;
 pub mod error;
 pub mod models;
-mod transport;
 #[cfg(feature = "testing")]
 pub mod testing;
+mod transport;
 
-
-
+pub use config::{DialerChoice, LlmConfig, RetryPolicy};
+pub use error::{Error, Result};
 
 use std::time::Duration;
 

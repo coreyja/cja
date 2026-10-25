@@ -27,10 +27,14 @@ pub(crate) const TIMEOUT_MARKER: &str = "cja-llm transport timeout:";
 pub(crate) enum TransportError {
     /// The connect phase (dial, TLS, HTTP handshake) exceeded its budget.
     /// Nothing was sent.
-    #[error("cja-llm transport connect: timed out after {0:?} before the request was sent; is this node on the tailnet with a policy grant to llm:443 (tag:llm on port 443)?")]
+    #[error(
+        "cja-llm transport connect: timed out after {0:?} before the request was sent; is this node on the tailnet with a policy grant to llm:443 (tag:llm on port 443)?"
+    )]
     ConnectTimeout(std::time::Duration),
     /// The connect phase failed outright. Nothing was sent.
-    #[error("cja-llm transport connect: failed before the request was sent: {source}; is this node on the tailnet with a policy grant to llm:443 (tag:llm on port 443)?")]
+    #[error(
+        "cja-llm transport connect: failed before the request was sent: {source}; is this node on the tailnet with a policy grant to llm:443 (tag:llm on port 443)?"
+    )]
     Connect {
         #[source]
         source: std::io::Error,
@@ -38,7 +42,9 @@ pub(crate) enum TransportError {
     /// The request deadline elapsed after the request was queued to the
     /// connection. The gateway drains and bills such attempts upstream, so
     /// this is never retried.
-    #[error("cja-llm transport timeout: request exceeded its deadline after the request was sent ({0:?} budget; the gateway may still bill the attempt)")]
+    #[error(
+        "cja-llm transport timeout: request exceeded its deadline after the request was sent ({0:?} budget; the gateway may still bill the attempt)"
+    )]
     Timeout(std::time::Duration),
 }
 

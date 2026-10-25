@@ -33,7 +33,9 @@ pub enum Error {
     /// determined"}`: tailnet `WhoIs` failed, so no upstream call was made.
     /// Check the tailnet policy grant that lets this node reach `llm:443`
     /// (e.g. a grant to `tag:llm` on port 443).
-    #[error("gateway could not identify this node's tailnet identity; check the tailnet policy grant that lets this node reach llm:443 (e.g. a grant to tag:llm on port 443): {body}")]
+    #[error(
+        "gateway could not identify this node's tailnet identity; check the tailnet policy grant that lets this node reach llm:443 (e.g. a grant to tag:llm on port 443): {body}"
+    )]
     IdentityRejected {
         /// The gateway's reply body.
         body: String,
@@ -84,7 +86,9 @@ pub enum Error {
     /// Dial, TLS, or handshake failure or a connect timeout: nothing was
     /// sent. Retryable within the retry policy. A node without the tailnet
     /// policy grant to `llm:443` fails here, not with a 403.
-    #[error("could not reach the gateway; is this node on the tailnet with a policy grant to llm:443 (tag:llm on port 443)?")]
+    #[error(
+        "could not reach the gateway; is this node on the tailnet with a policy grant to llm:443 (tag:llm on port 443)?"
+    )]
     Connect {
         #[source]
         source: Box<PromptError>,
@@ -107,9 +111,7 @@ pub enum Error {
     /// classifies gateway replies first, so `?` in app agent code still gets
     /// the gateway variants.
     #[error(transparent)]
-    Rig {
-        source: Box<PromptError>,
-    },
+    Rig { source: Box<PromptError> },
     /// Invalid cja-llm configuration.
     #[error("invalid cja-llm configuration: {0}")]
     Config(String),
@@ -125,10 +127,7 @@ impl From<StructuredOutputError> for Error {
     fn from(err: StructuredOutputError) -> Self {
         match err {
             StructuredOutputError::Deserialization { output, error } => {
-                Self::SchemaParse {
-                    raw: output,
-                    error,
-                }
+                Self::SchemaParse { raw: output, error }
             }
             StructuredOutputError::EmptyResponse => Self::EmptyStructuredOutput,
             StructuredOutputError::Prompt(prompt) => Self::from_prompt_error(prompt),
@@ -165,9 +164,7 @@ impl Error {
                 },
                 // A Bifrost envelope (stale virtual key) must win over the
                 // gateway wrapper's 403 strings.
-                401 | 403
-                    if matches!(body_type, Some("access_not_found" | "access_blocked")) =>
-                {
+                401 | 403 if matches!(body_type, Some("access_not_found" | "access_blocked")) => {
                     Self::Upstream {
                         status,
                         body,
@@ -269,7 +266,8 @@ mod tests {
 
     #[test]
     fn admin_403_is_admin_only() {
-        let error = Error::from_prompt_error(provider_with_response(403, r#"{"error":"admin only"}"#));
+        let error =
+            Error::from_prompt_error(provider_with_response(403, r#"{"error":"admin only"}"#));
         assert!(matches!(error, Error::AdminOnly { .. }), "{error:?}");
     }
 
@@ -332,9 +330,10 @@ mod tests {
                 .unwrap(),
             ),
         });
-        assert!(
-            matches!(Error::from_prompt_error(err), Error::BudgetExceeded { .. }),
-        );
+        assert!(matches!(
+            Error::from_prompt_error(err),
+            Error::BudgetExceeded { .. }
+        ),);
     }
 
     #[test]
@@ -363,12 +362,14 @@ mod tests {
 
     #[test]
     fn timeout_marker_classifies_on_the_provider_path() {
-        let err = PromptError::Provider(ProviderError::Http(Arc::new(
-            http_client::Error::instance(TransportError::Timeout(
-                std::time::Duration::from_secs(120),
-            )),
-        )));
-        assert!(matches!(Error::from_prompt_error(err), Error::Timeout { .. }));
+        let err =
+            PromptError::Provider(ProviderError::Http(Arc::new(http_client::Error::instance(
+                TransportError::Timeout(std::time::Duration::from_secs(120)),
+            ))));
+        assert!(matches!(
+            Error::from_prompt_error(err),
+            Error::Timeout { .. }
+        ));
     }
 
     #[test]
@@ -398,10 +399,7 @@ mod tests {
         ));
 
         let prompt = StructuredOutputError::Prompt(provider_with_response(402, "{}"));
-        assert!(matches!(
-            Error::from(prompt),
-            Error::BudgetExceeded { .. }
-        ));
+        assert!(matches!(Error::from(prompt), Error::BudgetExceeded { .. }));
     }
 
     #[test]
@@ -409,8 +407,7 @@ mod tests {
         // `?` on a PromptError goes through From<PromptError>, so a gateway
         // reply still classifies instead of landing in Rig.
         let result: Result<()> = (|| {
-            let err: PromptError =
-                provider_with_response(402, r#"{"type":"budget_exceeded"}"#);
+            let err: PromptError = provider_with_response(402, r#"{"type":"budget_exceeded"}"#);
             Err(err)?;
             Ok(())
         })();
