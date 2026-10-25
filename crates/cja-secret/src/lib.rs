@@ -16,7 +16,8 @@
 //! }
 //!
 //! // At boot, before building AppState:
-//! let (secrets, refresher) = SecretStore::connect(SetecConfig::from_env()?)?
+//! let (secrets, refresher) = SecretStore::connect(SetecConfig::from_env()?)
+//!     .await?
 //!     .load::<AppSecrets>()
 //!     .await?;
 //!
@@ -30,9 +31,12 @@
 //!
 //! # Reachability
 //!
-//! setec authorizes callers by tailnet identity, so the process must reach the
-//! server over the tailnet: a host `tailscaled`, or a sidecar exposing an
-//! HTTP(S) proxy via `HTTPS_PROXY`.
+//! setec authorizes callers by tailnet identity, so the connection has to come
+//! from a tailnet node. [`Transport::Host`] (the default) uses the host's
+//! network, for hosts running `tailscaled`. With the `tailnet` feature,
+//! [`Transport::Tailnet`] joins the tailnet in-process as an ephemeral node,
+//! keyless via workload identity federation (see `cja-tailnet`), for platforms
+//! like Cloud Run that can't run `tailscaled`.
 
 #[cfg(feature = "testing")]
 use std::collections::HashMap;
@@ -45,8 +49,7 @@ use std::{
     time::Duration,
 };
 
-use reqwest::Url;
-use setec::{SecretBytes, SecretValue, SecretVersion};
+use setec::{SecretBytes, SecretValue, SecretVersion, Url};
 use tokio::{sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -89,6 +92,9 @@ pub enum Error {
     },
     #[error("{} secret(s) failed to refresh", .0.len())]
     Refresh(Vec<Error>),
+    #[cfg(feature = "tailnet")]
+    #[error("could not join the tailnet")]
+    Tailnet(#[source] cja_tailnet::Error),
 }
 
 /// A set of secrets declared together. Derive it; don't implement it by hand.
@@ -136,6 +142,19 @@ pub struct SetecConfig {
     /// How long boot keeps retrying transient failures before giving up.
     /// Permanent failures (not found, access denied) fail immediately.
     pub boot_timeout: Duration,
+    /// How connections reach the tailnet.
+    pub transport: Transport,
+}
+
+/// How connections to setec reach the tailnet.
+#[derive(Debug, Clone, Default)]
+pub enum Transport {
+    /// The host's network. The host must be on the tailnet (`tailscaled`).
+    #[default]
+    Host,
+    /// Join the tailnet in-process as an ephemeral node.
+    #[cfg(feature = "tailnet")]
+    Tailnet(cja_tailnet::TailnetConfig),
 }
 
 impl SetecConfig {
@@ -144,11 +163,13 @@ impl SetecConfig {
             server,
             poll_interval: DEFAULT_POLL_INTERVAL,
             boot_timeout: DEFAULT_BOOT_TIMEOUT,
+            transport: Transport::Host,
         }
     }
 
-    /// Reads `SETEC_SERVER` (required), plus `SETEC_POLL_INTERVAL_SECS` and
-    /// `SETEC_BOOT_TIMEOUT_SECS` (optional).
+    /// Reads `SETEC_SERVER` (required), plus `SETEC_POLL_INTERVAL_SECS`,
+    /// `SETEC_BOOT_TIMEOUT_SECS`, and `SETEC_TRANSPORT` (`host`, the default,
+    /// or `tailnet`, which reads the rest from `TailnetConfig::from_env`).
     pub fn from_env() -> Result<Self, Error> {
         let server = std::env::var("SETEC_SERVER")
             .map_err(|_| Error::Config("SETEC_SERVER must be set".into()))?;
@@ -161,6 +182,18 @@ impl SetecConfig {
         if let Some(secs) = env_secs("SETEC_BOOT_TIMEOUT_SECS")? {
             config.boot_timeout = secs;
         }
+        config.transport = match std::env::var("SETEC_TRANSPORT").as_deref() {
+            Err(_) | Ok("host") => Transport::Host,
+            #[cfg(feature = "tailnet")]
+            Ok("tailnet") => {
+                Transport::Tailnet(cja_tailnet::TailnetConfig::from_env().map_err(Error::Tailnet)?)
+            }
+            Ok(other) => {
+                return Err(Error::Config(format!(
+                    "SETEC_TRANSPORT={other:?} is not supported by this build"
+                )));
+            }
+        };
         Ok(config)
     }
 }
@@ -183,6 +216,12 @@ pub struct SecretStore {
     poll_interval: Duration,
     boot_timeout: Duration,
     tracked: Mutex<Vec<Arc<dyn Tracked>>>,
+    /// Optional secrets that didn't exist at boot.
+    absent: Mutex<Vec<&'static str>>,
+    /// `host`, `tailnet`, or `fake`; reported in boot events.
+    transport: &'static str,
+    #[cfg(feature = "tailnet")]
+    tailnet: Option<Arc<cja_tailnet::Tailnet>>,
 }
 
 enum Source {
@@ -226,50 +265,137 @@ impl fmt::Debug for SecretStore {
 }
 
 impl SecretStore {
-    /// Builds a store backed by setec. Makes no requests until
-    /// [`SecretStore::load`].
-    pub fn connect(config: SetecConfig) -> Result<Self, Error> {
-        let client = setec::Client::new(config.server)
-            .map_err(|e| Error::Config(format!("building HTTP client: {e}")))?;
-        Ok(Self::from_source(
-            Source::Setec(client),
-            config.poll_interval,
-            config.boot_timeout,
-        ))
+    /// Builds a store backed by setec. With [`Transport::Tailnet`] this joins
+    /// the tailnet first (bounded by the tailnet config's join timeout);
+    /// otherwise it makes no requests until [`SecretStore::load`].
+    #[cfg_attr(
+        not(feature = "tailnet"),
+        expect(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "joining the tailnet awaits"
+        )
+    )]
+    pub async fn connect(config: SetecConfig) -> Result<Self, Error> {
+        let client = |dialer: Arc<dyn setec::Dialer>| {
+            setec::Client::new(config.server.clone(), dialer)
+                .map_err(|e| Error::Config(format!("setec client: {e}")))
+        };
+        match config.transport {
+            Transport::Host => Ok(Self::from_source(
+                Source::Setec(client(Arc::new(setec::TcpDialer))?),
+                "host",
+                config.poll_interval,
+                config.boot_timeout,
+            )),
+            #[cfg(feature = "tailnet")]
+            Transport::Tailnet(tailnet_config) => {
+                let tailnet = Arc::new(
+                    cja_tailnet::Tailnet::join(tailnet_config)
+                        .await
+                        .map_err(Error::Tailnet)?,
+                );
+                let mut store = Self::from_source(
+                    Source::Setec(client(tailnet.clone())?),
+                    "tailnet",
+                    config.poll_interval,
+                    config.boot_timeout,
+                );
+                store.tailnet = Some(tailnet);
+                Ok(store)
+            }
+        }
     }
 
-    fn from_source(source: Source, poll_interval: Duration, boot_timeout: Duration) -> Self {
+    fn from_source(
+        source: Source,
+        transport: &'static str,
+        poll_interval: Duration,
+        boot_timeout: Duration,
+    ) -> Self {
         Self {
             source: Arc::new(source),
             poll_interval,
             boot_timeout,
             tracked: Mutex::new(Vec::new()),
+            absent: Mutex::new(Vec::new()),
+            transport,
+            #[cfg(feature = "tailnet")]
+            tailnet: None,
         }
     }
 
-    /// Fetches every secret declared by `S`. Fails if any secret is missing,
-    /// denied, unparseable, or unreachable for longer than the boot timeout.
+    /// Fetches every secret declared by `S`. Fails if a required secret is
+    /// missing, or any secret is denied, unparseable, or unreachable for longer
+    /// than the boot timeout. An `Option<Secret<T>>` field that doesn't exist
+    /// is `None`.
     ///
     /// Returns the secrets and the [`Refresher`] that keeps them current.
     pub async fn load<S: Secrets>(self) -> Result<(S, Refresher), Error> {
         let secrets = S::declare(&self).await?;
         let tracked = self.tracked.into_inner().expect("tracked secrets lock");
+        let absent = self.absent.into_inner().expect("absent secrets lock");
+        tracing::info!(
+            event_type = "secrets_loaded",
+            secrets.loaded = tracked.len(),
+            secrets.absent = absent.len(),
+            setec.transport = self.transport,
+            "Secrets loaded"
+        );
         let refresher = Refresher {
             inner: Arc::new(RefresherInner {
                 source: self.source,
                 poll_interval: self.poll_interval,
                 tracked,
+                #[cfg(feature = "tailnet")]
+                tailnet: self.tailnet,
             }),
         };
         Ok((secrets, refresher))
     }
 
-    /// Fetches one secret and tracks it for refresh. Called by
+    /// Fetches one required secret and tracks it for refresh. Called by
     /// `#[derive(Secrets)]`.
     #[doc(hidden)]
     pub async fn declare<T: FromSecret>(&self, name: &'static str) -> Result<Secret<T>, Error> {
         let fetched = self.fetch_at_boot(name).await?;
-        let value = parse::<T>(name, &fetched)?;
+        self.track(name, &fetched, false)
+    }
+
+    /// Like [`SecretStore::declare`], but a secret that doesn't exist is
+    /// `None`. Only "not found" counts: denied, unreachable, or unparseable
+    /// still fail, so a missing grant can't pass for a disabled feature.
+    /// Called by `#[derive(Secrets)]` for `Option<Secret<T>>` fields.
+    #[doc(hidden)]
+    pub async fn declare_optional<T: FromSecret>(
+        &self,
+        name: &'static str,
+    ) -> Result<Option<Secret<T>>, Error> {
+        match self.fetch_at_boot(name).await {
+            Ok(fetched) => self.track(name, &fetched, true).map(Some),
+            Err(Error::Setec {
+                source: setec::Error::NotFound,
+                ..
+            }) => {
+                tracing::info!(
+                    event_type = "secret_absent",
+                    secret.name = name,
+                    "Optional secret not found"
+                );
+                self.absent.lock().expect("absent secrets lock").push(name);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn track<T: FromSecret>(
+        &self,
+        name: &'static str,
+        fetched: &SecretValue,
+        optional: bool,
+    ) -> Result<Secret<T>, Error> {
+        let value = parse::<T>(name, fetched)?;
         let entry = Arc::new(Entry {
             name,
             version: AtomicU32::new(fetched.version),
@@ -280,7 +406,13 @@ impl SecretStore {
             .lock()
             .expect("tracked secrets lock")
             .push(entry.clone());
-        tracing::info!(secret = name, version = fetched.version, "Loaded secret");
+        tracing::info!(
+            event_type = "secret_loaded",
+            secret.name = name,
+            secret.version = fetched.version,
+            secret.optional = optional,
+            "Secret loaded"
+        );
         Ok(Secret { entry })
     }
 
@@ -314,7 +446,13 @@ impl SecretStore {
                     last: Some(error),
                 });
             }
-            tracing::warn!(secret = name, error = ?error, retry_in = ?wait, "setec unavailable at boot; retrying");
+            tracing::warn!(
+                event_type = "secret_boot_retry",
+                secret.name = name,
+                error = ?error,
+                retry_in = ?wait,
+                "setec unavailable at boot; retrying"
+            );
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(MAX_RETRY_WAIT);
         }
@@ -332,6 +470,9 @@ struct RefresherInner {
     source: Arc<Source>,
     poll_interval: Duration,
     tracked: Vec<Arc<dyn Tracked>>,
+    /// Kept alive for the refresher's connections; left on shutdown.
+    #[cfg(feature = "tailnet")]
+    tailnet: Option<Arc<cja_tailnet::Tailnet>>,
 }
 
 impl fmt::Debug for Refresher {
@@ -345,14 +486,22 @@ impl fmt::Debug for Refresher {
 
 impl Refresher {
     /// Refreshes every `poll_interval` until `shutdown` is cancelled. Shaped
-    /// for `Supervisor::spawn`; it only returns once shutdown starts.
+    /// for `Supervisor::spawn`; it only returns once shutdown starts. With
+    /// [`Transport::Tailnet`] it then leaves the tailnet, so the ephemeral node
+    /// goes away promptly.
     pub async fn run(self, shutdown: CancellationToken) -> cja::Result<()> {
         let poll_interval = self.inner.poll_interval;
         let mut ticker = tokio::time::interval_at(Instant::now() + poll_interval, poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                () = shutdown.cancelled() => return Ok(()),
+                () = shutdown.cancelled() => {
+                    #[cfg(feature = "tailnet")]
+                    if let Some(tailnet) = &self.inner.tailnet {
+                        tailnet.shutdown().await;
+                    }
+                    return Ok(());
+                }
                 _ = ticker.tick() => {
                     // Failures are logged inside refresh and never stop the loop.
                     let _ = self.refresh().await;
@@ -374,10 +523,22 @@ impl Refresher {
                         ..
                     }
                     | Error::Parse { .. } => {
-                        tracing::error!(secret = entry.name(), error = ?error, "Secret refresh failed; keeping last good value");
+                        tracing::error!(
+                            event_type = "secret_refresh_failed",
+                            secret.name = entry.name(),
+                            secret.version = entry.version(),
+                            error = ?error,
+                            "Secret refresh failed; keeping last good value"
+                        );
                     }
                     _ => {
-                        tracing::warn!(secret = entry.name(), error = ?error, "Secret refresh failed; keeping last good value");
+                        tracing::warn!(
+                            event_type = "secret_refresh_failed",
+                            secret.name = entry.name(),
+                            secret.version = entry.version(),
+                            error = ?error,
+                            "Secret refresh failed; keeping last good value"
+                        );
                     }
                 }
                 failures.push(error);
@@ -402,9 +563,10 @@ impl Refresher {
         if let Some(value) = changed {
             entry.apply(&value)?;
             tracing::info!(
-                secret = name,
-                from = known,
-                to = value.version,
+                event_type = "secret_rotated",
+                secret.name = name,
+                secret.from_version = known,
+                secret.version = value.version,
                 "Secret rotated"
             );
         }
@@ -434,6 +596,7 @@ impl FakeSetec {
     pub fn store(&self) -> SecretStore {
         SecretStore::from_source(
             Source::Fake(self.clone()),
+            "fake",
             DEFAULT_POLL_INTERVAL,
             DEFAULT_BOOT_TIMEOUT,
         )
