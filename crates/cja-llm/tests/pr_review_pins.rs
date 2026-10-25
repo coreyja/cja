@@ -42,3 +42,39 @@ async fn oversized_multibyte_error_body_classifies_instead_of_panicking() {
     );
     assert_eq!(fake.requests().len(), 1, "400 is terminal");
 }
+
+/// Once a request is queued, the total deadline must remain a timeout even
+/// if the gateway has sent an error status but stalls in the error body.
+/// Returning the status instead hides the timeout and may allow callers to
+/// treat an incomplete provider reply as a definitive refusal.
+#[tokio::test]
+async fn stalled_error_body_reports_the_request_timeout() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    let url = url::Url::parse(&format!("http://{address}")).unwrap();
+    let llm = Llm::new(
+        &config(url)
+            .request_timeout(Duration::from_millis(150))
+            .retries(RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            }),
+    )
+    .unwrap();
+    let error = llm.complete(models::DEFAULT, "ping").await.unwrap_err();
+    server.abort();
+    assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
+}
