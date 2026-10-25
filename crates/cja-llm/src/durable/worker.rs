@@ -58,6 +58,19 @@ enum StepOutcome {
     Injected(cja::color_eyre::Report),
 }
 
+/// The outcome of [`Durable::claim_and_validate`]: a ready run, or nothing
+/// left to do (with `leased_by_other` distinguishing back-off from no-op).
+enum Claim {
+    Nothing {
+        leased_by_other: bool,
+    },
+    Ready {
+        row: db::ClaimedRun,
+        run: Box<AgentRun>,
+        kind: &'static AgentKind,
+    },
+}
+
 /// What [`Attempt::with_lease_guards`] produced: the guarded future's
 /// output, or a decision to stop driving this run.
 #[derive(Debug)]
@@ -81,8 +94,8 @@ impl RunSnapshot {
             run_state: serde_json::to_value(run)
                 .map_err(|e| cja::color_eyre::eyre::eyre!("failed to serialize run state: {e}"))?,
             turns: i32::try_from(run.turn()).unwrap_or(i32::MAX),
-            input_tokens: usage.input_tokens.unwrap_or(0).clamp(0, i64::MAX as u64) as i64,
-            output_tokens: usage.output_tokens.unwrap_or(0).clamp(0, i64::MAX as u64) as i64,
+            input_tokens: i64::try_from(usage.input_tokens.unwrap_or(0)).unwrap_or(i64::MAX),
+            output_tokens: i64::try_from(usage.output_tokens.unwrap_or(0)).unwrap_or(i64::MAX),
         })
     }
 
@@ -169,7 +182,8 @@ async fn project_messages(
         let body = serde_json::to_value(&**message).map_err(|e| {
             cja::color_eyre::eyre::eyre!("failed to serialize transcript message: {e}")
         })?;
-        new_messages.push((written + i as i64, message_role(message).to_owned(), body));
+        let seq = written + i64::try_from(i).unwrap_or(i64::MAX);
+        new_messages.push((seq, message_role(message).to_owned(), body));
     }
     Ok(new_messages)
 }
@@ -190,19 +204,19 @@ struct Attempt<'a> {
 }
 
 impl Durable {
-    /// Advance one run as a cja job attempt. Never in the request path;
-    /// `shutdown` is the worker's shutdown token (deploys), a different
-    /// signal from user cancellation.
-    pub(crate) async fn advance_run(
+    /// Claim the run and validate its permanent preconditions (unknown kind,
+    /// corrupt state, cancel-at-claim). One helper so `advance_run` stays
+    /// under the line budget: everything here either yields a ready run or
+    /// has already completed the attempt's terminal work.
+    async fn claim_and_validate(
         &self,
         db: &sqlx::PgPool,
         run_id: Uuid,
-        shutdown: CancellationToken,
-    ) -> cja::color_eyre::Result<()> {
-        let me = Uuid::new_v4().to_string();
+        me: &str,
+    ) -> cja::color_eyre::Result<Claim> {
         let row = match tokio::time::timeout(
             WRITE_BOUND,
-            db::try_claim(db, run_id, &me, self.lease_takeover),
+            db::try_claim(db, run_id, me, self.lease_takeover),
         )
         .await
         {
@@ -217,23 +231,32 @@ impl Durable {
             // (Err), so a duplicate job can never delete the job the live
             // owner depends on. Anything else (missing, terminal, waiting)
             // is a successful no-op.
-            return match db::current_status(db, run_id).await? {
-                Some(s) if s == RunStatus::Running.as_str() => {
-                    Err(cja::color_eyre::eyre::eyre!(
-                        "run {run_id} leased by another worker; backing off"
-                    ))
-                }
-                _ => Ok(()),
-            };
+            let leased_by_other = matches!(
+                db::current_status(db, run_id).await?,
+                Some(s) if s == RunStatus::Running.as_str()
+            );
+            return Ok(Claim::Nothing { leased_by_other });
         };
 
         // User cancel may have landed before we claimed the row: finish
         // cancelled without advancing, preserving the transcript.
         if row.cancel_requested {
             let snap = RunSnapshot::from_row(&row);
-            self.finish_run(db, run_id, &me, RunStatus::Cancelled, None, None, Some("cancelled by request".to_owned()), snap, None)
-                .await?;
-            return Ok(());
+            self.finish_run(
+                db,
+                run_id,
+                me,
+                RunStatus::Cancelled,
+                None,
+                None,
+                Some("cancelled by request".to_owned()),
+                snap,
+                None,
+            )
+            .await?;
+            return Ok(Claim::Nothing {
+                leased_by_other: false,
+            });
         }
 
         // Unknown kind is permanent: every retry would re-read the same row
@@ -244,7 +267,7 @@ impl Durable {
             self.finish_run(
                 db,
                 run_id,
-                &me,
+                me,
                 RunStatus::Failed,
                 Some(FailReason::UnknownKind),
                 None,
@@ -253,7 +276,9 @@ impl Durable {
                 None,
             )
             .await?;
-            return Ok(());
+            return Ok(Claim::Nothing {
+                leased_by_other: false,
+            });
         };
 
         // Corrupt run state (rig version skew, RUN_FORMAT mismatch) is
@@ -261,6 +286,9 @@ impl Durable {
         let run: AgentRun = match serde_json::from_value(row.run_state.clone()) {
             Ok(run) => run,
             Err(e) => {
+                // Content-free: the classification and position only —
+                // serde type-mismatch messages quote the offending value,
+                // and run_state is the whole conversation.
                 let message = format!(
                     "run state failed to deserialize ({:?} at line {} column {})",
                     e.classify(),
@@ -271,17 +299,52 @@ impl Durable {
                 self.finish_run(
                     db,
                     run_id,
-                    &me,
+                    me,
                     RunStatus::Failed,
                     Some(FailReason::CorruptState),
                     None,
-                    Some(message.to_owned()),
+                    Some(message),
                     snap,
                     None,
                 )
                 .await?;
-                return Ok(());
+                return Ok(Claim::Nothing {
+                    leased_by_other: false,
+                });
             }
+        };
+        Ok(Claim::Ready {
+            row,
+            run: Box::new(run),
+            kind,
+        })
+    }
+
+    /// Advance one run as a cja job attempt. Never in the request path;
+    /// `shutdown` is the worker's shutdown token (deploys), a different
+    /// signal from user cancellation.
+    pub(crate) async fn advance_run(
+        &self,
+        db: &sqlx::PgPool,
+        run_id: Uuid,
+        shutdown: CancellationToken,
+    ) -> cja::color_eyre::Result<()> {
+        let me = Uuid::new_v4().to_string();
+        let (row, run, kind) = match self.claim_and_validate(db, run_id, &me).await? {
+            Claim::Nothing {
+                leased_by_other: true,
+            } => {
+                // Back off (Err), so a duplicate job can never delete the
+                // job the live owner depends on.
+                return Err(cja::color_eyre::eyre::eyre!(
+                    "run {run_id} leased by another worker; backing off"
+                ));
+            }
+            // Missing, terminal, or waiting: nothing to advance.
+            Claim::Nothing {
+                leased_by_other: false,
+            } => return Ok(()),
+            Claim::Ready { row, run, kind } => (row, run, kind),
         };
         let mut run = run;
 
@@ -319,7 +382,11 @@ impl Durable {
                     prompt,
                     history,
                     turn,
-                } => attempt.call_model_step(&mut run, prompt, history, turn).await,
+                } => {
+                    attempt
+                        .call_model_step(&mut run, prompt, history, turn)
+                        .await
+                }
                 AgentRunStep::CallTools { calls } => attempt.call_tools_step(&mut run, calls).await,
                 AgentRunStep::Done(response) => {
                     // The final assistant message is committed by `next_step`'s
@@ -328,15 +395,17 @@ impl Durable {
                     // the terminal write.
                     match attempt.persist(&run).await {
                         StepOutcome::Continue => {}
-                        other => return match other {
-                            StepOutcome::Done => Ok(()),
-                            StepOutcome::Retry(error) => {
-                                self.fail_retryable(db, run_id, &me, error).await
-                            }
-                            #[cfg(feature = "testing")]
-                            StepOutcome::Injected(error) => Err(error),
-                            StepOutcome::Continue => unreachable!(),
-                        },
+                        other => {
+                            return match other {
+                                StepOutcome::Done => Ok(()),
+                                StepOutcome::Retry(error) => {
+                                    self.fail_retryable(db, run_id, &me, error).await
+                                }
+                                #[cfg(feature = "testing")]
+                                StepOutcome::Injected(error) => Err(error),
+                                StepOutcome::Continue => unreachable!(),
+                            };
+                        }
                     }
                     let snap = RunSnapshot::of(&run)?;
                     self.finish_run(
@@ -355,7 +424,7 @@ impl Durable {
                 }
             };
             match outcome {
-                StepOutcome::Continue => continue,
+                StepOutcome::Continue => {}
                 StepOutcome::Done => return Ok(()),
                 StepOutcome::Retry(error) => {
                     return self.fail_retryable(db, run_id, &me, error).await;
@@ -464,7 +533,12 @@ impl Durable {
 impl Attempt<'_> {
     /// Fail the run terminally (no retry) with a typed reason; the attempt
     /// then ends Ok so the job completes instead of storming retries.
-    async fn fail_terminal(&self, run: &AgentRun, reason: FailReason, message: &str) -> StepOutcome {
+    async fn fail_terminal(
+        &self,
+        run: &AgentRun,
+        reason: FailReason,
+        message: &str,
+    ) -> StepOutcome {
         let snap = match RunSnapshot::of(run) {
             Ok(snap) => snap,
             Err(e) => return StepOutcome::Retry(e),
@@ -535,9 +609,7 @@ impl Attempt<'_> {
         .await
         {
             Err(_) => {
-                return StepOutcome::Retry(cja::color_eyre::eyre::eyre!(
-                    "run persist timed out"
-                ))
+                return StepOutcome::Retry(cja::color_eyre::eyre::eyre!("run persist timed out"));
             }
             Ok(Err(e)) => return StepOutcome::Retry(e.into()),
             Ok(Ok(outcome)) => outcome,
@@ -641,7 +713,9 @@ impl Attempt<'_> {
         }
 
         let policy = prepared.policy.clone();
-        let request = prepared.apply(rig_core::completion::CompletionRequest::new((*prompt).clone()));
+        let request = prepared.apply(rig_core::completion::CompletionRequest::new(
+            (*prompt).clone(),
+        ));
         match self.with_lease_guards(run, self.model.call(request)).await {
             Err(e) => return StepOutcome::Retry(e),
             Ok(Guarded::Stop) => return StepOutcome::Done,
@@ -658,8 +732,7 @@ impl Attempt<'_> {
                     .await;
             }
             Ok(Guarded::Done(Ok(response))) => {
-                let turn =
-                    ModelTurn::from_policy(&response, policy);
+                let turn = ModelTurn::from_policy(&response, policy);
                 let mut outcome = match run.model_response(turn) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -667,28 +740,21 @@ impl Attempt<'_> {
                         return self.fail_terminal(run, reason, message).await;
                     }
                 };
-                loop {
-                    match outcome {
-                        ModelTurnOutcome::NeedsResolution(_) => {
-                            // Spec policy only (no hooks here): Fail (default)
-                            // or Ignore.
-                            outcome = match run.resolve_unhandled_invalid_tool_call() {
-                                Ok(outcome) => outcome,
-                                Err(error) => {
-                                    let (reason, message) = sanitize_prompt_error(&error);
-                                    return self.fail_terminal(run, reason, message).await;
-                                }
-                            };
+                while let ModelTurnOutcome::NeedsResolution(_) = outcome {
+                    // Spec policy only (no hooks here): Fail (default) or
+                    // Ignore.
+                    outcome = match run.resolve_unhandled_invalid_tool_call() {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            let (reason, message) = sanitize_prompt_error(&error);
+                            return self.fail_terminal(run, reason, message).await;
                         }
-                        // The corrective feedback is already committed; the
-                        // outer loop's `next_step()` re-issues `CallModel`.
-                        // Never `continue` — that re-matches this outcome
-                        // forever.
-                        ModelTurnOutcome::TurnRetried | ModelTurnOutcome::Continue { .. } => {
-                            break;
-                        }
-                    }
+                    };
                 }
+                // `TurnRetried` and `Continue` fall through: the corrective
+                // feedback is already committed; the outer loop's
+                // `next_step()` re-issues `CallModel`. (Never `continue` in
+                // a match on the outcome — it would re-match forever.)
             }
         }
 
@@ -718,7 +784,11 @@ impl Attempt<'_> {
     /// One `CallTools` step: intercept `ask` (suspend), execute everything
     /// else through the built agent's toolset with the idempotency key in
     /// its context, answer malformed calls with corrective feedback.
-    async fn call_tools_step(&self, run: &mut AgentRun, calls: Vec<PendingToolCall>) -> StepOutcome {
+    async fn call_tools_step(
+        &self,
+        run: &mut AgentRun,
+        calls: Vec<PendingToolCall>,
+    ) -> StepOutcome {
         for call in calls {
             match call {
                 PendingToolCall::Execute(exec) if exec.name().as_str() == Ask::NAME => {
@@ -787,59 +857,54 @@ impl Attempt<'_> {
     /// end the attempt Ok — a waiting run holds no worker and no job. An
     /// ask whose arguments don't parse never suspends: answer it with a
     /// corrective failure and continue the run.
-    async fn ask_step(
-        &self,
-        run: &mut AgentRun,
-        exec: rig_agent::run::ExecCall,
-    ) -> StepOutcome {
-        match serde_json::from_value::<AskArgs>(exec.arguments()) {
-            Ok(args) => {
-                let snap = match RunSnapshot::of(run) {
-                    Ok(snap) => snap,
-                    Err(e) => return StepOutcome::Retry(e),
-                };
-                let new_messages = match project_messages(self.db, self.run_id, run).await {
-                    Ok(messages) => messages,
-                    Err(e) => return StepOutcome::Retry(e),
-                };
-                let wrote = match tokio::time::timeout(
-                    WRITE_BOUND,
-                    db::set_waiting(
-                        self.db,
-                        self.run_id,
-                        &self.me,
-                        &snap.run_state,
-                        &exec.id().wire(),
-                        &args.question,
-                        &new_messages,
-                    ),
-                )
-                .await
-                {
-                    Err(_) => {
-                        return StepOutcome::Retry(cja::color_eyre::eyre::eyre!(
-                            "suspension write timed out"
-                        ))
-                    }
-                    Ok(Err(e)) => return StepOutcome::Retry(e.into()),
-                    Ok(Ok(wrote)) => wrote,
-                };
-                // `false` = lease lost: the thief continues the run; either
-                // way this attempt may not write again.
-                let _ = wrote;
-                StepOutcome::Done
+    async fn ask_step(&self, run: &mut AgentRun, exec: rig_agent::run::ExecCall) -> StepOutcome {
+        let Ok(args) = serde_json::from_value::<AskArgs>(exec.arguments()) else {
+            // An ask that doesn't parse never suspends: answer the call with
+            // a corrective failure and continue the run. Never park a run
+            // with no question.
+            if let Err(error) = run.answer(exec.answer(ToolResult::failed(
+                ToolExecutionError::invalid_args("ask requires a string `question`"),
+            ))) {
+                let (reason, message) = sanitize_prompt_error(&error);
+                return self.fail_terminal(run, reason, message).await;
             }
+            // The failed tool result is committed; the run continues.
+            return self.persist(run).await;
+        };
+        let snap = match RunSnapshot::of(run) {
+            Ok(snap) => snap,
+            Err(e) => return StepOutcome::Retry(e),
+        };
+        let new_messages = match project_messages(self.db, self.run_id, run).await {
+            Ok(messages) => messages,
+            Err(e) => return StepOutcome::Retry(e),
+        };
+        let wrote = match tokio::time::timeout(
+            WRITE_BOUND,
+            db::set_waiting(
+                self.db,
+                self.run_id,
+                &self.me,
+                &snap.run_state,
+                &exec.id().wire(),
+                &args.question,
+                &new_messages,
+            ),
+        )
+        .await
+        {
             Err(_) => {
-                if let Err(error) = run.answer(exec.answer(ToolResult::failed(
-                    ToolExecutionError::invalid_args("ask requires a string `question`"),
-                ))) {
-                    let (reason, message) = sanitize_prompt_error(&error);
-                    return self.fail_terminal(run, reason, message).await;
-                }
-                // The failed tool result is committed; the run continues.
-                self.persist(run).await
+                return StepOutcome::Retry(cja::color_eyre::eyre::eyre!(
+                    "suspension write timed out"
+                ));
             }
-        }
+            Ok(Err(e)) => return StepOutcome::Retry(e.into()),
+            Ok(Ok(wrote)) => wrote,
+        };
+        // `false` = lease lost: the thief continues the run; either way this
+        // attempt may not write again. A suspension always ends the attempt.
+        let _ = wrote;
+        StepOutcome::Done
     }
 
     /// Guard an in-flight step future with the lease heartbeat and the
@@ -848,7 +913,11 @@ impl Attempt<'_> {
     /// outcomes leave the loop early: the future completing, a lost/cancelled
     /// heartbeat (`Stop`), and shutdown (`Err`).
     #[allow(clippy::future_not_send)] // one task at a time; no cross-task awaits
-    async fn with_lease_guards<F>(&self, run: &AgentRun, fut: F) -> cja::color_eyre::Result<Guarded<F::Output>>
+    async fn with_lease_guards<F>(
+        &self,
+        run: &AgentRun,
+        fut: F,
+    ) -> cja::color_eyre::Result<Guarded<F::Output>>
     where
         F: Future + Send,
         F::Output: Send,
@@ -873,7 +942,7 @@ impl Attempt<'_> {
                         // A heartbeat timeout means ownership cannot be
                         // proven: abandon the step and return Ok, never
                         // write again. Same for a failed or lost heartbeat.
-                        Err(_) | Ok(Err(_)) | Ok(Ok(None)) => return Ok(Guarded::Stop),
+                        Err(_) | Ok(Err(_) | Ok(None)) => return Ok(Guarded::Stop),
                         Ok(Ok(Some(true))) => {
                             // User cancel mid-step: finish cancelled, keep
                             // the transcript.
@@ -893,7 +962,8 @@ impl Attempt<'_> {
                                 .await?;
                             return Ok(Guarded::Stop);
                         }
-                        Ok(Ok(Some(false))) => continue, // still owner: keep awaiting the SAME future
+                        // Still owner, no cancel: keep awaiting the SAME future.
+                        Ok(Ok(Some(false))) => {}
                     }
                 }
                 () = self.shutdown.cancelled() => {
@@ -935,7 +1005,10 @@ mod tests {
     static GUARD_KIND: AgentKind = AgentKind {
         name: "guard_probe",
         model: "m",
-        limits: RunLimits { max_turns: 20, max_total_tokens: 200_000 },
+        limits: RunLimits {
+            max_turns: 20,
+            max_total_tokens: 200_000,
+        },
         unhandled_invalid_tool_call: rig_agent::run::UnhandledInvalidToolCall::Fail,
         build: |llm, model| llm.agent(model),
     };
@@ -948,7 +1021,9 @@ mod tests {
             .run(&pool)
             .await
             .expect("cja migrations");
-        crate::durable::run_migrations(&pool).await.expect("durable migrations");
+        crate::durable::run_migrations(&pool)
+            .await
+            .expect("durable migrations");
         std::mem::forget(guard);
         pool
     }
@@ -957,8 +1032,8 @@ mod tests {
     async fn guard_completes_long_step_future() {
         let db = test_db().await;
         // A dead loopback URL: the guard test never calls the model.
-        let config = LlmConfig::new("http://127.0.0.1:9".parse().expect("url"))
-            .app_name("guard-test");
+        let config =
+            LlmConfig::new("http://127.0.0.1:9".parse().expect("url")).app_name("guard-test");
         let durable = Durable::new(&config)
             .expect("durable")
             .kind(&GUARD_KIND)
@@ -984,8 +1059,7 @@ mod tests {
             .await
             .expect("lease");
 
-        let attempt =
-            durable.attempt(&db, run_id, &me, &GUARD_KIND, "m", CancellationToken::new());
+        let attempt = durable.attempt(&db, run_id, &me, &GUARD_KIND, "m", CancellationToken::new());
         let run = AgentRun::new(rig_core::message::Message::user("probe"));
 
         // A step future that sleeps ~3.3 heartbeat periods before finishing.
@@ -1006,11 +1080,12 @@ mod tests {
             let mut distinct = std::collections::HashSet::new();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             while distinct.len() < 2 && tokio::time::Instant::now() < deadline {
-                if let Ok(Some(ts)) =
-                    sqlx::query_scalar::<_, String>("SELECT locked_at::text FROM agent_runs WHERE id = $1")
-                        .bind(run_id)
-                        .fetch_optional(&watch_db)
-                        .await
+                if let Ok(Some(ts)) = sqlx::query_scalar::<_, String>(
+                    "SELECT locked_at::text FROM agent_runs WHERE id = $1",
+                )
+                .bind(run_id)
+                .fetch_optional(&watch_db)
+                .await
                 {
                     distinct.insert(ts);
                 }

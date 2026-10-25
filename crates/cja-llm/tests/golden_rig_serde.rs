@@ -13,10 +13,10 @@ use std::collections::BTreeSet;
 use cja_llm::rig::rig_agent::run::{
     AgentRun, AgentRunStep, ModelTurn, PendingToolCall, TurnPolicy,
 };
+use cja_llm::rig::rig_core::completion::Usage;
 use cja_llm::rig::rig_core::completion::message::{
     AssistantContent, AssistantMessage, CallId, Message, ToolCall, ToolFunction, ToolName,
 };
-use cja_llm::rig::rig_core::completion::Usage;
 use cja_llm::rig::rig_core::tool::{ToolOutput, ToolResult};
 use serde_json::json;
 
@@ -60,8 +60,7 @@ fn expected_messages() -> Vec<(&'static str, Message)> {
 }
 
 fn messages_fixture_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/rig-0.45.0-messages.json")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rig-0.45.0-messages.json")
 }
 
 fn run_fixture_path() -> std::path::PathBuf {
@@ -75,9 +74,11 @@ fn run_fixture_path() -> std::path::PathBuf {
 fn suspended_run() -> AgentRun {
     let mut run = AgentRun::new(Message::user("golden run prompt")).max_turns(4);
     // -> CallModel
-    assert!(matches!(run.next_step().expect("first step"), AgentRunStep::CallModel { .. }));
-    let policy = TurnPolicy::new(BTreeSet::from(["add".to_owned()]), None, None)
-        .expect("policy");
+    assert!(matches!(
+        run.next_step().expect("first step"),
+        AgentRunStep::CallModel { .. }
+    ));
+    let policy = TurnPolicy::new(BTreeSet::from(["add".to_owned()]), None, None).expect("policy");
     let turn = ModelTurn::new(
         AssistantMessage::default(),
         vec![golden_tool_call()],
@@ -149,8 +150,8 @@ fn stored_messages_deserialize_to_expected_values() {
     // deserialize nothing and compare nothing).
     let mut perturbed = fixture.clone();
     perturbed[0]["json"]["content"][0]["text"] = json!("PERTURBED");
-    let got: Message = serde_json::from_value(perturbed[0]["json"].clone())
-        .expect("perturbed still parses");
+    let got: Message =
+        serde_json::from_value(perturbed[0]["json"].clone()).expect("perturbed still parses");
     assert_ne!(got, expected[0].1, "perturbation is detected");
 }
 

@@ -550,7 +550,7 @@ mod enqueue_on_tests {
             &self.db
         }
 
-        fn version(&self) -> &str {
+        fn version(&self) -> &'static str {
             "test"
         }
 
@@ -582,7 +582,7 @@ mod enqueue_on_tests {
         let mut tx = state.db().begin().await.unwrap();
 
         let job_id = EnqueueOnJob { value: 7 }
-            .enqueue_on(&mut *tx, "tx-test".to_string(), None)
+            .enqueue_on(&mut tx, "tx-test".to_string(), None)
             .await
             .unwrap();
 

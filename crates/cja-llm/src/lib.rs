@@ -31,10 +31,10 @@ pub mod rig {
 }
 
 pub mod config;
-pub mod error;
-pub mod models;
 #[cfg(feature = "durable")]
 pub mod durable;
+pub mod error;
+pub mod models;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod transport;

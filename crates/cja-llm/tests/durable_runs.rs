@@ -7,6 +7,11 @@
 //! (the cja-passkey precedent).
 
 #![allow(clippy::too_many_lines)]
+// `#[rig_tool]` generates the async dispatch boundary itself: a tool fn
+// without an interior await trips `unused_async`/`unnecessary_wraps` no
+// matter which signature shape is chosen (sync fns trip the generated impl
+// instead). These test tools mirror the README's documented shape.
+#![allow(clippy::unused_async, clippy::unnecessary_wraps)]
 
 use std::error::Error as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,17 +55,17 @@ async fn keyed_add(
     let key = context
         .require::<ToolCallKey>()
         .map_err(|e| rig_core::tool::ToolExecutionError::other(e.to_string()))?;
-    SEEN_KEYS
-        .lock()
-        .expect("key log lock")
-        .push(key.clone());
+    SEEN_KEYS.lock().expect("key log lock").push(key.clone());
     Ok(a + b)
 }
 
 static COUNTER: AgentKind = AgentKind {
     name: "counter",
     model: models::DEFAULT,
-    limits: RunLimits { max_turns: 20, max_total_tokens: 200_000 },
+    limits: RunLimits {
+        max_turns: 20,
+        max_total_tokens: 200_000,
+    },
     unhandled_invalid_tool_call: UnhandledInvalidToolCall::Fail,
     build: |llm, model| llm.agent(model).tool(Ask).tool(Add),
 };
@@ -68,7 +73,10 @@ static COUNTER: AgentKind = AgentKind {
 static KEYED: AgentKind = AgentKind {
     name: "keyed",
     model: models::DEFAULT,
-    limits: RunLimits { max_turns: 20, max_total_tokens: 200_000 },
+    limits: RunLimits {
+        max_turns: 20,
+        max_total_tokens: 200_000,
+    },
     unhandled_invalid_tool_call: UnhandledInvalidToolCall::Fail,
     build: |llm, model| llm.agent(model).tool(Ask).tool(KeyedAdd),
 };
@@ -99,7 +107,10 @@ static TINY_TOKENS: AgentKind = AgentKind {
 static IGNORE_BAD_TOOLS: AgentKind = AgentKind {
     name: "ignore_bad_tools",
     model: models::DEFAULT,
-    limits: RunLimits { max_turns: 20, max_total_tokens: 200_000 },
+    limits: RunLimits {
+        max_turns: 20,
+        max_total_tokens: 200_000,
+    },
     unhandled_invalid_tool_call: UnhandledInvalidToolCall::Ignore,
     build: |llm, model| llm.agent(model).tool(Ask).tool(Add),
 };
@@ -120,7 +131,7 @@ impl AppState for TestState {
         &self.db
     }
 
-    fn version(&self) -> &str {
+    fn version(&self) -> &'static str {
         "test"
     }
 
@@ -135,10 +146,7 @@ impl AppState for TestState {
             *arrived = true;
             park.1.notify_all();
             while *arrived {
-                arrived = park
-                    .1
-                    .wait(arrived)
-                    .expect("parking interrupted");
+                arrived = park.1.wait(arrived).expect("parking interrupted");
             }
         }
     }
@@ -157,10 +165,7 @@ struct Env {
     _guard: cja::testing::test_db::TestDatabaseGuard,
 }
 
-async fn setup_with(
-    kinds: &[&'static AgentKind],
-    takeover: Duration,
-) -> Env {
+async fn setup_with(kinds: &[&'static AgentKind], takeover: Duration) -> Env {
     setup_full(kinds, takeover, |_| {}).await
 }
 
@@ -176,7 +181,9 @@ async fn setup_full(
         .run(&pool)
         .await
         .expect("cja migrations");
-    durable::run_migrations(&pool).await.expect("durable migrations");
+    durable::run_migrations(&pool)
+        .await
+        .expect("durable migrations");
 
     let fake = FakeGateway::start().await;
     let mut config = LlmConfig::new(fake.url())
@@ -191,7 +198,9 @@ async fn setup_full(
         .dialer(Arc::new(setec::TcpDialer));
     configure(&mut config);
 
-    let mut durable = Durable::new(&config).expect("durable engine").lease_takeover(takeover);
+    let mut durable = Durable::new(&config)
+        .expect("durable engine")
+        .lease_takeover(takeover);
     for kind in kinds {
         durable = durable.kind(kind).expect("register kind");
     }
@@ -225,10 +234,7 @@ async fn drive(state: &TestState, run: RunId) -> cja::color_eyre::Result<()> {
 async fn spawn_worker(
     state: &TestState,
     sleep: Duration,
-) -> (
-    tokio::task::JoinHandle<cja::Result<()>>,
-    CancellationToken,
-) {
+) -> (tokio::task::JoinHandle<cja::Result<()>>, CancellationToken) {
     let token = CancellationToken::new();
     let handle = tokio::spawn(job_worker(
         state.clone(),
@@ -262,10 +268,7 @@ where
 }
 
 async fn status_of(db: &sqlx::PgPool, run: RunId) -> RunStatus {
-    durable::get_run(db, run)
-        .await
-        .expect("run row")
-        .status
+    durable::get_run(db, run).await.expect("run row").status
 }
 
 async fn view_of(db: &sqlx::PgPool, run: RunId) -> durable::RunView {
@@ -303,7 +306,12 @@ async fn transcript_rows(db: &sqlx::PgPool, run: RunId) -> Vec<(i64, String, ser
 
 /// Script the reference happy path: `add(2,3)` then `"5"`.
 fn script_happy(fake: &FakeGateway) {
-    fake.tool_call(models::DEFAULT, "call_1", "add", &serde_json::json!({"a": 2, "b": 3}));
+    fake.tool_call(
+        models::DEFAULT,
+        "call_1",
+        "add",
+        &serde_json::json!({"a": 2, "b": 3}),
+    );
     fake.chat_completion(models::DEFAULT, "5");
 }
 
@@ -363,8 +371,14 @@ async fn happy_path_round_trip() {
 /// * `n == 5`: death between pre-call t1 (4) and post-response t1 (5) —
 ///   the final completion is served twice.
 fn script_crash(fake: &FakeGateway, n: usize) {
-    let tool_call_reply =
-        |fake: &FakeGateway| fake.tool_call(models::DEFAULT, "call_1", "add", &serde_json::json!({"a": 2, "b": 3}));
+    let tool_call_reply = |fake: &FakeGateway| {
+        fake.tool_call(
+            models::DEFAULT,
+            "call_1",
+            "add",
+            &serde_json::json!({"a": 2, "b": 3}),
+        );
+    };
     tool_call_reply(fake);
     if n == 2 {
         tool_call_reply(fake);
@@ -408,7 +422,10 @@ async fn crash_at_every_step_resumes_identically() {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            assert!(attempts <= 20, "run did not complete within 20 attempts (crash at persist {n})");
+            assert!(
+                attempts <= 20,
+                "run did not complete within 20 attempts (crash at persist {n})"
+            );
             // The injected failure leaves the lease held (simulated process
             // death); the 1ms takeover window lets the next attempt re-claim.
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -596,7 +613,10 @@ async fn ask_suspends_and_answer_resumes_as_tool_result() {
     let ask_pos = rows
         .iter()
         .position(|(_, role, msg)| {
-            role == "assistant" && serde_json::to_string(msg).unwrap_or_default().contains("call_ask")
+            role == "assistant"
+                && serde_json::to_string(msg)
+                    .unwrap_or_default()
+                    .contains("call_ask")
         })
         .expect("ask assistant message");
     let result_msg = &rows[ask_pos + 1];
@@ -609,7 +629,10 @@ async fn ask_suspends_and_answer_resumes_as_tool_result() {
     );
     let answer_text =
         serde_json::to_string(&result_msg.2["content"][0]["content"]).unwrap_or_default();
-    assert!(answer_text.contains("yes"), "answer text in result: {answer_text}");
+    assert!(
+        answer_text.contains("yes"),
+        "answer text in result: {answer_text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +676,9 @@ async fn answer_requires_waiting() {
     assert!(matches!(loser, Err(RunError::NotWaiting(..))));
     // Drive the winner to completion so its scripted reply is consumed and
     // the queue is clean for the next part.
-    drive(&env.state, suspended).await.expect("winner completes");
+    drive(&env.state, suspended)
+        .await
+        .expect("winner completes");
 
     // Cancel a waiting run, then answer: NotWaiting.
     let cancelled = durable::start(&env.state, "counter", "z")
@@ -687,10 +712,16 @@ async fn cancel_paths() {
     let queued = durable::start(&env.state, "counter", "x")
         .await
         .expect("start");
-    durable::cancel(&env.state, queued).await.expect("cancel queued");
+    durable::cancel(&env.state, queued)
+        .await
+        .expect("cancel queued");
     assert_eq!(status_of(&env.db, queued).await, RunStatus::Cancelled);
     drive(&env.state, queued).await.expect("job no-ops Ok");
-    assert_eq!(status_of(&env.db, queued).await, RunStatus::Cancelled, "run untouched");
+    assert_eq!(
+        status_of(&env.db, queued).await,
+        RunStatus::Cancelled,
+        "run untouched"
+    );
 
     // waiting -> cancelled, both pending columns cleared; answer then fails.
     let waiting = durable::start(&env.state, "counter", "y")
@@ -703,7 +734,9 @@ async fn cancel_paths() {
         &serde_json::json!({"question": "q?"}),
     );
     drive(&env.state, waiting).await.expect("suspend");
-    durable::cancel(&env.state, waiting).await.expect("cancel waiting");
+    durable::cancel(&env.state, waiting)
+        .await
+        .expect("cancel waiting");
     assert_eq!(status_of(&env.db, waiting).await, RunStatus::Cancelled);
     let (call_id, question): (Option<String>, Option<String>) =
         sqlx::query_as("SELECT pending_call_id, pending_question FROM agent_runs WHERE id = $1")
@@ -732,17 +765,15 @@ async fn cancel_paths() {
     let driver = tokio::spawn(async move { drive(&state, live_run).await });
     // One request came from the `waiting` part; the live run's model call is
     // the second.
-    wait_until(|| async {
-        (env.fake.requests().len() == 2).then_some(())
-    })
-    .await;
-    durable::cancel(&env.state, live).await.expect("request cancel");
-    let result = tokio::time::timeout(Duration::from_secs(15), driver)
+    wait_until(|| async { (env.fake.requests().len() == 2).then_some(()) }).await;
+    durable::cancel(&env.state, live)
+        .await
+        .expect("request cancel");
+    tokio::time::timeout(Duration::from_secs(15), driver)
         .await
         .expect("driver returned")
         .expect("join")
         .expect("job completes Ok after cancel");
-    let _ = result;
     assert_eq!(status_of(&env.db, live).await, RunStatus::Cancelled);
     assert!(
         !transcript_rows(&env.db, live).await.is_empty(),
@@ -766,7 +797,9 @@ async fn cancel_paths() {
     .execute(&env.db)
     .await
     .expect("fake dead lease");
-    durable::cancel(&env.state, orphan).await.expect("cancel orphan");
+    durable::cancel(&env.state, orphan)
+        .await
+        .expect("cancel orphan");
     assert_eq!(status_of(&env.db, orphan).await, RunStatus::Cancelled);
 
     // Idempotent + terminal refusals + missing.
@@ -786,7 +819,9 @@ async fn cancel_paths() {
         .await
         .expect("start failed");
     env.fake.chat_completion(models::DEFAULT, "hi");
-    drive(&env.state, failed_env_run).await.expect("fail on budget");
+    drive(&env.state, failed_env_run)
+        .await
+        .expect("fail on budget");
     assert_eq!(status_of(&env.db, failed_env_run).await, RunStatus::Failed);
     assert!(matches!(
         durable::cancel(&env.state, failed_env_run).await,
@@ -863,7 +898,11 @@ async fn retryable_gateway_errors_fail_the_attempt_not_the_run() {
     let result = drive(&env.state, run).await;
     assert!(result.is_err(), "429 is retryable: the attempt errors");
     assert_eq!(locked_by_of(&env.db, run).await, None, "lease released");
-    assert_eq!(status_of(&env.db, run).await, RunStatus::Running, "not failed");
+    assert_eq!(
+        status_of(&env.db, run).await,
+        RunStatus::Running,
+        "not failed"
+    );
 }
 
 #[tokio::test]
@@ -880,7 +919,11 @@ async fn budget_exceeded_fails_the_run_immediately() {
     let view = view_of(&env.db, run).await;
     assert_eq!(view.status, RunStatus::Failed);
     assert_eq!(view.fail_reason, Some(FailReason::Gateway));
-    assert_eq!(env.fake.requests().len(), 1, "exactly one transport attempt");
+    assert_eq!(
+        env.fake.requests().len(),
+        1,
+        "exactly one transport attempt"
+    );
 }
 
 #[tokio::test]
@@ -968,15 +1011,14 @@ async fn shutdown_mid_model_call_aborts_promptly_and_releases_lease() {
     let task = {
         let token = token.clone();
         tokio::spawn(async move {
-            AdvanceRunJob { run_id: run_for_task.0 }
-                .run_with_cancellation(state, token)
-                .await
+            AdvanceRunJob {
+                run_id: run_for_task.0,
+            }
+            .run_with_cancellation(state, token)
+            .await
         })
     };
-    wait_until(|| async {
-        (env.fake.requests().len() == 1).then_some(())
-    })
-    .await;
+    wait_until(|| async { (env.fake.requests().len() == 1).then_some(()) }).await;
 
     let started = Instant::now();
     token.cancel();
@@ -1029,10 +1071,7 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
         },
     ));
 
-    wait_until(|| async {
-        (env.fake.requests().len() == 1).then_some(())
-    })
-    .await;
+    wait_until(|| async { (env.fake.requests().len() == 1).then_some(()) }).await;
     token.cancel();
     tokio::time::timeout(Duration::from_secs(10), async {
         let _ = worker.await;
@@ -1059,7 +1098,10 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
         if status == RunStatus::Succeeded {
             break;
         }
-        assert!(Instant::now() < deadline, "run did not complete after shutdown");
+        assert!(
+            Instant::now() < deadline,
+            "run did not complete after shutdown"
+        );
         // The worker's retry backoff is 2s at error_count 1; drive the
         // attempt directly to keep the test fast, exactly like a retry does.
         let _ = drive(&env.state, run).await;
@@ -1088,7 +1130,7 @@ async fn read_api_and_parsing_round_trips() {
     let transcript = durable::transcript(&env.db, run).await.expect("transcript");
     let seqs: Vec<i64> = transcript.iter().map(|m| m.seq).collect();
     let mut sorted = seqs.clone();
-    sorted.sort();
+    sorted.sort_unstable();
     assert_eq!(seqs, sorted, "ordered by seq");
     assert_eq!(transcript.len(), 4);
 
@@ -1120,7 +1162,10 @@ async fn read_api_and_parsing_round_trips() {
         let text = status.as_str();
         assert_eq!(text.parse::<RunStatus>().expect(text), status);
     }
-    assert!("Running".parse::<RunStatus>().is_err(), "wrong case rejected");
+    assert!(
+        "Running".parse::<RunStatus>().is_err(),
+        "wrong case rejected"
+    );
     assert!("nope".parse::<RunStatus>().is_err(), "unknown rejected");
 
     // A manually stored unknown status or fail_reason fails the read: the
@@ -1177,23 +1222,38 @@ async fn stored_errors_are_content_free() {
     drive(&env.state, run).await.expect("job Ok");
     let view = view_of(&env.db, run).await;
     assert_eq!(view.status, RunStatus::Failed);
-    assert!(view.error.as_deref().unwrap_or("").find(PROMPT_SENTINEL).is_none());
-    assert!(view.error.as_deref().unwrap_or("").find(REPLY_SENTINEL).is_none());
+    assert!(
+        view.error
+            .as_deref()
+            .unwrap_or("")
+            .find(PROMPT_SENTINEL)
+            .is_none()
+    );
+    assert!(
+        view.error
+            .as_deref()
+            .unwrap_or("")
+            .find(REPLY_SENTINEL)
+            .is_none()
+    );
 
     // The stored run_state DOES contain the prompt (it must, to resume);
     // only the error/detail surfaces must be content-free.
-    let state_text: String = sqlx::query_scalar(
-        "SELECT run_state::text FROM agent_runs WHERE id = $1",
-    )
-    .bind(run.0)
-    .fetch_one(&env.db)
-    .await
-    .expect("run_state");
-    assert!(state_text.contains(PROMPT_SENTINEL), "run_state keeps the conversation");
+    let state_text: String =
+        sqlx::query_scalar("SELECT run_state::text FROM agent_runs WHERE id = $1")
+            .bind(run.0)
+            .fetch_one(&env.db)
+            .await
+            .expect("run_state");
+    assert!(
+        state_text.contains(PROMPT_SENTINEL),
+        "run_state keeps the conversation"
+    );
 
     // (b) a 402 whose body carries a sentinel.
     let env2 = setup(&[&COUNTER]).await;
-    env2.fake.status(402, &format!("{{\"note\":\"{REPLY_SENTINEL}\"}}"));
+    env2.fake
+        .status(402, &format!("{{\"note\":\"{REPLY_SENTINEL}\"}}"));
     let run2 = durable::start(&env2.state, "counter", PROMPT_SENTINEL)
         .await
         .expect("start");
@@ -1201,8 +1261,14 @@ async fn stored_errors_are_content_free() {
     let view2 = view_of(&env2.db, run2).await;
     assert_eq!(view2.status, RunStatus::Failed);
     let err_text = view2.error.unwrap_or_default();
-    assert!(!err_text.contains(REPLY_SENTINEL), "error column: {err_text}");
-    assert!(!err_text.contains(PROMPT_SENTINEL), "error column: {err_text}");
+    assert!(
+        !err_text.contains(REPLY_SENTINEL),
+        "error column: {err_text}"
+    );
+    assert!(
+        !err_text.contains(PROMPT_SENTINEL),
+        "error column: {err_text}"
+    );
 
     // Walk the whole RunError chain: no link carries a sentinel.
     fn assert_chain_content_free(error: &(dyn std::error::Error + 'static)) {
@@ -1210,30 +1276,43 @@ async fn stored_errors_are_content_free() {
         while let Some(e) = cur {
             let display = e.to_string();
             let debug = format!("{e:?}");
-            assert!(!display.contains(REPLY_SENTINEL), "chain Display: {display}");
-            assert!(!display.contains(PROMPT_SENTINEL), "chain Display: {display}");
+            assert!(
+                !display.contains(REPLY_SENTINEL),
+                "chain Display: {display}"
+            );
+            assert!(
+                !display.contains(PROMPT_SENTINEL),
+                "chain Display: {display}"
+            );
             assert!(!debug.contains(REPLY_SENTINEL), "chain Debug: {debug}");
             cur = e.source();
         }
     }
-    let corrupt_error = durable::answer(&env2.state, run2, "x").await.expect_err("not waiting");
+    let corrupt_error = durable::answer(&env2.state, run2, "x")
+        .await
+        .expect_err("not waiting");
     assert_chain_content_free(&corrupt_error);
     let _ = &corrupt_error;
 
     // (c) corrupted run_state: the Corrupt variant renders only the serde
     // classification + position (no source that quotes the value).
-    sqlx::query("UPDATE agent_runs SET status = 'waiting', pending_call_id = 'x', \
-                 pending_question = 'y', run_state = '{\"format\": 999}' WHERE id = $1")
-        .bind(run2.0)
-        .execute(&env2.db)
-        .await
-        .expect("corrupt run_state");
-    let _ = env2.fake.chat_completion(models::DEFAULT, REPLY_SENTINEL);
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'waiting', pending_call_id = 'x', \
+                 pending_question = 'y', run_state = '{\"format\": 999}' WHERE id = $1",
+    )
+    .bind(run2.0)
+    .execute(&env2.db)
+    .await
+    .expect("corrupt run_state");
+    env2.fake.chat_completion(models::DEFAULT, REPLY_SENTINEL);
     let bad = durable::answer(&env2.state, run2, "z").await;
     match bad {
         Err(err @ RunError::Corrupt(..)) => {
             let display = err.to_string();
-            assert!(!display.contains(REPLY_SENTINEL), "Corrupt Display: {display}");
+            assert!(
+                !display.contains(REPLY_SENTINEL),
+                "Corrupt Display: {display}"
+            );
             assert!(err.source().is_none(), "Corrupt carries no source");
         }
         other => panic!("expected Corrupt, got {other:?}"),
@@ -1317,7 +1396,10 @@ async fn invalid_tool_call_policy() {
     let view = view_of(&env.db, run).await;
     assert_eq!(view.status, RunStatus::Failed);
     assert_eq!(view.fail_reason, Some(FailReason::Protocol));
-    assert!(!transcript_rows(&env.db, run).await.is_empty());
+    assert!(
+        !transcript_rows(&env.db, run).await.is_empty(),
+        "transcript preserved"
+    );
 
     // Ignore: the call is dropped, the run proceeds.
     let env2 = setup(&[&IGNORE_BAD_TOOLS]).await;
@@ -1424,9 +1506,7 @@ async fn multiple_asks_suspend_sequentially() {
                 .expect("user message content array")
                 .iter()
                 .filter(|item| item["type"] == "toolresult")
-                .map(|item| {
-                    serde_json::to_string(&item["call"]).expect("call id json")
-                })
+                .map(|item| serde_json::to_string(&item["call"]).expect("call id json"))
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -1442,7 +1522,8 @@ async fn multiple_asks_suspend_sequentially() {
 #[tokio::test]
 async fn ask_with_invalid_args_fails_and_continues() {
     let env = setup(&[&COUNTER]).await;
-    env.fake.tool_call(models::DEFAULT, "call_bad", "ask", &serde_json::json!({}));
+    env.fake
+        .tool_call(models::DEFAULT, "call_bad", "ask", &serde_json::json!({}));
     env.fake.chat_completion(models::DEFAULT, "recovered");
 
     let run = durable::start(&env.state, "counter", "bad ask")
@@ -1455,7 +1536,10 @@ async fn ask_with_invalid_args_fails_and_continues() {
     let result_row = rows
         .iter()
         .find(|(_, role, msg)| {
-            *role == "user" && serde_json::to_string(msg).unwrap_or_default().contains("call_bad")
+            *role == "user"
+                && serde_json::to_string(msg)
+                    .unwrap_or_default()
+                    .contains("call_bad")
         })
         .expect("corrective tool result for call_bad");
     let text = serde_json::to_string(&result_row.2).unwrap_or_default();
@@ -1464,10 +1548,16 @@ async fn ask_with_invalid_args_fails_and_continues() {
         "corrective failure text: {text}"
     );
     let result_pos = rows.iter().position(|(_, _, msg)| {
-        serde_json::to_string(msg).unwrap_or_default().contains("call_bad")
+        serde_json::to_string(msg)
+            .unwrap_or_default()
+            .contains("call_bad")
     });
     let last_role = rows.last().map(|(_, role, _)| role.as_str());
-    assert_eq!(last_role, Some("assistant"), "model recovered after the failure");
+    assert_eq!(
+        last_role,
+        Some("assistant"),
+        "model recovered after the failure"
+    );
     assert!(result_pos.is_some());
 }
 
@@ -1481,7 +1571,7 @@ async fn ask_with_invalid_args_fails_and_continues() {
 /// and parks that thread; while it stays parked, `mid_park` runs on the
 /// MAIN runtime and asserts what a fresh worker would see through its own
 /// connection. A dedicated thread is required: blocking a worker of the
-/// shared runtime stalls its I/O driver — mid_park's queries (even a
+/// shared runtime stalls its I/O driver — the visibility checks (even a
 /// `sleep`) would deadlock — while blocking the dedicated thread parks only
 /// that thread's own runtime, which has nothing else to do.
 async fn parked_op<O, F, Fut, M>(
@@ -1500,9 +1590,8 @@ where
     // runtime, so they bind to it (sharing the main pool across runtimes
     // would leave socket readiness registered with the wrong reactor).
     let state = TestState {
-        db: sqlx::postgres::PgPoolOptions::new().connect_lazy_with(
-            (*template.db.connect_options().clone()).clone(),
-        ),
+        db: sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy_with((*template.db.connect_options().clone()).clone()),
         cookie_key: template.cookie_key.clone(),
         durable: template.durable.clone(),
         wakes: template.wakes.clone(),
@@ -1560,14 +1649,26 @@ async fn enqueue_wakes_once_after_commit() {
         park.clone(),
         |state| async move { durable::start(&state, "counter", "x").await },
         async {
-            assert_eq!(count_rows(&db, "runs").await, 1, "run row committed before wake");
-            assert_eq!(count_rows(&db, "jobs").await, 1, "job row committed before wake");
+            assert_eq!(
+                count_rows(&db, "runs").await,
+                1,
+                "run row committed before wake"
+            );
+            assert_eq!(
+                count_rows(&db, "jobs").await,
+                1,
+                "job row committed before wake"
+            );
         },
     )
     .await
     .expect("start");
     let _ = run;
-    assert_eq!(env.state.wakes.load(Ordering::SeqCst), 1, "exactly one wake");
+    assert_eq!(
+        env.state.wakes.load(Ordering::SeqCst),
+        1,
+        "exactly one wake"
+    );
 
     // answer: suspend a second run, then park through answer's wake and
     // check its enqueued job is committed before the wake too.
@@ -1599,9 +1700,7 @@ async fn enqueue_wakes_once_after_commit() {
     parked_op(
         &env.state,
         park.clone(),
-        move |state| async move {
-            durable::answer(&state, suspended_answer, "yes").await
-        },
+        move |state| async move { durable::answer(&state, suspended_answer, "yes").await },
         async {
             assert_eq!(count_rows(&db, "runs").await, 2);
             assert_eq!(
@@ -1723,7 +1822,10 @@ async fn spans_carry_metadata_never_content() {
     static TRACED: AgentKind = AgentKind {
         name: "traced",
         model: models::DEFAULT,
-        limits: RunLimits { max_turns: 20, max_total_tokens: 200_000 },
+        limits: RunLimits {
+            max_turns: 20,
+            max_total_tokens: 200_000,
+        },
         unhandled_invalid_tool_call: UnhandledInvalidToolCall::Fail,
         build: |llm, model| llm.agent(model).tool(Ask).tool(Add),
     };
@@ -1743,7 +1845,8 @@ async fn spans_carry_metadata_never_content() {
         "add",
         &serde_json::json!({"a": 1, "b": 2, "note": SPAN_TOOL_SENTINEL}),
     );
-    env.fake.chat_completion(models::DEFAULT, SPAN_REPLY_SENTINEL);
+    env.fake
+        .chat_completion(models::DEFAULT, SPAN_REPLY_SENTINEL);
 
     let run = durable::start(&env.state, "traced", SPAN_PROMPT_SENTINEL)
         .await
@@ -1759,14 +1862,18 @@ async fn spans_carry_metadata_never_content() {
         .collect();
     assert!(!step_lines.is_empty(), "agent_run.step span lines captured");
     assert!(
-        step_lines
-            .iter()
-            .any(|l| l.contains("run.id=") && l.contains("run.turn=") && l.contains("run.input_tokens=")),
+        step_lines.iter().any(|l| l.contains("run.id=")
+            && l.contains("run.turn=")
+            && l.contains("run.input_tokens=")),
         "span carries run id, turn, and token fields: {}",
         step_lines.first().copied().unwrap_or_default()
     );
     // Negative: no content sentinel anywhere in the capture.
-    for sentinel in [SPAN_PROMPT_SENTINEL, SPAN_TOOL_SENTINEL, SPAN_REPLY_SENTINEL] {
+    for sentinel in [
+        SPAN_PROMPT_SENTINEL,
+        SPAN_TOOL_SENTINEL,
+        SPAN_REPLY_SENTINEL,
+    ] {
         assert!(
             !text.contains(sentinel),
             "content leaked into telemetry: {sentinel}"

@@ -141,7 +141,12 @@ async fn enqueue_identity_is_present_at_span_creation_and_matches_the_committed_
 async fn a_failed_enqueue_has_an_identity_and_error_but_no_commit_receipt() {
     let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
     let state = crate::common::app::TestAppState::new(pool.clone());
-    pool.close().await;
+    // Fail the enqueue INSIDE the connection work (past pool acquire):
+    // `Job::enqueue` acquires before creating its span, so a closed pool
+    // fails before any telemetry exists (the documented micro-delta of the
+    // `enqueue` -> `enqueue_on` delegation). Dropping the table makes the
+    // INSERT itself fail — the path that must carry identity + error.
+    sqlx::query("DROP TABLE jobs").execute(&pool).await.unwrap();
     let capture = capture();
     let job = super::jobs::TestJob {
         id: "game-456".into(),

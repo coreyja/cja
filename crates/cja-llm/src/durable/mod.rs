@@ -439,9 +439,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for RunView {
             (call_id, _) => {
                 return Err(decode_error(
                     "pending_call_id",
-                    format!(
-                        "waiting-ask columns disagree (pending_call_id is {call_id:?})"
-                    ),
+                    format!("waiting-ask columns disagree (pending_call_id is {call_id:?})"),
                 ));
             }
         };
@@ -491,11 +489,7 @@ pub struct RunMessage {
 ///   builder; use [`crate::Llm::extract`] outside durable runs or parse
 ///   inside a tool).
 /// - [`RunError::Storage`] when the transaction or enqueue fails.
-pub async fn start<S>(
-    state: &S,
-    kind: &str,
-    prompt: impl Into<String>,
-) -> Result<RunId, RunError>
+pub async fn start<S>(state: &S, kind: &str, prompt: impl Into<String>) -> Result<RunId, RunError>
 where
     S: HasDurable + Clone + 'static,
 {
@@ -515,13 +509,12 @@ where
     let prompt = prompt.into();
     // `from_spec` applies the spec's budgets; `.max_turns` then pins the
     // kind's turn cap over whatever the builder defaulted to.
-    let run =
-        rig_agent::run::AgentRun::from_spec(
-            &spec,
-            rig_core::completion::Message::user(prompt.clone()),
-            None,
-        )
-        .max_turns(kind.limits.max_turns);
+    let run = rig_agent::run::AgentRun::from_spec(
+        &spec,
+        rig_core::completion::Message::user(prompt.clone()),
+        None,
+    )
+    .max_turns(kind.limits.max_turns);
     let run_state = serde_json::to_value(&run)
         .map_err(|_| RunError::Corrupt("run state failed to serialize", 0, 0))?;
 
@@ -577,7 +570,8 @@ where
     let Some((kind_name, status, pending_call_id, run_state)) = row else {
         return Err(RunError::NotFound(run));
     };
-    let parsed_status = RunStatus::from_str(&status).map_err(|_| decode_error("status", &status))?;
+    let parsed_status =
+        RunStatus::from_str(&status).map_err(|_| decode_error("status", &status))?;
     if parsed_status != RunStatus::Waiting {
         return Err(RunError::NotWaiting(run, parsed_status));
     }
@@ -624,7 +618,8 @@ where
                 0,
             ));
         }
-        let result = rig_core::tool::ToolResult::success(rig_core::tool::ToolOutput::text(answer.clone()));
+        let result =
+            rig_core::tool::ToolResult::success(rig_core::tool::ToolOutput::text(answer.clone()));
         agent_run
             .answer(exec.answer(result))
             .map_err(|_| RunError::Corrupt("answer was rejected by the run", 0, 0))?;
@@ -650,13 +645,14 @@ where
             rig_core::completion::Message::User { .. } => "user",
             rig_core::completion::Message::Assistant(_) => "assistant",
         };
-        new_messages.push((i as i64, role.to_owned(), body));
+        let seq = i64::try_from(i).unwrap_or(i64::MAX);
+        new_messages.push((seq, role.to_owned(), body));
     }
     if !db::answer_waiting(&mut *tx, run.0, &run_state).await? {
         // Lost the race (row no longer waiting under us).
         return Err(RunError::NotWaiting(run, RunStatus::Running));
     }
-    db::insert_messages(&mut *tx, run.0, &new_messages).await?;
+    db::insert_messages(&mut tx, run.0, &new_messages).await?;
     enqueue_on_tx::<S>(&mut tx, run.0, format!("agent-run:{kind_name}")).await?;
     tx.commit().await?;
     state.job_enqueued();
@@ -672,9 +668,14 @@ pub async fn cancel<S>(state: &S, run: RunId) -> Result<(), RunError>
 where
     S: HasDurable,
 {
-    let row = sqlx::query_as::<_, (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
-        "SELECT status, locked_by, locked_at FROM agent_runs WHERE id = $1",
-    )
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >("SELECT status, locked_by, locked_at FROM agent_runs WHERE id = $1")
     .bind(run.0)
     .fetch_optional(state.db())
     .await?;
@@ -692,8 +693,7 @@ where
         RunStatus::Running => {
             let takeover = state.durable().lease_takeover_window();
             let dead_lease = match (locked_by.as_deref(), locked_at) {
-                (None, _) => true,
-                (Some(_), None) => true,
+                (None, _) | (Some(_), None) => true,
                 (Some(_), Some(at)) => at < chrono::Utc::now() - takeover,
             };
             if dead_lease {
@@ -752,11 +752,13 @@ async fn enqueue_on_tx<S: HasDurable>(
         None,
     )
     .await
-        .map_err(|e| match e {
-            cja::jobs::EnqueueError::SqlxError(e) => RunError::Storage(e),
-            other => RunError::Storage(sqlx::Error::Protocol(other.to_string())),
-        })
-        .map(|_| ())
+    .map_err(|e| match e {
+        cja::jobs::EnqueueError::SqlxError(e) => RunError::Storage(e),
+        other @ cja::jobs::EnqueueError::SerdeJsonError(_) => {
+            RunError::Storage(sqlx::Error::Protocol(other.to_string()))
+        }
+    })
+    .map(|_| ())
 }
 
 fn decode_error(column: &str, value: &str) -> RunError {
@@ -773,5 +775,9 @@ fn corrupt_from_serde(error: &serde_json::Error) -> RunError {
         serde_json::error::Category::Data => "data",
         serde_json::error::Category::Eof => "eof",
     };
-    RunError::Corrupt(kind, error.line() as u32, error.column() as u32)
+    RunError::Corrupt(
+        kind,
+        u32::try_from(error.line()).unwrap_or(u32::MAX),
+        u32::try_from(error.column()).unwrap_or(u32::MAX),
+    )
 }

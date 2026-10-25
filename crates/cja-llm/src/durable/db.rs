@@ -138,7 +138,7 @@ where
 /// Persist one step atomically: conditionally update the run state (proving
 /// lease ownership), then insert the newly committed transcript messages, in
 /// one transaction. `Ok(None)` = lease lost (write nothing, stop silently).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) async fn persist_step(
     db: &sqlx::PgPool,
     run_id: Uuid,
@@ -327,7 +327,11 @@ pub(super) async fn cancel_now<'e, E>(
 where
     E: Executor<'e, Database = sqlx::Postgres>,
 {
-    let wanted: Vec<String> = statuses.iter().map(RunStatus::as_str).map(str::to_owned).collect();
+    let wanted: Vec<String> = statuses
+        .iter()
+        .map(RunStatus::as_str)
+        .map(str::to_owned)
+        .collect();
     let from = sqlx::query_scalar::<_, String>(
         "WITH target AS (
              SELECT id, status FROM agent_runs
@@ -355,14 +359,13 @@ pub(super) async fn request_cancel<'e, E>(db: E, run_id: Uuid) -> sqlx::Result<b
 where
     E: Executor<'e, Database = sqlx::Postgres>,
 {
-    let rows = sqlx::query(
-        "UPDATE agent_runs SET cancel_requested = TRUE WHERE id = $1 AND status = $2",
-    )
-    .bind(run_id)
-    .bind(RunStatus::Running.as_str())
-    .execute(db)
-    .await?
-    .rows_affected();
+    let rows =
+        sqlx::query("UPDATE agent_runs SET cancel_requested = TRUE WHERE id = $1 AND status = $2")
+            .bind(run_id)
+            .bind(RunStatus::Running.as_str())
+            .execute(db)
+            .await?
+            .rows_affected();
     Ok(rows > 0)
 }
 
@@ -385,7 +388,9 @@ mod tests {
             .run(&pool)
             .await
             .expect("cja migrations");
-        crate::durable::run_migrations(&pool).await.expect("durable migrations");
+        crate::durable::run_migrations(&pool)
+            .await
+            .expect("durable migrations");
         std::mem::forget(guard); // live for the test body; the harness drops the DB
         pool
     }
@@ -442,7 +447,9 @@ mod tests {
             "owner on running releases"
         );
         assert_eq!(
-            release_lease(&db, queued, "me").await.expect("release again"),
+            release_lease(&db, queued, "me")
+                .await
+                .expect("release again"),
             0,
             "no longer leased by me"
         );
@@ -563,12 +570,14 @@ mod tests {
             Some(true)
         );
         // Not running: even the owner's heartbeat matches nothing.
-        sqlx::query("UPDATE agent_runs SET status = 'waiting', locked_by = NULL, \
-                     pending_call_id = 'c', pending_question = 'q' WHERE id = $1")
-            .bind(id)
-            .execute(&db)
-            .await
-            .expect("to waiting");
+        sqlx::query(
+            "UPDATE agent_runs SET status = 'waiting', locked_by = NULL, \
+                     pending_call_id = 'c', pending_question = 'q' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&db)
+        .await
+        .expect("to waiting");
         assert_eq!(
             heartbeat(&db, id, "me").await.expect("heartbeat waiting"),
             None
