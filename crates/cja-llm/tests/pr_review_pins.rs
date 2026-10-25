@@ -78,3 +78,50 @@ async fn stalled_error_body_reports_the_request_timeout() {
     server.abort();
     assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
 }
+
+/// The gateway's final SSE usage chunk must make the per-call completion
+/// event carry the reported token counts, as required for event-only sinks.
+#[tokio::test]
+async fn streamed_usage_reaches_the_completion_event() {
+    use futures::StreamExt as _;
+    use std::sync::Mutex;
+
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let output = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Writer(output.clone()))
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let fake = FakeGateway::start().await;
+    fake.chat_stream(models::DEFAULT, &["hello"]);
+    let llm = Llm::new(&config(fake.url())).unwrap();
+    let chunks: Vec<String> = llm
+        .stream(models::DEFAULT, "ping")
+        .map(|item| item.unwrap())
+        .collect()
+        .await;
+    assert_eq!(chunks, ["hello"]);
+    drop(guard);
+
+    let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    let event = text
+        .lines()
+        .find(|line| line.contains("gateway http call finished"))
+        .expect("transport completion event was captured");
+    assert!(event.contains("input_tokens=3"), "{event}");
+    assert!(event.contains("output_tokens=2"), "{event}");
+}
