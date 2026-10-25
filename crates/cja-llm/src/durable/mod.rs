@@ -5,9 +5,12 @@
 //! kinds, leases, ask/answer suspension, failure classification, and the
 //! enqueue/wake contract.
 
+pub(crate) mod ask;
 pub(crate) mod db;
 
 pub use db::run_migrations;
+
+pub use ask::{Ask, AskArgs};
 
 use std::fmt;
 use std::str::FromStr;
