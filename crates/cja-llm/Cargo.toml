@@ -1,0 +1,48 @@
+[package]
+name = "cja-llm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Opinionated rig setup for cja apps, keyless via the tailnet LLM gateway"
+publish = false
+
+[features]
+default = []
+# In-process tailnet transport (cja-tailnet). Hosts running tailscaled don't need it.
+tailnet = ["dep:cja-tailnet"]
+# Fake gateway for app tests: scripted OpenAI chat-completions over real HTTP.
+# (serde_json is a non-optional dependency — no `dep:serde_json` here; cargo
+# rejects `dep:` on non-optional dependencies.)
+testing = ["hyper/server"]
+
+[dependencies]
+rig-core = { version = "=0.45.0", default-features = false, features = ["derive"] }
+rig-agent = { version = "=0.45.0", default-features = false, features = ["derive"] }
+setec = { path = "../setec" }
+cja-tailnet = { path = "../cja-tailnet", optional = true }
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
+webpki-roots = "1"
+url = "2"
+schemars = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+futures = "0.3"
+fastrand = "2"
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber.workspace = true
+color-eyre = "0.6"
+cja-llm = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true
