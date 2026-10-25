@@ -1014,25 +1014,28 @@ fn is_stale_virtual_key(status: http::StatusCode, body: &str) -> bool {
         || (status == http::StatusCode::FORBIDDEN && body_type == "access_blocked")
 }
 
-/// The delay before the next attempt: a seconds-form `Retry-After` clamped
-/// to the ceiling when present, else exponential backoff from the initial
-/// delay, with full jitter. `None` when the deadline leaves no room, ending
-/// the loop with the last failure.
+/// The delay before the next attempt: a seconds-form `Retry-After` is a
+/// floor — exactly `after` clamped to `max_backoff`, never jittered down
+/// (retrying earlier than the server asked usually burns the attempt on
+/// another 429) — while the exponential path uses full jitter. `None` when
+/// the deadline leaves no room, ending the loop with the last failure.
 fn retryable_delay(
     policy: &RetryPolicy,
     attempt: u32,
     retry_after: Option<Duration>,
     deadline: tokio::time::Instant,
 ) -> Option<Duration> {
-    let base = match retry_after {
+    let delay = match retry_after {
         Some(after) => after.min(policy.max_backoff),
-        None => policy
-            .initial_backoff
-            .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
-            .min(policy.max_backoff),
+        None => {
+            let base = policy
+                .initial_backoff
+                .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+                .min(policy.max_backoff);
+            // Full jitter: uniform in [0, base].
+            Duration::from_secs_f64(base.as_secs_f64() * fastrand::f64())
+        }
     };
-    // Full jitter: uniform in [0, base].
-    let delay = Duration::from_secs_f64(base.as_secs_f64() * fastrand::f64());
     let now = tokio::time::Instant::now();
     (now + delay < deadline).then_some(delay)
 }
@@ -1174,6 +1177,45 @@ mod tests {
         // message() contract, not by a hand-built fake.
         assert!(should_retry_queue_reject(Some(&request)));
         assert!(!should_retry_queue_reject(None));
+    }
+
+    /// A seconds-form `Retry-After` is a floor: exactly `after` clamped to
+    /// `max_backoff`, never jittered down. The exponential path keeps full
+    /// jitter within its base.
+    #[test]
+    fn retry_after_is_a_floor_not_a_jitter_ceiling() {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_secs(30),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+
+        for _ in 0..50 {
+            assert_eq!(
+                retryable_delay(&policy, 1, Some(Duration::from_secs(1)), deadline),
+                Some(Duration::from_secs(1)),
+                "a present Retry-After is honored exactly, never jittered"
+            );
+        }
+        assert_eq!(
+            retryable_delay(&policy, 1, Some(Duration::from_secs(60)), deadline),
+            Some(Duration::from_secs(30)),
+            "clamped to max_backoff"
+        );
+
+        for attempt in 1..=5u32 {
+            let base = policy
+                .initial_backoff
+                .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+                .min(policy.max_backoff);
+            let delay = retryable_delay(&policy, attempt, None, deadline)
+                .expect("the far deadline always leaves room");
+            assert!(
+                delay <= base,
+                "the exponential path stays within its base: {delay:?} > {base:?}"
+            );
+        }
     }
 
     #[test]
