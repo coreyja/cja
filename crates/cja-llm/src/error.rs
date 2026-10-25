@@ -23,7 +23,7 @@
 use std::fmt;
 
 use rig_agent::completion::{PromptError, StructuredOutputError};
-use rig_core::error::ProviderError;
+use rig_core::error::{ErrorKind, ProviderError};
 
 use crate::transport::{CONNECT_MARKER, TIMEOUT_MARKER};
 
@@ -355,8 +355,12 @@ impl Error {
     /// the Bifrost body `type` checked before the gateway wrapper's `error`
     /// strings so a Bifrost envelope is never mistaken for the wrapper's
     /// identity 403. Response-less failures classify by the transport's
-    /// stable marker strings, which ride verbatim into rig's error text on
-    /// both the `Provider` and relayed `Report` paths.
+    /// stable marker strings — but only through a structural gate: the
+    /// error must be an HTTP-transport failure
+    /// ([`ErrorKind::Http`] on both the `Provider` and relayed `Report`
+    /// paths), because everywhere else rig's `Display` text is
+    /// model-controlled and a marker inside it (e.g. a model-emitted tool
+    /// name) must not masquerade as a transport failure.
     pub fn from_prompt_error(err: PromptError) -> Self {
         if let Some(status) = err.provider_response_status() {
             let status = status.as_u16();
@@ -399,12 +403,28 @@ impl Error {
                 },
             };
         }
+        // Structural gate: the transport markers may only classify a
+        // genuine HTTP-transport failure — `PromptError::Provider(e)`
+        // whose `e.kind() == ErrorKind::Http` (rig-core-0.45.0
+        // `src/error.rs:457-459`) or `PromptError::Report(r)` whose
+        // `r.kind == ErrorKind::Http` (public field, `error.rs:107`).
+        // Everywhere else rig's `Display` text is model-controlled —
+        // `PromptError::UnknownToolCall` interpolates the model-emitted
+        // `tool_name` (`rig-agent-0.45.0/src/run/response.rs:286-299`) —
+        // so an unguarded `contains(marker)` would let a prompt-injected
+        // tool name masquerade as a transport failure and carry its text
+        // into the source chain and reporters.
+        let is_http_transport = match &err {
+            PromptError::Provider(provider) => provider.kind() == ErrorKind::Http,
+            PromptError::Report(report) => report.kind == ErrorKind::Http,
+            _ => false,
+        };
         let text = err.to_string();
-        if text.contains(CONNECT_MARKER) {
+        if is_http_transport && text.contains(CONNECT_MARKER) {
             Self::Connect {
                 source: SanitizedError::from_prompt(err, &[]),
             }
-        } else if text.contains(TIMEOUT_MARKER) {
+        } else if is_http_transport && text.contains(TIMEOUT_MARKER) {
             Self::Timeout {
                 source: SanitizedError::from_prompt(err, &[]),
             }
@@ -602,6 +622,31 @@ mod tests {
         );
         let error = Error::from_prompt_error(report(&message));
         assert!(matches!(error, Error::Connect { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn marker_text_in_model_output_is_not_classified_as_transport() {
+        // A model-emitted tool name carrying the transport marker must NOT
+        // classify as Connect/Timeout: `UnknownToolCall`'s Display
+        // interpolates the model-controlled `tool_name`
+        // (rig-agent-0.45.0 src/run/response.rs:286-299), and only a
+        // structural HTTP-transport failure (`ErrorKind::Http`) may hit
+        // the marker check. Without the gate this error would surface as
+        // `Timeout` whose sanitized source keeps the marker-bearing
+        // Display — model output in the chain and in color_eyre reports.
+        for marker in [TIMEOUT_MARKER, CONNECT_MARKER] {
+            let err = PromptError::UnknownToolCall {
+                tool_name: format!("{marker} {DEBUG_SENTINEL}"),
+                available_tools: vec!["add".to_owned()],
+                allowed_tools: vec!["add".to_owned()],
+                chat_history: Vec::new(),
+            };
+            let error = Error::from_prompt_error(err);
+            assert!(matches!(error, Error::Rig { .. }), "{error:?}");
+            assert!(error.prompt_error().is_some());
+            assert_chain_is_sanitized(&error);
+            assert_color_eyre_sanitized(error);
+        }
     }
 
     #[test]
