@@ -1,0 +1,69 @@
+[
+  {
+    "role": "user",
+    "json": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "golden user prompt"
+        }
+      ]
+    }
+  },
+  {
+    "role": "assistant",
+    "json": {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "golden reply"
+        }
+      ]
+    }
+  },
+  {
+    "role": "assistant",
+    "json": {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "toolcall",
+          "id": {
+            "provider": "call_golden"
+          },
+          "function": {
+            "name": "add",
+            "arguments": {
+              "a": 1,
+              "b": 2
+            }
+          }
+        }
+      ],
+      "stop": "tool_use"
+    }
+  },
+  {
+    "role": "user",
+    "json": {
+      "role": "user",
+      "content": [
+        {
+          "type": "toolresult",
+          "call": {
+            "provider": "call_golden"
+          },
+          "name": "add",
+          "content": [
+            {
+              "type": "text",
+              "text": "golden result"
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

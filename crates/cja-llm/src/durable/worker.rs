@@ -60,6 +60,7 @@ enum StepOutcome {
 
 /// What [`Attempt::with_lease_guards`] produced: the guarded future's
 /// output, or a decision to stop driving this run.
+#[derive(Debug)]
 enum Guarded<T> {
     Done(T),
     Stop,
@@ -910,5 +911,135 @@ impl Attempt<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "durable"))]
+mod tests {
+    //! `with_lease_guards` pin-once loop structure: a step future that
+    //! outlives several heartbeat periods is neither dropped nor restarted,
+    //! heartbeats keep the lease fresh while it runs, and the guard returns
+    //! its output intact.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use cja::jobs::CancellationToken;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::LlmConfig;
+    use crate::durable::RunLimits;
+
+    static GUARD_KIND: AgentKind = AgentKind {
+        name: "guard_probe",
+        model: "m",
+        limits: RunLimits { max_turns: 20, max_total_tokens: 200_000 },
+        unhandled_invalid_tool_call: rig_agent::run::UnhandledInvalidToolCall::Fail,
+        build: |llm, model| llm.agent(model),
+    };
+
+    async fn test_db() -> sqlx::PgPool {
+        let (pool, guard) = cja::testing::test_db::create_test_database("cja_llm_durable_w_")
+            .await
+            .expect("create test database");
+        sqlx::migrate!("../cja/migrations")
+            .run(&pool)
+            .await
+            .expect("cja migrations");
+        crate::durable::run_migrations(&pool).await.expect("durable migrations");
+        std::mem::forget(guard);
+        pool
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_completes_long_step_future() {
+        let db = test_db().await;
+        // A dead loopback URL: the guard test never calls the model.
+        let config = LlmConfig::new("http://127.0.0.1:9".parse().expect("url"))
+            .app_name("guard-test");
+        let durable = Durable::new(&config)
+            .expect("durable")
+            .kind(&GUARD_KIND)
+            .expect("kind")
+            // takeover 90ms -> heartbeat period 30ms.
+            .lease_takeover(Duration::from_millis(90));
+
+        // A running row leased by `me`.
+        let run_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state) \
+             VALUES ($1, 'guard_probe', 'running', 'in', 'm', 'a', '{}'::jsonb)",
+        )
+        .bind(run_id)
+        .execute(&db)
+        .await
+        .expect("run row");
+        let me = "me".to_owned();
+        sqlx::query("UPDATE agent_runs SET locked_by = $2, locked_at = NOW() WHERE id = $1")
+            .bind(run_id)
+            .bind(&me)
+            .execute(&db)
+            .await
+            .expect("lease");
+
+        let attempt =
+            durable.attempt(&db, run_id, &me, &GUARD_KIND, "m", CancellationToken::new());
+        let run = AgentRun::new(rig_core::message::Message::user("probe"));
+
+        // A step future that sleeps ~3.3 heartbeat periods before finishing.
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_clone = started.clone();
+        let step = async move {
+            started_clone.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            7u32
+        };
+
+        // While the guarded future runs, count distinct locked_at values:
+        // every heartbeat rewrites it, so >= 2 distinct values prove the
+        // heartbeats actually ticked over the window (deadline-bounded poll,
+        // never a fixed sleep + snapshot).
+        let watch_db = db.clone();
+        let watch = tokio::spawn(async move {
+            let mut distinct = std::collections::HashSet::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while distinct.len() < 2 && tokio::time::Instant::now() < deadline {
+                if let Ok(Some(ts)) =
+                    sqlx::query_scalar::<_, String>("SELECT locked_at::text FROM agent_runs WHERE id = $1")
+                        .bind(run_id)
+                        .fetch_optional(&watch_db)
+                        .await
+                {
+                    distinct.insert(ts);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            distinct.len()
+        });
+
+        let outcome = attempt.with_lease_guards(&run, step).await.expect("guard");
+        let ticks = watch.await.expect("watcher");
+
+        assert!(
+            matches!(outcome, Guarded::Done(7)),
+            "the guarded future's output: {outcome:?}"
+        );
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the future was neither dropped nor restarted"
+        );
+        assert!(ticks >= 2, "heartbeats ticked at least twice: {ticks}");
+
+        let (locked_by, status): (Option<String>, String) =
+            sqlx::query_as("SELECT locked_by, status FROM agent_runs WHERE id = $1")
+                .bind(run_id)
+                .fetch_one(&db)
+                .await
+                .expect("row");
+        assert_eq!(locked_by.as_deref(), Some("me"), "still leased by me");
+        assert_eq!(status, "running");
     }
 }

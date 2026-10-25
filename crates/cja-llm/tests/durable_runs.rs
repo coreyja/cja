@@ -1634,3 +1634,142 @@ async fn enqueue_wakes_once_after_commit() {
         "only the successful start woke the worker"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 11. Spans carry metadata, never content
+// ---------------------------------------------------------------------------
+
+mod span_capture {
+    //! One global capture for this test binary. The subscriber deliberately
+    //! CAPS rig's raw-wire TRACE targets (`rig::completions`, `rig::streaming`)
+    //! at DEBUG and `rig_agent::agent::typed` at ERROR — the same stack cja's
+    //! production setup ships — because those targets unconditionally dump
+    //! whole request/reply JSON. Asserting only after capping would be vacuous
+    //! in the other direction with an unfiltered TRACE capture: rig's wire
+    //! dumps (not our spans) would trip the sentinel check. The capped stack
+    //! is the honest production-equivalent surface.
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Default)]
+    pub struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    pub struct SharedWrite(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedWriter {
+        pub fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("capture buffer")).into_owned()
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWrite;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWrite(self.0.clone())
+        }
+    }
+
+    impl io::Write for SharedWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    static CAPTURE: std::sync::OnceLock<SharedWriter> = std::sync::OnceLock::new();
+
+    pub fn capture() -> SharedWriter {
+        let writer = CAPTURE.get_or_init(SharedWriter::default).clone();
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let filter = tracing_subscriber::filter::Targets::new()
+                .with_default(tracing::Level::TRACE)
+                // rig unconditionally dumps raw request/reply JSON on these
+                // targets at TRACE (`providers::internal::trace_json`):
+                // wire debugging, not GenAI telemetry, and not something a
+                // library can gate from inside.
+                .with_target("rig::completions", tracing::Level::DEBUG)
+                .with_target("rig::streaming", tracing::Level::DEBUG)
+                // The one WARN that prints raw model output.
+                .with_target("rig_agent::agent::typed", tracing::Level::ERROR);
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(writer.clone())
+                .with_span_events(FmtSpan::FULL)
+                .with_ansi(false)
+                .finish()
+                .with(filter);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global tracing subscriber in this binary");
+        });
+        writer
+    }
+}
+
+#[tokio::test]
+async fn spans_carry_metadata_never_content() {
+    static TRACED: AgentKind = AgentKind {
+        name: "traced",
+        model: models::DEFAULT,
+        limits: RunLimits { max_turns: 20, max_total_tokens: 200_000 },
+        unhandled_invalid_tool_call: UnhandledInvalidToolCall::Fail,
+        build: |llm, model| llm.agent(model).tool(Ask).tool(Add),
+    };
+
+    let writer = span_capture::capture();
+    let env = setup(&[&TRACED]).await;
+
+    const SPAN_PROMPT_SENTINEL: &str = "SPAN_SENTINEL_PROMPT_5f31";
+    const SPAN_TOOL_SENTINEL: &str = "SPAN_SENTINEL_TOOL_9a77";
+    const SPAN_REPLY_SENTINEL: &str = "SPAN_SENTINEL_REPLY_2c4e";
+
+    // The sentinel rides in the tool arguments as an ignored extra field and
+    // in the final reply text: any surface that echoes model I/O carries it.
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_s",
+        "add",
+        &serde_json::json!({"a": 1, "b": 2, "note": SPAN_TOOL_SENTINEL}),
+    );
+    env.fake.chat_completion(models::DEFAULT, SPAN_REPLY_SENTINEL);
+
+    let run = durable::start(&env.state, "traced", SPAN_PROMPT_SENTINEL)
+        .await
+        .expect("start");
+    drive(&env.state, run).await.expect("drive");
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
+
+    let text = writer.text();
+    // Positive: the step span exists with its metadata fields, on one line.
+    let step_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("agent_run.step") && line.contains("run.kind=traced"))
+        .collect();
+    assert!(!step_lines.is_empty(), "agent_run.step span lines captured");
+    assert!(
+        step_lines
+            .iter()
+            .any(|l| l.contains("run.id=") && l.contains("run.turn=") && l.contains("run.input_tokens=")),
+        "span carries run id, turn, and token fields: {}",
+        step_lines.first().copied().unwrap_or_default()
+    );
+    // Negative: no content sentinel anywhere in the capture.
+    for sentinel in [SPAN_PROMPT_SENTINEL, SPAN_TOOL_SENTINEL, SPAN_REPLY_SENTINEL] {
+        assert!(
+            !text.contains(sentinel),
+            "content leaked into telemetry: {sentinel}"
+        );
+    }
+}

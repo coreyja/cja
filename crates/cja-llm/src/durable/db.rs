@@ -365,3 +365,270 @@ where
     .rows_affected();
     Ok(rows > 0)
 }
+
+#[cfg(all(test, feature = "durable"))]
+mod tests {
+    //! Claim/lease predicate tests against real SQL. These exercise the
+    //! branches the worker's outcomes depend on: every claimable shape, the
+    //! not-claimable shapes, and the ownership conditionals of release and
+    //! heartbeat. Status texts are compared by SQL equality only — exactly
+    //! what the conditional UPDATEs do — so casing bugs surface here.
+
+    use super::*;
+    use std::time::Duration;
+
+    async fn test_db() -> sqlx::PgPool {
+        let (pool, guard) = cja::testing::test_db::create_test_database("cja_llm_durable_db_")
+            .await
+            .expect("create test database");
+        sqlx::migrate!("../cja/migrations")
+            .run(&pool)
+            .await
+            .expect("cja migrations");
+        crate::durable::run_migrations(&pool).await.expect("durable migrations");
+        std::mem::forget(guard); // live for the test body; the harness drops the DB
+        pool
+    }
+
+    /// Insert one run row in the given state; returns its id. A `waiting`
+    /// row carries both pending-ask columns (the CHECK requires them).
+    async fn insert_run(db: &sqlx::PgPool, status: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let (pending_call, pending_question) = if status == "waiting" {
+            ("'c'", "'q'")
+        } else {
+            ("NULL", "NULL")
+        };
+        sqlx::query(&format!(
+            "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state, \
+             pending_call_id, pending_question) \
+             VALUES ($1, 'k', $2, 'in', 'm', 'a', '{{}}'::jsonb, {pending_call}, {pending_question})"
+        ))
+        .bind(id)
+        .bind(status)
+        .execute(db)
+        .await
+        .expect("insert run row");
+        id
+    }
+
+    async fn status_of(db: &sqlx::PgPool, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .expect("status")
+    }
+
+    #[tokio::test]
+    async fn claim_predicate_branches() {
+        let db = test_db().await;
+        let takeover = Duration::from_secs(90);
+
+        // queued -> claimed.
+        let queued = insert_run(&db, "queued").await;
+        assert!(
+            try_claim(&db, queued, "me", takeover)
+                .await
+                .expect("claim queued")
+                .is_some()
+        );
+        assert_eq!(status_of(&db, queued).await, "running");
+
+        // release: owner releases once; a second release is a no-op.
+        assert_eq!(
+            release_lease(&db, queued, "me").await.expect("release"),
+            1,
+            "owner on running releases"
+        );
+        assert_eq!(
+            release_lease(&db, queued, "me").await.expect("release again"),
+            0,
+            "no longer leased by me"
+        );
+
+        // running, unowned -> claimed (a released lease is immediately
+        // re-claimable: the fast retry path).
+        let unowned = insert_run(&db, "running").await;
+        assert!(
+            try_claim(&db, unowned, "me", takeover)
+                .await
+                .expect("claim unowned running")
+                .is_some()
+        );
+
+        // running under a FRESH foreign lease -> not claimable; the status
+        // read disambiguates Leased (back off) from NothingToDo.
+        let leased = insert_run(&db, "running").await;
+        sqlx::query("UPDATE agent_runs SET locked_by = 'other', locked_at = NOW() WHERE id = $1")
+            .bind(leased)
+            .execute(&db)
+            .await
+            .expect("fresh foreign lease");
+        assert!(
+            try_claim(&db, leased, "me", takeover)
+                .await
+                .expect("claim leased running")
+                .is_none()
+        );
+        assert_eq!(
+            current_status(&db, leased).await.expect("row exists"),
+            Some("running".to_owned()),
+            "-> Leased: back off"
+        );
+
+        // running under a STALE foreign lease -> taken over.
+        sqlx::query(
+            "UPDATE agent_runs SET locked_by = 'other', \
+             locked_at = NOW() - interval '120 seconds' WHERE id = $1",
+        )
+        .bind(leased)
+        .execute(&db)
+        .await
+        .expect("stale foreign lease");
+        let taken = try_claim(&db, leased, "me", takeover)
+            .await
+            .expect("claim stale running")
+            .expect("stale lease taken over");
+        assert_eq!(taken.kind, "k");
+
+        // waiting -> not claimable, NothingToDo (a waiting run already owns
+        // a fresh job from answer()).
+        let waiting = insert_run(&db, "waiting").await;
+        assert!(
+            try_claim(&db, waiting, "me", takeover)
+                .await
+                .expect("claim waiting")
+                .is_none()
+        );
+        assert_eq!(
+            current_status(&db, waiting).await.expect("row"),
+            Some("waiting".to_owned())
+        );
+
+        // terminal -> not claimable, NothingToDo.
+        let done = insert_run(&db, "succeeded").await;
+        assert!(
+            try_claim(&db, done, "me", takeover)
+                .await
+                .expect("claim succeeded")
+                .is_none()
+        );
+        assert_eq!(
+            current_status(&db, done).await.expect("row"),
+            Some("succeeded".to_owned()),
+            "-> NothingToDo"
+        );
+
+        // missing row -> not claimable, and no status to read.
+        let missing = Uuid::new_v4();
+        assert!(
+            try_claim(&db, missing, "me", takeover)
+                .await
+                .expect("claim missing")
+                .is_none()
+        );
+        assert_eq!(current_status(&db, missing).await.expect("read"), None);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_ownership_conditionals() {
+        let db = test_db().await;
+        let id = insert_run(&db, "running").await;
+        sqlx::query("UPDATE agent_runs SET locked_by = 'me', locked_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .expect("lease");
+
+        // Owner, no cancel requested.
+        assert_eq!(
+            heartbeat(&db, id, "me").await.expect("heartbeat"),
+            Some(false)
+        );
+        // Not the owner.
+        assert_eq!(
+            heartbeat(&db, id, "other").await.expect("heartbeat other"),
+            None,
+            "a foreign heartbeat matches nothing"
+        );
+        // Owner, cancel requested.
+        sqlx::query("UPDATE agent_runs SET cancel_requested = TRUE WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .expect("cancel requested");
+        assert_eq!(
+            heartbeat(&db, id, "me").await.expect("heartbeat cancel"),
+            Some(true)
+        );
+        // Not running: even the owner's heartbeat matches nothing.
+        sqlx::query("UPDATE agent_runs SET status = 'waiting', locked_by = NULL, \
+                     pending_call_id = 'c', pending_question = 'q' WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+            .expect("to waiting");
+        assert_eq!(
+            heartbeat(&db, id, "me").await.expect("heartbeat waiting"),
+            None
+        );
+    }
+
+    /// A wrong-case status text must not match any transition predicate.
+    /// Only SQL equality exposes casing bugs: Rust-side `from_str` hides
+    /// them, and tests that insert the same wrong literal stay green. The
+    /// CHECK constraint blocks such rows from ordinary writes, so drop it
+    /// first — the case being pinned is corruption or forward-version skew.
+    #[tokio::test]
+    async fn wrong_case_status_matches_no_predicate() {
+        let db = test_db().await;
+        sqlx::query("ALTER TABLE agent_runs DROP CONSTRAINT agent_runs_status_check")
+            .execute(&db)
+            .await
+            .expect("drop status check");
+        let id = insert_run(&db, "Running").await;
+        assert!(
+            try_claim(&db, id, "me", Duration::from_secs(90))
+                .await
+                .expect("claim wrong-case queued literal")
+                .is_none(),
+            "'Running' matches neither 'queued' nor 'running'"
+        );
+        // And the disambiguation read reports the row verbatim: it does not
+        // equal 'running', so the worker treats it as NothingToDo, never
+        // as Leased.
+        assert_ne!(
+            current_status(&db, id).await.expect("row"),
+            Some("running".to_owned())
+        );
+    }
+
+    /// `waiting -> cancelled` without clearing both pending columns violates
+    /// the `waiting_has_pending_ask` CHECK and fails loudly: a missed clear
+    /// can never leave a lying row behind.
+    #[tokio::test]
+    async fn waiting_cancel_must_clear_pending_columns() {
+        let db = test_db().await;
+        let id = insert_run(&db, "waiting").await;
+
+        let unclean = sqlx::query("UPDATE agent_runs SET status = 'cancelled' WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await;
+        assert!(
+            unclean.is_err(),
+            "the CHECK rejects a cancelled row that still carries a pending ask"
+        );
+
+        // Clearing both columns in the SAME update is accepted.
+        sqlx::query(
+            "UPDATE agent_runs SET status = 'cancelled', \
+             pending_call_id = NULL, pending_question = NULL WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&db)
+        .await
+        .expect("clean transition");
+    }
+}
