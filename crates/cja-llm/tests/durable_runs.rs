@@ -1982,6 +1982,95 @@ async fn heartbeat_db_error_does_not_complete_the_job() {
     );
 }
 
+/// Round 3 pin: a heartbeat that TIMES OUT — here a real Postgres row
+/// lock (`FOR UPDATE` from a second connection) pinning the heartbeat
+/// UPDATE past the 5s lease-write bound — has not proven the lease lost.
+/// Returning `Ok` there would make cja delete the only job row while the
+/// run is still `running` under this worker's lease: the same orphan the
+/// DB-error pin above prevents. The timeout must error the attempt
+/// (`fail_retryable`: bounded release + cja backoff); only a provably
+/// lost lease (zero rows) may complete the job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_timeout_does_not_complete_the_job() {
+    // Reference: the uninterrupted transcript this run must reach after
+    // recovery (plain completion, no delay).
+    let reference_env = setup(&[&COUNTER]).await;
+    reference_env.fake.chat_completion(models::DEFAULT, "5");
+    let reference_run = durable::start(&reference_env.state, "counter", "x")
+        .await
+        .expect("start reference");
+    drive(&reference_env.state, reference_run)
+        .await
+        .expect("reference drive");
+    let reference = transcript_rows(&reference_env.db, reference_run).await;
+
+    // 3s takeover -> 1s heartbeat period. The delayed reply keeps the
+    // model call in flight across several heartbeat ticks; the second
+    // completion is for the retry (the first reply is consumed by the
+    // interrupted call and its result dropped with it).
+    let env = setup_with(&[&COUNTER], Duration::from_secs(3)).await;
+    env.fake.delay(Duration::from_secs(3));
+    env.fake.chat_completion(models::DEFAULT, "5");
+    env.fake.chat_completion(models::DEFAULT, "5");
+    let run = durable::start(&env.state, "counter", "x")
+        .await
+        .expect("start");
+
+    let state = env.state.clone();
+    let task = tokio::spawn(async move {
+        AdvanceRunJob { run_id: run.0 }
+            .run_with_cancellation(state, CancellationToken::new())
+            .await
+    });
+    wait_until(|| async { (env.fake.requests().len() == 1).then_some(()) }).await;
+
+    // Hold the run row FOR UPDATE from this (second) connection, past the
+    // 5s WRITE_BOUND plus margin: the next heartbeat UPDATE blocks on the
+    // row lock and times out without proving anything about ownership.
+    let mut holder = env.db.begin().await.expect("begin lock holder");
+    sqlx::query("SELECT id FROM agent_runs WHERE id = $1 FOR UPDATE")
+        .bind(run.0)
+        .fetch_one(&mut *holder)
+        .await
+        .expect("lock run row");
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    holder.rollback().await.expect("release row lock");
+
+    let result = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("attempt returned")
+        .expect("join");
+
+    // The attempt errored, so cja keeps the job row and retries it. The run
+    // is NOT terminal, and nothing was written after the timeout: the only
+    // committed projection is still the pre-call user message, and no
+    // finish/persist landed. (The bounded release could not commit under
+    // the row lock; the lease is either still held-and-stale or cleared —
+    // both re-claimable.)
+    assert!(
+        result.is_err(),
+        "heartbeat timeout must error the attempt, not complete the job"
+    );
+    assert_eq!(jobs_for(&env.db, run).await, 1, "job row not deleted");
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Running);
+    let rows = transcript_rows(&env.db, run).await;
+    assert_eq!(rows.len(), 1, "no writes after the timeout: {rows:?}");
+    assert_eq!(rows[0].1, "user", "only the pre-call user message");
+
+    // With the lock released, a later attempt re-claims (cleared lease or
+    // stale-lease takeover — both are past the 3s window) and drives the
+    // run to `succeeded` with the reference transcript.
+    drive(&env.state, run)
+        .await
+        .expect("retry re-claims and completes");
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
+    assert_eq!(
+        transcript_rows(&env.db, run).await,
+        reference,
+        "recovered transcript equals the uninterrupted run's"
+    );
+}
+
 /// A concurrent queued -> running transition must not turn a valid run into
 /// `NotFound`. The row remains present and cancellation is valid in both
 /// states; `NotFound` is reserved for a missing run id.

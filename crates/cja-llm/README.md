@@ -263,6 +263,18 @@ errors (backoff) instead of completing — it can never delete the job the
 live owner depends on. A worker that loses its lease mid-run stops
 silently; the current owner continues.
 
+A heartbeat that cannot be proven — a DB error, or a write that outlives
+the 5s lease-write bound (e.g. an operator transaction holding the
+`agent_runs` row) — is **not** proof of a lost lease: the attempt errors
+(lease release attempted, then cja backoff) so the job row is never
+deleted while the run may still be `running` under our lease. Only a
+provably lost lease (the heartbeat matches zero rows) stops silently, and
+that is safe only because of an invariant: whoever took the lease claimed
+through a job row, so the run keeps an advancing job (or is already
+terminal). Any future path that clears `locked_by` without enqueueing a
+job — a lease sweeper, an operator tool — would reintroduce orphans; such
+a path must enqueue.
+
 ### Cancel vs shutdown
 
 - **User `cancel(run_id)`** marks a queued/waiting run (or a `running` run

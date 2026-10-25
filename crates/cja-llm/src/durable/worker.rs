@@ -496,7 +496,11 @@ impl Durable {
         )
         .await
         .map_err(|_| cja::color_eyre::eyre::eyre!("run finish timed out"))??;
-        let _ = wrote; // false = lease lost: the run moved on without us
+        // `false` = lease lost: the run moved on without us — a silent stop,
+        // never an error. Safe by the same orphan invariant as `persist`:
+        // the taker needed a job row to claim through. A future path that
+        // clears `locked_by` without enqueueing a job must not exist.
+        let _ = wrote;
         Ok(())
     }
 }
@@ -621,7 +625,13 @@ impl Attempt<'_> {
             Ok(Ok(outcome)) => outcome,
         };
         match wrote {
-            None => StepOutcome::Done, // lease lost: stop silently, never write again
+            // Lease lost: stop silently, never write again. Safe ONLY
+            // because a lost lease is provable (zero rows): whoever took it
+            // claimed through a job row, so the run keeps an advancing job
+            // (or is already terminal). Any future path that clears
+            // `locked_by` without enqueueing a job would turn this Ok into
+            // an orphan; such a path must enqueue.
+            None => StepOutcome::Done,
             Some(true) => {
                 // User cancel at a step boundary: mark cancelled, keep the
                 // transcript, end the attempt.
@@ -916,8 +926,17 @@ impl Attempt<'_> {
     /// Guard an in-flight step future with the lease heartbeat and the
     /// shutdown token. The future is pinned ONCE outside the loop and polled
     /// for the whole guard — never dropped, never restarted. Only three
-    /// outcomes leave the loop early: the future completing, a lost/cancelled
-    /// heartbeat (`Stop`), and shutdown (`Err`).
+    /// outcomes leave the loop early: the future completing, a provably
+    /// lost/cancelled heartbeat (`Stop`), and shutdown or an unprovable
+    /// heartbeat (`Err`, so cja retries — never a silent job completion
+    /// while the lease may still be ours).
+    ///
+    /// Orphan invariant: returning `Ok` on a lost lease is safe ONLY
+    /// because a lost lease is provable (zero rows): whoever took it needed
+    /// a job row to claim through, so the run keeps an advancing job (or is
+    /// already terminal). Any future path that clears `locked_by` without
+    /// enqueueing a job — a lease sweeper, an operator tool — would
+    /// reintroduce orphans here; such a path must enqueue.
     #[allow(clippy::future_not_send)] // one task at a time; no cross-task awaits
     async fn with_lease_guards<F>(
         &self,
@@ -945,16 +964,35 @@ impl Attempt<'_> {
                     )
                     .await
                     {
-                        // A heartbeat timeout (ownership cannot be proven)
-                        // or a lost heartbeat (zero rows): abandon the step
-                        // and return Ok, never write again (plan-specified
-                        // for both).
-                        Err(_) | Ok(Ok(None)) => return Ok(Guarded::Stop),
-                        // A DB error is NOT proof of a lost lease: return Err
-                        // (the caller routes through `fail_retryable`:
+                        // A heartbeat TIMEOUT is not proof of a lost lease
+                        // (e.g. an operator transaction holding the row
+                        // lock past WRITE_BOUND): error the attempt so the
+                        // caller routes it through `fail_retryable` (bounded
                         // release + cja backoff). Completing the job here
-                        // would delete the only job row while the run is
-                        // still `running` under our lease — an orphan.
+                        // would delete the only job row while the run may
+                        // still be `running` under our lease — an orphan.
+                        // No further writes after this.
+                        // A heartbeat TIMEOUT is not proof of a lost lease
+                        // (e.g. an operator transaction holding the row
+                        // lock past WRITE_BOUND): error the attempt so the
+                        // caller routes it through `fail_retryable` (bounded
+                        // release + cja backoff). Completing the job here
+                        // would delete the only job row while the run may
+                        // still be `running` under our lease — an orphan.
+                        // No further writes after this.
+                        Err(_) => {
+                            return Err(cja::color_eyre::eyre::eyre!(
+                                "lease heartbeat timed out; ownership unproven",
+                            ));
+                        }
+                        // Zero rows = the lease was provably taken over: the
+                        // taker needed a job row to claim through (or the run
+                        // is terminal). Abandon the step and return Ok, never
+                        // write again.
+                        Ok(Ok(None)) => return Ok(Guarded::Stop),
+                        // A DB error is NOT proof of a lost lease either:
+                        // same treatment as the timeout — Err (release +
+                        // cja backoff), never a silent completion.
                         Ok(Err(e)) => return Err(cja::color_eyre::Report::from(e)),
                         Ok(Ok(Some(true))) => {
                             // User cancel mid-step: finish cancelled, keep
