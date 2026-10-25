@@ -799,7 +799,11 @@ mod tests {
             "the question?",
             // The projected rows land in BOTH branches: pass one and assert
             // the cancel branch still commits it.
-            &[(0, "assistant".to_owned(), serde_json::json!({"role": "assistant"}))],
+            &[(
+                0,
+                "assistant".to_owned(),
+                serde_json::json!({"role": "assistant"}),
+            )],
         )
         .await
         .expect("suspension write");

@@ -215,11 +215,15 @@ async fn a_pool_acquire_failure_is_recorded_inside_the_enqueue_span() {
                 && record.fields.contains_key("error")
         })
         .expect("the acquire failure is recorded as an enqueue failure");
-    assert_eq!(failure.span_id, span.span_id, "inside the jobs.enqueue span");
+    assert_eq!(
+        failure.span_id, span.span_id,
+        "inside the jobs.enqueue span"
+    );
     assert!(
-        !records.iter().any(|record| record.fields.get("job_id")
-            == Some(&json!(job_id))
-            && record.fields.get("event_type") == Some(&json!("job_enqueued"))),
+        !records
+            .iter()
+            .any(|record| record.fields.get("job_id") == Some(&json!(job_id))
+                && record.fields.get("event_type") == Some(&json!("job_enqueued"))),
         "no receipt: nothing was inserted"
     );
 }
