@@ -7,7 +7,8 @@
 //! gateway through one shared HTTP transport with retries, timeouts, and
 //! tracing, and exposes a thin convenience layer on top.
 //!
-//! ```rust,no_run
+//! ```rust,ignore
+//! // Wired up in a later step: `Llm` lands with the client surface.
 //! use cja_llm::models;
 //!
 //! #[tokio::main]
