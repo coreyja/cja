@@ -202,6 +202,7 @@ impl FakeGateway {
             .iter()
             .map(|delta| sse_chunk(model, delta))
             .chain([
+                sse_finish_chunk(model),
                 sse_usage_chunk(model),
                 Bytes::from_static(b"data: [DONE]\n\n"),
             ])
@@ -303,6 +304,20 @@ fn sse_chunk(model: &str, delta: &str) -> Bytes {
             "index": 0,
             "delta": {"content": delta},
             "finish_reason": null,
+        }],
+    }))
+}
+
+fn sse_finish_chunk(model: &str) -> Bytes {
+    sse_line(&serde_json::json!({
+        "id": "fake",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop",
         }],
     }))
 }
@@ -468,6 +483,12 @@ impl setec::Dialer for CountingDialer {
         })
     }
 }
+
+/// Host-side side-effect flag for `#[rig_tool]` test tools: 0.45's macro
+/// generates unit structs, so host state rides the run's tool context scope.
+/// Test-only, shared across this crate's test modules.
+#[cfg(test)]
+pub(crate) struct Ran(pub tokio::sync::Mutex<bool>);
 
 /// A config pointing at `url` with the tiny timeouts the crate's fake-gateway
 /// tests use. Test-only, shared across this crate's test modules.
