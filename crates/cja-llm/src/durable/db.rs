@@ -259,7 +259,8 @@ pub(super) async fn set_waiting(
              pending_call_id = CASE WHEN d.cancel_requested THEN NULL ELSE $5 END,
              pending_question = CASE WHEN d.cancel_requested THEN NULL ELSE $6 END,
              locked_by = NULL, locked_at = NULL,
-             finished_at = CASE WHEN d.cancel_requested THEN NOW() ELSE r.finished_at END
+             finished_at = CASE WHEN d.cancel_requested THEN NOW() ELSE r.finished_at END,
+             error = CASE WHEN d.cancel_requested THEN $9 ELSE r.error END
          FROM decision d
          WHERE r.id = d.id
          RETURNING d.cancel_requested",
@@ -272,6 +273,7 @@ pub(super) async fn set_waiting(
     .bind(pending_question)
     .bind(RunStatus::Running.as_str())
     .bind(RunStatus::Cancelled.as_str())
+    .bind("cancelled by request")
     .fetch_optional(&mut *tx)
     .await?;
     let Some(cancelled) = parked else {
@@ -795,18 +797,23 @@ mod tests {
             &serde_json::json!({}),
             "call_1",
             "the question?",
-            &[],
+            // The projected rows land in BOTH branches: pass one and assert
+            // the cancel branch still commits it.
+            &[(0, "assistant".to_owned(), serde_json::json!({"role": "assistant"}))],
         )
         .await
         .expect("suspension write");
         assert_eq!(outcome, Some(true), "cancel wins over parking");
-        let (status, pending_call, pending_question, locked_by): (
+        let (status, pending_call, pending_question, locked_by, error, finished_at): (
             String,
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
         ) = sqlx::query_as(
-            "SELECT status, pending_call_id, pending_question, locked_by FROM agent_runs WHERE id = $1",
+            "SELECT status, pending_call_id, pending_question, locked_by, error, finished_at \
+             FROM agent_runs WHERE id = $1",
         )
         .bind(id)
         .fetch_one(&db)
@@ -816,6 +823,15 @@ mod tests {
         assert_eq!(pending_call, None, "pending columns cleared");
         assert_eq!(pending_question, None, "pending columns cleared");
         assert_eq!(locked_by, None, "lease cleared");
+        assert_eq!(error.as_deref(), Some("cancelled by request"));
+        assert!(finished_at.is_some(), "the cancel branch finishes the run");
+        let inserted: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM agent_messages WHERE run_id = $1")
+                .bind(id)
+                .fetch_one(&db)
+                .await
+                .expect("messages");
+        assert_eq!(inserted, 1, "the projected transcript row is committed");
 
         // The healthy path still parks.
         let healthy = insert_run(&db, "running").await;
