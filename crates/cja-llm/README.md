@@ -223,13 +223,30 @@ text at `WARN` on `rig_agent::agent::typed`. cja's tracing setup
 (`cja::setup`) always caps those targets (`rig::completions` and
 `rig::streaming` at DEBUG, `rig_agent::agent::typed` at ERROR), so an app
 using `cja::setup` is covered. An app that builds its own subscriber must
-add the same three directives:
+add the same cap as a **separate `Targets` filter layer ANDed onto the
+`EnvFilter`** — not `EnvFilter::add_directive`. `add_directive` only
+replaces *static* directives: a span-scoped directive like
+`RUST_LOG=info,[request]=trace` enables every event at or below its level
+inside that span, whatever the target, because `EnvFilter` consults
+span-scope directives before static ones. A stacked filter layer vetoes
+instead — every layer must enable an event — and no `RUST_LOG` value can
+raise it:
 
 ```rust,ignore
-filter
-    .add_directive("rig::completions=debug".parse()?)
-    .add_directive("rig::streaming=debug".parse()?)
-    .add_directive("rig_agent::agent::typed=error".parse()?);
+use tracing_subscriber::filter::{LevelFilter, Targets};
+
+let rig_cap = Targets::new()
+    .with_default(LevelFilter::TRACE)
+    .with_target("rig::completions", LevelFilter::DEBUG)
+    .with_target("rig::streaming", LevelFilter::DEBUG)
+    .with_target("rig_agent::agent::typed", LevelFilter::ERROR);
+
+// Stack it next to the EnvFilter — both must enable an event:
+tracing_subscriber::registry()
+    .with(/* your writer layers */)
+    .with(env_filter)
+    .with(rig_cap)
+    .init();
 ```
 
 `cja_llm::Error`'s `Debug` and `Display` — and every link of its
