@@ -1,6 +1,12 @@
-use reqwest::{StatusCode, Url};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use serde_json::json;
-use setec::{Client, Error, SecretInfo};
+use setec::{
+    Client, Connection, DialFuture, Dialer, Error, SecretInfo, StatusCode, TcpDialer, Url,
+};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, header, method, path},
@@ -8,7 +14,7 @@ use wiremock::{
 
 async fn setup() -> (MockServer, Client) {
     let server = MockServer::start().await;
-    let client = Client::new(Url::parse(&server.uri()).unwrap()).unwrap();
+    let client = Client::new(Url::parse(&server.uri()).unwrap(), Arc::new(TcpDialer)).unwrap();
     (server, client)
 }
 
@@ -110,7 +116,7 @@ async fn unreachable_server_is_retryable_transport_error() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
     drop(listener);
-    let client = Client::new(url).unwrap();
+    let client = Client::new(url, Arc::new(TcpDialer)).unwrap();
 
     let err = client.get("n").await.unwrap_err();
 
@@ -247,4 +253,58 @@ async fn list_with_nothing_visible_is_empty_not_an_error() {
         .await;
 
     assert_eq!(client.list().await.unwrap(), vec![]);
+}
+
+/// Sends every dial to a fixed address, the way an embedded tailnet node
+/// resolves `setec.<tailnet>.ts.net` to a peer itself.
+struct FixedDialer {
+    addr: std::net::SocketAddr,
+    dials: AtomicUsize,
+}
+
+impl Dialer for FixedDialer {
+    fn dial<'a>(&'a self, _host: &'a str, _port: u16) -> DialFuture<'a> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let stream = tokio::net::TcpStream::connect(self.addr).await?;
+            Ok(Box::new(stream) as Box<dyn Connection>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn requests_go_through_the_dialer_with_the_base_url_host() {
+    let server = MockServer::start().await;
+    let dialer = Arc::new(FixedDialer {
+        addr: *server.address(),
+        dials: AtomicUsize::new(0),
+    });
+    let client = Client::new(
+        Url::parse("http://setec.example.ts.net").unwrap(),
+        dialer.clone(),
+    )
+    .unwrap();
+    api("get")
+        .and(header("host", "setec.example.ts.net"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"Value": "aGk=", "Version": 1})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let secret = client.get("n").await.unwrap();
+
+    assert_eq!(secret.value.expose(), b"hi");
+    assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn non_http_urls_are_rejected() {
+    let err = Client::new(
+        Url::parse("ftp://setec.example").unwrap(),
+        Arc::new(TcpDialer),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidUrl(_)), "{err:?}");
 }

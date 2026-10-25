@@ -8,12 +8,14 @@ publish = false
 
 [features]
 testing = []
+# Join the tailnet in-process (Transport::Tailnet) for hosts without tailscaled.
+tailnet = ["dep:cja-tailnet"]
 
 [dependencies]
 cja = { path = "../cja", default-features = false }
 cja-secret-macros = { path = "../cja-secret-macros" }
+cja-tailnet = { path = "../cja-tailnet", optional = true }
 setec = { path = "../setec" }
-reqwest.workspace = true
 thiserror = "2"
 tokio.workspace = true
 tokio-util.workspace = true

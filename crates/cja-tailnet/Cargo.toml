@@ -1,0 +1,29 @@
+[package]
+name = "cja-tailnet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Join a tailnet in-process as an ephemeral node, keyless via workload identity federation"
+publish = false
+
+[dependencies]
+setec = { path = "../setec" }
+# Fork of tailscale/tailscale-rs main + an inbound-filter fix: outbound TCP
+# to peers the policy doesn't let initiate to us (e.g. tag:setec) never
+# completed. Branch tcp-return-traffic. Drop the fork once that's upstream.
+tailscale = { git = "https://github.com/coreyja-studio/tailscale-rs", rev = "e42877d1f71fb045e58a1c1a815f5327193b1cf3" }
+reqwest = { workspace = true, features = ["rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+tokio.workspace = true
+tracing.workspace = true
+url = "2"
+zeroize = "1.8"
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[lints]
+workspace = true

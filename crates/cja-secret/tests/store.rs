@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use cja_secret::{Error, FakeSetec, Refresher, Secret, SecretStore, Secrets, SetecConfig, setec};
-use reqwest::Url;
+use cja_secret::{
+    Error, FakeSetec, Refresher, Secret, SecretStore, Secrets, SetecConfig, setec, setec::Url,
+};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use wiremock::{
@@ -200,10 +201,10 @@ struct OneSecret {
     token: Secret<String>,
 }
 
-fn setec_store(server: &MockServer, boot_timeout: Duration) -> SecretStore {
+async fn setec_store(server: &MockServer, boot_timeout: Duration) -> SecretStore {
     let mut config = SetecConfig::new(Url::parse(&server.uri()).unwrap());
     config.boot_timeout = boot_timeout;
-    SecretStore::connect(config).unwrap()
+    SecretStore::connect(config).await.unwrap()
 }
 
 fn value(v: &str, version: u32) -> ResponseTemplate {
@@ -223,6 +224,7 @@ async fn access_denied_at_boot_fails_without_retrying() {
         .await;
 
     let err = setec_store(&server, Duration::from_secs(30))
+        .await
         .load::<OneSecret>()
         .await
         .unwrap_err();
@@ -257,6 +259,7 @@ async fn transient_failure_at_boot_is_retried() {
         .await;
 
     let (secrets, _refresher) = setec_store(&server, Duration::from_secs(30))
+        .await
         .load::<OneSecret>()
         .await
         .unwrap();
@@ -276,6 +279,7 @@ async fn persistent_outage_at_boot_times_out_with_last_error() {
 
     let started = std::time::Instant::now();
     let err = setec_store(&server, Duration::from_millis(600))
+        .await
         .load::<OneSecret>()
         .await
         .unwrap_err();
@@ -326,6 +330,7 @@ async fn refresh_sends_conditional_get_with_known_version() {
 
     let (secrets, refresher): (OneSecret, Refresher) =
         setec_store(&server, Duration::from_secs(30))
+            .await
             .load()
             .await
             .unwrap();
@@ -356,6 +361,7 @@ async fn refresh_failure_keeps_value_and_reports_error() {
 
     let (secrets, refresher): (OneSecret, Refresher) =
         setec_store(&server, Duration::from_secs(30))
+            .await
             .load()
             .await
             .unwrap();
