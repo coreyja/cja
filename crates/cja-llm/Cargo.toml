@@ -41,6 +41,7 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber.workspace = true
+color-eyre = "0.6"
 cja-llm = { path = ".", features = ["testing"] }
 
 [lints]

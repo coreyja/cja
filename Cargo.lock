@@ -762,6 +762,7 @@ dependencies = [
  "bytes",
  "cja-llm",
  "cja-tailnet",
+ "color-eyre",
  "fastrand",
  "futures",
  "http",

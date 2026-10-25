@@ -232,8 +232,13 @@ filter
     .add_directive("rig_agent::agent::typed=error".parse()?);
 ```
 
-`cja_llm::Error`'s `Debug` and `Display` never print content, but its
-`raw` and `body` fields carry it — don't log those fields.
+`cja_llm::Error`'s `Debug` and `Display` — and every link of its
+`source()` chain, which is what color_eyre and eyre reports print — never
+print content (reply bodies, model output, or serde value fragments): the
+`source()` of every error is a sanitized wrapper whose own `source()` is
+`None`. The `raw` and `body` fields still carry content, as do the
+originals behind the `Error::prompt_error()` and `Error::serde_error()`
+accessors — don't log those.
 
 No secret is read, stored, or logged by this crate. The placeholder
 credential rig requires never leaves the process: the transport middleware

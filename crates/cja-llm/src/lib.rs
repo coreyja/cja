@@ -642,7 +642,11 @@ mod tests {
             panic!("unexpected {error:?}");
         };
         assert_eq!(raw, "not json");
-        assert!(error.source().is_some(), "the serde error is the source");
+        assert!(error.source().is_some(), "a sanitized source is present");
+        assert!(
+            error.serde_error().is_some(),
+            "the original serde error stays reachable through the accessor"
+        );
     }
 
     /// The house defaults reach the wire: `max_tokens` 4096 on the request

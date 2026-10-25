@@ -8,11 +8,17 @@
 //!
 //! # Cause chains
 //!
-//! Every variant that wraps a rig failure carries the original
-//! [`PromptError`] as its `source`. On the direct provider path the chain
-//! holds rig's typed `ProviderError`; on the relayed agent path (the serve
-//! adapter) it holds the `ErrorReport`'s `message` plus `source_chain`
-//! strings. Either way `source()` keeps walking to the underlying error.
+//! Every variant that wraps a rig failure keeps the original
+//! [`PromptError`], but never prints it: the `source()` of every error is a
+//! [`SanitizedError`] whose `Display` carries only content-free text, and
+//! whose own `source()` returns `None`. A chain-walking reporter (`color_eyre`
+//! `{:?}`, eyre/anyhow `{:#}`) therefore sees only sanitized text — the
+//! original `PromptError`'s `Display` prints the reply body
+//! (`ProviderResponseError: status ..: {body}`), a serde error's prints the
+//! offending value fragment, and `MaxTurns`'s `Debug` prints the whole
+//! conversation. Reach the originals programmatically through
+//! [`Error::prompt_error`] and [`Error::serde_error`]; the `raw` and `body`
+//! fields carry content directly.
 
 use std::fmt;
 
@@ -24,8 +30,136 @@ use crate::transport::{CONNECT_MARKER, TIMEOUT_MARKER};
 const IDENTITY_403_BODY: &str = "forbidden: caller identity could not be determined";
 const ADMIN_403_BODY: &str = "admin only";
 
+/// The fixed summary carried by the sanitized source of an [`Error::Rig`].
+/// The original rig error's text is withheld entirely: on the relayed
+/// (`ErrorReport`) path its message is an arbitrary string that can embed
+/// reply bodies or serde value fragments with no error object left to walk,
+/// so no redaction of it can be proven content-free.
+const RIG_SOURCE_SUMMARY: &str = "the original error's text is withheld because it may \
+     contain model output or reply bodies; reach it via Error::prompt_error()";
+
 /// The result type for cja-llm.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// The `source()` of every [`Error`]: holds the original failure but never
+/// prints it.
+///
+/// `Display` and `Debug` print a content-free summary only (the transport
+/// markers, redacted statuses, a serde error's category and position), and
+/// `source()` returns `None`, so nothing below it can reach a reporter.
+/// The original error stays programmatically reachable through
+/// [`Error::prompt_error`] and [`Error::serde_error`].
+pub struct SanitizedError {
+    summary: String,
+    original: Original,
+}
+
+enum Original {
+    Prompt(Box<PromptError>),
+    Serde(serde_json::Error),
+}
+
+impl SanitizedError {
+    /// Wraps a rig failure, summarizing its `Display` with `redactions`
+    /// (the classified reply body) replaced by byte-length markers and any
+    /// serde error in the chain replaced by its sanitized form.
+    pub(crate) fn from_prompt(error: PromptError, redactions: &[&str]) -> Self {
+        let summary = sanitize_prompt_display(&error, redactions);
+        Self {
+            summary,
+            original: Original::Prompt(Box::new(error)),
+        }
+    }
+
+    /// Wraps a rig failure whose `Display` cannot be proven content-free
+    /// (see [`RIG_SOURCE_SUMMARY`]).
+    pub(crate) fn opaque_prompt(error: PromptError) -> Self {
+        Self {
+            summary: RIG_SOURCE_SUMMARY.to_owned(),
+            original: Original::Prompt(Box::new(error)),
+        }
+    }
+
+    /// Wraps a [`serde_json::Error`] whose `Display` prints the offending
+    /// value; the summary carries its category and position only.
+    pub(crate) fn from_serde(error: serde_json::Error) -> Self {
+        let summary = serde_summary(&error);
+        Self {
+            summary,
+            original: Original::Serde(error),
+        }
+    }
+
+    pub(crate) fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub(crate) fn prompt_error(&self) -> Option<&PromptError> {
+        match &self.original {
+            Original::Prompt(error) => Some(error),
+            Original::Serde(_) => None,
+        }
+    }
+
+    pub(crate) fn serde_error(&self) -> Option<&serde_json::Error> {
+        match &self.original {
+            Original::Serde(error) => Some(error),
+            Original::Prompt(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for SanitizedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.summary)
+    }
+}
+
+impl fmt::Debug for SanitizedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.summary)
+    }
+}
+
+impl std::error::Error for SanitizedError {
+    // Deliberately `None` (the default): the original below must never be
+    // reachable through the source chain.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+/// A serde error rendered without its value fragment: category, line, and
+/// column only.
+fn serde_summary(error: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+/// A rig failure's `Display` with every known content-bearing string
+/// redacted: the reply body (exact string) and any serde error reachable by
+/// walking the source chain, whose `Display` prints the offending value.
+fn sanitize_prompt_display(error: &PromptError, redactions: &[&str]) -> String {
+    let mut text = error.to_string();
+    for redaction in redactions.iter().filter(|redaction| !redaction.is_empty()) {
+        text = text.replace(*redaction, &format!("<redacted {} bytes>", redaction.len()));
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(link) = source {
+        if let Some(serde) = link.downcast_ref::<serde_json::Error>() {
+            let display = serde.to_string();
+            if !display.is_empty() {
+                text = text.replace(&display, &serde_summary(serde));
+            }
+        }
+        source = link.source();
+    }
+    text
+}
 
 /// Everything cja-llm can fail with, classified from the gateway's contract.
 #[derive(thiserror::Error)]
@@ -42,7 +176,7 @@ pub enum Error {
         /// The gateway's reply body.
         body: String,
         #[source]
-        source: Box<PromptError>,
+        source: SanitizedError,
     },
     /// Gateway HTTP 402 (Bifrost governance `policy_budget_exceeded`), matched
     /// on status, never a body string. Non-retryable: it fires once accrued
@@ -53,7 +187,7 @@ pub enum Error {
         /// The gateway's reply body.
         body: String,
         #[source]
-        source: Box<PromptError>,
+        source: SanitizedError,
     },
     /// Gateway `403 {"error":"admin only"}` — a programming error (wrong
     /// route); cja-llm only uses `POST /v1/chat/completions`.
@@ -62,7 +196,7 @@ pub enum Error {
         /// The gateway's reply body.
         body: String,
         #[source]
-        source: Box<PromptError>,
+        source: SanitizedError,
     },
     /// Any other provider or gateway reply: Bifrost's error envelope with a
     /// provider status, a stale virtual key after its one retry, or an
@@ -74,7 +208,7 @@ pub enum Error {
         /// The reply body.
         body: String,
         #[source]
-        source: Box<PromptError>,
+        source: SanitizedError,
     },
     /// The total deadline (non-streaming request or response head) or the
     /// inter-chunk idle timeout elapsed. The attempt may still have been
@@ -83,7 +217,7 @@ pub enum Error {
     #[error("gateway request timed out; the gateway may still have billed the attempt")]
     Timeout {
         #[source]
-        source: Box<PromptError>,
+        source: SanitizedError,
     },
     /// Dial, TLS, or handshake failure or a connect timeout: nothing was
     /// sent. Retryable within the retry policy. A node without the tailnet
@@ -93,7 +227,7 @@ pub enum Error {
     )]
     Connect {
         #[source]
-        source: Box<PromptError>,
+        source: SanitizedError,
     },
     /// Structured output failed to parse; `raw` is the model's output text.
     #[error("structured output did not parse")]
@@ -101,19 +235,24 @@ pub enum Error {
         /// The model's output text that failed to parse.
         raw: String,
         #[source]
-        error: serde_json::Error,
+        error: SanitizedError,
     },
     /// The model returned no accepted content for a typed extraction.
     #[error("the model returned no structured output")]
     EmptyStructuredOutput,
-    /// Anything else rig reported (max turns, memory, decode, ...). The chain
-    /// is preserved.
+    /// Anything else rig reported (max turns, memory, decode, ...). The
+    /// original is preserved and reachable through [`Error::prompt_error`].
     ///
     /// Deliberately not `#[from]`: the hand-written [`From<PromptError>`]
     /// classifies gateway replies first, so `?` in app agent code still gets
     /// the gateway variants.
-    #[error(transparent)]
-    Rig { source: Box<PromptError> },
+    #[error(
+        "rig reported an error; the original is preserved and available via Error::prompt_error()"
+    )]
+    Rig {
+        #[source]
+        source: SanitizedError,
+    },
     /// Invalid cja-llm configuration.
     #[error("invalid cja-llm configuration: {0}")]
     Config(String),
@@ -126,14 +265,15 @@ impl From<PromptError> for Error {
 }
 
 /// [`fmt::Debug`] never prints content. The `raw`/`body` fields print as
-/// byte lengths only, and every boxed [`PromptError`] source prints through
-/// its `Display` with this variant's own content redacted out of it —
-/// `PromptError::MaxTurns`'s derived `Debug` would print the whole
-/// conversation, and a provider-response `PromptError`'s `Display` prints
-/// the reply body (`ProviderResponseError: status ..: {body}`). Apps
-/// return `cja_llm::Result` from `main`, whose failure path prints
-/// `Error: {:?}`, so a derived `Debug` would leak model output and reply
-/// bodies into logs.
+/// byte lengths only, and every source prints through its sanitized
+/// summary — the original [`PromptError`]'s `Debug` would print the whole
+/// conversation (`MaxTurns`), its `Display` the reply body
+/// (`ProviderResponseError: status ..: {body}`), and a serde error's either
+/// form the offending value fragment. Apps return `cja_llm::Result` from
+/// `main`, whose failure path prints `Error: {:?}`, and every cja app walks
+/// the source chain through `color_eyre`, so a derived `Debug` or a
+/// content-bearing source would leak model output and reply bodies into
+/// logs.
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         /// A content-bearing string printed as its byte length only.
@@ -145,34 +285,21 @@ impl fmt::Debug for Error {
             }
         }
 
-        /// The source rendered through its `Display` (never its `Debug`),
-        /// with `redact`'s strings replaced by byte-length markers so a
-        /// provider-response body cannot ride along in the chain.
-        fn source_field(source: &PromptError, redact: &[&str]) -> String {
-            let mut text = source.to_string();
-            for secret in redact {
-                if !secret.is_empty() {
-                    text = text.replace(secret, &format!("<redacted {} bytes>", secret.len()));
-                }
-            }
-            text
-        }
-
         match self {
             Self::IdentityRejected { body, source } => f
                 .debug_struct("IdentityRejected")
                 .field("body", &Redacted(body))
-                .field("source", &source_field(source, &[body.as_str()]))
+                .field("source", source)
                 .finish(),
             Self::BudgetExceeded { body, source } => f
                 .debug_struct("BudgetExceeded")
                 .field("body", &Redacted(body))
-                .field("source", &source_field(source, &[body.as_str()]))
+                .field("source", source)
                 .finish(),
             Self::AdminOnly { body, source } => f
                 .debug_struct("AdminOnly")
                 .field("body", &Redacted(body))
-                .field("source", &source_field(source, &[body.as_str()]))
+                .field("source", source)
                 .finish(),
             Self::Upstream {
                 status,
@@ -182,27 +309,19 @@ impl fmt::Debug for Error {
                 .debug_struct("Upstream")
                 .field("status", status)
                 .field("body", &Redacted(body))
-                .field("source", &source_field(source, &[body.as_str()]))
+                .field("source", source)
                 .finish(),
-            Self::Timeout { source } => f
-                .debug_struct("Timeout")
-                .field("source", &source_field(source, &[]))
-                .finish(),
-            Self::Connect { source } => f
-                .debug_struct("Connect")
-                .field("source", &source_field(source, &[]))
-                .finish(),
+            Self::Timeout { source } => f.debug_struct("Timeout").field("source", source).finish(),
+            Self::Connect { source } => f.debug_struct("Connect").field("source", source).finish(),
             Self::SchemaParse { raw, error } => f
                 .debug_struct("SchemaParse")
                 .field("raw", &Redacted(raw))
-                // The serde error carries only a message plus line/column.
-                .field("error", error)
+                // The serde error prints as category plus line and column
+                // only — never its value fragment.
+                .field("error", &error.summary())
                 .finish(),
             Self::EmptyStructuredOutput => f.write_str("EmptyStructuredOutput"),
-            Self::Rig { source } => f
-                .debug_struct("Rig")
-                .field("source", &source_field(source, &[]))
-                .finish(),
+            Self::Rig { source } => f.debug_struct("Rig").field("source", source).finish(),
             Self::Config(message) => f.debug_tuple("Config").field(message).finish(),
         }
     }
@@ -211,9 +330,10 @@ impl fmt::Debug for Error {
 impl From<StructuredOutputError> for Error {
     fn from(err: StructuredOutputError) -> Self {
         match err {
-            StructuredOutputError::Deserialization { output, error } => {
-                Self::SchemaParse { raw: output, error }
-            }
+            StructuredOutputError::Deserialization { output, error } => Self::SchemaParse {
+                raw: output,
+                error: SanitizedError::from_serde(error),
+            },
             StructuredOutputError::EmptyResponse => Self::EmptyStructuredOutput,
             StructuredOutputError::Prompt(prompt) => Self::from_prompt_error(prompt),
         }
@@ -244,45 +364,45 @@ impl Error {
                 .and_then(serde_json::Value::as_str);
             return match status {
                 402 => Self::BudgetExceeded {
+                    source: SanitizedError::from_prompt(err, &[body.as_str()]),
                     body,
-                    source: Box::new(err),
                 },
                 // A Bifrost envelope (stale virtual key) must win over the
                 // gateway wrapper's 403 strings.
                 401 | 403 if matches!(body_type, Some("access_not_found" | "access_blocked")) => {
                     Self::Upstream {
                         status,
+                        source: SanitizedError::from_prompt(err, &[body.as_str()]),
                         body,
-                        source: Box::new(err),
                     }
                 }
                 403 if body_error == Some(IDENTITY_403_BODY) => Self::IdentityRejected {
+                    source: SanitizedError::from_prompt(err, &[body.as_str()]),
                     body,
-                    source: Box::new(err),
                 },
                 403 if body_error == Some(ADMIN_403_BODY) => Self::AdminOnly {
+                    source: SanitizedError::from_prompt(err, &[body.as_str()]),
                     body,
-                    source: Box::new(err),
                 },
                 _ => Self::Upstream {
                     status,
+                    source: SanitizedError::from_prompt(err, &[body.as_str()]),
                     body,
-                    source: Box::new(err),
                 },
             };
         }
         let text = err.to_string();
         if text.contains(CONNECT_MARKER) {
             Self::Connect {
-                source: Box::new(err),
+                source: SanitizedError::from_prompt(err, &[]),
             }
         } else if text.contains(TIMEOUT_MARKER) {
             Self::Timeout {
-                source: Box::new(err),
+                source: SanitizedError::from_prompt(err, &[]),
             }
         } else {
             Self::Rig {
-                source: Box::new(err),
+                source: SanitizedError::opaque_prompt(err),
             }
         }
     }
@@ -291,6 +411,36 @@ impl Error {
     /// surfaces it, for callers holding the provider error directly.
     pub fn from_provider_error(err: ProviderError) -> Self {
         Self::from_prompt_error(PromptError::from(err))
+    }
+
+    /// The original rig [`PromptError`] this error was classified from,
+    /// when it wraps one ([`Error::IdentityRejected`],
+    /// [`Error::BudgetExceeded`], [`Error::AdminOnly`], [`Error::Upstream`],
+    /// [`Error::Timeout`], [`Error::Connect`], [`Error::Rig`]).
+    ///
+    /// Its `Debug` and its `Display` can print model output, reply bodies,
+    /// and serde value fragments — never log it, only inspect it.
+    pub fn prompt_error(&self) -> Option<&PromptError> {
+        match self {
+            Self::IdentityRejected { source, .. }
+            | Self::BudgetExceeded { source, .. }
+            | Self::AdminOnly { source, .. }
+            | Self::Upstream { source, .. }
+            | Self::Timeout { source }
+            | Self::Connect { source }
+            | Self::Rig { source } => source.prompt_error(),
+            Self::SchemaParse { .. } | Self::EmptyStructuredOutput | Self::Config(_) => None,
+        }
+    }
+
+    /// The original [`serde_json::Error`] behind a [`Error::SchemaParse`],
+    /// whose `Display` and `Debug` print the offending value fragment —
+    /// never log it, only inspect it.
+    pub fn serde_error(&self) -> Option<&serde_json::Error> {
+        match self {
+            Self::SchemaParse { error, .. } => error.serde_error(),
+            _ => None,
+        }
     }
 }
 
@@ -301,6 +451,7 @@ mod tests {
     use rig_agent::completion::PromptError;
     use rig_core::error::{ErrorKind, ErrorReport, ProviderError};
     use rig_core::http_client;
+    use serde::Deserialize;
     use serde_json::json;
 
     use super::*;
@@ -511,40 +662,107 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn sanitized_source_renders_serde_errors_without_fragments() {
+        let summary = SanitizedError::from_serde(mismatch_error(DEBUG_SENTINEL))
+            .summary()
+            .to_owned();
+        assert!(summary.contains("Data error at line"), "{summary}");
+        assert!(!summary.contains(DEBUG_SENTINEL), "{summary}");
+    }
+
+    #[test]
+    fn sanitized_prompt_display_redacts_the_known_body() {
+        let err = provider_with_response(500, DEBUG_SENTINEL);
+        let text = sanitize_prompt_display(&err, &[DEBUG_SENTINEL]);
+        assert!(!text.contains(DEBUG_SENTINEL), "{text}");
+        assert!(text.contains("<redacted"), "{text}");
+    }
+
+    #[test]
+    fn sanitized_prompt_display_redacts_chain_serde_errors() {
+        // A ProviderError::Json's Display embeds the serde error's value
+        // fragment; walking the chain finds the serde error and replaces it.
+        let err = PromptError::Provider(ProviderError::Json(Arc::new(mismatch_error(
+            DEBUG_SENTINEL,
+        ))));
+        let text = sanitize_prompt_display(&err, &[]);
+        assert!(!text.contains(DEBUG_SENTINEL), "{text}");
+        assert!(text.contains("Data error at line"), "{text}");
+    }
+
     const DEBUG_SENTINEL: &str = "SENTINEL-DEBUG-LEAK-6f1c";
 
-    /// `Debug` and `Display` never print content, but the `raw`/`body`
-    /// fields still carry it. All three cases use the realistic
-    /// constructions: `SchemaParse` from a real parse failure, `Upstream`
-    /// from a real provider reply (whose source `Display` prints the body
-    /// — so the redaction is load-bearing, not decorative), and `Rig`
-    /// wrapping a `MaxTurns` whose history holds the sentinel.
+    #[derive(Debug, Deserialize)]
+    #[expect(dead_code, reason = "the type exists only to produce a real mismatch")]
+    struct Mismatch {
+        n: u32,
+    }
+
+    /// A real serde type-mismatch error whose Display carries the sentinel
+    /// as the offending value: `invalid type: string "SENTINEL...", expected
+    /// u32 at line 1 column N`.
+    fn mismatch_error(sentinel: &str) -> serde_json::Error {
+        serde_json::from_str::<Mismatch>(&format!(r#"{{"n":"{sentinel}"}}"#)).unwrap_err()
+    }
+
+    /// No `Display` or `Debug` of the error or of any link of its
+    /// `source()` chain contains the sentinel, and `color_eyre`'s report —
+    /// which walks exactly that chain — does not either. Every case uses a
+    /// realistic construction: `SchemaParse` from a real type mismatch,
+    /// `Upstream` from a real provider reply, `Rig` wrapping `MaxTurns`
+    /// (whose `Debug` prints the whole conversation), and `Rig` wrapping a
+    /// `ProviderError::Json` from the same type mismatch.
     ///
-    /// Mutation-checked: restoring `#[derive(Debug)]` fails this test
-    /// (the derived `Debug` prints `raw`, `body`, and the whole
-    /// conversation).
+    /// Mutation-checked: restoring `#[source] source: Box<PromptError>` on
+    /// `Upstream` fails this test (the chain-walk link's `Display` prints
+    /// the reply body). See the commit that introduced it.
     #[test]
     fn debug_and_display_never_print_content() {
-        // SchemaParse: raw = the model's output text.
+        fn assert_chain_is_sanitized(error: &Error) {
+            let mut current: Option<&dyn std::error::Error> = Some(error);
+            while let Some(link) = current {
+                assert!(
+                    !link.to_string().contains(DEBUG_SENTINEL),
+                    "Display leaked: {link}"
+                );
+                assert!(
+                    !format!("{link:?}").contains(DEBUG_SENTINEL),
+                    "Debug leaked: {link:?}"
+                );
+                current = link.source();
+            }
+        }
+
+        // SchemaParse: raw = the model's output text, error = a real type
+        // mismatch whose Display carries the sentinel value fragment.
+        let output = format!(r#"{{"n":"{DEBUG_SENTINEL}"}}"#);
         let error = Error::from(StructuredOutputError::Deserialization {
-            output: DEBUG_SENTINEL.to_owned(),
-            error: serde_json::from_str::<serde_json::Value>(DEBUG_SENTINEL).unwrap_err(),
+            output,
+            error: mismatch_error(DEBUG_SENTINEL),
         });
         let Error::SchemaParse { raw, .. } = &error else {
             panic!("expected SchemaParse");
         };
-        assert_eq!(raw, DEBUG_SENTINEL, "the field still carries the raw text");
         assert!(
-            !format!("{error:?}").contains(DEBUG_SENTINEL),
-            "Debug leaked: {error:?}"
+            raw.contains(DEBUG_SENTINEL),
+            "the field still carries the text"
         );
         assert!(
-            !format!("{error}").contains(DEBUG_SENTINEL),
-            "Display leaked: {error}"
+            error
+                .serde_error()
+                .is_some_and(|e| e.to_string().contains(DEBUG_SENTINEL)),
+            "the accessor still returns the original serde error"
+        );
+        assert_chain_is_sanitized(&error);
+        assert!(
+            !format!("{:?}", color_eyre::Report::from(error)).contains(DEBUG_SENTINEL),
+            "color_eyre leaked"
         );
 
-        // Upstream: body = the reply body, and the source's Display prints
-        // that same body (ProviderResponseError: status ..: {body}).
+        // Upstream: body = the reply body, and the original PromptError's
+        // Display prints that same body (ProviderResponseError: status ..:
+        // {body}) — so the sanitized source is load-bearing, not decorative.
         let error = Error::from_prompt_error(provider_with_response(500, DEBUG_SENTINEL));
         let Error::Upstream {
             status: 500, body, ..
@@ -554,31 +772,54 @@ mod tests {
         };
         assert_eq!(body, DEBUG_SENTINEL, "the field still carries the body");
         assert!(
-            !format!("{error:?}").contains(DEBUG_SENTINEL),
-            "Debug leaked: {error:?}"
+            error
+                .prompt_error()
+                .is_some_and(|p| p.to_string().contains(DEBUG_SENTINEL)),
+            "the accessor still returns the original PromptError"
         );
+        assert_chain_is_sanitized(&error);
         assert!(
-            !format!("{error}").contains(DEBUG_SENTINEL),
-            "Display leaked: {error}"
+            !format!("{:?}", color_eyre::Report::from(error)).contains(DEBUG_SENTINEL),
+            "color_eyre leaked"
         );
 
-        // Rig wrapping MaxTurns: the derived Debug would print the whole
-        // conversation (chat_history and prompt); Display does not.
+        // Rig wrapping MaxTurns: the original's derived Debug would print
+        // the whole conversation (chat_history and prompt).
         let inner = PromptError::MaxTurns {
             max_turns: 8,
             chat_history: vec![rig_core::completion::Message::user(DEBUG_SENTINEL)],
             prompt: rig_core::completion::Message::user(DEBUG_SENTINEL),
         };
-        let error = Error::Rig {
-            source: Box::new(inner),
-        };
+        let error = Error::from_prompt_error(inner);
+        assert!(matches!(error, Error::Rig { .. }), "{error:?}");
         assert!(
-            !format!("{error:?}").contains(DEBUG_SENTINEL),
-            "Debug leaked: {error:?}"
+            error.prompt_error().is_some(),
+            "the original PromptError stays reachable"
         );
+        assert_chain_is_sanitized(&error);
         assert!(
-            !format!("{error}").contains(DEBUG_SENTINEL),
-            "Display leaked: {error}"
+            !format!("{:?}", color_eyre::Report::from(error)).contains(DEBUG_SENTINEL),
+            "color_eyre leaked"
+        );
+
+        // Rig wrapping a ProviderError::Json from the same type mismatch:
+        // its Display is `JsonError: {serde error}` and would print the
+        // value fragment.
+        let inner = PromptError::Provider(ProviderError::Json(Arc::new(mismatch_error(
+            DEBUG_SENTINEL,
+        ))));
+        let error = Error::from_prompt_error(inner);
+        assert!(matches!(error, Error::Rig { .. }), "{error:?}");
+        assert!(
+            error
+                .prompt_error()
+                .is_some_and(|p| p.to_string().contains(DEBUG_SENTINEL)),
+            "the accessor still returns the original PromptError"
+        );
+        assert_chain_is_sanitized(&error);
+        assert!(
+            !format!("{:?}", color_eyre::Report::from(error)).contains(DEBUG_SENTINEL),
+            "color_eyre leaked"
         );
     }
 }
