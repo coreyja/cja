@@ -7,17 +7,20 @@
 
 pub(crate) mod ask;
 pub(crate) mod db;
+pub(crate) mod job;
 pub(crate) mod worker;
 
-pub use db::run_migrations;
-
 pub use ask::{Ask, AskArgs};
+pub use db::run_migrations;
+pub use job::AdvanceRunJob;
 
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use rig_core::tool::Tool as _;
 
 use crate::Llm;
 use crate::config::LlmConfig;
@@ -231,6 +234,16 @@ impl Durable {
     #[must_use]
     pub fn llm(&self) -> &Llm {
         &self.llm
+    }
+
+    #[must_use]
+    pub(crate) fn app_name(&self) -> &str {
+        &self.app_name
+    }
+
+    #[must_use]
+    pub(crate) fn lease_takeover_window(&self) -> Duration {
+        self.lease_takeover
     }
 
     #[must_use]
@@ -464,4 +477,301 @@ pub struct RunMessage {
     pub message: serde_json::Value,
     /// When the row was written.
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Start a run of `kind`: build the fresh rig run from the kind's spec,
+/// insert the `queued` row, and enqueue [`AdvanceRunJob`] — all in one
+/// transaction, with the worker woken only after commit. Never blocks on
+/// the model.
+///
+/// # Errors
+/// - [`RunError::UnknownKind`] when no registered kind carries the name.
+/// - [`RunError::UnsupportedKind`] when the kind's built agent carries an
+///   `output_schema` (typed output runs in the runner's private request
+///   builder; use [`crate::Llm::extract`] outside durable runs or parse
+///   inside a tool).
+/// - [`RunError::Storage`] when the transaction or enqueue fails.
+pub async fn start<S>(
+    state: &S,
+    kind: &str,
+    prompt: impl Into<String>,
+) -> Result<RunId, RunError>
+where
+    S: HasDurable + Clone + 'static,
+{
+    let durable = state.durable();
+    let Some(kind) = durable.kind_named(kind) else {
+        return Err(RunError::UnknownKind(kind.to_owned()));
+    };
+
+    let agent = (kind.build)(durable.llm(), kind.model).build();
+    let mut spec = agent.run_spec();
+    spec.unhandled_invalid_tool_call = kind.unhandled_invalid_tool_call;
+    if spec.output_schema.is_some() {
+        return Err(RunError::UnsupportedKind(
+            "output_schema (typed output); parse inside a tool or use Llm::extract",
+        ));
+    }
+    let prompt = prompt.into();
+    // `from_spec` applies the spec's budgets; `.max_turns` then pins the
+    // kind's turn cap over whatever the builder defaulted to.
+    let run =
+        rig_agent::run::AgentRun::from_spec(
+            &spec,
+            rig_core::completion::Message::user(prompt.clone()),
+            None,
+        )
+        .max_turns(kind.limits.max_turns);
+    let run_state = serde_json::to_value(&run)
+        .map_err(|_| RunError::Corrupt("run state failed to serialize", 0, 0))?;
+
+    let run_id = uuid::Uuid::new_v4();
+    let mut tx = state.db().begin().await?;
+    sqlx::query(
+        "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(run_id)
+    .bind(kind.name)
+    .bind(RunStatus::Queued.as_str())
+    .bind(&prompt)
+    .bind(kind.model)
+    .bind(durable.app_name())
+    .bind(&run_state)
+    .execute(&mut *tx)
+    .await?;
+    enqueue_on_tx::<S>(&mut tx, run_id, format!("agent-run:{}", kind.name)).await?;
+    tx.commit().await?;
+    // Not a transaction-commit hook: wake only after the row is committed,
+    // so an idle worker never wakes to find no job.
+    state.job_enqueued();
+    Ok(RunId(run_id))
+}
+
+/// Answer a run's suspended ask: supply the answer as *that tool call's*
+/// result (providers reject a plain user message while a tool call is
+/// unresolved), transition `waiting → running`, and enqueue a fresh
+/// [`AdvanceRunJob`] — one transaction, worker woken after commit. A
+/// waiting run holds no worker and no job between suspension and answer.
+///
+/// If a batch carried several asks, they suspend sequentially in call
+/// order; this resolves exactly the ask recorded in `pending_call_id`, and
+/// the sibling re-suspends on the next pass.
+///
+/// # Errors
+/// - [`RunError::NotFound`], or [`RunError::NotWaiting`] when the run is
+///   not suspended (including when a concurrent answer won the race).
+/// - [`RunError::Corrupt`] when the stored columns disagree with the run
+///   state (no open `ask` call matches the recorded call id).
+pub async fn answer<S>(state: &S, run: RunId, answer: impl Into<String>) -> Result<(), RunError>
+where
+    S: HasDurable + Clone + 'static,
+{
+    let mut tx = state.db().begin().await?;
+    let row = sqlx::query_as::<_, (String, String, Option<String>, serde_json::Value)>(
+        "SELECT kind, status, pending_call_id, run_state FROM agent_runs WHERE id = $1 FOR UPDATE",
+    )
+    .bind(run.0)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((kind_name, status, pending_call_id, run_state)) = row else {
+        return Err(RunError::NotFound(run));
+    };
+    let parsed_status = RunStatus::from_str(&status).map_err(|_| decode_error("status", &status))?;
+    if parsed_status != RunStatus::Waiting {
+        return Err(RunError::NotWaiting(run, parsed_status));
+    }
+    let Some(call_id) = pending_call_id else {
+        // The CHECK constraint makes this unreachable; fail loudly if skew
+        // ever produces it.
+        return Err(RunError::Corrupt(
+            "waiting run has no pending_call_id",
+            0,
+            0,
+        ));
+    };
+
+    let mut agent_run: rig_agent::run::AgentRun =
+        serde_json::from_value(run_state).map_err(|e| corrupt_from_serde(&e))?;
+    // The suspended run must be mid tool batch; re-emit its open calls.
+    let step = agent_run
+        .next_step()
+        .map_err(|_| RunError::Corrupt("suspended run is not in an executable state", 0, 0))?;
+    let rig_agent::run::AgentRunStep::CallTools { calls } = step else {
+        return Err(RunError::Corrupt(
+            "suspended run is not waiting on tool calls",
+            0,
+            0,
+        ));
+    };
+
+    // Resolve exactly the recorded ask: same call id, same tool. A mismatch
+    // between the columns and the run state is corruption, never a guess.
+    let answer = answer.into();
+    let mut resolved = false;
+    let before = agent_run.messages().len();
+    for call in calls {
+        let rig_agent::run::PendingToolCall::Execute(exec) = call else {
+            continue;
+        };
+        if exec.id().wire() != call_id {
+            continue;
+        }
+        if exec.name().as_str() != Ask::NAME {
+            return Err(RunError::Corrupt(
+                "recorded pending call is not an ask call",
+                0,
+                0,
+            ));
+        }
+        let result = rig_core::tool::ToolResult::success(rig_core::tool::ToolOutput::text(answer.clone()));
+        agent_run
+            .answer(exec.answer(result))
+            .map_err(|_| RunError::Corrupt("answer was rejected by the run", 0, 0))?;
+        resolved = true;
+        break;
+    }
+    if !resolved {
+        return Err(RunError::Corrupt(
+            "recorded pending ask call is not open in the run",
+            0,
+            0,
+        ));
+    }
+
+    let run_state = serde_json::to_value(&agent_run)
+        .map_err(|_| RunError::Corrupt("run state failed to serialize", 0, 0))?;
+    let mut new_messages = Vec::new();
+    for (i, message) in agent_run.messages().iter().enumerate().skip(before) {
+        let body = serde_json::to_value(&**message)
+            .map_err(|_| RunError::Corrupt("transcript message failed to serialize", 0, 0))?;
+        let role = match &**message {
+            rig_core::completion::Message::System { .. } => "system",
+            rig_core::completion::Message::User { .. } => "user",
+            rig_core::completion::Message::Assistant(_) => "assistant",
+        };
+        new_messages.push((i as i64, role.to_owned(), body));
+    }
+    if !db::answer_waiting(&mut *tx, run.0, &run_state).await? {
+        // Lost the race (row no longer waiting under us).
+        return Err(RunError::NotWaiting(run, RunStatus::Running));
+    }
+    db::insert_messages(&mut *tx, run.0, &new_messages).await?;
+    enqueue_on_tx::<S>(&mut tx, run.0, format!("agent-run:{kind_name}")).await?;
+    tx.commit().await?;
+    state.job_enqueued();
+    Ok(())
+}
+
+/// Cancel a run. `queued`/`waiting` (and `running` under a dead lease — the
+/// orphaned-run escape hatch) transition to `cancelled` directly; a live
+/// `running` run is flagged and its owner marks it `cancelled` at the next
+/// step boundary, keeping the transcript. Cancelling an already-cancelled
+/// run is `Ok`; other terminal statuses are [`RunError::InvalidTransition`].
+pub async fn cancel<S>(state: &S, run: RunId) -> Result<(), RunError>
+where
+    S: HasDurable,
+{
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT status, locked_by, locked_at FROM agent_runs WHERE id = $1",
+    )
+    .bind(run.0)
+    .fetch_optional(state.db())
+    .await?;
+    let Some((status, locked_by, locked_at)) = row else {
+        return Err(RunError::NotFound(run));
+    };
+    let status = RunStatus::from_str(&status).map_err(|_| decode_error("status", &status))?;
+    match status {
+        RunStatus::Queued | RunStatus::Waiting => {
+            db::cancel_now(state.db(), run.0, &[status])
+                .await?
+                .ok_or(RunError::NotFound(run))?;
+            Ok(())
+        }
+        RunStatus::Running => {
+            let takeover = state.durable().lease_takeover_window();
+            let dead_lease = match (locked_by.as_deref(), locked_at) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(_), Some(at)) => at < chrono::Utc::now() - takeover,
+            };
+            if dead_lease {
+                // Orphaned (dead-lettered job, crashed worker, lost
+                // release): cancel directly; a zombie owner's next
+                // conditional write fails and it stops silently.
+                db::cancel_now(state.db(), run.0, &[RunStatus::Running])
+                    .await?
+                    .ok_or(RunError::NotFound(run))?;
+            } else {
+                db::request_cancel(state.db(), run.0).await?;
+            }
+            Ok(())
+        }
+        RunStatus::Cancelled => Ok(()),
+        RunStatus::Succeeded | RunStatus::Failed => Err(RunError::InvalidTransition {
+            run,
+            from: status,
+            to: RunStatus::Cancelled,
+        }),
+    }
+}
+
+/// Read one run row. An unknown stored status or fail reason fails the read
+/// with [`RunError::Storage`] (the manual `FromRow`'s parse failure) — there
+/// is exactly one parsing path.
+pub async fn get_run(db: &sqlx::PgPool, run: RunId) -> Result<RunView, RunError> {
+    sqlx::query_as::<_, RunView>("SELECT * FROM agent_runs WHERE id = $1")
+        .bind(run.0)
+        .fetch_optional(db)
+        .await?
+        .ok_or(RunError::NotFound(run))
+}
+
+/// The run's ordered transcript (message bodies are rig serde `Message`).
+pub async fn transcript(db: &sqlx::PgPool, run: RunId) -> Result<Vec<RunMessage>, RunError> {
+    Ok(sqlx::query_as::<_, RunMessage>(
+        "SELECT * FROM agent_messages WHERE run_id = $1 ORDER BY seq",
+    )
+    .bind(run.0)
+    .fetch_all(db)
+    .await?)
+}
+
+/// Enqueue an [`AdvanceRunJob`] on an open transaction (the same one that
+/// wrote the run row), mapping enqueue failures into [`RunError::Storage`].
+async fn enqueue_on_tx<S: HasDurable>(
+    tx: &mut sqlx::PgConnection,
+    run_id: uuid::Uuid,
+    context: String,
+) -> Result<(), RunError> {
+    <job::AdvanceRunJob as cja::jobs::Job<S>>::enqueue_on(
+        job::AdvanceRunJob { run_id },
+        &mut *tx,
+        context,
+        None,
+    )
+    .await
+        .map_err(|e| match e {
+            cja::jobs::EnqueueError::SqlxError(e) => RunError::Storage(e),
+            other => RunError::Storage(sqlx::Error::Protocol(other.to_string())),
+        })
+        .map(|_| ())
+}
+
+fn decode_error(column: &str, value: &str) -> RunError {
+    RunError::Storage(sqlx::Error::ColumnDecode {
+        index: column.to_owned(),
+        source: format!("unknown stored value `{value}`").into(),
+    })
+}
+
+fn corrupt_from_serde(error: &serde_json::Error) -> RunError {
+    let kind = match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    RunError::Corrupt(kind, error.line() as u32, error.column() as u32)
 }

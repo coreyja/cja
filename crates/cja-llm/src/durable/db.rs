@@ -15,6 +15,7 @@ use super::RunStatus;
 
 /// Row data returned by a successful claim.
 pub(super) struct ClaimedRun {
+    #[expect(dead_code)] // identical to the run id the worker already holds
     pub run_id: Uuid,
     pub kind: String,
     pub model: String,
