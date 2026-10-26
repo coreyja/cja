@@ -214,9 +214,20 @@ impl FakeGateway {
         });
     }
 
-    /// Scripts a 200 whose assistant message is a single tool call, with
-    /// `finish_reason: "tool_calls"`.
-    pub fn tool_call(&self, model: &str, call_id: &str, name: &str, args: &serde_json::Value) {
+    /// Scripts a 200 whose assistant message carries `calls` tool calls in
+    /// call order, with `finish_reason: "tool_calls"`. Each entry is
+    /// `(call_id, tool_name, arguments)`.
+    pub fn tool_calls(&self, model: &str, calls: &[(&str, &str, &serde_json::Value)]) {
+        let tool_calls: Vec<_> = calls
+            .iter()
+            .map(|(call_id, name, args)| {
+                serde_json::json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args.to_string()},
+                })
+            })
+            .collect();
         let body = serde_json::json!({
             "id": "fake",
             "object": "chat.completion",
@@ -226,11 +237,7 @@ impl FakeGateway {
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": args.to_string()},
-                    }],
+                    "tool_calls": tool_calls,
                 },
                 "finish_reason": "tool_calls",
             }],
@@ -241,6 +248,12 @@ impl FakeGateway {
             content_type: "application/json",
             body: body.to_string().into_bytes(),
         });
+    }
+
+    /// Scripts a 200 whose assistant message is a single tool call, with
+    /// `finish_reason: "tool_calls"`.
+    pub fn tool_call(&self, model: &str, call_id: &str, name: &str, args: &serde_json::Value) {
+        self.tool_calls(model, &[(call_id, name, args)]);
     }
 
     /// Scripts a raw status + body reply (error envelopes).

@@ -141,7 +141,12 @@ async fn enqueue_identity_is_present_at_span_creation_and_matches_the_committed_
 async fn a_failed_enqueue_has_an_identity_and_error_but_no_commit_receipt() {
     let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
     let state = crate::common::app::TestAppState::new(pool.clone());
-    pool.close().await;
+    // Fail the enqueue INSIDE the connection work (past pool acquire —
+    // which is also recorded inside the span, pinned by
+    // `a_pool_acquire_failure_is_recorded_inside_the_enqueue_span`):
+    // dropping the table makes the INSERT itself fail, the path that must
+    // carry identity + error + no receipt.
+    sqlx::query("DROP TABLE jobs").execute(&pool).await.unwrap();
     let capture = capture();
     let job = super::jobs::TestJob {
         id: "game-456".into(),
@@ -167,4 +172,58 @@ async fn a_failed_enqueue_has_an_identity_and_error_but_no_commit_receipt() {
         .unwrap();
     assert_eq!(failure.fields["job_id"], span.fields["job.id"]);
     assert_eq!(failure.span_id, span.span_id);
+}
+
+/// The restored parity of the `enqueue` → `enqueue_on` delegation: a
+/// pool-acquire failure is an enqueue failure like any other. The span is
+/// created before the acquire, so the failure event is recorded INSIDE a
+/// `jobs.enqueue` span carrying the job's identity — and no `job_enqueued`
+/// receipt exists, because nothing was inserted. (sqlx does not log
+/// `PoolTimedOut`/`PoolClosed` itself, so without the failure event the
+/// acquire failure would be invisible to telemetry.) Pins that behavior
+/// so it cannot silently change.
+#[tokio::test]
+async fn a_pool_acquire_failure_is_recorded_inside_the_enqueue_span() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+    pool.close().await;
+    let state = crate::common::app::TestAppState::new(pool);
+    let capture = capture();
+    let job = super::jobs::TestJob {
+        id: "game-789".into(),
+        value: 42,
+    };
+    // A unique context: only this test's span carries it, so the
+    // assertions below can never match another test's records (never
+    // vacuous).
+    let context = format!("closed pool {}", uuid::Uuid::new_v4());
+    assert!(
+        job.enqueue(state, context.clone(), None).await.is_err(),
+        "enqueue on a closed pool must fail"
+    );
+    let records = capture.0.lock().unwrap();
+    let span = records
+        .iter()
+        .find(|record| record.is_span && record.fields.get("job.context") == Some(&json!(context)))
+        .expect("the span is created before the acquire, so it must exist");
+    let job_id = span.fields["job.id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(job_id).is_ok());
+    let failure = records
+        .iter()
+        .find(|record| {
+            !record.is_span
+                && record.fields.get("job_id") == Some(&json!(job_id))
+                && record.fields.contains_key("error")
+        })
+        .expect("the acquire failure is recorded as an enqueue failure");
+    assert_eq!(
+        failure.span_id, span.span_id,
+        "inside the jobs.enqueue span"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.fields.get("job_id") == Some(&json!(job_id))
+                && record.fields.get("event_type") == Some(&json!("job_enqueued"))),
+        "no receipt: nothing was inserted"
+    );
 }

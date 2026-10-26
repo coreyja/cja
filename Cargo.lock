@@ -759,7 +759,10 @@ dependencies = [
 name = "cja-llm"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "bytes",
+ "chrono",
+ "cja",
  "cja-llm",
  "cja-tailnet",
  "color-eyre",
@@ -776,12 +779,14 @@ dependencies = [
  "serde",
  "serde_json",
  "setec",
+ "sqlx",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "webpki-roots 1.0.10",
 ]
 
