@@ -10,6 +10,9 @@ publish = false
 default = []
 # In-process tailnet transport (cja-tailnet). Hosts running tailscaled don't need it.
 tailnet = ["dep:cja-tailnet"]
+# Durable agent runs: rig AgentRun persisted in Postgres, advanced by cja
+# jobs. Ships the agent_runs/agent_messages migrations.
+durable = ["dep:cja", "cja/jobs", "dep:sqlx", "dep:uuid", "dep:chrono", "dep:async-trait"]
 # Fake gateway for app tests: scripted OpenAI chat-completions over real HTTP.
 # (serde_json is a non-optional dependency — no `dep:serde_json` here; cargo
 # rejects `dep:` on non-optional dependencies.)
@@ -20,6 +23,11 @@ rig-core = { version = "=0.45.0", default-features = false, features = ["derive"
 rig-agent = { version = "=0.45.0", default-features = false, features = ["derive"] }
 setec = { path = "../setec" }
 cja-tailnet = { path = "../cja-tailnet", optional = true }
+cja = { path = "../cja", default-features = false, optional = true }
+sqlx = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
@@ -42,7 +50,8 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber.workspace = true
 color-eyre = "0.6"
-cja-llm = { path = ".", features = ["testing"] }
+cja-llm = { path = ".", features = ["testing", "durable"] }
+cja = { path = "../cja" }
 
 [lints]
 workspace = true

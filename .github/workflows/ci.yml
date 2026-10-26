@@ -16,6 +16,44 @@ jobs:
     with:
       rust-version: stable
 
+  # cja-llm's self dev-dependency turns on `testing`, so every `--all-targets`
+  # build compiles the library WITH that feature. This lane checks the
+  # library the way a real app consumes it — lib only, `durable` without
+  # `testing` — which once failed to compile while every other lane stayed
+  # green.
+  check-cja-llm-durable-lib:
+    name: Check cja-llm lib (durable without testing)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      SQLX_OFFLINE: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Rust toolchain
+        run: |
+          ver="$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          echo "Resolved toolchain: $ver"
+          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+
+      - name: Cache native cja tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cja
+          key: cja-tools-${{ runner.os }}-${{ runner.arch }}-tsc-7.0.2-tailwindcss-4.3.3
+
+      - name: Check cja-llm lib with durable
+        run: cargo check -p cja-llm --lib --features durable
+
+      - name: Check cja-llm lib default
+        run: cargo check -p cja-llm --lib
+
   check-nightly:
     uses: ./.github/workflows/check-rust.yml
     with:
