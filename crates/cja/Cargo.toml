@@ -11,6 +11,8 @@ jobs = []
 testing = ["serde_urlencoded"]
 
 [dependencies]
+# Pin async-trait at >= 0.1.92: Rust 1.99 clippy breaks double must_use on
+# <= 0.1.88; the lockfile resolves 0.1.92 — don't let a cargo update regress it.
 async-trait.workspace = true
 axum.workspace = true
 sqlx.workspace = true

@@ -1,0 +1,79 @@
+{
+  "format": 5,
+  "max_turns": 4,
+  "max_invalid_tool_call_retries": 0,
+  "max_consecutive_malformed_tool_calls": null,
+  "unhandled_invalid_tool_call": "fail",
+  "output_tool_name": null,
+  "output_schema": null,
+  "max_output_retries": 0,
+  "output_retries": 0,
+  "chat_history": null,
+  "new_messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "golden run prompt"
+        }
+      ]
+    }
+  ],
+  "current_turn": 1,
+  "usage": {
+    "input_tokens": 3,
+    "output_tokens": 2,
+    "total_tokens": 5
+  },
+  "completion_calls": [
+    {
+      "call_index": 0,
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 2,
+        "total_tokens": 5
+      },
+      "raw": {
+        "origin": "golden fixture"
+      }
+    }
+  ],
+  "completion_call_index": 1,
+  "invalid_tool_call_retries": 0,
+  "malformed_tool_call_retries": 0,
+  "previous_model": null,
+  "turn_tools": null,
+  "entries": [],
+  "state": {
+    "AwaitingAdvance": {
+      "head": {
+        "content": []
+      },
+      "items": [
+        {
+          "type": "toolcall",
+          "id": {
+            "provider": "call_golden"
+          },
+          "function": {
+            "name": "add",
+            "arguments": {
+              "a": 1,
+              "b": 2
+            }
+          }
+        }
+      ],
+      "has_tool_calls": true,
+      "skipped": {},
+      "policy": {
+        "executable": [
+          "add"
+        ],
+        "tool_choice": null,
+        "output_tool": null
+      }
+    }
+  }
+}

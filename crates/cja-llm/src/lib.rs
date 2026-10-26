@@ -31,6 +31,8 @@ pub mod rig {
 }
 
 pub mod config;
+#[cfg(feature = "durable")]
+pub mod durable;
 pub mod error;
 pub mod models;
 #[cfg(feature = "testing")]
