@@ -28,6 +28,18 @@
 //!
 //! Sessions are automatically created on first access and persisted via encrypted cookies.
 //!
+//! # Multiple Hosts
+//!
+//! To serve a different router for some hosts, build an [`App`] and pass it
+//! where a router would go. cja dispatches by host before route matching and
+//! applies its middleware to each router, so request spans keep their route:
+//!
+//! ```rust,ignore
+//! let app = cja::server::App::new(site_routes)
+//!     .host(["engine.example.com"], engine_routes);
+//! cja::server::run_server_until(app, shutdown).await?;
+//! ```
+//!
 //! # Zero-Downtime Reload
 //!
 //! ```bash
@@ -56,6 +68,9 @@ pub mod cookies {
 
     pub use tower_cookies::cookie::SameSite;
 }
+
+mod app;
+pub use app::App;
 
 pub mod page;
 
@@ -90,22 +105,24 @@ where
 /// accepting connections and finish in-flight requests. Preserves `PORT`,
 /// systemfd listeners, request tracing and cookie middleware.
 ///
+/// `app` is a router, or an [`App`] with routers for specific hosts.
+///
 /// The caller should bound the drain if a request can run indefinitely.
 pub async fn run_server_until(
-    routes: axum::Router,
+    app: impl Into<App>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> color_eyre::Result<()> {
-    serve_until(bind_listener().await?, routes, shutdown).await
+    serve_until(bind_listener().await?, app, shutdown).await
 }
 
 /// Serve an already-bound listener with cja middleware and graceful shutdown.
 /// This is useful when the application owns its bind address or port.
 pub async fn serve_until(
     listener: TcpListener,
-    routes: axum::Router,
+    app: impl Into<App>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> color_eyre::Result<()> {
-    axum::serve(listener, prepare_routes(routes))
+    axum::serve(listener, app.into().into_router())
         .with_graceful_shutdown(shutdown)
         .await
         .wrap_err("Failed to run server")

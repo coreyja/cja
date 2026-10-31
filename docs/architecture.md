@@ -65,6 +65,7 @@ cron/
   worker.rs        — Cron Worker tick loop with configurable poll interval and timezone
 server/
   mod.rs           — run_server(), middleware stack (tracing + cookies)
+  app.rs           — App: default router + per-host routers, host dispatch
   cookies/
     cookie_key.rs  — CookieKey (from COOKIE_KEY env or auto-generated)
     cookie_jar.rs  — CookieJar Axum extractor
@@ -256,6 +257,17 @@ stop accepting connections and drain existing requests. It preserves the
 standard tracing/cookie middleware and `PORT`/systemfd listener setup.
 `server::serve_until(listener, routes, shutdown_future)` accepts a listener
 owned by the application. The original `run_server` remains available.
+
+## Multiple Hosts
+
+`run_server_until` and `serve_until` take `impl Into<server::App>`; a plain
+`Router` converts as before. `App::new(default).host(hosts, router)` serves
+`router` for requests whose host is one of `hosts` (the `Host` header, else
+the URI authority; ASCII case, port and a trailing dot are ignored) and
+`default` for everything else. Dispatch happens before route matching, and
+the tracing and cookie layers wrap each router, so `http.route` on
+`server.request` spans stays the matched template on every host.
+`App::into_router()` returns the exact served stack for tests.
 
 Cron cancellation takes effect between ticks and during the polling sleep.
 An active tick finishes its callbacks and persists successful `last_run_at`
