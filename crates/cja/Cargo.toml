@@ -43,6 +43,7 @@ maud.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+proptest = "1.12"
 reqwest = { workspace = true, features = ["cookies"] }
 # Paused-clock tests for the shutdown supervisor.
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 262a42c0c41c65bd51dd94999b7df4df6fd76572afcdada8e56ca78a75e7fe47 # shrinks to (timezone, transition) = (America/New_York, 2026-11-01T06:00:00Z), minute = "*", hour = "*", tick_secs = 5, phase_ms = 0, lead_minutes = 1, outage = Some((42, 138))

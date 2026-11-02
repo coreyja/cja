@@ -1,6 +1,6 @@
 use std::{collections::HashMap, error::Error, future::Future, pin::Pin, time::Duration};
 
-use chrono::Utc;
+use chrono::{TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 
 use crate::app_state::AppState as AS;
@@ -93,8 +93,31 @@ impl IntervalSchedule {
     }
 }
 
+/// A cron expression, evaluated against local wall-clock time.
+///
+/// A job fires on the first tick at which the wall clock has passed a
+/// scheduled time that it had not passed at the previous fire. Across a
+/// daylight-saving change this means:
+///
+/// - A time the clock skips (02:30 when US clocks spring forward) fires on the
+///   first tick after the jump.
+/// - A time the clock repeats (01:30 when US clocks fall back) fires once, in
+///   whichever copy of the hour the wall clock first reaches it.
+/// - Sub-hourly expressions do not fire again while the clock repeats an hour,
+///   so `0 */15 * * * * *` goes 75 minutes between fires that night. Register
+///   an interval for elapsed-time cadence.
 #[derive(Clone, Debug)]
 pub struct CronSchedule(pub Box<cron::Schedule>);
+
+/// The wall-clock time of `at` in `timezone`, carried in a `DateTime<Utc>`.
+///
+/// UTC has no daylight saving, so the cron expression can be evaluated here
+/// without `cron`'s handling of repeated times: from inside the second copy
+/// of a repeated hour, `Schedule::after` returns the first copy, which is
+/// earlier than its argument.
+fn wall_clock(at: &chrono::DateTime<Utc>, timezone: Tz) -> chrono::DateTime<Utc> {
+    at.with_timezone(&timezone).naive_local().and_utc()
+}
 
 impl CronSchedule {
     fn should_run(
@@ -106,14 +129,10 @@ impl CronSchedule {
     ) -> bool {
         // Use last run time if available, otherwise use worker start time
         let last_run = last_run.unwrap_or(&worker_started_at);
-        let last_run_tz = last_run.with_timezone(&timezone);
-
-        if let Some(next_run) = self.0.after(&last_run_tz).next() {
-            let now_tz = now.with_timezone(&timezone);
-            now_tz >= next_run
-        } else {
-            false
-        }
+        self.0
+            .after(&wall_clock(last_run, timezone))
+            .next()
+            .is_some_and(|next_run| wall_clock(&now, timezone) >= next_run)
     }
 
     pub fn next_run(
@@ -123,8 +142,37 @@ impl CronSchedule {
         timezone: Tz,
     ) -> chrono::DateTime<Tz> {
         let last_run = last_run.unwrap_or(&now);
-        let last_run_tz = last_run.with_timezone(&timezone);
-        self.0.after(&last_run_tz).next().unwrap()
+        let next_run = self
+            .0
+            .after(&wall_clock(last_run, timezone))
+            .next()
+            .unwrap()
+            .naive_utc();
+        match timezone.from_local_datetime(&next_run) {
+            chrono::LocalResult::Single(at) => at,
+            chrono::LocalResult::Ambiguous(earlier, later) => {
+                if earlier > *last_run {
+                    earlier
+                } else {
+                    later
+                }
+            }
+            // Skipped by the clock, so reached when the clock jumps past it:
+            // the first whole minute that exists after it.
+            chrono::LocalResult::None => {
+                let minute = next_run
+                    .with_second(0)
+                    .and_then(|at| at.with_nanosecond(0))
+                    .unwrap();
+                (1..=24 * 60)
+                    .find_map(|offset| {
+                        timezone
+                            .from_local_datetime(&(minute + chrono::Duration::minutes(offset)))
+                            .earliest()
+                    })
+                    .unwrap()
+            }
+        }
     }
 }
 
@@ -2537,5 +2585,249 @@ mod test {
         .await
         .unwrap();
         assert_eq!(job_count.count.unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod dst_test {
+    //! Cron expressions across daylight-saving transitions, against the pure
+    //! `CronSchedule` logic the worker runs on every tick.
+
+    use std::str::FromStr;
+
+    use chrono::{DateTime, Duration, NaiveDateTime, Offset, TimeZone, Timelike, Utc};
+    use chrono_tz::Tz;
+    use proptest::prelude::*;
+
+    use super::CronSchedule;
+
+    const NEW_YORK: Tz = chrono_tz::America::New_York;
+
+    fn schedule(expr: &str) -> CronSchedule {
+        CronSchedule(Box::new(cron::Schedule::from_str(expr).unwrap()))
+    }
+
+    fn utc(at: &str) -> DateTime<Utc> {
+        at.parse().unwrap()
+    }
+
+    /// Local wall-clock time of `at`, computed independently of the code under test.
+    fn wall(at: DateTime<Utc>, timezone: Tz) -> NaiveDateTime {
+        at.with_timezone(&timezone).naive_local()
+    }
+
+    /// Ticks a worker every `tick` from `from` until `until`, starting from a
+    /// stored `last_run`, and returns the instants it fired.
+    fn fires(
+        schedule: &CronSchedule,
+        timezone: Tz,
+        last_run: DateTime<Utc>,
+        (from, until): (DateTime<Utc>, DateTime<Utc>),
+        tick: Duration,
+    ) -> Vec<DateTime<Utc>> {
+        let mut last_run = last_run;
+        let mut fired = vec![];
+        let mut now = from;
+        while now < until {
+            if schedule.should_run(Some(&last_run), now, from, timezone) {
+                fired.push(now);
+                last_run = now;
+            }
+            now += tick;
+        }
+        fired
+    }
+
+    // New York repeats 01:00-01:59 on 2026-11-01 (EDT 05:00-05:59Z, then EST
+    // 06:00-06:59Z) and skips 02:00-02:59 on 2027-03-14 (07:00Z is 03:00 EDT).
+
+    #[test]
+    fn repeated_time_fires_once_when_the_worker_runs_all_night() {
+        let fired = fires(
+            &schedule("0 30 1 * * * *"),
+            NEW_YORK,
+            utc("2026-10-31T05:30:07Z"),
+            (utc("2026-11-01T04:00:03Z"), utc("2026-11-01T09:00:00Z")),
+            Duration::seconds(60),
+        );
+        assert_eq!(fired, vec![utc("2026-11-01T05:30:03Z")]);
+    }
+
+    #[test]
+    fn worker_back_during_the_second_copy_fires_once() {
+        // Down through the EDT copy, back at 01:10 EST. cron's `after` from
+        // there returns 01:30 EDT, which is already past, so every tick fired
+        // until 01:30 EST: 21 times on a 60 s tick, 121 times on a 10 s tick.
+        for tick in [10, 60] {
+            let fired = fires(
+                &schedule("0 30 1 * * * *"),
+                NEW_YORK,
+                utc("2026-10-31T05:30:07Z"),
+                (utc("2026-11-01T06:10:03Z"), utc("2026-11-01T09:00:00Z")),
+                Duration::seconds(tick),
+            );
+            assert_eq!(fired, vec![utc("2026-11-01T06:30:03Z")], "{tick}s tick");
+        }
+    }
+
+    #[test]
+    fn last_fire_in_the_final_second_before_fall_back_does_not_refire_the_hour() {
+        // cron's `after(01:59:59 EDT)` returns 01:00 EDT, an hour before its
+        // argument, and the every-minute job then fired on every 10 s tick.
+        let fired = fires(
+            &schedule("0 * * * * * *"),
+            NEW_YORK,
+            utc("2026-11-01T05:59:59.400Z"),
+            (utc("2026-11-01T06:00:09.400Z"), utc("2026-11-01T07:00:00Z")),
+            Duration::seconds(10),
+        );
+        assert!(fired.is_empty(), "{fired:?}");
+    }
+
+    #[test]
+    fn skipped_time_fires_when_the_clock_jumps_past_it() {
+        let fired = fires(
+            &schedule("0 30 2 * * * *"),
+            NEW_YORK,
+            utc("2027-03-13T07:30:05Z"),
+            (utc("2027-03-14T05:00:05Z"), utc("2027-03-14T12:00:00Z")),
+            Duration::seconds(60),
+        );
+        assert_eq!(fired, vec![utc("2027-03-14T07:00:05Z")]);
+    }
+
+    #[test]
+    fn utc_schedules_are_unchanged() {
+        let fired = fires(
+            &schedule("0 */20 * * * * *"),
+            chrono_tz::UTC,
+            utc("2026-11-01T05:40:00.250Z"),
+            (utc("2026-11-01T05:40:30Z"), utc("2026-11-01T07:00:00Z")),
+            Duration::seconds(30),
+        );
+        let expected: Vec<_> = ["06:00:00", "06:20:00", "06:40:00"]
+            .iter()
+            .map(|t| utc(&format!("2026-11-01T{t}Z")))
+            .collect();
+        assert_eq!(fired, expected);
+    }
+
+    #[test]
+    fn next_run_is_when_the_wall_clock_reaches_the_slot() {
+        let now = utc("2026-10-01T00:00:00Z");
+        // Skipped 02:30 is reached when the clock jumps to 03:00 EDT.
+        assert_eq!(
+            schedule("0 30 2 * * * *").next_run(Some(&utc("2027-03-13T07:30:05Z")), now, NEW_YORK),
+            utc("2027-03-14T07:00:00Z")
+        );
+        // Repeated 01:50 after a fire before the hour: the first copy.
+        assert_eq!(
+            schedule("0 50 1 * * * *").next_run(Some(&utc("2026-10-31T05:50:00Z")), now, NEW_YORK),
+            utc("2026-11-01T05:50:00Z")
+        );
+        // Repeated 01:50 after a fire at 01:20 EST: the second copy.
+        assert_eq!(
+            schedule("0 50 1 * * * *").next_run(Some(&utc("2026-11-01T06:20:00Z")), now, NEW_YORK),
+            utc("2026-11-01T06:50:00Z")
+        );
+    }
+
+    /// Instants at which `timezone` changes its UTC offset during `year`.
+    fn transitions(timezone: Tz, year: i32) -> Vec<DateTime<Utc>> {
+        let offset = |at: DateTime<Utc>| timezone.offset_from_utc_datetime(&at.naive_utc()).fix();
+        let start = Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
+        (0..366 * 24)
+            .map(|hour| start + Duration::hours(hour))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| offset(pair[0]) != offset(pair[1]))
+            .map(|pair| pair[1])
+            .collect()
+    }
+
+    fn transition() -> impl Strategy<Value = (Tz, DateTime<Utc>)> {
+        // Lord Howe shifts 30 minutes; Santiago changes at midnight.
+        let zones = [
+            chrono_tz::America::New_York,
+            chrono_tz::Europe::London,
+            chrono_tz::Australia::Sydney,
+            chrono_tz::Australia::Lord_Howe,
+            chrono_tz::America::Santiago,
+        ];
+        let all: Vec<_> = zones
+            .into_iter()
+            .flat_map(|tz| [2026, 2027].map(|year| (tz, year)))
+            .flat_map(|(tz, year)| transitions(tz, year).into_iter().map(move |at| (tz, at)))
+            .collect();
+        proptest::sample::select(all)
+    }
+
+    fn field(size: u32, hot: &'static [u32]) -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("*".to_owned()),
+            (2..=size / 2).prop_map(|step| format!("*/{step}")),
+            (0..size).prop_map(|value| value.to_string()),
+            proptest::sample::select(hot).prop_map(|value| value.to_string()),
+            (0..size, 1..size).prop_map(move |(a, b)| format!("{a},{}", (a + b) % size)),
+            (0..size, 0..size).prop_map(|(a, b)| format!("{}-{}", a.min(b), a.max(b))),
+        ]
+    }
+
+    proptest! {
+        /// The spec, checked tick by tick against a brute-force oracle: a tick
+        /// fires iff some scheduled wall-clock time lies after the wall clock
+        /// at the last fire and at or before the wall clock now.
+        #[test]
+        fn fires_exactly_when_the_wall_clock_passes_a_scheduled_time(
+            (timezone, transition) in transition(),
+            minute in field(60, &[0, 30, 59]),
+            hour in field(24, &[0, 1, 2, 3, 23]),
+            tick_secs in 5i64..=120,
+            phase_ms in 0i64..120_000,
+            lead_minutes in 1i64..=26 * 60,
+            outage in proptest::option::of((0i64..=5 * 60, 1i64..=3 * 60)),
+        ) {
+            let expr = format!("0 {minute} {hour} * * * *");
+            let schedule = schedule(&expr);
+            let from = transition - Duration::hours(3) + Duration::milliseconds(phase_ms);
+            let until = transition + Duration::hours(3);
+            let down = outage.map(|(start, length)| {
+                (from + Duration::minutes(start), from + Duration::minutes(start + length))
+            });
+            let mut last_run = from - Duration::minutes(lead_minutes);
+
+            // Every scheduled wall-clock minute in range, found with `includes`
+            // rather than the `after` iterator the code under test uses.
+            let first = (wall(last_run, timezone) - Duration::hours(2))
+                .with_second(0)
+                .and_then(|at| at.with_nanosecond(0))
+                .unwrap();
+            let slots: Vec<NaiveDateTime> = (0..36 * 60)
+                .map(|minute| first + Duration::minutes(minute))
+                .filter(|at| schedule.0.includes(at.and_utc()))
+                .collect();
+            let slot_in = |after: NaiveDateTime, upto: NaiveDateTime| {
+                let i = slots.partition_point(|slot| *slot <= after);
+                slots.get(i).is_some_and(|slot| *slot <= upto)
+            };
+
+            let mut now = from;
+            while now < until {
+                if !down.is_some_and(|(start, end)| start <= now && now < end) {
+                    let fired = schedule.should_run(Some(&last_run), now, from, timezone);
+                    let expected = slot_in(wall(last_run, timezone), wall(now, timezone));
+                    prop_assert_eq!(
+                        fired,
+                        expected,
+                        "{} in {}: tick {} ({}), last fire {} ({})",
+                        expr, timezone, now, wall(now, timezone), last_run, wall(last_run, timezone)
+                    );
+                    if fired {
+                        last_run = now;
+                    }
+                }
+                now += Duration::seconds(tick_secs);
+            }
+        }
     }
 }
