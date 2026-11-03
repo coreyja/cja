@@ -138,23 +138,23 @@ async fn user_fields_recorded_in_a_handler_land_on_the_server_request_span() {
         state.creation
     );
 
-    // Handler records land on the span; the anon request contributed none.
-    assert_eq!(
-        state
-            .recorded
-            .iter()
-            .filter(|(f, v)| f == "user_id" && v == "11111111-1111-1111-1111-111111111111")
-            .count(),
-        1
-    );
-    assert_eq!(
-        state
-            .recorded
-            .iter()
-            .filter(|(f, v)| f == "auth_type" && v == "session")
-            .count(),
-        1
-    );
+    // The exact set of recorded values for each user field is the authed
+    // handler's pair. Anything else — the anon request, or a regression
+    // recording on every request — shows up here and fails.
+    let user_ids: Vec<_> = state
+        .recorded
+        .iter()
+        .filter(|(f, _)| f == "user_id")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(user_ids, ["11111111-1111-1111-1111-111111111111"]);
+    let auth_types: Vec<_> = state
+        .recorded
+        .iter()
+        .filter(|(f, _)| f == "auth_type")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(auth_types, ["session"]);
 
     // `Tracer::on_response` recording still works (`u16` visits via the
     // `record_u64` -> `record_debug` default, captured as the string).
