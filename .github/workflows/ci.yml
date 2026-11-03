@@ -139,7 +139,9 @@ jobs:
 
   passkey-browser:
     name: Passkey browser
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, and `playwright install chromium`
+    # fails there ("Playwright does not support chromium on ubuntu26.04-x64").
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
