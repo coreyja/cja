@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{Router, body::Body, routing::get};
 use cja::server::App;
-use http::Request;
+use http::{Request, StatusCode};
 use tower::ServiceExt as _;
 use tracing::{Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
@@ -88,12 +88,13 @@ impl Visit for FieldValues {
     }
 }
 
-async fn send(app: App, host: &str, path: &str) {
+async fn send(app: App, host: &str, path: &str) -> StatusCode {
     let request = Request::get(path)
         .header("host", host)
         .body(Body::empty())
         .unwrap();
-    app.into_router().oneshot(request).await.unwrap();
+    let response = app.into_router().oneshot(request).await.unwrap();
+    response.status()
 }
 
 #[tokio::test]
@@ -110,8 +111,8 @@ async fn user_fields_recorded_in_a_handler_land_on_the_server_request_span() {
     let anon = Router::new().route("/public", get(|| async { "anon" }));
     let app = App::new(authed).host(["anon.example.com"], anon);
 
-    send(app.clone(), "example.com", "/me").await;
-    send(app, "anon.example.com", "/public").await;
+    assert_eq!(send(app.clone(), "example.com", "/me").await, StatusCode::OK);
+    assert_eq!(send(app, "anon.example.com", "/public").await, StatusCode::OK);
 
     let state = fields.0.lock().unwrap();
 
@@ -157,11 +158,13 @@ async fn user_fields_recorded_in_a_handler_land_on_the_server_request_span() {
     assert_eq!(auth_types, ["session"]);
 
     // `Tracer::on_response` recording still works (`u16` visits via the
-    // `record_u64` -> `record_debug` default, captured as the string).
-    assert!(
-        state
-            .recorded
-            .iter()
-            .any(|(f, v)| f == "http.response.status_code" && v == "200")
-    );
+    // `record_u64` -> `record_debug` default, captured as the string), and
+    // both requests were actually served: exactly one 200 each.
+    let status_codes: Vec<_> = state
+        .recorded
+        .iter()
+        .filter(|(f, _)| f == "http.response.status_code")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(status_codes, ["200", "200"]);
 }
