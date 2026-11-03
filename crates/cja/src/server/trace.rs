@@ -20,8 +20,10 @@ pub struct RequestUserIdentity {
     auth_type: Box<str>,
 }
 
-/// Per-request identity slot. `RefCell` borrows are held only synchronously
-/// (never across an `.await`), so they cannot overlap.
+/// Per-request identity slot. `RefCell` is sound here because no caller
+/// code runs while a borrow is held: [`record_request_user`] formats the
+/// identity before taking the borrow, and `on_response` only moves a
+/// value out.
 type Slot = RefCell<Option<RequestUserIdentity>>;
 
 tokio::task_local! {
@@ -55,10 +57,16 @@ tokio::task_local! {
 pub fn record_request_user(user_id: impl fmt::Display, auth_type: impl fmt::Display) -> bool {
     REQUEST_USER
         .try_with(|slot| {
-            slot.borrow_mut().replace(RequestUserIdentity {
+            // Build the identity before borrowing: caller `Display` code
+            // runs here, and a `Display` impl that calls
+            // `record_request_user` again would panic on the `RefCell` if
+            // this ran while the borrow was held. Staying inside the
+            // closure also keeps the no-scope path allocation-free.
+            let identity = RequestUserIdentity {
                 user_id: user_id.to_string().into_boxed_str(),
                 auth_type: auth_type.to_string().into_boxed_str(),
-            });
+            };
+            *slot.borrow_mut() = Some(identity);
         })
         .is_ok()
 }

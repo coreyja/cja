@@ -600,6 +600,51 @@ async fn record_without_a_request_returns_false() {
     assert_eq!(state.events.len(), 0);
 }
 
+/// A `Display` impl that re-enters `record_request_user` while its
+/// `record_request_user` call is formatting must not panic on the slot's
+/// `RefCell`, and the outer call's values must win over the re-entrant
+/// inner call's.
+#[tokio::test]
+async fn reentrant_display_does_not_panic() {
+    let _guard = SERIALIZE.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    struct ReentrantUserId;
+
+    impl std::fmt::Display for ReentrantUserId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // Runs while the outer `record_request_user` call is
+            // formatting: formatting caller `Display` code while the slot
+            // is mutably borrowed would panic here on the `RefCell`.
+            assert!(record_request_user(
+                "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                "token"
+            ));
+            f.write_str("cccccccc-cccc-cccc-cccc-cccccccccccc")
+        }
+    }
+
+    let app = App::new(Router::new().route(
+        "/reentrant",
+        get(|| async {
+            assert!(record_request_user(ReentrantUserId, "session"));
+            "authed"
+        }),
+    ));
+
+    assert_eq!(send(app, "example.com", "/reentrant").await, StatusCode::OK);
+
+    let state = capture.lock();
+    assert_eq!(state.events.len(), 1);
+    let event = &state.events[0];
+    assert_eq!(
+        field(event, "user_id"),
+        Some("cccccccc-cccc-cccc-cccc-cccccccccccc")
+    );
+    assert_eq!(field(event, "auth_type"), Some("session"));
+}
+
 #[tokio::test]
 async fn last_write_wins() {
     let _guard = SERIALIZE.lock().await;
