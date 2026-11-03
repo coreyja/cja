@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use axum::{Router, body::Body, extract::FromRequestParts, routing::get};
 use cja::server::App;
 use cja::server::trace::{RequestUserLayer, Tracer, record_request_user};
-use http::{Request, StatusCode};
+use http::{Request, StatusCode, Response};
 use tower::ServiceExt as _;
 use tracing::{Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
@@ -841,6 +841,128 @@ async fn hand_rolled_documented_layering_lands_the_user() {
         Some("13131313-1313-1313-1313-131313131313")
     );
     assert_eq!(field(event, "auth_type"), Some("session"));
+}
+
+/// A record from a response-body stream, polled after the handler
+/// returned: the service future — and the request-user scope with it — has
+/// already resolved, so the record returns `false` and the event stays
+/// anonymous.
+#[tokio::test]
+async fn body_stream_record_after_handler_returns_false() {
+    let _guard = SERIALIZE.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let app = App::new(Router::new().route(
+        "/stream",
+        get(|| async {
+            let stream = futures::stream::once(async {
+                let recorded = record_request_user(
+                    "16161616-1616-1616-1616-161616161616",
+                    "token",
+                );
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                    if recorded { "true" } else { "false" },
+                ))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    ));
+
+    let request = Request::get("/stream")
+        .header("host", "example.com")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.into_router().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Polling the body runs after the handler — and the request's service
+    // future, which carried the scope — resolved.
+    let body = axum::body::to_bytes(response.into_body(), 64)
+        .await
+        .unwrap();
+    assert_eq!(body, "false");
+
+    let state = capture.lock();
+    assert_eq!(state.events.len(), 1);
+    let event = &state.events[0];
+    assert!(
+        event.iter().all(|(f, _)| f != "user_id" && f != "auth_type"),
+        "event is not anonymous: {event:?}"
+    );
+}
+
+/// `spawn_blocking` moves to the blocking pool: a record made there does
+/// not reach the request, while the handler's own record does.
+#[tokio::test]
+async fn spawn_blocking_cannot_record() {
+    let _guard = SERIALIZE.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let app = App::new(Router::new().route(
+        "/blocking",
+        get(|| async {
+            let recorded = tokio::task::spawn_blocking(|| {
+                record_request_user("1b1b1b1b-1b1b-1b1b-1b1b-1b1b1b1b1b1b", "token")
+            })
+            .await
+            .unwrap();
+            assert!(!recorded, "spawn_blocking claimed to record a user");
+            assert!(record_request_user(
+                "17171717-1717-1717-1717-171717171717",
+                "session"
+            ));
+            "done"
+        }),
+    ));
+
+    assert_eq!(send(app, "example.com", "/blocking").await, StatusCode::OK);
+
+    let state = capture.lock();
+    assert_eq!(state.events.len(), 1);
+    let event = &state.events[0];
+    assert_eq!(
+        field(event, "user_id"),
+        Some("17171717-1717-1717-1717-171717171717")
+    );
+    assert_eq!(field(event, "auth_type"), Some("session"));
+}
+
+/// A helper under `#[tracing::instrument]` runs on the request's task and
+/// poll chain, so its record lands on the request's event.
+#[tracing::instrument]
+async fn authed_helper() -> bool {
+    tokio::task::yield_now().await;
+    record_request_user("18181818-1818-1818-1818-181818181818", "token")
+}
+
+#[tokio::test]
+async fn instrumented_helper_records_for_the_request() {
+    let _guard = SERIALIZE.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let app = App::new(Router::new().route(
+        "/helper",
+        get(|| async {
+            assert!(authed_helper().await);
+            "authed"
+        }),
+    ));
+
+    assert_eq!(send(app, "example.com", "/helper").await, StatusCode::OK);
+
+    let state = capture.lock();
+    assert_eq!(state.events.len(), 1);
+    let event = &state.events[0];
+    assert_eq!(
+        field(event, "user_id"),
+        Some("18181818-1818-1818-1818-181818181818")
+    );
+    assert_eq!(field(event, "auth_type"), Some("token"));
 }
 
 /// [`RequestUserLayer`] inside the trace layer — the documented trap: the
