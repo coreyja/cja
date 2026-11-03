@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use axum::{Router, body::Body, extract::FromRequestParts, routing::get};
 use cja::server::App;
 use cja::server::trace::{RequestUserLayer, Tracer, record_request_user};
-use http::{Request, StatusCode, Response};
+use http::{Request, Response, StatusCode};
 use tower::ServiceExt as _;
 use tracing::{Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
@@ -721,10 +721,7 @@ async fn nested_router_outer_user_survives_anonymous_inner() {
     let capture = capture();
     capture.clear();
 
-    let inner = App::new(Router::new().route(
-        "/inner",
-        get(|| async { StatusCode::ACCEPTED }),
-    ));
+    let inner = App::new(Router::new().route("/inner", get(|| async { StatusCode::ACCEPTED })));
 
     async fn call_inner(
         axum::extract::State(inner): axum::extract::State<App>,
@@ -734,12 +731,7 @@ async fn nested_router_outer_user_survives_anonymous_inner() {
             "session"
         ));
         let request = Request::get("/inner").body(Body::empty()).unwrap();
-        let inner_status = inner
-            .into_router()
-            .oneshot(request)
-            .await
-            .unwrap()
-            .status();
+        let inner_status = inner.into_router().oneshot(request).await.unwrap().status();
         assert_eq!(inner_status, StatusCode::ACCEPTED);
         // The outer response is its own 200, not the inner 202.
         (StatusCode::OK, "outer")
@@ -765,7 +757,9 @@ async fn nested_router_outer_user_survives_anonymous_inner() {
         .find(|ev| field(ev, "status") == Some("200"))
         .expect("the outer event (200) fired");
     assert!(
-        inner_event.iter().all(|(f, _)| f != "user_id" && f != "auth_type"),
+        inner_event
+            .iter()
+            .all(|(f, _)| f != "user_id" && f != "auth_type"),
         "the inner anonymous event carries a user: {inner_event:?}"
     );
     assert_eq!(
@@ -788,10 +782,7 @@ async fn hand_rolled_without_request_user_layer_fires_anonymous_event() {
         "/me",
         get(|| async {
             assert!(
-                !record_request_user(
-                    "12121212-1212-1212-1212-121212121212",
-                    "session"
-                ),
+                !record_request_user("12121212-1212-1212-1212-121212121212", "session"),
                 "a record with no RequestUserLayer claimed to succeed"
             );
             "authed"
@@ -804,7 +795,9 @@ async fn hand_rolled_without_request_user_layer_fires_anonymous_event() {
     assert_eq!(state.events.len(), 1);
     let event = &state.events[0];
     assert!(
-        event.iter().all(|(f, _)| f != "user_id" && f != "auth_type"),
+        event
+            .iter()
+            .all(|(f, _)| f != "user_id" && f != "auth_type"),
         "event is not anonymous: {event:?}"
     );
     assert_eq!(field(event, "status"), Some("200"));
@@ -857,13 +850,12 @@ async fn body_stream_record_after_handler_returns_false() {
         "/stream",
         get(|| async {
             let stream = futures::stream::once(async {
-                let recorded = record_request_user(
-                    "16161616-1616-1616-1616-161616161616",
-                    "token",
-                );
-                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
-                    if recorded { "true" } else { "false" },
-                ))
+                let recorded = record_request_user("16161616-1616-1616-1616-161616161616", "token");
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(if recorded {
+                    "true"
+                } else {
+                    "false"
+                }))
             });
             Response::builder()
                 .status(StatusCode::OK)
@@ -889,7 +881,9 @@ async fn body_stream_record_after_handler_returns_false() {
     assert_eq!(state.events.len(), 1);
     let event = &state.events[0];
     assert!(
-        event.iter().all(|(f, _)| f != "user_id" && f != "auth_type"),
+        event
+            .iter()
+            .all(|(f, _)| f != "user_id" && f != "auth_type"),
         "event is not anonymous: {event:?}"
     );
 }
@@ -976,17 +970,18 @@ async fn hand_rolled_request_user_layer_inside_trace_is_silent() {
     capture.clear();
 
     let router = with_trace_layer(
-        Router::new().route(
-            "/me",
-            get(|| async {
-                assert!(record_request_user(
-                    "14141414-1414-1414-1414-141414141414",
-                    "session"
-                ));
-                "authed"
-            }),
-        )
-        .layer(RequestUserLayer),
+        Router::new()
+            .route(
+                "/me",
+                get(|| async {
+                    assert!(record_request_user(
+                        "14141414-1414-1414-1414-141414141414",
+                        "session"
+                    ));
+                    "authed"
+                }),
+            )
+            .layer(RequestUserLayer),
     );
 
     assert_eq!(send_router(router, "/me").await, StatusCode::OK);
@@ -995,7 +990,9 @@ async fn hand_rolled_request_user_layer_inside_trace_is_silent() {
     assert_eq!(state.events.len(), 1);
     let event = &state.events[0];
     assert!(
-        event.iter().all(|(f, _)| f != "user_id" && f != "auth_type"),
+        event
+            .iter()
+            .all(|(f, _)| f != "user_id" && f != "auth_type"),
         "event is not anonymous: {event:?}"
     );
 }
