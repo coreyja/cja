@@ -13,6 +13,23 @@ use tracing::Level;
 ///     .make_span_with(tracer)
 ///     .on_response(tracer);
 /// ```
+///
+/// The span declares `user_id` and `auth_type` as empty fields for apps to
+/// fill in once authentication has run. Record them from code that runs
+/// while `Span::current()` is still this `server.request` span — an auth
+/// extractor, middleware, or a plain handler. Inside an `#[instrument]`ed
+/// function (or a spawned task) the current span is a different one that
+/// does not declare these fields, and the record is silently dropped:
+///
+/// ```rust,ignore
+/// // e.g. in an auth extractor, after the user is known:
+/// tracing::Span::current().record("user_id", user_id.to_string());
+/// tracing::Span::current().record("auth_type", "session");
+/// ```
+///
+/// Field names use underscores (`user_id`, not `user.id`) because Eyes reads
+/// dotted keys as nested paths. Requests that record nothing keep the fields
+/// empty, and no values are emitted for them.
 #[derive(Debug, Clone, Copy)]
 pub struct Tracer;
 
@@ -47,6 +64,8 @@ impl<Body> MakeSpan<Body> for Tracer {
 
             http.response.status_code = tracing::field::Empty,
             http.response.header.content_type = tracing::field::Empty,
+            user_id = tracing::field::Empty,
+            auth_type = tracing::field::Empty,
         )
     }
 }
