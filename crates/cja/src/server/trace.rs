@@ -27,9 +27,10 @@ use tracing::Level;
 /// tracing::Span::current().record("auth_type", "session");
 /// ```
 ///
-/// Field names use underscores (`user_id`, not `user.id`) because Eyes reads
-/// dotted keys as nested paths. Requests that record nothing keep the fields
-/// empty, and no values are emitted for them.
+/// Field names use underscores (`user_id`, not `user.id`) so Eyes queries can
+/// address them as `fields.user_id`; Eyes keys are atomic, so a dotted name
+/// would need quoting as `fields["user.id"]`. Requests that record nothing
+/// keep the fields empty, and no values are emitted for them.
 #[derive(Debug, Clone, Copy)]
 pub struct Tracer;
 

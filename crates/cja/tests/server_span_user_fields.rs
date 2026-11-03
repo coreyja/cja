@@ -111,8 +111,14 @@ async fn user_fields_recorded_in_a_handler_land_on_the_server_request_span() {
     let anon = Router::new().route("/public", get(|| async { "anon" }));
     let app = App::new(authed).host(["anon.example.com"], anon);
 
-    assert_eq!(send(app.clone(), "example.com", "/me").await, StatusCode::OK);
-    assert_eq!(send(app, "anon.example.com", "/public").await, StatusCode::OK);
+    assert_eq!(
+        send(app.clone(), "example.com", "/me").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(app, "anon.example.com", "/public").await,
+        StatusCode::OK
+    );
 
     let state = fields.0.lock().unwrap();
 
