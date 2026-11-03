@@ -709,6 +709,72 @@ async fn last_write_wins() {
     assert_eq!(field(event, "auth_type"), Some("token"));
 }
 
+/// The reverse of [`nested_router_inner_user_stays_inner`]: the outer
+/// handler records a user, then calls an anonymous inner `App`. The inner
+/// event must stay anonymous and the outer event must keep the user. The
+/// events are told apart by `status` — the inner handler returns 202, the
+/// outer returns its own 200 — because a shared slot would only swap
+/// which event carries the user.
+#[tokio::test]
+async fn nested_router_outer_user_survives_anonymous_inner() {
+    let _guard = SERIALIZE.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let inner = App::new(Router::new().route(
+        "/inner",
+        get(|| async { StatusCode::ACCEPTED }),
+    ));
+
+    async fn call_inner(
+        axum::extract::State(inner): axum::extract::State<App>,
+    ) -> (StatusCode, &'static str) {
+        assert!(record_request_user(
+            "15151515-1515-1515-1515-151515151515",
+            "session"
+        ));
+        let request = Request::get("/inner").body(Body::empty()).unwrap();
+        let inner_status = inner
+            .into_router()
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(inner_status, StatusCode::ACCEPTED);
+        // The outer response is its own 200, not the inner 202.
+        (StatusCode::OK, "outer")
+    }
+
+    let routes = Router::new()
+        .route("/outer", get(call_inner))
+        .with_state(inner);
+    let app = App::new(routes);
+
+    assert_eq!(send(app, "example.com", "/outer").await, StatusCode::OK);
+
+    let state = capture.lock();
+    assert_eq!(state.events.len(), 2, "events: {:?}", state.events);
+    let inner_event = state
+        .events
+        .iter()
+        .find(|ev| field(ev, "status") == Some("202"))
+        .expect("the inner event (202) fired");
+    let outer_event = state
+        .events
+        .iter()
+        .find(|ev| field(ev, "status") == Some("200"))
+        .expect("the outer event (200) fired");
+    assert!(
+        inner_event.iter().all(|(f, _)| f != "user_id" && f != "auth_type"),
+        "the inner anonymous event carries a user: {inner_event:?}"
+    );
+    assert_eq!(
+        field(outer_event, "user_id"),
+        Some("15151515-1515-1515-1515-151515151515")
+    );
+    assert_eq!(field(outer_event, "auth_type"), Some("session"));
+}
+
 /// A hand-rolled stack with the trace layer but no [`RequestUserLayer`]:
 /// the handler's record returns `false`, the event still fires with
 /// `status` and `latency`, and neither user key is present.
