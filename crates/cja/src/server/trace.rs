@@ -1,41 +1,168 @@
+use std::cell::RefCell;
+use std::fmt;
+use std::task::{Context, Poll};
+
+use tokio::task::futures::TaskLocalFuture;
 use tower_http::trace::{MakeSpan, OnResponse};
+use tower_layer::Layer;
+use tower_service::Service;
 use tracing::Level;
 
-/// `MakeSpan`/`OnResponse` implementation behind cja's `server.request` spans.
+/// The identity an app recorded for one request, in the words of
+/// [`record_request_user`]. Carried from auth code to the `finished
+/// processing request` event via the `REQUEST_USER` task-local.
+///
+/// Public with private fields only because it names a type in the public
+/// [`RequestUserService`] future; it cannot be constructed outside cja.
+#[derive(Debug)]
+pub struct RequestUserIdentity {
+    user_id: Box<str>,
+    auth_type: Box<str>,
+}
+
+/// Per-request identity slot. `RefCell` borrows are held only synchronously
+/// (never across an `.await`), so they cannot overlap.
+type Slot = RefCell<Option<RequestUserIdentity>>;
+
+tokio::task_local! {
+    /// Per-request identity slot, written by auth code via
+    /// [`record_request_user`] and read by [`Tracer`]'s `on_response` when
+    /// it emits `finished processing request`. Scoped by
+    /// [`RequestUserLayer`]; unset outside a request, so reads fail rather
+    /// than mis-attribute.
+    static REQUEST_USER: Slot;
+}
+
+/// Record the authenticated user for the request this code is serving, so
+/// cja's `finished processing request` event carries `user_id` and
+/// `auth_type` for Eyes to count.
+///
+/// Works anywhere the request's own future is being polled on its own task,
+/// before the response resolves: an auth extractor, a middleware layered
+/// inside cja's trace layer, a plain handler, and helpers under
+/// `#[instrument]`. Returns `false` — recording nothing — anywhere else:
+/// inside `tokio::spawn` or `spawn_blocking` (task-locals do not cross
+/// tasks), a tower layer that moves work to another task (such as `Buffer`),
+/// a layer applied outside [`RequestUserLayer`], a response-body stream
+/// polled after the handler returned (e.g. SSE), or a hand-rolled serve
+/// loop that did not add [`RequestUserLayer`]. A `false` return is never
+/// attributed to another request.
+///
+/// If called twice on one request, the last call wins: the innermost auth
+/// decision (say, an extractor that ran after an outer middleware's guess)
+/// overwrites the earlier one.
+#[must_use = "returns false when no request is in progress; log or assert it in development"]
+pub fn record_request_user(user_id: impl fmt::Display, auth_type: impl fmt::Display) -> bool {
+    REQUEST_USER
+        .try_with(|slot| {
+            slot.borrow_mut().replace(RequestUserIdentity {
+                user_id: user_id.to_string().into_boxed_str(),
+                auth_type: auth_type.to_string().into_boxed_str(),
+            });
+        })
+        .is_ok()
+}
+
+/// Tower layer that scopes the `REQUEST_USER` task-local around the entire
+/// inner stack — including cja's trace layer, so `on_response` reads the
+/// slot when it emits `finished processing request`.
+///
+/// cja's `run_server`, `run_server_until`, `serve_until` and
+/// [`App`](super::App) install this automatically, outside the trace layer.
+/// Apps that manage their own `axum::serve` loop must layer it themselves,
+/// outside (applied after) the trace layer:
+///
+/// ```rust,ignore
+/// let tracer = cja::server::trace::Tracer;
+/// let app = routes
+///     .layer(tower_http::trace::TraceLayer::new_for_http()
+///         .make_span_with(tracer)
+///         .on_response(tracer))
+///     .layer(cja::server::trace::RequestUserLayer);
+/// ```
+///
+/// If it ends up inside the trace layer, [`record_request_user`] still
+/// returns `true` from handlers, but the event silently carries no user:
+/// `on_response` runs outside the scope. Do not also wrap a router that
+/// passes through cja's serving path in a second trace layer — that
+/// double-counts `server.request` spans.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestUserLayer;
+
+impl<S> Layer<S> for RequestUserLayer
+where
+    S: Service<axum::extract::Request>,
+{
+    type Service = RequestUserService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestUserService(inner)
+    }
+}
+
+/// The service [`RequestUserLayer`] produces. Public with a private field
+/// only because it names a type in the public layer impl.
+#[derive(Debug, Clone)]
+pub struct RequestUserService<S>(S);
+
+impl<S> Service<axum::extract::Request> for RequestUserService<S>
+where
+    S: Service<axum::extract::Request>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = TaskLocalFuture<Slot, S::Future>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    #[inline]
+    fn call(&mut self, request: axum::extract::Request) -> Self::Future {
+        // `scope` builds the future in place: no boxing, no heap
+        // allocation, even for requests that never record a user.
+        REQUEST_USER.scope(Slot::default(), self.0.call(request))
+    }
+}
+
+/// `MakeSpan`/`OnResponse` implementation behind cja's `server.request`
+/// spans, plus the per-request user slot that feeds the `finished
+/// processing request` event.
 ///
 /// [`run_server`](super::run_server) installs this automatically. Apps that
 /// manage their own `axum::serve` loop (custom bind address, graceful
-/// shutdown) can attach it themselves to keep the same span vocabulary:
+/// shutdown) can attach it themselves to keep the same span vocabulary —
+/// with [`RequestUserLayer`] outside the trace layer so
+/// [`record_request_user`] still reaches the event:
 ///
 /// ```rust,ignore
 /// let tracer = cja::server::trace::Tracer;
 /// let trace_layer = tower_http::trace::TraceLayer::new_for_http()
 ///     .make_span_with(tracer)
 ///     .on_response(tracer);
+/// let app = routes
+///     .layer(trace_layer)
+///     .layer(cja::server::trace::RequestUserLayer);
 /// ```
 ///
-/// The span declares `user_id` and `auth_type` as empty fields for apps to
-/// fill in once authentication has run. Record them while `Span::current()` is
-/// still this `server.request` span: from an auth extractor, a middleware
-/// layered inside the trace layer, or a plain handler.
+/// Apps record the authenticated user with [`record_request_user`]. It
+/// works while the request's own future is being polled on its own task,
+/// before the response resolves: an auth extractor, a middleware layered
+/// inside cja's trace layer, a plain handler, and helpers under
+/// `#[instrument]`. It returns `false` — recording nothing — anywhere else:
+/// inside `tokio::spawn` or `spawn_blocking` (task-locals do not cross
+/// tasks), a tower layer that moves work to another task (such as `Buffer`),
+/// a layer applied outside [`RequestUserLayer`], a response-body stream
+/// polled after the handler returned (e.g. SSE), or a hand-rolled serve
+/// loop that did not add [`RequestUserLayer`]. A `false` return is never
+/// attributed to another request. If called twice on one request, the last
+/// call wins: the innermost auth decision overwrites the earlier one.
 ///
-/// ```rust,ignore
-/// // e.g. in an auth extractor, after the user is known:
-/// tracing::Span::current().record("user_id", user_id.to_string());
-/// tracing::Span::current().record("auth_type", "session");
-/// ```
-///
-/// Anywhere else the record is silently dropped, because the current span does
-/// not declare these fields or there is no current span. That covers a layer
-/// outside the trace layer, code under `#[instrument]` or `.instrument(...)`,
-/// and a bare `tokio::spawn`.
-///
-/// Field names use underscores (`user_id`, not `user.id`) because Eyes keys are
-/// atomic: a dotted name would need quoting as `fields["user.id"]`. Recorded
-/// values ship on the span's close row, which Eyes `telemetry` queries do not
-/// read as of this writing, so `fields.user_id` matches nothing there until Eyes
-/// folds close rows in. Requests that record nothing keep the fields empty, and
-/// no values are emitted for them.
+/// The event's field names use underscores (`user_id`, not `user.id`)
+/// because Eyes keys are atomic: a dotted name would need quoting as
+/// `fields["user.id"]`. Requests that record nothing emit no values for
+/// these fields.
 #[derive(Debug, Clone, Copy)]
 pub struct Tracer;
 
@@ -70,8 +197,6 @@ impl<Body> MakeSpan<Body> for Tracer {
 
             http.response.status_code = tracing::field::Empty,
             http.response.header.content_type = tracing::field::Empty,
-            user_id = tracing::field::Empty,
-            auth_type = tracing::field::Empty,
         )
     }
 }
@@ -84,10 +209,20 @@ impl<Body> OnResponse<Body> for Tracer {
         span: &tracing::Span,
     ) {
         let status_code = response.status().as_u16();
+        // Runs inside `RequestUserLayer`'s scope for stacks cja serves, so
+        // the slot is readable here. A hand-rolled loop with the `Tracer`
+        // but no `RequestUserLayer` gets the same event without the user
+        // fields — take the value out first so the event always fires.
+        let user = REQUEST_USER
+            .try_with(|slot| slot.borrow_mut().take())
+            .ok()
+            .flatten();
         tracing::event!(
             Level::INFO,
             status = status_code,
             latency = format_args!("{} ms", latency.as_millis()),
+            user_id = user.as_ref().map(|u| &*u.user_id),
+            auth_type = user.as_ref().map(|u| &*u.auth_type),
             "finished processing request"
         );
 
