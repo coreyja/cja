@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{Router, body::Body, extract::FromRequestParts, routing::get};
 use cja::server::App;
-use cja::server::trace::record_request_user;
+use cja::server::trace::{RequestUserLayer, Tracer, record_request_user};
 use http::{Request, StatusCode};
 use tower::ServiceExt as _;
 use tracing::{Subscriber, field::Visit};
@@ -173,6 +173,27 @@ async fn send(app: App, host: &str, path: &str) -> StatusCode {
         .unwrap();
     let response = app.into_router().oneshot(request).await.unwrap();
     response.status()
+}
+
+/// Sends to a hand-rolled stack: a plain `Router` with the `Tracer` trace
+/// layer (and optionally [`RequestUserLayer`]) instead of an [`App`].
+async fn send_router(router: Router, path: &str) -> StatusCode {
+    let request = Request::get(path)
+        .header("host", "example.com")
+        .body(Body::empty())
+        .unwrap();
+    router.oneshot(request).await.unwrap().status()
+}
+
+/// Applies the hand-rolled trace layer (the `Tracer` exactly as
+/// [`Tracer`]'s docs describe it) to a plain `Router`.
+fn with_trace_layer(routes: Router) -> Router {
+    let tracer = Tracer;
+    routes.layer(
+        tower_http::trace::TraceLayer::new_for_http()
+            .make_span_with(tracer)
+            .on_response(tracer),
+    )
 }
 
 #[tokio::test]
@@ -686,4 +707,107 @@ async fn last_write_wins() {
         Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     );
     assert_eq!(field(event, "auth_type"), Some("token"));
+}
+
+/// A hand-rolled stack with the trace layer but no [`RequestUserLayer`]:
+/// the handler's record returns `false`, the event still fires with
+/// `status` and `latency`, and neither user key is present.
+#[tokio::test]
+async fn hand_rolled_without_request_user_layer_fires_anonymous_event() {
+    let _guard = SERIALIZE.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let router = with_trace_layer(Router::new().route(
+        "/me",
+        get(|| async {
+            assert!(
+                !record_request_user(
+                    "12121212-1212-1212-1212-121212121212",
+                    "session"
+                ),
+                "a record with no RequestUserLayer claimed to succeed"
+            );
+            "authed"
+        }),
+    ));
+
+    assert_eq!(send_router(router, "/me").await, StatusCode::OK);
+
+    let state = capture.lock();
+    assert_eq!(state.events.len(), 1);
+    let event = &state.events[0];
+    assert!(
+        event.iter().all(|(f, _)| f != "user_id" && f != "auth_type"),
+        "event is not anonymous: {event:?}"
+    );
+    assert_eq!(field(event, "status"), Some("200"));
+    assert!(field(event, "latency").is_some());
+}
+
+/// The documented hand-rolled layering — trace layer first, then
+/// [`RequestUserLayer`] outermost — lands the user on the event.
+#[tokio::test]
+async fn hand_rolled_documented_layering_lands_the_user() {
+    let _guard = SERIALIZE.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let router = with_trace_layer(Router::new().route(
+        "/me",
+        get(|| async {
+            assert!(record_request_user(
+                "13131313-1313-1313-1313-131313131313",
+                "session"
+            ));
+            "authed"
+        }),
+    ))
+    .layer(RequestUserLayer);
+
+    assert_eq!(send_router(router, "/me").await, StatusCode::OK);
+
+    let state = capture.lock();
+    assert_eq!(state.events.len(), 1);
+    let event = &state.events[0];
+    assert_eq!(
+        field(event, "user_id"),
+        Some("13131313-1313-1313-1313-131313131313")
+    );
+    assert_eq!(field(event, "auth_type"), Some("session"));
+}
+
+/// [`RequestUserLayer`] inside the trace layer — the documented trap: the
+/// handler's record returns `true` (the scope wraps the routes), but
+/// `on_response` runs outside the scope, so the event has neither user
+/// key.
+#[tokio::test]
+async fn hand_rolled_request_user_layer_inside_trace_is_silent() {
+    let _guard = SERIALIZE.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let router = with_trace_layer(
+        Router::new().route(
+            "/me",
+            get(|| async {
+                assert!(record_request_user(
+                    "14141414-1414-1414-1414-141414141414",
+                    "session"
+                ));
+                "authed"
+            }),
+        )
+        .layer(RequestUserLayer),
+    );
+
+    assert_eq!(send_router(router, "/me").await, StatusCode::OK);
+
+    let state = capture.lock();
+    assert_eq!(state.events.len(), 1);
+    let event = &state.events[0];
+    assert!(
+        event.iter().all(|(f, _)| f != "user_id" && f != "auth_type"),
+        "event is not anonymous: {event:?}"
+    );
 }
