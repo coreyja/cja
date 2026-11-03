@@ -44,16 +44,24 @@ tokio::task_local! {
 /// inside cja's trace layer, a plain handler, and helpers under
 /// `#[instrument]`. Returns `false` — recording nothing — anywhere else:
 /// inside `tokio::spawn` or `spawn_blocking` (task-locals do not cross
-/// tasks), a tower layer that moves work to another task (such as `Buffer`),
-/// a layer applied outside [`RequestUserLayer`], a response-body stream
-/// polled after the handler returned (e.g. SSE), or a hand-rolled serve
-/// loop that did not add [`RequestUserLayer`]. A `false` return is never
-/// attributed to another request.
+/// tasks), inside a middleware that runs the inner call under
+/// `tokio::spawn` (say, `axum::middleware::from_fn` middleware doing
+/// `tokio::spawn(next.run(req)).await`), code that runs synchronously in a
+/// tower `Service::call` rather than in the future it returns, a layer
+/// applied outside [`RequestUserLayer`], a response-body stream polled
+/// after the handler returned (e.g. SSE), or a hand-rolled serve loop that
+/// did not add [`RequestUserLayer`]. A `false` return is never attributed
+/// to another request.
 ///
-/// If called twice on one request, the last call wins: the innermost auth
-/// decision (say, an extractor that ran after an outer middleware's guess)
-/// overwrites the earlier one.
-#[must_use = "returns false when no request is in progress; log or assert it in development"]
+/// On a hand-rolled stack, a layer sitting between the trace layer and
+/// [`RequestUserLayer`] that records after the inner response resolved
+/// gets `true`, but the event has already fired, so that record is lost.
+///
+/// If called twice on one request, the last call wins. A record cannot be
+/// withdrawn: middleware that records from a session cookie before an
+/// extractor rejects that session still ships the `401` response carrying
+/// that `user_id`. Record only after the user is verified.
+#[must_use = "returns false when this task is outside the request scope, e.g. inside tokio::spawn during a live request; bind the result and check it — debug_assert! alone is compiled out of release builds"]
 pub fn record_request_user(user_id: impl fmt::Display, auth_type: impl fmt::Display) -> bool {
     REQUEST_USER
         .try_with(|slot| {
@@ -71,9 +79,11 @@ pub fn record_request_user(user_id: impl fmt::Display, auth_type: impl fmt::Disp
         .is_ok()
 }
 
-/// Tower layer that scopes the `REQUEST_USER` task-local around the entire
-/// inner stack — including cja's trace layer, so `on_response` reads the
-/// slot when it emits `finished processing request`.
+/// Tower layer that scopes the `REQUEST_USER` task-local around the
+/// response future of the inner stack — including cja's trace layer, so
+/// `on_response` reads the slot when it emits `finished processing
+/// request`. Synchronous code in an inner service's `Service::call` runs
+/// before that future is first polled, outside the scope.
 ///
 /// cja's `run_server`, `run_server_until`, `serve_until` and
 /// [`App`](super::App) install this automatically, outside the trace layer.
@@ -160,12 +170,21 @@ where
 /// inside cja's trace layer, a plain handler, and helpers under
 /// `#[instrument]`. It returns `false` — recording nothing — anywhere else:
 /// inside `tokio::spawn` or `spawn_blocking` (task-locals do not cross
-/// tasks), a tower layer that moves work to another task (such as `Buffer`),
-/// a layer applied outside [`RequestUserLayer`], a response-body stream
-/// polled after the handler returned (e.g. SSE), or a hand-rolled serve
-/// loop that did not add [`RequestUserLayer`]. A `false` return is never
-/// attributed to another request. If called twice on one request, the last
-/// call wins: the innermost auth decision overwrites the earlier one.
+/// tasks), inside a middleware that runs the inner call under `tokio::spawn`
+/// (say, `axum::middleware::from_fn` middleware doing
+/// `tokio::spawn(next.run(req)).await`), code that runs synchronously in a
+/// tower `Service::call` rather than in the future it returns, a layer
+/// applied outside [`RequestUserLayer`], a response-body stream polled
+/// after the handler returned (e.g. SSE), or a hand-rolled serve loop that
+/// did not add [`RequestUserLayer`]. A `false` return is never attributed
+/// to another request. On a hand-rolled stack, a layer between the trace
+/// layer and [`RequestUserLayer`] that records after the inner response
+/// resolved still gets `true`, but the event has already fired, so that
+/// record is lost. If called twice on one request, the last call wins. A
+/// record cannot be withdrawn: middleware that records from a session
+/// cookie before an extractor rejects that session still ships the `401`
+/// response carrying that `user_id`. Record only after the user is
+/// verified.
 ///
 /// The event's field names use underscores (`user_id`, not `user.id`)
 /// because Eyes keys are atomic: a dotted name would need quoting as
