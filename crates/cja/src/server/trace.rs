@@ -15,11 +15,9 @@ use tracing::Level;
 /// ```
 ///
 /// The span declares `user_id` and `auth_type` as empty fields for apps to
-/// fill in once authentication has run. Record them from code that runs
-/// while `Span::current()` is still this `server.request` span — an auth
-/// extractor, middleware, or a plain handler. Inside an `#[instrument]`ed
-/// function (or a spawned task) the current span is a different one that
-/// does not declare these fields, and the record is silently dropped:
+/// fill in once authentication has run. Record them while `Span::current()` is
+/// still this `server.request` span: from an auth extractor, a middleware
+/// layered inside the trace layer, or a plain handler.
 ///
 /// ```rust,ignore
 /// // e.g. in an auth extractor, after the user is known:
@@ -27,10 +25,17 @@ use tracing::Level;
 /// tracing::Span::current().record("auth_type", "session");
 /// ```
 ///
-/// Field names use underscores (`user_id`, not `user.id`) so Eyes queries can
-/// address them as `fields.user_id`; Eyes keys are atomic, so a dotted name
-/// would need quoting as `fields["user.id"]`. Requests that record nothing
-/// keep the fields empty, and no values are emitted for them.
+/// Anywhere else the record is silently dropped, because the current span does
+/// not declare these fields or there is no current span. That covers a layer
+/// outside the trace layer, code under `#[instrument]` or `.instrument(...)`,
+/// and a bare `tokio::spawn`.
+///
+/// Field names use underscores (`user_id`, not `user.id`) because Eyes keys are
+/// atomic: a dotted name would need quoting as `fields["user.id"]`. Recorded
+/// values ship on the span's close row, which Eyes `telemetry` queries do not
+/// read as of this writing, so `fields.user_id` matches nothing there until Eyes
+/// folds close rows in. Requests that record nothing keep the fields empty, and
+/// no values are emitted for them.
 #[derive(Debug, Clone, Copy)]
 pub struct Tracer;
 
