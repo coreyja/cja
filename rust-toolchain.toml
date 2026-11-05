@@ -6,5 +6,5 @@
 # Bumps are proposed automatically by .github/workflows/update-rust.yml, which
 # opens a PR when a newer stable is released so CI can vet it before we adopt it.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
