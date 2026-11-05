@@ -64,7 +64,7 @@ cron/
   registry.rs      — CronRegistry, Schedule enum (Interval | Cron), CronJob
   worker.rs        — Cron Worker tick loop with configurable poll interval and timezone
 server/
-  mod.rs           — run_server(), middleware stack (tracing + cookies)
+  mod.rs           — run_server(), middleware stack (request-user + tracing + cookies)
   app.rs           — App: default router + per-host routers, host dispatch
   cookies/
     cookie_key.rs  — CookieKey (from COOKIE_KEY env or auto-generated)
@@ -72,7 +72,7 @@ server/
   session.rs       — CJASession, AppSession trait, Session<A> extractor
   page.rs          — Page wrapper for HTML responses
   page/factory.rs  — Factory Axum extractor
-  trace.rs         — Tracer (MakeSpan + OnResponse for tower-http)
+  trace.rs         — Tracer (MakeSpan + OnResponse), record_request_user, RequestUserLayer
 testing/
   mod.rs           — Test-support exports
   test_db.rs       — Isolated PostgreSQL database lifecycle and stale reaping
@@ -142,11 +142,12 @@ The `Session<A>` extractor automatically loads or creates sessions from the `ses
 ```
 Incoming request
   → TcpListener (or systemfd handoff)
-    → tower-http TraceLayer (MakeSpan + OnResponse)
-      → CookieManagerLayer
-        → Axum Router (your routes)
-          → Handler (with extractors: Session, CookieJar, State, etc.)
-            → Response
+    → CookieManagerLayer
+      → RequestUserLayer (task-local user slot, zero-allocation)
+        → tower-http TraceLayer (MakeSpan + OnResponse)
+          → Axum Router (your routes)
+            → Handler (with extractors: Session, CookieJar, State, etc.)
+              → Response
 ```
 
 ### Job Flow
@@ -268,6 +269,8 @@ the URI authority; ASCII case, port and a trailing dot are ignored) and
 the tracing and cookie layers wrap each router, so `http.route` on
 `server.request` spans stays the matched template on every host.
 `App::into_router()` returns the exact served stack for tests.
+`record_request_user` works on every host router because `App::into_router`
+applies `prepare_routes` — including `RequestUserLayer` — to each.
 
 Cron cancellation takes effect between ticks and during the polling sleep.
 An active tick finishes its callbacks and persists successful `last_run_at`

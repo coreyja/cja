@@ -134,7 +134,12 @@ fn prepare_routes<AS: Clone + Send + Sync + 'static>(routes: axum::Router<AS>) -
         .make_span_with(tracer)
         .on_response(tracer);
 
-    routes.layer(trace_layer).layer(CookieManagerLayer::new())
+    // The tuple applies its first layer outermost: `RequestUserLayer` must
+    // wrap the trace layer so `Tracer::on_response` reads the user slot
+    // when it emits `finished processing request`. Cookies stay outermost.
+    routes
+        .layer((trace::RequestUserLayer, trace_layer))
+        .layer(CookieManagerLayer::new())
 }
 
 async fn bind_listener() -> color_eyre::Result<TcpListener> {
