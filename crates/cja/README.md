@@ -358,6 +358,13 @@ Worker::new_with_timezone(app_state, registry, chrono_tz::US::Eastern, Duration:
 
 Note: `Worker::new()` uses a 60-second poll interval with UTC. The only way to customize the poll interval is `Worker::new_with_timezone()` — there is no `new_with_interval()` method.
 
+Cron expressions are evaluated against local wall-clock time in the worker's
+timezone. Across daylight-saving changes, a time the clock skips (02:30 on
+spring-forward night in the US) fires right after the jump, and a time the
+clock repeats (01:30 on fall-back night) fires once. Sub-hourly expressions
+don't fire again during the repeated hour, so use an interval when a job needs
+elapsed-time cadence.
+
 ### Queue Pileup Warning
 
 If a cron job takes longer to run than its scheduling interval, the queue grows unbounded (no built-in deduplication). For example, a 60s interval with a 20min runtime means ~1 new queued job per minute. Mitigations: increase the interval, add job-level deduplication, or use timeouts.
