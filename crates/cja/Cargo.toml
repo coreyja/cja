@@ -36,7 +36,7 @@ cron = "0.17.0"
 chrono-tz = "0.10.0"
 
 color-eyre = "0.6.3"
-eyes-subscriber = "0.8"
+eyes-subscriber = "0.10"
 tracing-subscriber = { workspace = true }
 tracing-tree = { workspace = true }
 serde_urlencoded = { version = "0.7", optional = true }

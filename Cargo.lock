@@ -1645,9 +1645,9 @@ dependencies = [
 
 [[package]]
 name = "eyes-query"
-version = "0.1.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad47db44035e24bcc69c7f400cc904b0d370e44d5377ff06f1c7fa86d8bd1e98"
+checksum = "a75eeec71f0467f762835ceeeebebc2b8e037b8c085cce907b76de8dbeb59470"
 dependencies = [
  "chrono",
  "regex",
@@ -1659,9 +1659,9 @@ dependencies = [
 
 [[package]]
 name = "eyes-subscriber"
-version = "0.8.3"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d1d8573c444b8546335aea90d7106a27883c9e0f0a3926d41ff285c3f0b64db"
+checksum = "2b2e99146a3377c68ca19c88f7195e72336166d929fdcfea1e50d43246edcd38"
 dependencies = [
  "async-trait",
  "chrono",
