@@ -2333,10 +2333,13 @@ mod idle_gate_tests {
     }
 
     async fn setup(db: &sqlx::PgPool) {
-        sqlx::query("CREATE TABLE gate_job_starts (id TEXT PRIMARY KEY)")
-            .execute(db)
-            .await
-            .unwrap();
+        sqlx::query(concat!(
+            "CREATE TABLE gate_job_starts (id TEXT PRIMARY KEY, ",
+            "started_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())"
+        ))
+        .execute(db)
+        .await
+        .unwrap();
     }
 
     struct Workers {
@@ -2365,19 +2368,25 @@ mod idle_gate_tests {
         }
         async fn stop(self) {
             self.token.cancel();
-            let mut all_exited_cleanly = true;
-            for mut handle in self.handles {
+            let mut failures = Vec::new();
+            for (index, mut handle) in self.handles.into_iter().enumerate() {
                 match tokio::time::timeout(Duration::from_secs(10), &mut handle).await {
                     Ok(Ok(Ok(()))) => {}
-                    Ok(_) => all_exited_cleanly = false,
+                    Ok(Ok(Err(error))) => failures.push(format!("worker {index}: {error:#}")),
+                    Ok(Err(join_error)) => failures.push(format!("worker {index}: {join_error}")),
                     Err(_) => {
                         handle.abort();
                         let _ = handle.await;
-                        all_exited_cleanly = false;
+                        failures.push(format!("worker {index}: still running after 10s"));
                     }
                 }
             }
-            assert!(all_exited_cleanly, "worker shutdown failed");
+            assert!(
+                failures.is_empty(),
+                "worker shutdown failed ({} of them): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
     }
 
@@ -2751,9 +2760,11 @@ mod idle_gate_tests {
         let gate = IdlePollGate::new(NonZeroUsize::new(1).unwrap());
         let state = make_state(db.clone(), gate.clone());
         state.park.store(true, SeqCst);
+        let retry_delay = "0.5 seconds";
+        let reclaim_window = Duration::from_millis(1200);
         let config = JobWorkerConfig {
             heartbeat_interval: Duration::from_millis(300),
-            reclaim_window: Duration::from_millis(1200),
+            reclaim_window,
             idle_poll_gate: Some(gate),
             ..Default::default()
         };
@@ -2779,7 +2790,7 @@ mod idle_gate_tests {
             handles: vec![first, second],
         };
         with_workers(workers, async {
-            let retry_id = insert_sql(&db, "retry", "0.5 seconds", None).await;
+            let retry_id = insert_sql(&db, "retry", retry_delay, None).await;
             sqlx::query(concat!(
                 "UPDATE jobs SET error_count = 1, ",
                 "last_error_message = 'previous attempt failed' WHERE job_id = $1"
@@ -2789,14 +2800,36 @@ mod idle_gate_tests {
             .await
             .unwrap();
             let lease_id = insert_sql(&db, "lease", "0 seconds", Some("dead-worker")).await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let early = started(&db).await;
-            let result = tokio::time::timeout(Duration::from_secs(2), async {
+            // Liveness. Correct code claims the retry at run_at (+0.5s) and the
+            // lease at created_at + reclaim_window (+1.2s), each within one
+            // 100ms poll. A gate that never polls while idle claims neither, so
+            // a 10s deadline separates the two by a wide ratio, even on a
+            // starved runner.
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
                 while started(&db).await < 2 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await;
+            // Safety, in database time: no job may start before it became
+            // claimable. insert_sql sets run_at and locked_at from the same
+            // NOW() as created_at; both columns can move later (a new owner
+            // overwrites locked_at, a failed attempt pushes run_at), so
+            // created_at plus the delay is the stable reference. The old
+            // check, "nothing started within 200ms of the inserts", timed the
+            // runner instead: under load the inserts alone outlast the retry's
+            // 0.5s delay, and the retry is then claimed correctly.
+            let early: Vec<String> = sqlx::query_scalar(concat!(
+                "SELECT s.id FROM gate_job_starts s JOIN jobs j ON j.context = s.id ",
+                "WHERE s.started_at < j.created_at + CASE s.id ",
+                "WHEN 'lease' THEN $1::bigint * interval '1 microsecond' ",
+                "ELSE $2::interval END ORDER BY s.id"
+            ))
+            .bind(i64::try_from(reclaim_window.as_micros()).unwrap())
+            .bind(retry_delay)
+            .fetch_all(&db)
+            .await
+            .unwrap();
             let row: (i32, String) = sqlx::query_as(
                 "SELECT error_count, last_error_message FROM jobs WHERE job_id = $1",
             )
@@ -2805,8 +2838,8 @@ mod idle_gate_tests {
             .await
             .unwrap();
             state.release.notify_waiters();
-            assert_eq!(early, 0);
             result.expect("periodic discovery of retry and lease");
+            assert!(early.is_empty(), "started before claimable: {early:?}");
             assert_eq!(row.0, 1);
             assert!(row.1.starts_with("Job lease expired"));
         })
