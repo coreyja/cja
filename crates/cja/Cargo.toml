@@ -27,6 +27,7 @@ base64.workspace = true
 futures = "0.3"
 thiserror = "2.0.21"
 tower-cookies = { version = "0.11.0", features = ["signed", "private"] }
+tower-layer = "0.3"
 http = "1.0.0"
 tower-http = { version = "0.6.6", features = ["trace"] }
 tower-service = "0.3.2"
