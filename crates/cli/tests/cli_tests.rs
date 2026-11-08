@@ -142,26 +142,22 @@ fn test_init_command_github_flag_help() {
     cmd.args(["init", "--help"])
         .assert()
         .success()
-        .stdout(str::contains("Use GitHub version instead of crates.io"));
+        .stdout(str::contains("Git repository for the cja dependency"));
 }
 
 #[test]
-fn test_init_command_branch_requires_github() {
+fn test_init_command_branch_without_github() {
+    // --branch no longer requires --github: it overrides the default repo's
+    // branch. Verified via `cja new` (file generation only, no cargo/network).
     let temp_dir = assert_fs::TempDir::new().unwrap();
-    temp_dir
-        .child("Cargo.toml")
-        .write_str(
-            r#"[package]
-name = "test-project"
-version = "0.1.0"
-edition = "2021"
-"#,
-        )
-        .unwrap();
 
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.current_dir(&temp_dir)
-        .args(["init", "--branch", "develop"])
+        .args(["new", "branchy", "--branch", "develop"])
         .assert()
-        .failure();
+        .success();
+
+    temp_dir
+        .child("branchy/Cargo.toml")
+        .assert(str::contains("branch = \"develop\""));
 }

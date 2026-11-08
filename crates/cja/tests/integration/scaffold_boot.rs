@@ -5,7 +5,7 @@
 // test proves the sequence actually works against a fresh database.
 use std::time::Duration;
 
-use cja::jobs::{CancellationToken, Job, worker::job_worker, DEFAULT_MAX_RETRIES};
+use cja::jobs::{CancellationToken, DEFAULT_MAX_RETRIES, Job, worker::job_worker};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ScaffoldJob;
@@ -61,7 +61,7 @@ async fn generated_boot_path_passes_worker_schema_check() {
         Duration::from_mins(1),
         DEFAULT_MAX_RETRIES,
         token,
-        Default::default(),
+        cja::jobs::worker::JobWorkerConfig::default(),
     )
     .await
     .unwrap();

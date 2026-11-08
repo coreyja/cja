@@ -624,8 +624,10 @@ async fn verify_jobs_schema(db: &sqlx::PgPool) -> color_eyre::Result<()> {
         if schema_mismatch {
             return Err(color_eyre::eyre::eyre!(
                 "The jobs schema is missing cja migrations ({error}). The job worker cannot \
-                 claim jobs until they are applied: copy the missing files from cja's \
-                 `migrations/` directory (`cja sync-migrations`) and run them."
+                 claim jobs until they are applied: run `cja::db::run_migrations(&pool)` against \
+                 this database at startup (generated apps do this in `setup_db_pool`), or, if \
+                 this app keeps its own copies of cja's migrations, copy the missing files \
+                 (`cja sync-migrations`) and run them."
             ));
         }
         tracing::warn!(

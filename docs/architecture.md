@@ -302,12 +302,12 @@ The budget has to fit the platform's kill window: Cloud Run sends SIGKILL a fixe
 
 ## Migration Locations
 
-Three copies of migrations exist in the repository:
+Three copies of migrations exist in the repository, but only one is authoritative:
 
 | Location | Purpose | Used by |
 |----------|---------|---------|
 | `crates/cja/migrations/` | **Source of truth** | `cja::db::run_migrations()` via `sqlx::migrate!("./migrations")` |
-| `migrations/` (root) | Copy for `sqlx` CLI | `sqlx migrate run` from workspace root |
-| `crates/cja.app/migrations/` | Example app's copy | `sqlx::migrate!()` in `cja.app/src/main.rs` |
+| `migrations/` (root) | Partial, best-effort copy for `sqlx` CLI | `sqlx migrate run` from workspace root |
+| `crates/cja.app/migrations/` | Partial, best-effort copy | `sqlx::migrate!()` in `cja.app/src/main.rs` |
 
-When adding a new framework migration, it must be added to all three locations. The `sqlx::migrate!("./migrations")` macro in `db.rs` resolves the path relative to the crate's `Cargo.toml`, i.e., `crates/cja/migrations/`. The `sqlx::migrate!()` call (no path argument) in `cja.app` similarly resolves to `crates/cja.app/migrations/`.
+CLI-generated apps carry no copies: they call `cja::db::run_migrations()` at boot. The `sqlx::migrate!("./migrations")` macro in `db.rs` resolves the path relative to the crate's `Cargo.toml`, i.e., `crates/cja/migrations/`. The `sqlx::migrate!()` call (no path argument) in `cja.app` similarly resolves to `crates/cja.app/migrations/`.

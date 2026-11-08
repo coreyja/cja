@@ -880,7 +880,7 @@ async fn challenge_state_registration_round_trip_via_json_text() {
 /// Regression for the `ignore_missing` composition fix (DEV-2188): the real
 /// passkey-app boot sequence is `cja::db::run_migrations` followed by
 /// `cja_passkey::run_migrations`. Before the fix, cja's migrator rejected
-/// cja_passkey's foreign `_sqlx_migrations` rows on the *second* boot.
+/// `cja_passkey`'s foreign `_sqlx_migrations` rows on the *second* boot.
 #[tokio::test]
 async fn migrations_compose_across_two_boots() {
     let (pool, _guard) = cja::testing::test_db::create_test_database("cja_passkey_test_")

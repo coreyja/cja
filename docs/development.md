@@ -139,13 +139,14 @@ cd crates/cja
 sqlx migrate add MyMigrationName
 ```
 
-Then copy the new migration file to all three locations:
+`crates/cja/migrations/` is the source of truth (already where `sqlx migrate add`
+created the file). The `migrations/` dir at the workspace root and
+`crates/cja.app/migrations/` are partial, best-effort convenience copies — do
+not rely on them being complete. CLI-generated apps carry no copies at all:
+they call `cja::db::run_migrations` at boot, so a new framework migration
+reaches them on their next `cargo update`/deploy.
 
-1. `crates/cja/migrations/` — source of truth (already created by `sqlx migrate add`)
-2. `migrations/` (workspace root) — copy for `sqlx` CLI
-3. `crates/cja.app/migrations/` — example app
-
-See [Architecture: Migration Locations](architecture.md#migration-locations) for details on why three copies exist.
+See [Architecture: Migration Locations](architecture.md#migration-locations) for details.
 
 ### SQLx Offline Cache
 

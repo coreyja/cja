@@ -2,6 +2,23 @@ use assert_cmd::Command;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
 use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
+/// How long a full `cja init` may take: the cja `cargo add` clones the git
+/// repository (there is no usable crates.io release).
+const INIT_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// The new scaffold contract: `migrations/` holds the app's own migrations
+/// only. cja's framework migrations run at boot via `cja::db::run_migrations`,
+/// so no cja `.sql` files are ever copied into an initialized project.
+fn assert_migrations_hold_only_gitkeep(migrations: &Path) {
+    let entries = fs::read_dir(migrations).unwrap();
+    for entry in entries {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        assert_eq!(name, ".gitkeep", "unexpected file in migrations/: {name}");
+    }
+}
 
 #[test]
 fn test_init_command_in_valid_project() {
@@ -30,7 +47,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success()
         .stdout(predicate::str::contains("Successfully initialized CJA"))
@@ -43,17 +60,9 @@ edition = "2021"
     temp.child("migrations").assert(predicate::path::is_dir());
     temp.child("build.rs").assert(predicate::path::exists());
 
-    // Verify migrations were created
-    temp.child("migrations/20231210151519_AddJobsTable.sql")
-        .assert(predicate::path::exists());
-    temp.child("migrations/20240228040146_AddCrons.up.sql")
-        .assert(predicate::path::exists());
-    temp.child("migrations/20240228040146_AddCrons.down.sql")
-        .assert(predicate::path::exists());
-    temp.child("migrations/20250413182934_AddSessions.up.sql")
-        .assert(predicate::path::exists());
-    temp.child("migrations/20250413182934_AddSessions.down.sql")
-        .assert(predicate::path::exists());
+    // Framework migrations run at boot via cja::db::run_migrations — the
+    // generated migrations/ dir holds only .gitkeep.
+    assert_migrations_hold_only_gitkeep(temp.child("migrations").path());
 
     // Verify Cargo.toml was updated with [[bin]] section
     let cargo_content = fs::read_to_string(temp.child("Cargo.toml").path()).unwrap();
@@ -84,7 +93,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--bin-name", "web-server"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -122,17 +131,13 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--no-jobs"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
-    // Verify jobs migration was NOT created
-    temp.child("migrations/20231210151519_AddJobsTable.sql")
-        .assert(predicate::path::exists().not());
-
-    // Verify cron migrations were also NOT created (since cron depends on jobs)
-    temp.child("migrations/20240228040146_AddCrons.up.sql")
-        .assert(predicate::path::exists().not());
+    // Framework migrations run at boot via cja::db::run_migrations — no cja
+    // .sql files, with or without jobs.
+    assert_migrations_hold_only_gitkeep(temp.child("migrations").path());
 
     // Verify binary doesn't contain jobs code
     let binary_content = fs::read_to_string(temp.child("src/bin/test-project.rs").path()).unwrap();
@@ -160,19 +165,13 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--no-cron"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
-    // Verify cron migrations were NOT created
-    temp.child("migrations/20240228040146_AddCrons.up.sql")
-        .assert(predicate::path::exists().not());
-    temp.child("migrations/20240228040146_AddCrons.down.sql")
-        .assert(predicate::path::exists().not());
-
-    // But jobs migration should still exist
-    temp.child("migrations/20231210151519_AddJobsTable.sql")
-        .assert(predicate::path::exists());
+    // Framework migrations run at boot via cja::db::run_migrations — no cja
+    // .sql files, with or without cron.
+    assert_migrations_hold_only_gitkeep(temp.child("migrations").path());
 
     // Verify binary doesn't contain cron code
     let binary_content = fs::read_to_string(temp.child("src/bin/test-project.rs").path()).unwrap();
@@ -200,15 +199,13 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--no-sessions"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
-    // Verify session migrations were NOT created
-    temp.child("migrations/20250413182934_AddSessions.up.sql")
-        .assert(predicate::path::exists().not());
-    temp.child("migrations/20250413182934_AddSessions.down.sql")
-        .assert(predicate::path::exists().not());
+    // Framework migrations run at boot via cja::db::run_migrations — no cja
+    // .sql files, with or without sessions.
+    assert_migrations_hold_only_gitkeep(temp.child("migrations").path());
 
     // Verify binary doesn't contain session code
     let binary_content = fs::read_to_string(temp.child("src/bin/test-project.rs").path()).unwrap();
@@ -236,19 +233,15 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.args(["init", "--no-jobs", "--no-cron", "--no-sessions"])
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success()
         .stderr(predicate::str::contains("--no-jobs implies --no-cron"));
 
-    // Verify NO migrations were created
+    // Verify migrations dir holds only .gitkeep
     let migrations_dir = temp.child("migrations");
     migrations_dir.assert(predicate::path::is_dir());
-
-    // Check that the directory is empty or only has minimal files
-    let entries = fs::read_dir(migrations_dir.path()).unwrap();
-    let count = entries.count();
-    assert_eq!(count, 0, "Expected no migration files but found {count}");
+    assert_migrations_hold_only_gitkeep(migrations_dir.path());
 }
 
 #[test]
@@ -305,7 +298,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
@@ -345,7 +338,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
@@ -387,7 +380,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(temp.child("my-app").path())
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
@@ -445,7 +438,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
@@ -479,7 +472,7 @@ edition = "2021"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
@@ -487,9 +480,13 @@ edition = "2021"
     temp.child("migrations/existing.sql")
         .assert(predicate::path::exists());
 
-    // And new migrations are added
-    temp.child("migrations/20231210151519_AddJobsTable.sql")
-        .assert(predicate::path::exists());
+    // And no cja migration copies are added (framework migrations run at
+    // boot via cja::db::run_migrations)
+    let entries = fs::read_dir(temp.child("migrations").path()).unwrap();
+    let names: Vec<String> = entries
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["existing.sql".to_string()]);
 }
 
 #[test]
@@ -518,7 +515,7 @@ test-case = "3.0"
     let mut cmd = Command::cargo_bin("cja").unwrap();
     cmd.arg("init")
         .current_dir(&temp)
-        .timeout(std::time::Duration::from_mins(2))
+        .timeout(INIT_TIMEOUT)
         .assert()
         .success();
 
