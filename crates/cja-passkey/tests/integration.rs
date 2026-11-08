@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use axum::body::Body;
+use cja::server::session::SESSION_COOKIE_NAME;
 use cja_passkey::config::HasPasskeyConfig;
 use cja_passkey::session::{ChallengeState, PasskeySession};
 use cja_passkey::{PasskeyConfig, models};
@@ -79,18 +80,14 @@ fn make_router(state: TestAppState) -> axum::Router {
         .with_state(state)
 }
 
-/// Cookie name shared by the mint/read helpers below.
-/// Matches the framework's session cookie name.
-const SESSION_COOKIE: &str = "session_id";
-
 fn make_session_cookie(session_id: Uuid, key: &cja::server::cookies::CookieKey) -> String {
     let key = key.0.clone();
     let mut jar = tower_cookies::cookie::CookieJar::new();
     jar.private_mut(&key).add(tower_cookies::cookie::Cookie::new(
-        SESSION_COOKIE,
+        SESSION_COOKIE_NAME,
         session_id.to_string(),
     ));
-    jar.get(SESSION_COOKIE).unwrap().to_string()
+    jar.get(SESSION_COOKIE_NAME).unwrap().to_string()
 }
 
 /// Decrypt the session id from a response's `Set-Cookie` header, mirroring
@@ -103,10 +100,10 @@ fn set_cookie_session_id(
         .get_all(http::header::SET_COOKIE)
         .iter()
         .find_map(|v| v.to_str().ok())
-        .filter(|v| v.starts_with(&format!("{SESSION_COOKIE}=")))?;
+        .filter(|v| v.starts_with(&format!("{SESSION_COOKIE_NAME}=")))?;
     let mut jar = tower_cookies::cookie::CookieJar::new();
     jar.add_original(tower_cookies::cookie::Cookie::parse(raw.to_owned()).ok()?);
-    let decrypted = jar.private(&key.0).get(SESSION_COOKIE)?;
+    let decrypted = jar.private(&key.0).get(SESSION_COOKIE_NAME)?;
     Uuid::parse_str(decrypted.value()).ok()
 }
 

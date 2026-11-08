@@ -6,6 +6,29 @@ use crate::app_state::AppState;
 
 use super::cookies::CookieJar;
 
+/// Name of the framework session cookie.
+///
+/// The `__Host-` prefix means browsers only accept this cookie when it is set
+/// over HTTPS with `Path=/` and no `Domain` attribute, so a sibling subdomain
+/// cannot overwrite the victim's session cookie.
+pub const SESSION_COOKIE_NAME: &str = "__Host-session_id";
+
+/// Write the private session cookie for `session_id` into `jar`.
+///
+/// Private (encrypted with the app's [`AppState::cookie_key`]), `HttpOnly`,
+/// `Secure`, `Path=/`, `SameSite=Lax`, `__Host-` prefixed, and session-scoped
+/// (no `Max-Age`/`Expires`).
+pub fn save_session_cookie<A: AppState>(jar: &CookieJar<A>, session_id: uuid::Uuid) {
+    let cookie = tower_cookies::Cookie::build((SESSION_COOKIE_NAME, session_id.to_string()))
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(tower_cookies::cookie::SameSite::Lax)
+        .expires(None);
+
+    jar.add(cookie.into());
+}
+
 /// Core session data that all sessions must contain.
 ///
 /// This struct represents the minimal session information stored in the database.
@@ -36,18 +59,6 @@ pub struct CJASession {
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Timestamp when the session was first created
     pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl CJASession {
-    fn save_cookie<A: AppState>(&self, jar: &CookieJar<A>) {
-        let cookie = tower_cookies::Cookie::build(("session_id", self.session_id.to_string()))
-            .path("/")
-            .http_only(true)
-            .secure(true)
-            .expires(None);
-
-        jar.add(cookie.into());
-    }
 }
 
 // #[async_trait::async_trait]
@@ -344,7 +355,7 @@ impl<A: AppState + Send + Sync, S: AppSession + Send + Sync> FromRequestParts<A>
                 .map(Session)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            session.0.inner().save_cookie(cookies);
+            save_session_cookie(cookies, session.0.inner().session_id);
 
             Ok(session)
         }
@@ -353,7 +364,7 @@ impl<A: AppState + Send + Sync, S: AppSession + Send + Sync> FromRequestParts<A>
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let Some(session_cookie) = cookies.get("session_id") else {
+        let Some(session_cookie) = cookies.get(SESSION_COOKIE_NAME) else {
             return create_session(state, &cookies).await;
         };
 
