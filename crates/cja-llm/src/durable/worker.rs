@@ -306,8 +306,8 @@ impl Durable {
         }
 
         // Unknown kind is permanent: every retry would re-read the same row
-        // forever (and eventually dead-letter the job, orphaning the run).
-        // Fail the run, complete the job.
+        // forever (and, past the unknown-name age limit, dead-letter the
+        // job, orphaning the run). Fail the run, complete the job.
         let Some(kind) = self.kind_named(&row.kind) else {
             let snap = RunSnapshot::from_row(&row);
             self.finish_run(

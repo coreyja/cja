@@ -13,8 +13,8 @@ use super::HasDurable;
 /// with `#[serde(default)]`, or old rows fail to deserialize and dead-letter
 /// on the first dispatch, orphaning their runs. Keep [`Self::NAME`] stable —
 /// renaming it strands in-flight rows as permanent `Unknown job type`s
-/// (released uncharged on a short delay, retried forever until an operator
-/// deletes the row).
+/// (released uncharged on an age-scaled delay — 30s, then hourly — and
+/// dead-lettered past 14 days).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdvanceRunJob {
     /// The run to advance.

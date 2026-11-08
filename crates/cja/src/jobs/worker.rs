@@ -206,11 +206,28 @@ const TICK_ERROR_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Maximum backoff duration between retries after consecutive tick failures.
 const TICK_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Delay before a job row whose name this binary does not know becomes
+/// Delay before a fresh job row whose name this binary does not know becomes
 /// claimable again. Long enough to keep claim churn trivial during a rolling
 /// deploy, short enough that a binary which knows the name picks it up
-/// promptly.
+/// promptly. Rows older than [`UNKNOWN_JOB_SLOW_AFTER`] use
+/// [`UNKNOWN_JOB_SLOW_RELEASE_DELAY`] instead.
 const UNKNOWN_JOB_RELEASE_DELAY: Duration = Duration::from_secs(30);
+
+/// Row age at which an unknown-name release slows from
+/// [`UNKNOWN_JOB_RELEASE_DELAY`] to [`UNKNOWN_JOB_SLOW_RELEASE_DELAY`], so
+/// rows a rolling deploy cannot pick up stop cycling every 30 seconds.
+const UNKNOWN_JOB_SLOW_AFTER: Duration = Duration::from_hours(1);
+
+/// Release delay for an unknown-name row at least [`UNKNOWN_JOB_SLOW_AFTER`]
+/// old. Bounds aggregate claim churn from long-lived unknown rows to roughly
+/// one claim per row per hour.
+const UNKNOWN_JOB_SLOW_RELEASE_DELAY: Duration = Duration::from_hours(1);
+
+/// Row age past which an unknown-name row is dead-lettered on its next
+/// dispatch. `created_at` is row age, not time spent unknown, so the limit is
+/// generous — the same order as the ~12-day ladder a permanent dispatch
+/// error used to climb.
+const UNKNOWN_JOB_MAX_AGE: Duration = Duration::from_hours(24 * 14);
 
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
@@ -417,8 +434,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         };
         // The body and all heartbeat futures have ended before finalization.
         if let Err(error) = job_result {
+            let error_message = format!("{error:#}");
             // Ordered before the max-retries check so a cooperative shutdown
-            // never escalates toward dead-letter: yields release uncharged.
+            // or an unknown-name release never escalates toward dead-letter.
             if error.downcast_ref::<JobYield>().is_some() {
                 let result = sqlx::query(
                     "UPDATE jobs SET locked_by = NULL, locked_at = NULL
@@ -437,29 +455,48 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 return Ok(RunJobOutcome::Released(job.job_id));
             }
             if error.downcast_ref::<UnknownJobType>().is_some() {
+                // Age-scaled release, evaluated on the DB clock in the same
+                // UPDATE as the release: 30s while the row is under
+                // UNKNOWN_JOB_SLOW_AFTER old, hourly after that, and no match
+                // (dead-letter below) past UNKNOWN_JOB_MAX_AGE.
                 let result = sqlx::query(
                     "UPDATE jobs SET locked_by = NULL, locked_at = NULL,
-                     run_at = NOW() + $3::bigint * interval '1 microsecond'
-                     WHERE job_id = $1 AND locked_by = $2",
+                     run_at = NOW() + CASE
+                       WHEN created_at > NOW() - $4::double precision * interval '1 second'
+                       THEN $3::double precision * interval '1 second'
+                       ELSE $5::double precision * interval '1 second' END
+                     WHERE job_id = $1 AND locked_by = $2
+                       AND created_at > NOW() - $6::double precision * interval '1 second'",
                 )
                 .bind(job.job_id)
                 .bind(&self.owner_token)
-                .bind(
-                    i64::try_from(UNKNOWN_JOB_RELEASE_DELAY.as_micros())
-                        .expect("30s fits in i64 micros"),
-                )
+                .bind(UNKNOWN_JOB_RELEASE_DELAY.as_secs_f64())
+                .bind(UNKNOWN_JOB_SLOW_AFTER.as_secs_f64())
+                .bind(UNKNOWN_JOB_SLOW_RELEASE_DELAY.as_secs_f64())
+                .bind(UNKNOWN_JOB_MAX_AGE.as_secs_f64())
                 .execute(self.state.db())
                 .await?;
                 if result.rows_affected() != 1 {
-                    tracing::warn!(job_id = %job.job_id, "Unknown-job release lost ownership");
-                    return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                    // Zero rows: ownership was lost, or the row is past
+                    // UNKNOWN_JOB_MAX_AGE. dead_letter_owned re-checks
+                    // ownership under FOR UPDATE, so a lost lease stays a
+                    // LeaseLost and cannot dead-letter the new owner's row.
+                    let count = job
+                        .error_count
+                        .checked_add(1)
+                        .ok_or_else(|| color_eyre::eyre::eyre!("job error_count overflow"))?;
+                    if !self.dead_letter_owned(&job, count, &error_message).await? {
+                        tracing::warn!(job_id = %job.job_id, "Unknown-job release lost ownership");
+                        return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                    }
+                    tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
+                        "Job permanently failed - unknown job type past its age limit, moved to dead letter queue");
+                    return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
                 }
                 tracing::warn!(job_id = %job.job_id, name = %job.name,
-                    retry_in_secs = UNKNOWN_JOB_RELEASE_DELAY.as_secs(),
-                    "Unknown job type for this binary; released uncharged with a short delay");
+                    "Unknown job type for this binary; released uncharged with an age-scaled delay");
                 return Ok(RunJobOutcome::Released(job.job_id));
             }
-            let error_message = format!("{error:#}");
             if error.downcast_ref::<InvalidJobPayload>().is_some() {
                 let count = job
                     .error_count
@@ -469,7 +506,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     return Ok(RunJobOutcome::LeaseLost(job.job_id));
                 }
                 tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
-                    "Job payload is not deserializable - moved to dead letter queue without retries");
+                    "Job permanently failed - payload is not deserializable, moved to dead letter queue without retries");
                 return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
             }
             if job.error_count >= self.max_retries {
@@ -772,8 +809,10 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// - Any currently executing job gets a bounded drain to complete
 /// - A cooperative body may return `Err(JobYield::new(...).into())` inside
 ///   that drain to have its row released uncharged
-/// - Rows whose `name` this binary does not know are released uncharged with
-///   a short delay instead of being charged and retried
+/// - Rows whose `name` this binary does not know are released uncharged on
+///   an age-scaled delay (30s for the first hour of the row's life, hourly
+///   after that, dead-letter past 14 days) instead of being charged and
+///   retried
 /// - Remaining owned locks are released after the drain without charging an attempt
 ///
 /// # Transient Error Resilience
@@ -1846,14 +1885,75 @@ mod tests {
         );
     }
 
-    /// Direct path (no worker loop): the yield branch itself unlocks the row —
-    /// `cleanup_worker_locks` never runs here, so the unlock can only have
-    /// come from the yield intercept, and the outcome must be `Released`.
+    /// Direct path (no worker loop): a cooperative yield whose lock was
+    /// stolen by another owner must not unlock the new owner's row.
     #[sqlx::test]
     async fn test_yield_release_is_owner_guarded(db: sqlx::PgPool) {
         let state = test_state(db.clone());
         YieldingJob
             .enqueue(state.clone(), "yield-owner-guard-test".into(), None)
+            .await
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let worker = std::sync::Arc::new(
+            Worker::new(
+                state,
+                Jobs,
+                Duration::from_millis(20),
+                20,
+                token.clone(),
+                JobWorkerConfig::default(),
+            )
+            .unwrap(),
+        );
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        let job_id = claimed.job.job_id;
+        let runner = tokio::spawn({
+            let worker = std::sync::Arc::clone(&worker);
+            async move { worker.run_next_job(claimed).await }
+        });
+        wait_until_started(&db, YieldingJob::NAME).await;
+        // Steal the lease: the yield's release must not touch the new
+        // owner's row.
+        sqlx::query("UPDATE jobs SET locked_by = 'new-owner' WHERE job_id = $1")
+            .bind(job_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, RunJobOutcome::LeaseLost(id) if id == job_id));
+        let row: (Option<String>, i32) =
+            sqlx::query_as("SELECT locked_by, error_count FROM jobs WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some("new-owner"),
+            "the new owner keeps the row"
+        );
+        assert_eq!(row.1, 0);
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0);
+    }
+
+    /// Direct path (no worker loop, so `cleanup_worker_locks` never runs):
+    /// the row's unlock can only have come from the yield intercept itself.
+    #[sqlx::test]
+    async fn test_yield_release_unlocks_via_the_yield_branch(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        YieldingJob
+            .enqueue(state.clone(), "yield-unlock-test".into(), None)
             .await
             .unwrap();
 
@@ -1896,9 +1996,64 @@ mod tests {
         assert_eq!(row.1, 0);
     }
 
+    /// Pin the intercept ordering: a yielding row already at `max_retries`
+    /// is released uncharged, never dead-lettered.
+    #[sqlx::test]
+    async fn test_yield_at_max_retries_releases_without_dead_lettering(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        YieldingJob
+            .enqueue(state.clone(), "yield-max-retries-test".into(), None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET error_count = 20 WHERE name = $1")
+            .bind(YieldingJob::NAME)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let worker = std::sync::Arc::new(
+            Worker::new(
+                state,
+                Jobs,
+                Duration::from_millis(20),
+                20,
+                token.clone(),
+                JobWorkerConfig::default(),
+            )
+            .unwrap(),
+        );
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        let job_id = claimed.job.job_id;
+        let runner = tokio::spawn({
+            let worker = std::sync::Arc::clone(&worker);
+            async move { worker.run_next_job(claimed).await }
+        });
+        wait_until_started(&db, YieldingJob::NAME).await;
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, RunJobOutcome::Released(id) if id == job_id));
+        let error_count: i32 = sqlx::query_scalar("SELECT error_count FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(error_count, 20, "the yield must not change error_count");
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0, "a yield never dead-letters");
+    }
+
     /// An unknown job name (rolling deploy: a newer binary enqueued a type
     /// this one predates) is released uncharged with a short delay instead of
-    /// climbing the retry ladder toward a dead-letter.
+    /// climbing the retry ladder toward a dead-letter. The delay is asserted
+    /// against the DB clock: a 1s delay would fail the 20s lower bound.
     #[sqlx::test]
     async fn test_unknown_job_name_releases_uncharged_with_delay(db: sqlx::PgPool) {
         let job_id = uuid::Uuid::new_v4();
@@ -1927,13 +2082,9 @@ mod tests {
         let outcome = worker.run_next_job(claimed).await.unwrap();
         assert!(matches!(outcome, RunJobOutcome::Released(id) if id == job_id));
 
-        let row: (
-            Option<String>,
-            i32,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-        ) = sqlx::query_as(
-            "SELECT locked_by, error_count, last_error_message, run_at
+        let row: (Option<String>, i32, Option<String>, f64) = sqlx::query_as(
+            "SELECT locked_by, error_count, last_error_message,
+                    EXTRACT(EPOCH FROM run_at - NOW())::double precision
              FROM jobs WHERE job_id = $1",
         )
         .bind(job_id)
@@ -1944,9 +2095,275 @@ mod tests {
         assert_eq!(row.1, 0, "unknown name must not charge an attempt");
         assert!(row.2.is_none());
         assert!(
-            row.3 > chrono::Utc::now(),
-            "unknown name must back off ~30s (run_at = {:?})",
+            (20.0..=31.0).contains(&row.3),
+            "a fresh unknown row must back off ~30s, got {}s",
             row.3
+        );
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0);
+    }
+
+    /// An unknown-name row older than an hour is released on the hourly
+    /// delay, still uncharged: rows a rolling deploy cannot pick up stop
+    /// cycling every 30 seconds.
+    #[sqlx::test]
+    async fn test_unknown_job_name_old_row_releases_hourly(db: sqlx::PgPool) {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+             VALUES ($1, 'NoSuchJob', '{}', 0, NOW(), NOW() - interval '2 hours', 'unknown-old-test')",
+        )
+        .bind(job_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.job_id, job_id);
+
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(matches!(outcome, RunJobOutcome::Released(id) if id == job_id));
+
+        let row: (Option<String>, i32, Option<String>, f64) = sqlx::query_as(
+            "SELECT locked_by, error_count, last_error_message,
+                    EXTRACT(EPOCH FROM run_at - NOW())::double precision
+             FROM jobs WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(row.0.is_none());
+        assert_eq!(row.1, 0, "an old unknown row is still not charged");
+        assert!(row.2.is_none());
+        assert!(
+            (59.0 * 60.0..=61.0 * 60.0).contains(&row.3),
+            "an unknown row older than 1h must back off ~1h, got {}s",
+            row.3
+        );
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0);
+    }
+
+    /// An unknown-name row past the 14-day age limit dead-letters on its
+    /// first sighting instead of cycling forever.
+    #[sqlx::test]
+    async fn test_unknown_job_name_past_age_limit_dead_letters(db: sqlx::PgPool) {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+             VALUES ($1, 'NoSuchJob', '{}', 0, NOW(), NOW() - interval '15 days', 'unknown-aged-test')",
+        )
+        .bind(job_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.job_id, job_id);
+
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(
+            matches!(&outcome, RunJobOutcome::Completed(Err(_))),
+            "an unknown row past its age limit must dead-letter"
+        );
+
+        let row: (i32, String) = sqlx::query_as(
+            "SELECT error_count, last_error_message FROM dead_letter_jobs
+             WHERE original_job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0, 1,
+            "an unknown row past its age limit dead-letters on the first sighting"
+        );
+        assert!(row.1.contains("Unknown job type"), "{}", row.1);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0, "job row must be deleted after dead-lettering");
+    }
+
+    /// The age-limit dead-letter is owner-guarded: with the lease stolen
+    /// before dispatch, the zero-row release must stay a `LeaseLost` and
+    /// must not dead-letter the new owner's row.
+    #[sqlx::test]
+    async fn test_unknown_job_name_age_dead_letter_is_owner_guarded(db: sqlx::PgPool) {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+             VALUES ($1, 'NoSuchJob', '{}', 0, NOW(), NOW() - interval '15 days', 'unknown-aged-steal-test')",
+        )
+        .bind(job_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.job_id, job_id);
+        sqlx::query("UPDATE jobs SET locked_by = 'new-owner' WHERE job_id = $1")
+            .bind(job_id)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(matches!(outcome, RunJobOutcome::LeaseLost(id) if id == job_id));
+
+        let row: (Option<String>, i32) =
+            sqlx::query_as("SELECT locked_by, error_count FROM jobs WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some("new-owner"),
+            "the new owner keeps the row"
+        );
+        assert_eq!(row.1, 0);
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0, "a stolen row must not be dead-lettered");
+    }
+
+    /// Fresh-row unknown-name release is owner-guarded: with the lease stolen
+    /// between claim and dispatch, the release must not touch the new
+    /// owner's row.
+    #[sqlx::test]
+    async fn test_unknown_job_release_is_owner_guarded(db: sqlx::PgPool) {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+             VALUES ($1, 'NoSuchJob', '{}', 0, NOW(), NOW(), 'unknown-steal-test')",
+        )
+        .bind(job_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.job_id, job_id);
+        sqlx::query("UPDATE jobs SET locked_by = 'new-owner' WHERE job_id = $1")
+            .bind(job_id)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(matches!(outcome, RunJobOutcome::LeaseLost(id) if id == job_id));
+
+        let row: (Option<String>, i32) =
+            sqlx::query_as("SELECT locked_by, error_count FROM jobs WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some("new-owner"),
+            "the release must not touch the new owner's row"
+        );
+        assert_eq!(row.1, 0);
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0);
+    }
+
+    /// Pin the intercept ordering: an unknown-name row already at
+    /// `max_retries` is released uncharged, never dead-lettered by the
+    /// ordinary max-retries check.
+    #[sqlx::test]
+    async fn test_unknown_name_at_max_retries_releases_without_dead_lettering(db: sqlx::PgPool) {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
+             VALUES ($1, 'NoSuchJob', '{}', 0, NOW(), NOW(), 'unknown-max-retries-test', 20)",
+        )
+        .bind(job_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.job_id, job_id);
+
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(matches!(outcome, RunJobOutcome::Released(id) if id == job_id));
+
+        let row: (i32, f64) = sqlx::query_as(
+            "SELECT error_count, EXTRACT(EPOCH FROM run_at - NOW())::double precision
+             FROM jobs WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(row.0, 20, "the release must not change error_count");
+        assert!(
+            (20.0..=31.0).contains(&row.1),
+            "a fresh unknown row still gets the 30s delay, got {}s",
+            row.1
         );
         let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
             .fetch_one(&db)

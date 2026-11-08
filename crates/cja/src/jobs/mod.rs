@@ -74,9 +74,10 @@
 //! With `max_retries = N`, a job can execute N+1 times. Returned errors,
 //! caught handler panics, and expired leases each count as a failed attempt.
 //! A [`JobYield`] error releases the row uncharged; an unknown job name is
-//! released uncharged with a short delay; an undeserializable payload is
-//! dead-lettered on first dispatch. The final incremented count is stored in
-//! `dead_letter_jobs`.
+//! released uncharged on an age-scaled delay (30s for the first hour of the
+//! row's life, hourly after that, dead-letter past 14 days); an
+//! undeserializable payload is dead-lettered on first dispatch. The final
+//! incremented count is stored in `dead_letter_jobs`.
 //!
 //! # Idempotency
 //!
@@ -265,10 +266,11 @@ impl JobYield {
 
 /// The claimed job's `name` is not in this binary's registry — typically a
 /// newer binary enqueued a job type this one predates. Produced by
-/// [`crate::impl_job_registry!`]; the worker releases the row uncharged with
-/// a short delay so a binary that knows the name can claim it soon.
-/// Hand-written `JobRegistry` impls should return this from their fallback
-/// arm to get the same treatment.
+/// [`crate::impl_job_registry!`]; the worker releases the row uncharged on
+/// an age-scaled delay — 30s for the first hour of the row's life, hourly
+/// after that — so a binary that knows the name can claim it soon, and
+/// dead-letters the row past 14 days. Hand-written `JobRegistry` impls
+/// should return this from their fallback arm to get the same treatment.
 #[derive(Debug, Error)]
 #[error("Unknown job type: {0}")]
 pub struct UnknownJobType(pub String);
