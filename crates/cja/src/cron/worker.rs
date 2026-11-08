@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState as AS;
 
-use super::registry::{CronRegistry, recoverable};
+use super::registry::{CronRegistry, TickError, recoverable};
 
 /// Observable summary of one tick, for tests. `Worker::run` discards it;
 /// every failure inside a tick is logged, never propagated.
@@ -67,7 +67,9 @@ impl<AppState: AS> Worker<AppState> {
     ///
     /// Tick errors are logged, never propagated: a cron whose callback or
     /// claim fails does not end the loop, and the next tick runs normally.
-    /// `run` therefore returns only on shutdown.
+    /// `run` therefore returns only on shutdown. A panicking callback still
+    /// ends the process via the Supervisor — and, because the claim already
+    /// committed, recurs every interval.
     ///
     /// # Arguments
     ///
@@ -160,8 +162,16 @@ impl<AppState: AS> Worker<AppState> {
                 .await
             {
                 outcome.failed += 1;
+                let sqlstate = match &error {
+                    TickError::SqlxError(err) => err
+                        .as_database_error()
+                        .and_then(sqlx::error::DatabaseError::code),
+                    TickError::JobError(_) => None,
+                };
                 tracing::error!(
                     cron.name = job.name,
+                    cron_worker.id = %self.id,
+                    sqlstate = ?sqlstate,
                     cause = %error,
                     "Cron tick failed; continuing to next cron"
                 );

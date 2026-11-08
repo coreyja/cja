@@ -343,8 +343,9 @@ Callback registrations (`register` and `register_with_cron`) claim at most once
 per interval: the timestamp commits before invocation. A callback error is
 logged and the worker keeps running — the next interval fires without a
 restart. Process death still skips that interval; the next interval fires
-after restart. During a rollout, an older scheduler overlapping an upgraded
-one can still double-fire.
+after restart. A panicking callback still ends the process via the Supervisor —
+and, because the claim already committed, recurs every interval. During a
+rollout, an older scheduler overlapping an upgraded one can still double-fire.
 
 ### Running the Cron Worker
 
@@ -358,8 +359,9 @@ Worker::new_with_timezone(app_state, registry, chrono_tz::US::Eastern, Duration:
     .await;
 
 // Inside a `tasks::Supervisor`, whose tasks return `cja::Result<()>`:
+let token = shutdown.clone();
 supervisor.spawn("cron", async move {
-    worker.run(shutdown.clone()).await;
+    worker.run(token).await;
     Ok(())
 });
 ```

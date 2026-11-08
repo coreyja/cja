@@ -62,7 +62,10 @@ async fn callback_error_does_not_end_the_worker_or_stop_sibling_crons(pool: sqlx
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(!worker_task.is_finished(), "worker still running");
+    assert!(
+        !worker_task.is_finished(),
+        "worker ended after a callback error"
+    );
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(2), worker_task)

@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use cja::cron::{CronRegistry, Worker};
 use tokio::sync::Notify;
@@ -66,10 +72,24 @@ async fn check_active_cron_shutdown(pool: sqlx::PgPool, fail: bool) {
 #[sqlx::test]
 async fn already_cancelled_worker_does_not_start_a_tick(pool: sqlx::PgPool) {
     let state = crate::common::app::TestAppState::new(pool.clone());
-    // A tick would fail on this closed pool. A pre-cancelled worker should
-    // return without attempting database access or scheduling work.
-    pool.close().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = CronRegistry::new();
+    let seen = calls.clone();
+    registry.register("never_runs", None, Duration::from_millis(1), move |_, _| {
+        let seen = seen.clone();
+        Box::pin(async move {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), std::io::Error>(())
+        })
+    });
     let shutdown = CancellationToken::new();
     shutdown.cancel();
-    Worker::new(state, CronRegistry::new()).run(shutdown).await;
+    Worker::new(state, registry).run(shutdown).await;
+    // A pre-cancelled worker must not attempt a claim or run any callback.
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM crons")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, 0);
 }

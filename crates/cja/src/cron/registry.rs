@@ -1555,29 +1555,48 @@ mod test {
         };
         let failing_calls = Arc::new(AtomicUsize::new(0));
         let healthy_calls = Arc::new(AtomicUsize::new(0));
-        let mut registry = CronRegistry::new();
-        let failing_seen = failing_calls.clone();
-        registry.register("failing", None, Duration::from_millis(1), move |_, _| {
-            let failing_seen = failing_seen.clone();
-            Box::pin(async move {
-                failing_seen.fetch_add(1, Ordering::SeqCst);
-                Err::<(), std::io::Error>(std::io::Error::other("boom"))
-            })
-        });
-        let healthy_seen = healthy_calls.clone();
-        registry.register(
-            "healthy_sibling",
-            None,
-            Duration::from_millis(1),
-            move |_, _| {
-                let healthy_seen = healthy_seen.clone();
+
+        // `jobs` is a HashMap: iteration order is arbitrary. Gate on the
+        // failing cron iterating FIRST, so the loop under test cannot reach
+        // the sibling only by luck. Each `CronRegistry::new()` gets a fresh
+        // RandomState seed, so a rebuild re-rolls the order (~2 tries).
+        let mut first_is_failing = None;
+        for _ in 0..64 {
+            let mut candidate = CronRegistry::new();
+            let failing_seen = failing_calls.clone();
+            candidate.register("failing", None, Duration::from_millis(1), move |_, _| {
+                let failing_seen = failing_seen.clone();
                 Box::pin(async move {
-                    healthy_seen.fetch_add(1, Ordering::SeqCst);
-                    Ok::<(), std::io::Error>(())
+                    failing_seen.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), std::io::Error>(std::io::Error::other("boom"))
                 })
-            },
-        );
-        let outcome = crate::cron::Worker::new(state, registry).tick().await;
+            });
+            let healthy_seen = healthy_calls.clone();
+            candidate.register(
+                "healthy_sibling",
+                None,
+                Duration::from_millis(1),
+                move |_, _| {
+                    let healthy_seen = healthy_seen.clone();
+                    Box::pin(async move {
+                        healthy_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), std::io::Error>(())
+                    })
+                },
+            );
+            if candidate.jobs.keys().next() == Some(&"failing") {
+                first_is_failing = Some(candidate);
+                break;
+            }
+        }
+        let registry =
+            first_is_failing.expect("no ordering put the failing cron first in 64 attempts");
+
+        let capture = EventCapture::default();
+        let outcome = crate::cron::Worker::new(state, registry)
+            .tick()
+            .with_subscriber(capture.dispatch())
+            .await;
         assert_eq!(
             outcome,
             TickOutcome {
@@ -1595,6 +1614,50 @@ mod test {
                 .unwrap(),
             2
         );
+        // Exactly one ERROR from the worker names the failing cron. Assert
+        // level, target and field — not the message text.
+        let failing_errors = capture
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.target == "cja::cron::worker"
+                    && event.level == tracing::Level::ERROR
+                    && event.fields.get("cron.name").map(String::as_str) == Some("failing")
+            })
+            .count();
+        assert_eq!(failing_errors, 1);
+    }
+
+    #[sqlx::test]
+    async fn unreadable_crons_map_skips_the_whole_tick(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        sqlx::query("DROP TABLE crons").execute(&db).await.unwrap();
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = CronRegistry::new();
+        let seen = calls.clone();
+        registry.register("probe", None, Duration::from_millis(1), move |_, _| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), std::io::Error>(())
+            })
+        });
+        let outcome = crate::cron::Worker::new(state, registry).tick().await;
+        assert_eq!(
+            outcome,
+            TickOutcome {
+                map_read_failed: true,
+                ..TickOutcome::default()
+            }
+        );
+        // The whole tick is skipped: no callback runs while the map is unreadable.
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
