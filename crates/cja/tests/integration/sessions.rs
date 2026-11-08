@@ -178,7 +178,10 @@ async fn session_cookie_is_host_prefixed_lax_and_private() {
     let set_cookie = response.headers()[http::header::SET_COOKIE]
         .to_str()
         .unwrap();
-    assert!(set_cookie.starts_with("__Host-session_id="), "got: {set_cookie}");
+    assert!(
+        set_cookie.starts_with("__Host-session_id="),
+        "got: {set_cookie}"
+    );
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("Secure"));
     assert!(set_cookie.contains("Path=/"));
