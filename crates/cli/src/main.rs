@@ -520,6 +520,10 @@ fn create_project(
     println!("  cd {project_name}");
     println!("  export DATABASE_URL=postgres:///...   # any PostgreSQL database");
     println!("  cargo run");
+    println!(
+        "\ncja and your app share the `_sqlx_migrations` table; if you use the \
+         sqlx CLI on this database, pass `--ignore-missing`."
+    );
 
     Ok(())
 }
@@ -604,7 +608,24 @@ fn init_project(
 
     // Create migrations directory if it doesn't exist
     let migrations_dir = Path::new("migrations");
-    if !migrations_dir.exists() {
+    if migrations_dir.exists() {
+        // A pre-existing migrations dir is kept as-is (init never edits the
+        // app's own migrations), but warn about the sharing hazard.
+        let has_sql_files = fs::read_dir(migrations_dir)
+            .context("Failed to read migrations directory")?
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "sql"));
+        if has_sql_files {
+            eprintln!(
+                "Warning: migrations/ already holds .sql files. Once the CJA binary first \
+                 boots, cja's rows are in `_sqlx_migrations` and any OTHER migrator on this \
+                 database fails with `VersionMissing`: the project's existing binary running \
+                 plain `sqlx::migrate!().run()`, or `sqlx migrate run` without \
+                 `--ignore-missing`. Those migrators need `set_ignore_missing(true)` or \
+                 `--ignore-missing`."
+            );
+        }
+    } else {
         fs::create_dir(migrations_dir).context("Failed to create migrations directory")?;
         fs::write(migrations_dir.join(".gitkeep"), "")
             .context("Failed to write migrations/.gitkeep")?;
@@ -1172,7 +1193,7 @@ fn generate_run_application(no_jobs: bool, no_cron: bool) -> String {
     let mut tasks = String::from(
         r#"
 async fn run_application() -> cja::Result<()> {
-    let _eyes_handle = setup_tracing("cja-site")?;
+    let _eyes_handle = setup_tracing(env!("CARGO_CRATE_NAME"))?;
 
     let app_state = AppState::from_env().await?;
 
@@ -1247,7 +1268,8 @@ mod jobs {
     use cja::jobs::Job;
     use serde::{Deserialize, Serialize};
 
-    /// Example job: enqueued by the cron scheduler below.
+    /// Example job. With cron enabled, the cron module below enqueues it
+    /// every minute.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ExampleJob {
         pub message: String,

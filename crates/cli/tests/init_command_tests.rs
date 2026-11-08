@@ -11,13 +11,20 @@ const INIT_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// The new scaffold contract: `migrations/` holds the app's own migrations
 /// only. cja's framework migrations run at boot via `cja::db::run_migrations`,
-/// so no cja `.sql` files are ever copied into an initialized project.
+/// so no cja `.sql` files are ever copied into an initialized project. The
+/// entry list must be exactly `[".gitkeep"]` — an empty dir would pass a
+/// per-entry check vacuously.
 fn assert_migrations_hold_only_gitkeep(migrations: &Path) {
-    let entries = fs::read_dir(migrations).unwrap();
-    for entry in entries {
-        let name = entry.unwrap().file_name().into_string().unwrap();
-        assert_eq!(name, ".gitkeep", "unexpected file in migrations/: {name}");
-    }
+    let mut names: Vec<String> = fs::read_dir(migrations)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![".gitkeep".to_string()],
+        "migrations/ must contain exactly .gitkeep"
+    );
 }
 
 #[test]
@@ -69,6 +76,17 @@ edition = "2021"
     assert!(cargo_content.contains("[[bin]]"));
     assert!(cargo_content.contains("name = \"test-project\""));
     assert!(cargo_content.contains("path = \"src/bin/test-project.rs\""));
+
+    // The default cja dependency is a git one on the canonical repo's main
+    // branch — exactly the line `cargo add cja --git ... --branch main`
+    // writes (there is no usable crates.io release; cargo add appends the
+    // version it reads from the git repo's manifest).
+    assert!(
+        cargo_content.contains(
+            r#"cja = { git = "https://github.com/coreyja/cja", branch = "main", version = "0.0.0" }"#
+        ),
+        "unexpected cja dependency line:\n{cargo_content}"
+    );
 }
 
 #[test]

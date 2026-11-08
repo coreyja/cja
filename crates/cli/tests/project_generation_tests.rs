@@ -5,13 +5,20 @@ use std::path::Path;
 
 /// The new scaffold contract: `migrations/` holds the app's own migrations
 /// only. cja's framework migrations run at boot via `cja::db::run_migrations`,
-/// so no cja `.sql` files are ever copied into a generated project.
+/// so no cja `.sql` files are ever copied into a generated project. The
+/// entry list must be exactly `[".gitkeep"]` — an empty dir would pass a
+/// per-entry check vacuously.
 fn assert_migrations_hold_only_gitkeep(migrations: &Path) {
-    let entries = std::fs::read_dir(migrations).unwrap();
-    for entry in entries {
-        let name = entry.unwrap().file_name().into_string().unwrap();
-        assert_eq!(name, ".gitkeep", "unexpected file in migrations/: {name}");
-    }
+    let mut names: Vec<String> = std::fs::read_dir(migrations)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![".gitkeep".to_string()],
+        "migrations/ must contain exactly .gitkeep"
+    );
 }
 
 #[test]

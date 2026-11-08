@@ -38,7 +38,17 @@
 ///
 /// Tolerates foreign rows in `_sqlx_migrations` (your app's own migrations,
 /// or those of sibling crates like `cja-passkey`), so this composes with
-/// other migrators over the same table — see "App migrations" below.
+/// other migrators over the same table — see the module-level docs
+/// ("App migrations").
+///
+/// Two protections are traded away for that tolerance: rows recorded by a
+/// NEWER cja are also ignored, so booting an older binary against a database
+/// migrated by a newer cja is no longer refused at boot (the older binary
+/// simply leaves the newer rows alone); and a deleted cja migration (a
+/// version recorded in the database whose file was removed from
+/// `crates/cja/migrations/`) is no longer detected. Checksum verification for
+/// versions both sides know still applies, so an edited copy of a cja
+/// migration still fails loudly.
 pub async fn run_migrations(db_pool: &sqlx::PgPool) -> crate::Result<()> {
     let mut migrator = sqlx::migrate!("./migrations");
     migrator.set_ignore_missing(true);

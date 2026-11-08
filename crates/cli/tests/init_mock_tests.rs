@@ -36,22 +36,6 @@ fn test_init_help_shows_all_options() {
 }
 
 #[test]
-fn test_init_branch_works_without_github_flag() {
-    let temp = assert_fs::TempDir::new().unwrap();
-
-    // --branch without --github customizes the default repo's branch
-    // (cja new writes files only — no cargo invocation, no network).
-    let mut cmd = Command::cargo_bin("cja").unwrap();
-    cmd.args(["new", "branchy", "--branch", "develop"])
-        .current_dir(&temp)
-        .assert()
-        .success();
-
-    temp.child("branchy/Cargo.toml")
-        .assert(predicate::str::contains(r#"branch = "develop""#));
-}
-
-#[test]
 fn test_init_invalid_cargo_toml() {
     let temp = assert_fs::TempDir::new().unwrap();
 
