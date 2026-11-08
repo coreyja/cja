@@ -340,20 +340,32 @@ crash before commit rolls everything back, so the next tick retries. Job
 execution remains at-least-once under worker lease and retry semantics.
 
 Callback registrations (`register` and `register_with_cron`) claim at most once
-per interval: the timestamp commits before invocation. A callback error or
-process death skips that interval; the next interval fires normally. During a
-rollout, an older scheduler overlapping an upgraded one can still double-fire.
+per interval: the timestamp commits before invocation. A callback error is
+logged and the worker keeps running — the next interval fires without a
+restart. Process death still skips that interval; the next interval fires
+after restart. A panicking callback is not caught: under the Supervisor it
+ends the process. Its claim has already committed, so the restart does not
+retry it immediately, but a callback that always panics ends the process
+again each interval. During a rollout, an older scheduler overlapping an
+upgraded one can still double-fire.
 
 ### Running the Cron Worker
 
 ```rust
 // Default: UTC timezone, 60-second poll interval
-Worker::new(app_state, registry).run(shutdown_token).await?;
+Worker::new(app_state, registry).run(shutdown_token).await;
 
 // Custom timezone and poll interval
 Worker::new_with_timezone(app_state, registry, chrono_tz::US::Eastern, Duration::from_secs(10))
     .run(shutdown_token)
-    .await?;
+    .await;
+
+// Inside a `tasks::Supervisor`, whose tasks return `cja::Result<()>`:
+let token = shutdown.clone();
+supervisor.spawn("cron", async move {
+    worker.run(token).await;
+    Ok(())
+});
 ```
 
 Note: `Worker::new()` uses a 60-second poll interval with UTC. The only way to customize the poll interval is `Worker::new_with_timezone()` — there is no `new_with_interval()` method.

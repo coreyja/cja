@@ -1,4 +1,6 @@
 #[cfg(feature = "cron")]
+mod cron_resilience;
+#[cfg(feature = "cron")]
 mod cron_shutdown;
 #[cfg(feature = "jobs")]
 mod job_telemetry;

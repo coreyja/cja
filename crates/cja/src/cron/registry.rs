@@ -295,10 +295,10 @@ fn recoverable_sqlstate(code: &str) -> bool {
 }
 
 #[cfg(feature = "jobs")]
-fn recoverable(error: &sqlx::Error) -> bool {
+pub(super) fn recoverable(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(db) => db.code().is_some_and(|code| recoverable_sqlstate(&code)),
-        sqlx::Error::Io(_) | sqlx::Error::PoolClosed => true,
+        sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::PoolTimedOut => true,
         _ => false,
     }
 }
@@ -750,6 +750,7 @@ impl<AppState: AS> Default for CronRegistry<AppState> {
 #[cfg(test)]
 mod test {
     use crate::app_state::AppState;
+    use crate::cron::worker::TickOutcome;
     use crate::server::cookies::CookieKey;
     use std::fmt::Write;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -1051,8 +1052,8 @@ mod test {
                 },
                 barrier.wait(),
             );
-            a.unwrap();
-            b.unwrap();
+            assert_eq!(a, TickOutcome::default());
+            assert_eq!(b, TickOutcome::default());
         };
         pair().await;
         assert_eq!(count().await, 1);
@@ -1124,8 +1125,8 @@ mod test {
                 },
                 barrier.wait(),
             );
-            a.unwrap();
-            b.unwrap();
+            assert_eq!(a, TickOutcome::default());
+            assert_eq!(b, TickOutcome::default());
             let actual = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
                 .bind(TestJob::NAME)
                 .fetch_one(&db)
@@ -1168,8 +1169,8 @@ mod test {
                     .execute(&db).await.unwrap();
             }
             let (a, b) = tokio::join!(first.tick(), second.tick());
-            a.unwrap();
-            b.unwrap();
+            assert_eq!(a, TickOutcome::default());
+            assert_eq!(b, TickOutcome::default());
             assert_eq!(calls.load(Ordering::SeqCst), expected);
             println!(
                 "callback interval {expected}: {} invocation(s)",
@@ -1232,7 +1233,10 @@ mod test {
                 Ok::<(), std::io::Error>(())
             })
         });
-        crate::cron::Worker::new(state, retry).tick().await.unwrap();
+        assert_eq!(
+            crate::cron::Worker::new(state, retry).tick().await,
+            TickOutcome::default()
+        );
         assert_eq!(remaining.load(Ordering::SeqCst), 1);
         println!("aborted callback: first interval skipped; next interval invoked once");
     }
@@ -1260,7 +1264,7 @@ mod test {
             0
         );
         let worker = crate::cron::Worker::new(state.clone(), registry);
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
                 .fetch_one(&db)
@@ -1279,10 +1283,10 @@ mod test {
             .unwrap()
             .unwrap();
         drop(claim);
-        crate::cron::Worker::new(state, registry)
-            .tick()
-            .await
-            .unwrap();
+        assert_eq!(
+            crate::cron::Worker::new(state, registry).tick().await,
+            TickOutcome::default()
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
                 .fetch_one(&db)
@@ -1301,10 +1305,10 @@ mod test {
         let mut registry = CronRegistry::new();
         registry.register_job(TestJob, None, Duration::from_secs(864));
         let worker = crate::cron::Worker::new(state, registry);
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
         sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '862 seconds' WHERE name = $1")
             .bind(TestJob::NAME).execute(&db).await.unwrap();
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
                 .fetch_one(&db)
@@ -1318,7 +1322,7 @@ mod test {
             .fetch_one(&db)
             .await
             .unwrap();
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
         let after = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
             .fetch_one(&db)
             .await
@@ -1358,10 +1362,12 @@ mod test {
             .fetch_one(&mut *blocker)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), worker.tick())
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), worker.tick())
+                .await
+                .unwrap(),
+            TickOutcome::default()
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
                 .bind(SecondTestJob::NAME)
@@ -1379,7 +1385,7 @@ mod test {
             0
         );
         blocker.rollback().await.unwrap();
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
                 .bind(TestJob::NAME)
@@ -1399,10 +1405,12 @@ mod test {
         let mut blocker = db.begin().await.unwrap();
         sqlx::query("INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at) VALUES ($1, $2, clock_timestamp(), clock_timestamp(), clock_timestamp())")
             .bind(uuid::Uuid::new_v4()).bind(TestJob::NAME).execute(&mut *blocker).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), worker.tick())
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), worker.tick())
+                .await
+                .unwrap(),
+            TickOutcome::default()
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
                 .fetch_one(&db)
@@ -1411,7 +1419,7 @@ mod test {
             0
         );
         blocker.rollback().await.unwrap();
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
                 .fetch_one(&db)
@@ -1456,11 +1464,13 @@ mod test {
                 .unwrap()
         );
         pause.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(3), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            TickOutcome::default()
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
                 .fetch_one(&db)
@@ -1477,10 +1487,10 @@ mod test {
         );
         let mut retry_registry = CronRegistry::new();
         retry_registry.register_job(TestJob, None, Duration::from_mins(1));
-        crate::cron::Worker::new(state, retry_registry)
-            .tick()
-            .await
-            .unwrap();
+        assert_eq!(
+            crate::cron::Worker::new(state, retry_registry).tick().await,
+            TickOutcome::default()
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
                 .fetch_one(&db)
@@ -1529,6 +1539,128 @@ mod test {
         }
     }
 
+    #[test]
+    fn pool_errors_are_recoverable() {
+        assert!(recoverable(&sqlx::Error::PoolTimedOut));
+        assert!(recoverable(&sqlx::Error::PoolClosed));
+        assert!(!recoverable(&sqlx::Error::RowNotFound));
+    }
+
+    #[sqlx::test]
+    async fn failing_callback_does_not_stop_sibling_crons_in_a_tick(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let failing_calls = Arc::new(AtomicUsize::new(0));
+        let healthy_calls = Arc::new(AtomicUsize::new(0));
+
+        // `jobs` is a HashMap: iteration order is arbitrary. Gate on the
+        // failing cron iterating FIRST — mirroring `Worker::tick`'s
+        // `values()` iteration — so the loop under test cannot reach the
+        // sibling only by luck. Each `CronRegistry::new()` gets a fresh
+        // RandomState seed, so a rebuild re-rolls the order (~2 tries).
+        let mut first_is_failing = None;
+        for _ in 0..64 {
+            let mut candidate = CronRegistry::new();
+            let failing_seen = failing_calls.clone();
+            candidate.register("failing", None, Duration::from_millis(1), move |_, _| {
+                let failing_seen = failing_seen.clone();
+                Box::pin(async move {
+                    failing_seen.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), std::io::Error>(std::io::Error::other("boom"))
+                })
+            });
+            let healthy_seen = healthy_calls.clone();
+            candidate.register(
+                "healthy_sibling",
+                None,
+                Duration::from_millis(1),
+                move |_, _| {
+                    let healthy_seen = healthy_seen.clone();
+                    Box::pin(async move {
+                        healthy_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), std::io::Error>(())
+                    })
+                },
+            );
+            if candidate.jobs.values().next().map(|job| job.name) == Some("failing") {
+                first_is_failing = Some(candidate);
+                break;
+            }
+        }
+        let registry =
+            first_is_failing.expect("no ordering put the failing cron first in 64 attempts");
+
+        let capture = EventCapture::default();
+        let outcome = crate::cron::Worker::new(state, registry)
+            .tick()
+            .with_subscriber(capture.dispatch())
+            .await;
+        assert_eq!(
+            outcome,
+            TickOutcome {
+                failed: 1,
+                ..TickOutcome::default()
+            }
+        );
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failing_calls.load(Ordering::SeqCst), 1);
+        // The failing claim commits before its callback errors, so both rows exist.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            2
+        );
+        // Exactly one ERROR from the worker names the failing cron. Assert
+        // level, target and field — not the message text.
+        let failing_errors = capture
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.target == "cja::cron::worker"
+                    && event.level == tracing::Level::ERROR
+                    && event.fields.get("cron.name").map(String::as_str) == Some("failing")
+            })
+            .count();
+        assert_eq!(failing_errors, 1);
+    }
+
+    #[sqlx::test]
+    async fn unreadable_crons_map_skips_the_whole_tick(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        sqlx::query("DROP TABLE crons").execute(&db).await.unwrap();
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = CronRegistry::new();
+        let seen = calls.clone();
+        registry.register("probe", None, Duration::from_millis(1), move |_, _| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), std::io::Error>(())
+            })
+        });
+        let outcome = crate::cron::Worker::new(state, registry).tick().await;
+        assert_eq!(
+            outcome,
+            TickOutcome {
+                map_read_failed: true,
+                ..TickOutcome::default()
+            }
+        );
+        // The whole tick is skipped: no callback runs while the map is unreadable.
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
     struct CronContextJob;
 
@@ -1557,10 +1689,12 @@ mod test {
         };
         let mut registry = CronRegistry::new();
         registry.register_job(CronContextJob, None, Duration::from_mins(1));
-        crate::cron::Worker::new(state.clone(), registry)
-            .tick()
-            .await
-            .unwrap();
+        assert_eq!(
+            crate::cron::Worker::new(state.clone(), registry)
+                .tick()
+                .await,
+            TickOutcome::default()
+        );
         let job_id: uuid::Uuid = sqlx::query_scalar("SELECT job_id FROM jobs WHERE name = $1")
             .bind(CronContextJob::NAME)
             .fetch_one(&db)
@@ -1621,7 +1755,7 @@ mod test {
         let mut registry = CronRegistry::new();
         registry.register_job(TelemetryJob, None, Duration::from_mins(1));
         let worker = crate::cron::Worker::new(state.clone(), registry);
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
         let captured = lines.lock().unwrap().clone();
         let span = captured
             .iter()
@@ -1667,7 +1801,13 @@ mod test {
         // The capture is shared by concurrently running tests, so look only at
         // what was recorded from here on instead of clearing it under them.
         let start = lines.lock().unwrap().len();
-        assert!(worker.tick().await.is_err());
+        assert_eq!(
+            worker.tick().await,
+            TickOutcome {
+                failed: 1,
+                ..TickOutcome::default()
+            }
+        );
         let rejected = lines.lock().unwrap()[start..].to_vec();
         assert!(
             !rejected
@@ -1711,11 +1851,10 @@ mod test {
         let capture = EventCapture::default();
         let dispatch = capture.dispatch();
         let worker = job_worker(db.clone());
-        worker
-            .tick()
-            .with_subscriber(dispatch.clone())
-            .await
-            .unwrap();
+        assert_eq!(
+            worker.tick().with_subscriber(dispatch.clone()).await,
+            TickOutcome::default()
+        );
         let receipts = capture.fire_receipts(TestJob::NAME);
         assert_eq!(receipts.len(), 1, "{receipts:?}");
         assert_fire_receipt(&receipts[0], TestJob::NAME, None);
@@ -1723,15 +1862,17 @@ mod test {
         assert_eq!(receipts[0].parent.as_deref(), Some("jobs.enqueue"));
 
         // Same interval: nothing is due, so nothing is claimed or reported.
-        worker
-            .tick()
-            .with_subscriber(dispatch.clone())
-            .await
-            .unwrap();
+        assert_eq!(
+            worker.tick().with_subscriber(dispatch.clone()).await,
+            TickOutcome::default()
+        );
         assert_eq!(capture.fire_receipts(TestJob::NAME).len(), 1);
 
         let previous = backdate(&db, TestJob::NAME, "2 minutes").await;
-        worker.tick().with_subscriber(dispatch).await.unwrap();
+        assert_eq!(
+            worker.tick().with_subscriber(dispatch).await,
+            TickOutcome::default()
+        );
         let receipts = capture.fire_receipts(TestJob::NAME);
         assert_eq!(receipts.len(), 2, "{receipts:?}");
         assert_fire_receipt(&receipts[1], TestJob::NAME, Some(previous));
@@ -1756,25 +1897,26 @@ mod test {
             cookie_key: CookieKey::generate(),
         };
         let worker = crate::cron::Worker::new(state, registry);
-        worker
-            .tick()
-            .with_subscriber(dispatch.clone())
-            .await
-            .unwrap();
+        assert_eq!(
+            worker.tick().with_subscriber(dispatch.clone()).await,
+            TickOutcome::default()
+        );
         let receipts = capture.fire_receipts(RECEIPT_CALLBACK);
         assert_eq!(receipts.len(), 1, "{receipts:?}");
         assert_fire_receipt(&receipts[0], RECEIPT_CALLBACK, None);
         assert_eq!(receipts[0].parent.as_deref(), Some("cron_job.tick"));
 
-        worker
-            .tick()
-            .with_subscriber(dispatch.clone())
-            .await
-            .unwrap();
+        assert_eq!(
+            worker.tick().with_subscriber(dispatch.clone()).await,
+            TickOutcome::default()
+        );
         assert_eq!(capture.fire_receipts(RECEIPT_CALLBACK).len(), 1);
 
         let previous = backdate(&db, RECEIPT_CALLBACK, "2 minutes").await;
-        worker.tick().with_subscriber(dispatch).await.unwrap();
+        assert_eq!(
+            worker.tick().with_subscriber(dispatch).await,
+            TickOutcome::default()
+        );
         let receipts = capture.fire_receipts(RECEIPT_CALLBACK);
         assert_eq!(receipts.len(), 2, "{receipts:?}");
         assert_fire_receipt(&receipts[1], RECEIPT_CALLBACK, Some(previous));
@@ -1816,13 +1958,15 @@ mod test {
             .execute(&mut *blocker)
             .await
             .unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(3),
-            worker.tick().with_subscriber(dispatch.clone()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                worker.tick().with_subscriber(dispatch.clone()),
+            )
+            .await
+            .unwrap(),
+            TickOutcome::default()
+        );
         let skipped = capture
             .messages()
             .iter()
@@ -1834,7 +1978,10 @@ mod test {
         }
 
         blocker.rollback().await.unwrap();
-        worker.tick().with_subscriber(dispatch).await.unwrap();
+        assert_eq!(
+            worker.tick().with_subscriber(dispatch).await,
+            TickOutcome::default()
+        );
         for name in [TestJob::NAME, RECEIPT_CALLBACK] {
             let receipts = capture.fire_receipts(name);
             assert_eq!(receipts.len(), 1, "{name}: {receipts:?}");
@@ -1878,11 +2025,13 @@ mod test {
                     .unwrap()
             );
             pause.release.notify_one();
-            tokio::time::timeout(Duration::from_secs(3), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(3), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                TickOutcome::default()
+            );
             assert!(capture.fire_receipts(name).is_empty(), "{name}");
         }
         assert_eq!(
@@ -1893,11 +2042,13 @@ mod test {
             0
         );
 
-        crate::cron::Worker::new(state, receipt_registry())
-            .tick()
-            .with_subscriber(dispatch)
-            .await
-            .unwrap();
+        assert_eq!(
+            crate::cron::Worker::new(state, receipt_registry())
+                .tick()
+                .with_subscriber(dispatch)
+                .await,
+            TickOutcome::default()
+        );
         for name in [TestJob::NAME, RECEIPT_CALLBACK] {
             let receipts = capture.fire_receipts(name);
             assert_eq!(receipts.len(), 1, "{name}: {receipts:?}");
@@ -1944,8 +2095,8 @@ mod test {
             }
             .with_subscriber(dispatch.clone())
             .await;
-            a.unwrap();
-            b.unwrap();
+            assert_eq!(a, TickOutcome::default());
+            assert_eq!(b, TickOutcome::default());
             for name in [TestJob::NAME, RECEIPT_CALLBACK] {
                 let receipts = capture.fire_receipts(name);
                 assert_eq!(receipts.len(), interval, "{name}: {receipts:?}");
@@ -1982,7 +2133,7 @@ mod test {
             existing_record.unwrap().cron_id
         );
 
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
 
         let last_run = sqlx::query!(
             "SELECT last_run_at FROM Crons WHERE name = $1",
@@ -2023,7 +2174,7 @@ mod test {
         .await
         .unwrap();
 
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
 
         let last_run = sqlx::query!(
             "SELECT last_run_at FROM Crons WHERE name = $1",
@@ -2059,7 +2210,7 @@ mod test {
         .await
         .unwrap();
 
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
 
         let last_run = sqlx::query!(
             "SELECT last_run_at FROM Crons WHERE name = $1",
@@ -2181,7 +2332,7 @@ mod test {
 
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
 
         let test_job_record = sqlx::query!(
             "SELECT last_run_at FROM Crons WHERE name = $1",
@@ -2244,7 +2395,7 @@ mod test {
         .await
         .unwrap();
 
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
 
         let test_job_record = sqlx::query!(
             "SELECT last_run_at FROM Crons WHERE name = $1",
@@ -2437,7 +2588,7 @@ mod test {
         worker.started_at = Utc::now() - chrono::Duration::seconds(2);
 
         // Both jobs should run on first tick
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
 
         let test_job_count = sqlx::query!(
             "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
@@ -2519,7 +2670,7 @@ mod test {
 
         // Multiple simulated worker ticks while the interval has not elapsed
         for _ in 0..3 {
-            worker.tick().await.unwrap();
+            assert_eq!(worker.tick().await, TickOutcome::default());
 
             let last_run = sqlx::query!(
                 "SELECT last_run_at FROM Crons WHERE name = $1",
@@ -2561,7 +2712,7 @@ mod test {
         .await
         .unwrap();
 
-        worker.tick().await.unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
 
         let last_run = sqlx::query!(
             "SELECT last_run_at FROM Crons WHERE name = $1",
