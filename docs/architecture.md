@@ -133,7 +133,7 @@ Trait for custom session types backed by the `sessions` table:
 - `from_inner(CJASession) -> Self`
 - `inner(&self) -> &CJASession`
 
-The `Session<A>` extractor automatically loads or creates sessions from the `session_id` cookie.
+The `Session<A>` extractor automatically loads or creates sessions from the `__Host-session_id` cookie (private, `HttpOnly`, `Secure`, `SameSite=Lax`). cja-passkey replaces the session row (new id) on every successful registration/login, so a pre-authentication cookie never authenticates.
 
 ## Data Flow
 
