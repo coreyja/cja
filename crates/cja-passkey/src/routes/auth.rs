@@ -1,7 +1,8 @@
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use cja::app_state::AppState;
-use cja::server::session::{AppSession, Session};
+use cja::server::cookies::CookieJar;
+use cja::server::session::{AppSession, CJASession, Session};
 use webauthn_rs::prelude::{
     AuthenticationResult, DiscoverableKey, Passkey, PublicKeyCredential, RequestChallengeResponse,
 };
@@ -113,36 +114,72 @@ where
 pub async fn finish<S>(
     State(state): State<S>,
     Session(session): Session<PasskeySession>,
+    jar: CookieJar<S>,
     Json(credential_payload): Json<PublicKeyCredential>,
 ) -> Result<StatusCode, StatusCode>
 where
     S: AppState + HasPasskeyConfig,
 {
-    let Some(challenge_value) = session.challenge_state.clone() else {
-        return Err(StatusCode::BAD_REQUEST);
+    let mut tx = state.db().begin().await.map_err(|err| {
+        tracing::error!("begin tx: {err}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    match finish_named_tx(&state, &mut tx, *session.session_id(), &credential_payload).await {
+        Ok(new_session) => {
+            tx.commit().await.map_err(|err| {
+                tracing::error!("commit finish tx: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            cja::server::session::save_session_cookie(&jar, new_session.session_id);
+            Ok(StatusCode::OK)
+        }
+        Err(status) => {
+            if let Err(err) = tx.rollback().await {
+                tracing::warn!("rollback finish tx: {err}");
+            }
+            Err(status)
+        }
+    }
+}
+
+async fn finish_named_tx<S>(
+    state: &S,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: uuid::Uuid,
+    credential_payload: &PublicKeyCredential,
+) -> Result<CJASession, StatusCode>
+where
+    S: AppState + HasPasskeyConfig,
+{
+    // 1. Lock the row and read the challenge (NOT the extractor snapshot).
+    let Some(challenge_value) = PasskeySession::lock_challenge_state(&mut **tx, session_id)
+        .await
+        .map_err(|err| {
+            tracing::error!("lock_challenge_state: {err:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    else {
+        return Err(StatusCode::BAD_REQUEST); // no challenge / already consumed
     };
+    // 2. Deserialize + variant-check (same logic as before, but on the locked value).
     let challenge_state: ChallengeState =
         serde_json::from_value(challenge_value).map_err(|err| {
             tracing::warn!("invalid challenge_state JSON: {err}");
             StatusCode::BAD_REQUEST
         })?;
-    let ChallengeState::Authentication {
-        auth_state,
-        user_id,
-    } = challenge_state
-    else {
+    let ChallengeState::Authentication { auth_state, user_id } = challenge_state else {
         return Err(StatusCode::BAD_REQUEST);
     };
-
+    // 3. Verify the ceremony (on failure the outer half rolls back,
+    //    so the challenge survives a 401 — retry semantics).
     let webauthn = state.passkey_config().webauthn.clone();
     let auth_result = webauthn
-        .finish_passkey_authentication(&credential_payload, &auth_state)
+        .finish_passkey_authentication(credential_payload, &auth_state)
         .map_err(|err| {
             tracing::warn!("finish_passkey_authentication failed: {err}");
             StatusCode::UNAUTHORIZED
         })?;
-
-    let row = credential::find_by_credential_id(state.db(), auth_result.cred_id().as_ref())
+    let row = credential::find_by_credential_id(&mut **tx, auth_result.cred_id().as_ref())
         .await
         .map_err(|err| {
             tracing::error!("find_by_credential_id failed: {err}");
@@ -154,37 +191,72 @@ where
         tracing::error!("Passkey deserialize failed: {err}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    persist_authenticated_credential(state.db(), row, passkey, &auth_result).await?;
-
-    let session_id = *session.session_id();
-    PasskeySession::set_user_id(state.db(), session_id, user_id)
+    persist_authenticated_credential(&mut **tx, row, passkey, &auth_result).await?;
+    // 4. Rotate + consume, atomically with everything above.
+    PasskeySession::rotate_session_id(&mut **tx, session_id, user_id)
         .await
         .map_err(|err| {
-            tracing::error!("set_user_id: {err}");
+            tracing::error!("rotate_session_id: {err:#}");
             StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    PasskeySession::clear_challenge_state(state.db(), session_id)
-        .await
-        .map_err(|err| {
-            tracing::error!("clear_challenge_state: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(StatusCode::OK)
+        })
 }
 
 pub async fn finish_discoverable<S>(
     State(state): State<S>,
     Session(session): Session<PasskeySession>,
+    jar: CookieJar<S>,
     Json(credential_payload): Json<PublicKeyCredential>,
 ) -> Result<StatusCode, StatusCode>
 where
     S: AppState + HasPasskeyConfig,
 {
-    let challenge_value = session
-        .challenge_state
-        .clone()
-        .ok_or(StatusCode::BAD_REQUEST)?;
+    let mut tx = state.db().begin().await.map_err(|err| {
+        tracing::error!("begin tx: {err}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    match finish_discoverable_tx(
+        &state,
+        &mut tx,
+        *session.session_id(),
+        &credential_payload,
+    )
+    .await
+    {
+        Ok(new_session) => {
+            tx.commit().await.map_err(|err| {
+                tracing::error!("commit finish tx: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            cja::server::session::save_session_cookie(&jar, new_session.session_id);
+            Ok(StatusCode::OK)
+        }
+        Err(status) => {
+            if let Err(err) = tx.rollback().await {
+                tracing::warn!("rollback finish tx: {err}");
+            }
+            Err(status)
+        }
+    }
+}
+
+async fn finish_discoverable_tx<S>(
+    state: &S,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: uuid::Uuid,
+    credential_payload: &PublicKeyCredential,
+) -> Result<CJASession, StatusCode>
+where
+    S: AppState + HasPasskeyConfig,
+{
+    let Some(challenge_value) = PasskeySession::lock_challenge_state(&mut **tx, session_id)
+        .await
+        .map_err(|err| {
+            tracing::error!("lock_challenge_state: {err:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    else {
+        return Err(StatusCode::BAD_REQUEST); // no challenge / already consumed
+    };
     let challenge_state: ChallengeState =
         serde_json::from_value(challenge_value).map_err(|err| {
             tracing::warn!("invalid challenge_state JSON: {err}");
@@ -196,12 +268,12 @@ where
 
     let webauthn = &state.passkey_config().webauthn;
     let (user_id, credential_id) = webauthn
-        .identify_discoverable_authentication(&credential_payload)
+        .identify_discoverable_authentication(credential_payload)
         .map_err(|err| {
             tracing::warn!("identify_discoverable_authentication failed: {err}");
             StatusCode::UNAUTHORIZED
         })?;
-    let row = credential::find_by_credential_id(state.db(), credential_id)
+    let row = credential::find_by_credential_id(&mut **tx, credential_id)
         .await
         .map_err(|err| {
             tracing::error!("find_by_credential_id failed: {err}");
@@ -215,7 +287,7 @@ where
     })?;
     let auth_result = webauthn
         .finish_discoverable_authentication(
-            &credential_payload,
+            credential_payload,
             auth_state,
             &[DiscoverableKey::from(&passkey)],
         )
@@ -223,26 +295,18 @@ where
             tracing::warn!("finish_discoverable_authentication failed: {err}");
             StatusCode::UNAUTHORIZED
         })?;
-    persist_authenticated_credential(state.db(), row, passkey, &auth_result).await?;
+    persist_authenticated_credential(&mut **tx, row, passkey, &auth_result).await?;
 
-    let session_id = *session.session_id();
-    PasskeySession::set_user_id(state.db(), session_id, user_id)
+    PasskeySession::rotate_session_id(&mut **tx, session_id, user_id)
         .await
         .map_err(|err| {
-            tracing::error!("set_user_id: {err}");
+            tracing::error!("rotate_session_id: {err:#}");
             StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    PasskeySession::clear_challenge_state(state.db(), session_id)
-        .await
-        .map_err(|err| {
-            tracing::error!("clear_challenge_state: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    Ok(StatusCode::OK)
+        })
 }
 
 async fn persist_authenticated_credential(
-    db: &sqlx::PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     row: credential::PasskeyCredential,
     mut passkey: Passkey,
     result: &AuthenticationResult,
@@ -257,7 +321,7 @@ async fn persist_authenticated_credential(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
             credential::update_after_auth(
-                db,
+                executor,
                 row.credential_id_pk,
                 credential_json,
                 chrono::Utc::now(),
@@ -269,7 +333,7 @@ async fn persist_authenticated_credential(
             })?;
         }
         Some(false) => {
-            credential::update_last_used(db, row.credential_id_pk)
+            credential::update_last_used(executor, row.credential_id_pk)
                 .await
                 .map_err(|err| {
                     tracing::error!("update_last_used failed: {err}");

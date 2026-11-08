@@ -908,68 +908,60 @@ async fn credential_model_crud() {
 }
 
 #[tokio::test]
-async fn passkey_session_lifecycle() {
+async fn lock_and_rotate_challenge_lifecycle() {
     let (pool, _guard) = setup_test_db().await;
     let session_id = create_anonymous_session(&pool).await;
+    // Lock with no challenge set -> None.
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(
+        PasskeySession::lock_challenge_state(&mut *tx, session_id)
+            .await
+            .unwrap(),
+        None
+    );
+    tx.rollback().await.unwrap();
 
     PasskeySession::set_challenge_state(&pool, session_id, serde_json::json!({"k": "v"}))
         .await
         .unwrap();
-    let row = sqlx::query("SELECT challenge_state FROM sessions WHERE session_id = $1")
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let cs: Option<serde_json::Value> = row.try_get("challenge_state").unwrap();
-    assert_eq!(cs, Some(serde_json::json!({"k": "v"})));
+    let created_before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM sessions WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
-    PasskeySession::clear_challenge_state(&pool, session_id)
-        .await
-        .unwrap();
-    let row = sqlx::query("SELECT challenge_state FROM sessions WHERE session_id = $1")
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let cs: Option<serde_json::Value> = row.try_get("challenge_state").unwrap();
-    assert_eq!(cs, None);
-
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(
+        PasskeySession::lock_challenge_state(&mut *tx, session_id)
+            .await
+            .unwrap(),
+        Some(serde_json::json!({"k": "v"}))
+    );
     let user_id = insert_user(&pool, "alice").await;
-    PasskeySession::set_user_id(&pool, session_id, user_id)
+    let rotated = PasskeySession::rotate_session_id(&mut *tx, session_id, user_id)
         .await
         .unwrap();
-    let row = sqlx::query("SELECT user_id FROM sessions WHERE session_id = $1")
+    tx.commit().await.unwrap();
+
+    assert_ne!(rotated.session_id, session_id);
+    assert_eq!(rotated.created_at, created_before); // session age carries over
+    // Old row is gone; new row is authenticated with no challenge.
+    let old: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE session_id = $1")
         .bind(session_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    let uid: Option<Uuid> = row.try_get("user_id").unwrap();
-    assert_eq!(uid, Some(user_id));
-}
-
-#[tokio::test]
-async fn clearing_challenge_state_does_not_affect_user_id() {
-    let (pool, _guard) = setup_test_db().await;
-    let session_id = create_anonymous_session(&pool).await;
-    let user_id = insert_user(&pool, "alice").await;
-
-    PasskeySession::set_user_id(&pool, session_id, user_id)
-        .await
-        .unwrap();
-    PasskeySession::set_challenge_state(&pool, session_id, serde_json::json!({"a": 1}))
-        .await
-        .unwrap();
-    PasskeySession::clear_challenge_state(&pool, session_id)
-        .await
-        .unwrap();
-
-    let row = sqlx::query("SELECT user_id FROM sessions WHERE session_id = $1")
-        .bind(session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let uid: Option<Uuid> = row.try_get("user_id").unwrap();
-    assert_eq!(uid, Some(user_id));
+    assert_eq!(old, 0);
+    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT user_id, challenge_state FROM sessions WHERE session_id = $1",
+    )
+    .bind(rotated.session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(user, Some(user_id));
+    assert_eq!(challenge, None);
 }
 
 #[tokio::test]
@@ -1468,15 +1460,21 @@ async fn concurrent_finishes_exactly_one_succeeds() {
         .await
         .unwrap();
     assert_eq!(old, 0);
-    let authenticated: (i64, Uuid) = sqlx::query_as(
-        "SELECT count(*), min(session_id) FROM sessions WHERE user_id = $1",
+    let authenticated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sessions WHERE user_id = $1",
     )
     .bind(alice_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(authenticated.0, 1);
-    assert_ne!(authenticated.1, session_before);
+    assert_eq!(authenticated, 1);
+    let new_session: Uuid =
+        sqlx::query_scalar("SELECT session_id FROM sessions WHERE user_id = $1")
+            .bind(alice_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(new_session, session_before);
 }
 
 #[tokio::test]
