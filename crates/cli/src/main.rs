@@ -422,17 +422,22 @@ fn sync_migrations(dry_run: bool) -> Result<()> {
 /// This function orchestrates the complete project creation process, including:
 /// - Directory structure creation
 /// - Template file generation
-/// - Database migration copying
 /// - Feature-based conditional logic
+///
+/// The generated app runs cja's framework migrations at boot via
+/// `cja::db::run_migrations` (its `migrations/` dir starts empty, reserved
+/// for the app's own migrations), and depends on cja from git — `github_repo`
+/// customizes the repository and `branch` the branch (both default to the
+/// canonical repo's `main`).
 ///
 /// # Arguments
 ///
 /// * `project_name` - The name of the project to create (used as directory name and in Cargo.toml)
-/// * `no_cron` - If true, excludes cron scheduling functionality and migrations
-/// * `no_jobs` - If true, excludes background job processing functionality and migrations
-/// * `no_sessions` - If true, excludes session management functionality and migrations
-/// * `github_repo` - Optional GitHub repository URL to use instead of crates.io
-/// * `branch` - GitHub branch to use (defaults to "main")
+/// * `no_cron` - If true, excludes cron scheduling functionality
+/// * `no_jobs` - If true, excludes background job processing functionality (implies `no_cron`)
+/// * `no_sessions` - If true, excludes session management functionality
+/// * `github_repo` - Optional git repository URL for the cja dependency
+/// * `branch` - Branch of the cja git dependency (defaults to "main")
 ///
 /// # Returns
 ///
@@ -445,7 +450,6 @@ fn sync_migrations(dry_run: bool) -> Result<()> {
 /// - A directory with the same name already exists
 /// - Insufficient permissions to create directories or files
 /// - Template generation fails
-/// - Migration file copying fails
 ///
 /// # Feature Dependencies
 ///
@@ -457,14 +461,14 @@ fn sync_migrations(dry_run: bool) -> Result<()> {
 /// ```rust,no_run
 /// use anyhow::Result;
 ///
-/// // Create a full-featured project from crates.io
+/// // Create a full-featured project
 /// create_project("my-app", false, false, false, None, "main")?;
 ///
-/// // Create a minimal API server from GitHub
-/// create_project("my-api", true, true, true, Some(&"https://github.com/coreyja/cja".to_string()), "main")?;
+/// // Create a minimal API server
+/// create_project("my-api", true, true, true, None, "main")?;
 ///
 /// // Create a project with jobs but no cron from a custom branch
-/// create_project("my-worker", true, false, false, Some(&"https://github.com/coreyja/cja".to_string()), "develop")?;
+/// create_project("my-worker", true, false, false, None, "develop")?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 fn create_project(
@@ -532,15 +536,20 @@ fn create_project(
 ///
 /// This function adds CJA to an existing Cargo project, creating the necessary
 /// files and structure while preserving the existing project configuration.
+/// The generated boot path runs cja's framework migrations at boot via
+/// `cja::db::run_migrations` (the `migrations/` dir starts empty, reserved
+/// for the app's own migrations), and adds cja as a git dependency —
+/// `github_repo` customizes the repository and `branch` the branch (both
+/// default to the canonical repo's `main`).
 ///
 /// # Arguments
 ///
 /// * `bin_name` - Optional binary name (defaults to project name from Cargo.toml)
 /// * `no_cron` - If true, excludes cron scheduling functionality
-/// * `no_jobs` - If true, excludes background job processing functionality
+/// * `no_jobs` - If true, excludes background job processing functionality (implies `no_cron`)
 /// * `no_sessions` - If true, excludes session management functionality
-/// * `github_repo` - Optional GitHub repository URL to use instead of crates.io
-/// * `branch` - GitHub branch to use (defaults to "main")
+/// * `github_repo` - Optional git repository URL for the cja dependency
+/// * `branch` - Branch of the cja git dependency (defaults to "main")
 ///
 /// # Returns
 ///
@@ -1320,9 +1329,7 @@ mod cron {
     }
 
     pub async fn run(app_state: AppState, shutdown: CancellationToken) -> cja::Result<()> {
-        // A tick error ends the process via the Supervisor — current cja
-        // semantics; don't work around it in the template.
-        Worker::new(app_state, build_registry()).run(shutdown).await?;
+        Worker::new(app_state, build_registry()).run(shutdown).await;
         Ok(())
     }
 }

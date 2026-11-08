@@ -79,13 +79,20 @@ edition = "2021"
 
     // The default cja dependency is a git one on the canonical repo's main
     // branch — exactly the line `cargo add cja --git ... --branch main`
-    // writes (there is no usable crates.io release; cargo add appends the
-    // version it reads from the git repo's manifest).
+    // writes (there is no usable crates.io release). The version cargo add
+    // appends comes from the remote manifest over the network, so don't pin
+    // it here — the first release-please bump would turn that red.
+    let cja_line = cargo_content
+        .lines()
+        .find(|line| line.starts_with("cja = "))
+        .expect("cja dependency line missing");
     assert!(
-        cargo_content.contains(
-            r#"cja = { git = "https://github.com/coreyja/cja", branch = "main", version = "0.0.0" }"#
-        ),
-        "unexpected cja dependency line:\n{cargo_content}"
+        cja_line.contains(r#"git = "https://github.com/coreyja/cja""#),
+        "cja dependency is not a git dep on the canonical repo:\n{cja_line}"
+    );
+    assert!(
+        cja_line.contains(r#"branch = "main""#),
+        "cja dependency is not on branch main:\n{cja_line}"
     );
 }
 
@@ -509,6 +516,49 @@ edition = "2021"
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     assert_eq!(names, vec!["existing.sql".to_string()]);
+}
+
+/// Negative counterpart of `test_init_preserves_existing_migrations_dir`:
+/// the shared-`_sqlx_migrations` warning only fires when migrations/
+/// already holds `.sql` files. A missing migrations dir (the fresh-project
+/// case) and a `.gitkeep`-only dir (what `cja new`/`cja init` leave behind)
+/// must both print no `VersionMissing` warning — otherwise every clean
+/// scaffold would cry wolf.
+#[test]
+fn test_init_fresh_migrations_dir_prints_no_version_missing_warning() {
+    for existing_dir in [false, true] {
+        let temp = assert_fs::TempDir::new().unwrap();
+
+        temp.child("Cargo.toml")
+            .write_str(
+                r#"[package]
+name = "test-project"
+version = "0.1.0"
+edition = "2021"
+"#,
+            )
+            .unwrap();
+
+        temp.child("src").create_dir_all().unwrap();
+        temp.child("src/main.rs").write_str("fn main() {}").unwrap();
+
+        if existing_dir {
+            temp.child("migrations").create_dir_all().unwrap();
+            temp.child("migrations/.gitkeep").write_str("").unwrap();
+        }
+
+        let mut cmd = Command::cargo_bin("cja").unwrap();
+        cmd.arg("init")
+            .current_dir(&temp)
+            .timeout(INIT_TIMEOUT)
+            .assert()
+            .success()
+            // No shared-_sqlx_migrations warning for a clean migrations dir
+            // (its text is the only place init says "VersionMissing").
+            .stderr(predicate::str::contains("VersionMissing").not());
+
+        assert_migrations_hold_only_gitkeep(temp.child("migrations").path());
+    }
 }
 
 #[test]

@@ -82,7 +82,10 @@ Tests use real PostgreSQL databases (no mocking). Each test creates an isolated 
 cargo test --package cja --lib --test lib
 ```
 
-**Important:** `cargo test --doc` does not work for this project because `sqlx::query!` macros require a live database connection at compile time, and doctest crates don't inherit the `DATABASE_URL` environment variable. Use `--lib --test lib` instead.
+**Important:** `cargo test --doc` works without a database — since the crons
+read became a runtime query, cja has no non-test `sqlx::query!` macros, so
+doctest crates compile offline. Use `--lib --test lib` for the DB-backed
+suite.
 
 ### Lima VM / Unix Socket Setup
 

@@ -149,7 +149,8 @@ fn test_init_command_github_flag_help() {
 fn test_new_command_branch_without_github() {
     // --branch no longer requires --github: it overrides the default repo's
     // branch. Verified via `cja new` (file generation only, no cargo/network);
-    // the cli_tests.rs copy of this check lives here now.
+    // the duplicate of this check that used to live in init_mock_tests.rs was
+    // removed when init grew its own network-backed coverage.
     let temp_dir = assert_fs::TempDir::new().unwrap();
 
     let mut cmd = Command::cargo_bin("cja").unwrap();

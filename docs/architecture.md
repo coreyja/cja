@@ -44,7 +44,7 @@ crates/
   cja-build/        — Compile-time static hashing, type checking, and bundling
   cja.app/          — Example application (canonical usage reference)
   cli/              — `cja` CLI tool (project scaffolding)
-migrations/         — Copy of crates/cja/migrations/ for sqlx CLI
+migrations/         — Partial, best-effort copy of crates/cja/migrations/ (see Migration Locations)
 ```
 
 ### Module Tree (`crates/cja/src/`)
@@ -307,7 +307,7 @@ Three copies of migrations exist in the repository, but only one is authoritativ
 | Location | Purpose | Used by |
 |----------|---------|---------|
 | `crates/cja/migrations/` | **Source of truth** | `cja::db::run_migrations()` via `sqlx::migrate!("./migrations")` |
-| `migrations/` (root) | Stale partial copy (2 of 8 files) — kept for history; do **not** use it with `sqlx migrate run`, it fails on a fresh database | nothing |
+| `migrations/` (root) | Partial, best-effort copy (2 of 8 files) — do not rely on it being complete; it fails on a fresh database under `sqlx migrate run` | nothing |
 | `crates/cja.app/migrations/` | Partial, best-effort copy | `sqlx::migrate!()` in `cja.app/src/main.rs` |
 
 CLI-generated apps carry no copies: they call `cja::db::run_migrations()` at boot. The `sqlx::migrate!("./migrations")` macro in `db.rs` resolves the path relative to the crate's `Cargo.toml`, i.e., `crates/cja/migrations/`. The `sqlx::migrate!()` call (no path argument) in `cja.app` similarly resolves to `crates/cja.app/migrations/`.

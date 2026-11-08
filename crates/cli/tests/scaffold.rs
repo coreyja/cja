@@ -62,15 +62,17 @@ fn patch_cja_dep_to_checkout(manifest: &Path, cja_path: &Path) {
 }
 
 /// `cargo check` a generated/initialized project. The env is the point:
-/// `DATABASE_URL` points at an unreachable host with `SQLX_OFFLINE` unset,
-/// so any compile-time `query!` macro anywhere in the dependency tree would
-/// go live-mode and fail to connect. A generated app must compile against a
-/// database that doesn't have (and here can't even be reached by) cja's
-/// tables, because its boot path creates them at runtime — the exact
+/// `DATABASE_URL` points at an unreachable host with `SQLX_OFFLINE` forced
+/// off, so any compile-time `query!` macro anywhere in the dependency tree
+/// would go live-mode and fail to connect. A generated app must compile
+/// against a database that doesn't have (and here can't even be reached by)
+/// cja's tables, because its boot path creates them at runtime — the exact
 /// situation a user hits on `cja new myapp && export DATABASE_URL=... &&
 /// cargo run` against a fresh database.
-fn cargo_check_generated(project: &Path, package: &str, what: &str) {
-    let package_summary = format!("`{package}`");
+///
+/// Returns `(success, stderr)` so the canary in `generated_projects_compile`
+/// can reuse the same env and gate for its positive control.
+fn run_cargo_check(project: &Path) -> (bool, String) {
     let target = std::env::temp_dir().join("cja-cli-scaffold-check-target");
     let output = std::process::Command::new("cargo")
         .args(["check", "--message-format=short"])
@@ -82,29 +84,36 @@ fn cargo_check_generated(project: &Path, package: &str, what: &str) {
             "DATABASE_URL",
             "postgres://127.0.0.1:1/cja_scaffold_check_unreachable",
         )
-        .env_remove("SQLX_OFFLINE")
+        // Set explicitly, not removed: sqlx-macros falls back to
+        // <manifest>/.env when the var is unset, so a developer's local .env
+        // could otherwise flip this gate offline.
+        .env("SQLX_OFFLINE", "false")
         .env_remove("SQLX_OFFLINE_DIR")
         // Dropped so the generated project's intermediates stay under this
         // test's own target dir rather than a shared build dir.
         .env_remove("CARGO_BUILD_BUILD_DIR")
         .output()
         .expect("failed to spawn cargo");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
+    (
         output.status.success(),
-        "cargo check failed for {what}:\n{stderr}"
-    );
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
 
-    // A scaffold that compiles with warnings (unused import, unused variable
-    // in some flag combination) is still broken for its user. Warnings in
-    // generated code show up three ways in short format: rustc diagnostics
-    // for the crate's own files (`src/...`, `build.rs...` — relative paths;
-    // the cja path dep's are absolute), and cargo's per-package summary line
-    // for the generated package (``warning: `myapp` (bin "myapp") generated
-    // N warnings``) as a backstop for warnings attributed to another path.
-    // vergen's outside-git `cargo:warning` notes (`warning: myapp@0.1.0: ...`)
-    // match none of these — deliberately, they are build-host noise.
-    let warnings: Vec<&str> = stderr
+/// Stderr lines that indicate a warning in *generated* code. Warnings show
+/// up three ways in short format: rustc diagnostics for the crate's own
+/// files (`src/...`, `build.rs...` — relative paths; the cja path dep's are
+/// absolute), and cargo's per-package summary line for the generated
+/// package (``warning: `myapp` (bin "myapp") generated N warnings``) as a
+/// backstop for warnings attributed to another path. vergen's outside-git
+/// `cargo:warning` notes (`warning: myapp@0.1.0: ...`) match none of these —
+/// deliberately, they are build-host noise.
+///
+/// Kept as a named function because it is the warning gate: the canary in
+/// `generated_projects_compile` proves it still catches a planted warning.
+fn generated_code_warnings<'a>(stderr: &'a str, package: &str) -> Vec<&'a str> {
+    let package_summary = format!("`{package}`");
+    stderr
         .lines()
         .filter(|line| {
             (line.starts_with("src/") || line.starts_with("build.rs")) && line.contains("warning:")
@@ -112,11 +121,20 @@ fn cargo_check_generated(project: &Path, package: &str, what: &str) {
                     && line.contains("generated")
                     && line.contains("warning"))
         })
-        .collect();
+        .collect()
+}
+
+fn cargo_check_generated(project: &Path, package: &str, what: &str) {
+    let (success, stderr) = run_cargo_check(project);
+    assert!(success, "cargo check failed for {what}:\n{stderr}");
+
+    // A scaffold that compiles with warnings (unused import, unused variable
+    // in some flag combination) is still broken for its user. Full stderr on
+    // failure: the matched lines alone can hide why the gate misfired.
+    let warnings = generated_code_warnings(&stderr, package);
     assert!(
         warnings.is_empty(),
-        "generated code has warnings for {what}:\n{}",
-        warnings.join("\n")
+        "generated code has warnings for {what}:\nfull stderr:\n{stderr}"
     );
 }
 
@@ -168,4 +186,31 @@ edition = "2021"
 
     patch_cja_dep_to_checkout(dir.child("Cargo.toml").path(), &cja_path);
     cargo_check_generated(dir.path(), "myinitapp", "cja init");
+
+    // Positive control for the warning gate (same test so CI's "1 passed"
+    // grep holds): plant a warning in a default-generated project and assert
+    // the filter lights up. Without this, a gate regression (rustc output
+    // format change, path prefix change) would silently turn the gate into a
+    // no-op that passes everything.
+    let dir = assert_fs::TempDir::new().unwrap();
+    let project = generate(dir.path(), &[]);
+    patch_cja_dep_to_checkout(&project.join("Cargo.toml"), &cja_path);
+
+    let main_rs = project.join("src/main.rs");
+    let src = fs::read_to_string(&main_rs).unwrap();
+    fs::write(
+        &main_rs,
+        format!("{src}\nfn canary() {{\n    let unused = 1;\n}}\n"),
+    )
+    .unwrap();
+
+    let (success, stderr) = run_cargo_check(&project);
+    assert!(success, "canary project must still compile:\n{stderr}");
+    let warnings = generated_code_warnings(&stderr, "myapp");
+    assert!(
+        !warnings.is_empty(),
+        "warning gate is blind: a planted unused variable in src/main.rs \
+         produced no matching lines, so the gate no longer detects \
+         generated-code warnings.\nfull stderr:\n{stderr}"
+    );
 }
