@@ -1,4 +1,4 @@
-use cja::server::session::{AppSession, CJASession};
+use cja::server::session::{AppSession, CJASession, Session};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -128,4 +128,59 @@ async fn test_concurrent_session_creation() {
 
     // All sessions should have unique IDs
     assert_eq!(session_ids.len(), 10);
+}
+
+#[tokio::test]
+async fn session_cookie_is_host_prefixed_lax_and_private() {
+    let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
+
+    #[derive(Clone)]
+    struct CookieProbeState {
+        db: sqlx::PgPool,
+        cookie_key: cja::server::cookies::CookieKey,
+    }
+    impl cja::app_state::AppState for CookieProbeState {
+        fn version(&self) -> &'static str {
+            "test"
+        }
+        fn db(&self) -> &sqlx::PgPool {
+            &self.db
+        }
+        fn cookie_key(&self) -> &cja::server::cookies::CookieKey {
+            &self.cookie_key
+        }
+    }
+
+    async fn probe(Session(_session): Session<TestSession>) -> &'static str {
+        "ok"
+    }
+
+    let state = CookieProbeState {
+        db: pool,
+        cookie_key: cja::server::cookies::CookieKey::generate(),
+    };
+    let app = axum::Router::new()
+        .route("/probe", axum::routing::get(probe))
+        .layer(tower_cookies::CookieManagerLayer::new())
+        .with_state(state);
+
+    use tower::ServiceExt as _;
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/probe")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let set_cookie = response.headers()[http::header::SET_COOKIE]
+        .to_str()
+        .unwrap();
+    assert!(set_cookie.starts_with("__Host-session_id="), "got: {set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("Secure"));
+    assert!(set_cookie.contains("Path=/"));
+    assert!(set_cookie.contains("SameSite=Lax"));
 }
