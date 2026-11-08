@@ -83,10 +83,11 @@ fn make_router(state: TestAppState) -> axum::Router {
 fn make_session_cookie(session_id: Uuid, key: &cja::server::cookies::CookieKey) -> String {
     let key = key.0.clone();
     let mut jar = tower_cookies::cookie::CookieJar::new();
-    jar.private_mut(&key).add(tower_cookies::cookie::Cookie::new(
-        SESSION_COOKIE_NAME,
-        session_id.to_string(),
-    ));
+    jar.private_mut(&key)
+        .add(tower_cookies::cookie::Cookie::new(
+            SESSION_COOKIE_NAME,
+            session_id.to_string(),
+        ));
     jar.get(SESSION_COOKIE_NAME).unwrap().to_string()
 }
 
@@ -192,15 +193,30 @@ impl SoftPasskey {
     fn cose_key(&self) -> Vec<u8> {
         let (x, y) = self.public_coords();
         let mut map = std::collections::BTreeMap::new();
-        map.insert(serde_cbor_2::Value::Integer(1), serde_cbor_2::Value::Integer(2));
-        map.insert(serde_cbor_2::Value::Integer(3), serde_cbor_2::Value::Integer(-7));
-        map.insert(serde_cbor_2::Value::Integer(-1), serde_cbor_2::Value::Integer(1));
-        map.insert(serde_cbor_2::Value::Integer(-2), serde_cbor_2::Value::Bytes(x));
-        map.insert(serde_cbor_2::Value::Integer(-3), serde_cbor_2::Value::Bytes(y));
+        map.insert(
+            serde_cbor_2::Value::Integer(1),
+            serde_cbor_2::Value::Integer(2),
+        );
+        map.insert(
+            serde_cbor_2::Value::Integer(3),
+            serde_cbor_2::Value::Integer(-7),
+        );
+        map.insert(
+            serde_cbor_2::Value::Integer(-1),
+            serde_cbor_2::Value::Integer(1),
+        );
+        map.insert(
+            serde_cbor_2::Value::Integer(-2),
+            serde_cbor_2::Value::Bytes(x),
+        );
+        map.insert(
+            serde_cbor_2::Value::Integer(-3),
+            serde_cbor_2::Value::Bytes(y),
+        );
         serde_cbor_2::to_vec(&serde_cbor_2::Value::Map(map)).unwrap()
     }
 
-    /// DER-encoded ECDSA-SHA256 signature (the format WebAuthn expects).
+    /// DER-encoded ECDSA-SHA256 signature (the format `WebAuthn` expects).
     fn sign(&self, message: &[u8]) -> Vec<u8> {
         let pkey = openssl::pkey::PKey::from_ec_key(self.ec_key.clone()).unwrap();
         let mut signer =
@@ -210,8 +226,11 @@ impl SoftPasskey {
     }
 
     /// Registration response with `fmt: "none"` attestation.
+    ///
+    /// ```text
     /// authData = rp_id_hash || 0x45 (UP|UV|AT) || u32be(0) || aaguid(16 zero bytes)
     ///            || u16be(cred_id len) || cred_id || cose_key
+    /// ```
     fn registration_response(&self, challenge: &str) -> serde_json::Value {
         let mut auth_data = sha256(RP_ID.as_bytes());
         auth_data.push(0x45);
@@ -229,7 +248,7 @@ impl SoftPasskey {
         );
         att_obj.insert(
             serde_cbor_2::Value::Text("attStmt".into()),
-            serde_cbor_2::Value::Map(Default::default()),
+            serde_cbor_2::Value::Map(std::collections::BTreeMap::default()),
         );
         att_obj.insert(
             serde_cbor_2::Value::Text("authData".into()),
@@ -252,7 +271,10 @@ impl SoftPasskey {
     }
 
     /// Assertion response. Counter strictly increases (registration stores 0).
-    /// authData = rp_id_hash || 0x05 (UP|UV) || u32be(counter).
+    ///
+    /// ```text
+    /// authData = rp_id_hash || 0x05 (UP|UV) || u32be(counter)
+    /// ```
     fn assertion_response(&self, challenge: &str, user_handle: Option<&[u8]>) -> serde_json::Value {
         let counter = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let mut auth_data = sha256(RP_ID.as_bytes());
@@ -387,6 +409,31 @@ async fn authenticated_session_id(pool: &sqlx::PgPool) -> Uuid {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+/// Block until `expected` other backends in this database are waiting on locks
+/// (lock views are cluster-wide, so scope by `datname`).
+async fn wait_for_lock_waiters(pool: &sqlx::PgPool, expected: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiters: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND wait_event_type = 'Lock' \
+               AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiters >= expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "finishes never blocked on the lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Hit a `CurrentUser`-protected route with `cookie`; returns (status, body).
@@ -953,13 +1000,12 @@ async fn lock_and_rotate_challenge_lifecycle() {
         .await
         .unwrap();
     assert_eq!(old, 0);
-    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
-        "SELECT user_id, challenge_state FROM sessions WHERE session_id = $1",
-    )
-    .bind(rotated.session_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT user_id, challenge_state FROM sessions WHERE session_id = $1")
+            .bind(rotated.session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(user, Some(user_id));
     assert_eq!(challenge, None);
 }
@@ -1195,13 +1241,12 @@ async fn assert_rotated(
         .await
         .unwrap();
     assert_eq!(old, 0, "old session row must be deleted");
-    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
-        "SELECT user_id, challenge_state FROM sessions WHERE session_id = $1",
-    )
-    .bind(new_id)
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT user_id, challenge_state FROM sessions WHERE session_id = $1")
+            .bind(new_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
     assert!(user.is_some(), "rotated session must be authenticated");
     assert_eq!(challenge, None, "rotated session must have no challenge");
 
@@ -1239,8 +1284,7 @@ async fn named_login_rotates_session_id_and_invalidates_old_cookie() {
     let cookie = make_session_cookie(anon_id, &state.cookie_key);
     let soft = SoftPasskey::new();
 
-    let (status, _) =
-        register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
+    let (status, _) = register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
     assert_eq!(status, 200);
 
     // Registration rotated the session: re-mint the cookie from the DB row.
@@ -1264,8 +1308,7 @@ async fn discoverable_login_rotates_session_id() {
     let cookie = make_session_cookie(anon_id, &state.cookie_key);
     let soft = SoftPasskey::new();
 
-    let (status, _) =
-        register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
+    let (status, _) = register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
     assert_eq!(status, 200);
 
     let before_login = authenticated_session_id(&pool).await;
@@ -1298,8 +1341,7 @@ async fn finish_after_successful_finish_returns_400() {
     let cookie = make_session_cookie(anon_id, &state.cookie_key);
     let soft = SoftPasskey::new();
 
-    let (status, _) =
-        register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
+    let (status, _) = register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
     assert_eq!(status, 200);
 
     let before_login = authenticated_session_id(&pool).await;
@@ -1335,7 +1377,11 @@ async fn finish_after_successful_finish_returns_400() {
 
     // Same assertion again with the rotated cookie: the challenge is consumed.
     let replay = app
-        .oneshot(json_request("/auth/finish", &assertion, Some(&rotated_cookie)))
+        .oneshot(json_request(
+            "/auth/finish",
+            &assertion,
+            Some(&rotated_cookie),
+        ))
         .await
         .unwrap();
     assert_eq!(replay.status(), 400);
@@ -1362,8 +1408,7 @@ async fn concurrent_finishes_exactly_one_succeeds() {
     let cookie = make_session_cookie(anon_id, &state.cookie_key);
     let soft = SoftPasskey::new();
 
-    let (status, _) =
-        register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
+    let (status, _) = register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
     assert_eq!(status, 200);
     let session_before = authenticated_session_id(&pool).await;
     let alice_id: Uuid =
@@ -1405,14 +1450,16 @@ async fn concurrent_finishes_exactly_one_succeeds() {
     let assertion_a = assertion.clone();
     let assertion_b = assertion.clone();
     let a = tokio::spawn(async move {
-        app_a.oneshot(json_request("/auth/finish", &assertion_a, Some(&cookie_a)))
+        app_a
+            .oneshot(json_request("/auth/finish", &assertion_a, Some(&cookie_a)))
             .await
             .unwrap()
             .status()
             .as_u16()
     });
     let b = tokio::spawn(async move {
-        app_b.oneshot(json_request("/auth/finish", &assertion_b, Some(&cookie_b)))
+        app_b
+            .oneshot(json_request("/auth/finish", &assertion_b, Some(&cookie_b)))
             .await
             .unwrap()
             .status()
@@ -1421,32 +1468,12 @@ async fn concurrent_finishes_exactly_one_succeeds() {
 
     // Wait until both requests are blocked on the lock (they are in THIS
     // database, waiting on locks, and not the poller itself).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let waiters: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() \
-               AND wait_event_type = 'Lock' \
-               AND pid <> pg_backend_pid()",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        if waiters >= 2 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "finishes never blocked on the lock"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    wait_for_lock_waiters(&pool, 2).await;
 
     holder.rollback().await.unwrap();
-    let (a, b) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        async { (a.await.unwrap(), b.await.unwrap()) },
-    )
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        (a.await.unwrap(), b.await.unwrap())
+    })
     .await
     .expect("finishes must complete after the lock is released");
 
@@ -1460,13 +1487,11 @@ async fn concurrent_finishes_exactly_one_succeeds() {
         .await
         .unwrap();
     assert_eq!(old, 0);
-    let authenticated: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM sessions WHERE user_id = $1",
-    )
-    .bind(alice_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let authenticated: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE user_id = $1")
+        .bind(alice_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(authenticated, 1);
     let new_session: Uuid =
         sqlx::query_scalar("SELECT session_id FROM sessions WHERE user_id = $1")
@@ -1499,8 +1524,7 @@ async fn consumer_fk_rows_cascade_on_rotation() {
     let state = make_state(pool.clone());
     let cookie = make_session_cookie(old_id, &state.cookie_key);
     let soft = SoftPasskey::new();
-    let (status, _headers) =
-        register_over_http(make_router(state), &cookie, &soft, "alice").await;
+    let (status, _headers) = register_over_http(make_router(state), &cookie, &soft, "alice").await;
     assert_eq!(status, 200);
 
     let old: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE session_id = $1")
@@ -1514,12 +1538,11 @@ async fn consumer_fk_rows_cascade_on_rotation() {
         .await
         .unwrap();
     assert_eq!(notes, 0, "pre-auth consumer rows must cascade away");
-    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
-        "SELECT user_id, challenge_state FROM sessions WHERE user_id IS NOT NULL",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT user_id, challenge_state FROM sessions WHERE user_id IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(user.is_some());
     assert_eq!(challenge, None);
 }
@@ -1553,8 +1576,7 @@ async fn register_write_failure_leaves_no_account_and_live_challenge() {
     let state = make_state(pool.clone());
     let cookie = make_session_cookie(session_id, &state.cookie_key);
     let soft = SoftPasskey::new();
-    let (status, _headers) =
-        register_over_http(make_router(state), &cookie, &soft, "alice").await;
+    let (status, _headers) = register_over_http(make_router(state), &cookie, &soft, "alice").await;
     assert_eq!(status, 500);
 
     let users: i64 = sqlx::query_scalar("SELECT count(*) FROM passkey_users")
@@ -1567,15 +1589,17 @@ async fn register_write_failure_leaves_no_account_and_live_challenge() {
         .await
         .unwrap();
     assert_eq!(creds, 0, "no credential may survive a failed registration");
-    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
-        "SELECT user_id, challenge_state FROM sessions WHERE session_id = $1",
-    )
-    .bind(session_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT user_id, challenge_state FROM sessions WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(user, None, "session must stay anonymous");
-    assert!(challenge.is_some(), "challenge must stay usable for a retry");
+    assert!(
+        challenge.is_some(),
+        "challenge must stay usable for a retry"
+    );
 }
 
 #[tokio::test]
@@ -1585,13 +1609,8 @@ async fn login_write_failure_leaves_session_anonymous_and_challenge_live() {
     let reg_cookie_session = create_anonymous_session(&pool).await;
     let reg_cookie = make_session_cookie(reg_cookie_session, &state.cookie_key);
     let soft = SoftPasskey::new();
-    let (status, _) = register_over_http(
-        make_router(state.clone()),
-        &reg_cookie,
-        &soft,
-        "alice",
-    )
-    .await;
+    let (status, _) =
+        register_over_http(make_router(state.clone()), &reg_cookie, &soft, "alice").await;
     assert_eq!(status, 200);
     let (cred_json, last_used): (serde_json::Value, Option<chrono::DateTime<chrono::Utc>>) =
         sqlx::query_as("SELECT credential_json, last_used_at FROM passkey_credentials")
@@ -1608,15 +1627,17 @@ async fn login_write_failure_leaves_session_anonymous_and_challenge_live() {
         named_login_over_http(make_router(state.clone()), &login_cookie, &soft, "alice").await;
     assert_eq!(status, 500);
 
-    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
-        "SELECT user_id, challenge_state FROM sessions WHERE session_id = $1",
-    )
-    .bind(login_session)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (user, challenge): (Option<Uuid>, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT user_id, challenge_state FROM sessions WHERE session_id = $1")
+            .bind(login_session)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(user, None, "session must stay anonymous behind the 500");
-    assert!(challenge.is_some(), "challenge must stay usable for a retry");
+    assert!(
+        challenge.is_some(),
+        "challenge must stay usable for a retry"
+    );
 
     let (cred_json_after, last_used_after): (
         serde_json::Value,
@@ -1625,6 +1646,9 @@ async fn login_write_failure_leaves_session_anonymous_and_challenge_live() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(cred_json_after, cred_json, "credential counter must roll back");
+    assert_eq!(
+        cred_json_after, cred_json,
+        "credential counter must roll back"
+    );
     assert_eq!(last_used_after, last_used, "last_used_at must roll back");
 }

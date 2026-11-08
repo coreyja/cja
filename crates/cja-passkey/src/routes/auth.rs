@@ -167,7 +167,11 @@ where
             tracing::warn!("invalid challenge_state JSON: {err}");
             StatusCode::BAD_REQUEST
         })?;
-    let ChallengeState::Authentication { auth_state, user_id } = challenge_state else {
+    let ChallengeState::Authentication {
+        auth_state,
+        user_id,
+    } = challenge_state
+    else {
         return Err(StatusCode::BAD_REQUEST);
     };
     // 3. Verify the ceremony (on failure the outer half rolls back,
@@ -214,13 +218,7 @@ where
         tracing::error!("begin tx: {err}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    match finish_discoverable_tx(
-        &state,
-        &mut tx,
-        *session.session_id(),
-        &credential_payload,
-    )
-    .await
+    match finish_discoverable_tx(&state, &mut tx, *session.session_id(), &credential_payload).await
     {
         Ok(new_session) => {
             tx.commit().await.map_err(|err| {

@@ -101,7 +101,7 @@ impl PasskeySession {
         Ok(())
     }
 
-    /// Lock the session row and read its challenge state, making the WebAuthn
+    /// Lock the session row and read its challenge state, making the `WebAuthn`
     /// ceremony single-use: the row stays locked until the caller commits
     /// (consuming the challenge via [`Self::rotate_session_id`]) or rolls back
     /// (leaving the challenge untouched for a retry). Nothing is consumed by

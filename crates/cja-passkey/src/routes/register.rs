@@ -97,14 +97,7 @@ where
         tracing::error!("begin tx: {err}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    match register_finish_tx(
-        &state,
-        &mut tx,
-        *session.session_id(),
-        &credential_payload,
-    )
-    .await
-    {
+    match register_finish_tx(&state, &mut tx, *session.session_id(), &credential_payload).await {
         Ok(new_session) => {
             tx.commit().await.map_err(|err| {
                 tracing::error!("commit finish tx: {err}");
@@ -172,8 +165,13 @@ where
     // a failure anywhere leaves neither "account exists, session anonymous" nor a
     // half-consumed challenge — and the rotation's cascade removes consumer
     // pre-auth rows (e.g. chess's registration_authorizations) atomically.
-    if let Err(err) =
-        user::create(&mut **tx, user_unique_id, &username, display_name.as_deref()).await
+    if let Err(err) = user::create(
+        &mut **tx,
+        user_unique_id,
+        &username,
+        display_name.as_deref(),
+    )
+    .await
     {
         tracing::warn!("user::create failed (likely race): {err}");
         return Err(StatusCode::CONFLICT);
