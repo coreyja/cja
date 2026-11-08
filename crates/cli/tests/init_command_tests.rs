@@ -492,7 +492,11 @@ edition = "2021"
         .current_dir(&temp)
         .timeout(INIT_TIMEOUT)
         .assert()
-        .success();
+        .success()
+        // A pre-existing migrations dir with .sql files gets the shared-
+        // _sqlx_migrations warning on stderr.
+        .stderr(predicate::str::contains("VersionMissing"))
+        .stderr(predicate::str::contains("--ignore-missing"));
 
     // Verify existing migration is preserved
     temp.child("migrations/existing.sql")
