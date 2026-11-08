@@ -67,9 +67,10 @@ impl<AppState: AS> Worker<AppState> {
     ///
     /// Tick errors are logged, never propagated: a cron whose callback or
     /// claim fails does not end the loop, and the next tick runs normally.
-    /// `run` therefore returns only on shutdown. A panicking callback still
-    /// ends the process via the Supervisor — and, because the claim already
-    /// committed, recurs every interval.
+    /// `run` therefore returns only on shutdown. A panicking callback is not
+    /// caught: under the Supervisor it ends the process. Its claim has
+    /// already committed, so the restart does not retry it immediately, but
+    /// a callback that always panics ends the process again each interval.
     ///
     /// # Arguments
     ///
@@ -78,17 +79,17 @@ impl<AppState: AS> Worker<AppState> {
     /// # Example
     ///
     /// ```ignore
+    /// use cja::tasks::{ShutdownBudget, Supervisor};
     /// use tokio_util::sync::CancellationToken;
     ///
-    /// let shutdown_token = CancellationToken::new();
-    /// let worker_token = shutdown_token.clone();
+    /// let shutdown = CancellationToken::new();
+    /// let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
     ///
-    /// tokio::spawn(async move {
-    ///     worker.run(worker_token).await;
-    /// });
+    /// let token = shutdown.clone();
+    /// supervisor.spawn("cron", async move { worker.run(token).await; Ok(()) });
     ///
     /// // Later, trigger shutdown
-    /// shutdown_token.cancel();
+    /// shutdown.cancel();
     /// ```
     pub async fn run(self, shutdown_token: CancellationToken) {
         tracing::debug!(cron_worker_id = %self.id, "Starting Cron loop");

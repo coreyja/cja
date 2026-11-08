@@ -198,9 +198,10 @@ continues with the next cron and the next tick; if the `crons` table cannot be
 read the tick is skipped (recoverable errors log a warning) and retried on the
 next poll; `Worker::run` returns only on shutdown, so a Supervisor-spawned
 cron worker no longer ends the process on cron errors. A panicking callback
-still ends the process via the Supervisor — and, because the claim already
-committed, recurs every interval. Lock, statement, and
-idle-transaction timeouts are fixed inside the scheduler.
+is not caught: under the Supervisor it ends the process. Its claim has
+already committed, so the restart does not retry it immediately, but a
+callback that always panics ends the process again each interval. Lock,
+statement, and idle-transaction timeouts are fixed inside the scheduler.
 During a rollout, an older scheduler overlapping an upgraded one can still
 double-fire.
 

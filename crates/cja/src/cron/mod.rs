@@ -60,7 +60,10 @@
 //! that interval is skipped and the next interval fires normally. A callback
 //! error is logged and the worker keeps running — no process restart is needed
 //! for the next interval. A tick whose `crons` read fails is skipped the same
-//! way and retried on the next poll.
+//! way and retried on the next poll. A panicking callback is not caught: under
+//! the Supervisor it ends the process. Its claim has already committed, so the
+//! restart does not retry it immediately, but a callback that always panics
+//! ends the process again each interval.
 //! During a rollout, an older scheduler overlapping an upgraded one can still
 //! double-fire.
 //!

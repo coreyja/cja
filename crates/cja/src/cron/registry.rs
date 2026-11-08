@@ -1557,8 +1557,9 @@ mod test {
         let healthy_calls = Arc::new(AtomicUsize::new(0));
 
         // `jobs` is a HashMap: iteration order is arbitrary. Gate on the
-        // failing cron iterating FIRST, so the loop under test cannot reach
-        // the sibling only by luck. Each `CronRegistry::new()` gets a fresh
+        // failing cron iterating FIRST — mirroring `Worker::tick`'s
+        // `values()` iteration — so the loop under test cannot reach the
+        // sibling only by luck. Each `CronRegistry::new()` gets a fresh
         // RandomState seed, so a rebuild re-rolls the order (~2 tries).
         let mut first_is_failing = None;
         for _ in 0..64 {
@@ -1584,7 +1585,7 @@ mod test {
                     })
                 },
             );
-            if candidate.jobs.keys().next() == Some(&"failing") {
+            if candidate.jobs.values().next().map(|job| job.name) == Some("failing") {
                 first_is_failing = Some(candidate);
                 break;
             }
