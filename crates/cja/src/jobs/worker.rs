@@ -17,6 +17,7 @@ use tracing::Span;
 use crate::app_state::AppState as AS;
 
 use super::registry::JobRegistry;
+use super::{InvalidJobPayload, JobYield, UnknownJobType};
 
 /// Default maximum number of retry attempts before a job is moved to the dead letter queue.
 ///
@@ -205,6 +206,12 @@ const TICK_ERROR_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Maximum backoff duration between retries after consecutive tick failures.
 const TICK_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Delay before a job row whose name this binary does not know becomes
+/// claimable again. Long enough to keep claim churn trivial during a rolling
+/// deploy, short enough that a binary which knows the name picks it up
+/// promptly.
+const UNKNOWN_JOB_RELEASE_DELAY: Duration = Duration::from_secs(30);
+
 pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 
 #[derive(Debug)]
@@ -213,6 +220,9 @@ pub(super) struct RunJobSuccess(JobFromDB);
 enum RunJobOutcome {
     Completed(RunJobResult),
     LeaseLost(uuid::Uuid),
+    /// The row was released without charging a failure: cooperative yield or
+    /// unknown job type.
+    Released(uuid::Uuid),
 }
 
 struct ClaimedJob {
@@ -407,7 +417,61 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         };
         // The body and all heartbeat futures have ended before finalization.
         if let Err(error) = job_result {
+            // Ordered before the max-retries check so a cooperative shutdown
+            // never escalates toward dead-letter: yields release uncharged.
+            if error.downcast_ref::<JobYield>().is_some() {
+                let result = sqlx::query(
+                    "UPDATE jobs SET locked_by = NULL, locked_at = NULL
+                     WHERE job_id = $1 AND locked_by = $2",
+                )
+                .bind(job.job_id)
+                .bind(&self.owner_token)
+                .execute(self.state.db())
+                .await?;
+                if result.rows_affected() != 1 {
+                    tracing::warn!(job_id = %job.job_id, "Job yield release lost ownership");
+                    return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                }
+                tracing::info!(job_id = %job.job_id, reason = %error,
+                    "Job yielded; released without charging an attempt");
+                return Ok(RunJobOutcome::Released(job.job_id));
+            }
+            if error.downcast_ref::<UnknownJobType>().is_some() {
+                let result = sqlx::query(
+                    "UPDATE jobs SET locked_by = NULL, locked_at = NULL,
+                     run_at = NOW() + $3::bigint * interval '1 microsecond'
+                     WHERE job_id = $1 AND locked_by = $2",
+                )
+                .bind(job.job_id)
+                .bind(&self.owner_token)
+                .bind(
+                    i64::try_from(UNKNOWN_JOB_RELEASE_DELAY.as_micros())
+                        .expect("30s fits in i64 micros"),
+                )
+                .execute(self.state.db())
+                .await?;
+                if result.rows_affected() != 1 {
+                    tracing::warn!(job_id = %job.job_id, "Unknown-job release lost ownership");
+                    return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                }
+                tracing::warn!(job_id = %job.job_id, name = %job.name,
+                    retry_in_secs = UNKNOWN_JOB_RELEASE_DELAY.as_secs(),
+                    "Unknown job type for this binary; released uncharged with a short delay");
+                return Ok(RunJobOutcome::Released(job.job_id));
+            }
             let error_message = format!("{error:#}");
+            if error.downcast_ref::<InvalidJobPayload>().is_some() {
+                let count = job
+                    .error_count
+                    .checked_add(1)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("job error_count overflow"))?;
+                if !self.dead_letter_owned(&job, count, &error_message).await? {
+                    return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                }
+                tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
+                    "Job payload is not deserializable - moved to dead letter queue without retries");
+                return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
+            }
             if job.error_count >= self.max_retries {
                 let count = job
                     .error_count
@@ -706,6 +770,10 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// When the `shutdown_token` is cancelled:
 /// - The worker stops polling for new jobs
 /// - Any currently executing job gets a bounded drain to complete
+/// - A cooperative body may return `Err(JobYield::new(...).into())` inside
+///   that drain to have its row released uncharged
+/// - Rows whose `name` this binary does not know are released uncharged with
+///   a short delay instead of being charged and retried
 /// - Remaining owned locks are released after the drain without charging an attempt
 ///
 /// # Transient Error Resilience
@@ -934,6 +1002,11 @@ async fn run_claimed_job<AppState: AS, R: JobRegistry<AppState>>(
             tracing::warn!(worker.id = %worker.id, %job_id, "Job lease lost; body stopped");
             Ok(())
         }
+        Ok(RunJobOutcome::Released(job_id)) => {
+            tracing::info!(worker.id = %worker.id, %job_id,
+                "Job released without charge (yield or unknown job type)");
+            Ok(())
+        }
         Err(error) => Err(error),
     })
 }
@@ -1084,6 +1157,59 @@ mod tests {
         }
     }
 
+    /// Announces start, then yields ([`JobYield`]) when shutdown is requested.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct YieldingJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for YieldingJob {
+        const NAME: &'static str = "YieldingJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            app_state: TestAppState,
+            cancellation_token: CancellationToken,
+        ) -> color_eyre::Result<()> {
+            sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+            cancellation_token.cancelled().await;
+            Err(JobYield::new("test shutdown").into())
+        }
+    }
+
+    /// Announces start, then returns a plain `Err` when shutdown is requested —
+    /// the pre-yield behavior, kept as the charged contrast.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct ChargedOnShutdownJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for ChargedOnShutdownJob {
+        const NAME: &'static str = "ChargedOnShutdownJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            app_state: TestAppState,
+            cancellation_token: CancellationToken,
+        ) -> color_eyre::Result<()> {
+            sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+            cancellation_token.cancelled().await;
+            Err(color_eyre::eyre::eyre!("simulated failure during shutdown"))
+        }
+    }
+
     impl_job_registry!(
         TestAppState,
         TestJob,
@@ -1091,7 +1217,9 @@ mod tests {
         NormalProbeJob,
         LongJob,
         DrainCooperativeJob,
-        DrainStubbornJob
+        DrainStubbornJob,
+        YieldingJob,
+        ChargedOnShutdownJob
     );
 
     fn test_state(db: sqlx::PgPool) -> TestAppState {
@@ -1602,6 +1730,321 @@ mod tests {
         )
         .await;
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    /// A cooperative body that returns `JobYield` on shutdown must have its
+    /// row released with `error_count`, the error columns, and `run_at`
+    /// untouched — uncharged and immediately claimable again.
+    #[sqlx::test]
+    async fn test_shutdown_yield_releases_uncharged(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        YieldingJob
+            .enqueue(state.clone(), "yield-shutdown-test".into(), None)
+            .await
+            .unwrap();
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(10),
+            20,
+            worker_token,
+            JobWorkerConfig {
+                shutdown_drain_timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+        ));
+
+        wait_until_started(&db, YieldingJob::NAME).await;
+        shutdown_token.cancel();
+        tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("worker must exit inside the drain window")
+            .unwrap()
+            .expect("worker must not error");
+
+        let locks: (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT locked_by, locked_at FROM jobs WHERE name = $1")
+                .bind(YieldingJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(locks.0.is_none(), "yield must unlock the row");
+        assert!(locks.1.is_none(), "yield must clear locked_at");
+        let charges: (i32, Option<String>, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+            "SELECT error_count, last_error_message, run_at FROM jobs WHERE name = $1",
+        )
+        .bind(YieldingJob::NAME)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(charges.0, 0, "yield must not charge an attempt");
+        assert!(
+            charges.1.is_none(),
+            "yield must not record an error message"
+        );
+        assert!(
+            charges.2 <= chrono::Utc::now(),
+            "yield leaves run_at immediately claimable, not backed off"
+        );
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0);
+    }
+
+    /// The pre-yield behavior, kept as the charged contrast: a plain `Err`
+    /// from a cancellation-aware body on shutdown charges a failed attempt.
+    #[sqlx::test]
+    async fn test_shutdown_plain_error_is_charged(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        ChargedOnShutdownJob
+            .enqueue(state.clone(), "charged-shutdown-test".into(), None)
+            .await
+            .unwrap();
+
+        let shutdown_token = CancellationToken::new();
+        let worker_token = shutdown_token.clone();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(10),
+            20,
+            worker_token,
+            JobWorkerConfig {
+                shutdown_drain_timeout: Duration::from_secs(10),
+                ..Default::default()
+            },
+        ));
+
+        wait_until_started(&db, ChargedOnShutdownJob::NAME).await;
+        shutdown_token.cancel();
+        tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("worker must exit inside the drain window")
+            .unwrap()
+            .expect("worker must not error");
+
+        let row: (Option<String>, i32, Option<String>) = sqlx::query_as(
+            "SELECT locked_by, error_count, last_error_message FROM jobs WHERE name = $1",
+        )
+        .bind(ChargedOnShutdownJob::NAME)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(row.0.is_none());
+        assert_eq!(row.1, 1, "a plain error on shutdown is charged");
+        assert!(
+            row.2
+                .as_deref()
+                .is_some_and(|m| m.contains("simulated failure during shutdown")),
+            "last_error_message: {:?}",
+            row.2
+        );
+    }
+
+    /// Direct path (no worker loop): the yield branch itself unlocks the row —
+    /// `cleanup_worker_locks` never runs here, so the unlock can only have
+    /// come from the yield intercept, and the outcome must be `Released`.
+    #[sqlx::test]
+    async fn test_yield_release_is_owner_guarded(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        YieldingJob
+            .enqueue(state.clone(), "yield-owner-guard-test".into(), None)
+            .await
+            .unwrap();
+
+        let token = CancellationToken::new();
+        let worker = std::sync::Arc::new(
+            Worker::new(
+                state,
+                Jobs,
+                Duration::from_millis(20),
+                20,
+                token.clone(),
+                JobWorkerConfig::default(),
+            )
+            .unwrap(),
+        );
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        let job_id = claimed.job.job_id;
+        let runner = tokio::spawn({
+            let worker = std::sync::Arc::clone(&worker);
+            async move { worker.run_next_job(claimed).await }
+        });
+        wait_until_started(&db, YieldingJob::NAME).await;
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, RunJobOutcome::Released(id) if id == job_id));
+        let row: (Option<String>, i32) =
+            sqlx::query_as("SELECT locked_by, error_count FROM jobs WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(
+            row.0.is_none(),
+            "the unlock must come from the yield branch"
+        );
+        assert_eq!(row.1, 0);
+    }
+
+    /// An unknown job name (rolling deploy: a newer binary enqueued a type
+    /// this one predates) is released uncharged with a short delay instead of
+    /// climbing the retry ladder toward a dead-letter.
+    #[sqlx::test]
+    async fn test_unknown_job_name_releases_uncharged_with_delay(db: sqlx::PgPool) {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+             VALUES ($1, 'NoSuchJob', '{}', 0, NOW(), NOW(), 'unknown-type-test')",
+        )
+        .bind(job_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.job_id, job_id);
+        assert!(claimed.previous_locked_by.is_none());
+
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(matches!(outcome, RunJobOutcome::Released(id) if id == job_id));
+
+        let row: (
+            Option<String>,
+            i32,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            "SELECT locked_by, error_count, last_error_message, run_at
+             FROM jobs WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(row.0.is_none(), "unknown name must be released uncharged");
+        assert_eq!(row.1, 0, "unknown name must not charge an attempt");
+        assert!(row.2.is_none());
+        assert!(
+            row.3 > chrono::Utc::now(),
+            "unknown name must back off ~30s (run_at = {:?})",
+            row.3
+        );
+        let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(dead_letters, 0);
+    }
+
+    /// A payload that cannot be deserialized will never deserialize: it must
+    /// dead-letter on the first attempt instead of retrying for ~12 days.
+    #[sqlx::test]
+    async fn test_undeserializable_payload_dead_letters_immediately(db: sqlx::PgPool) {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+             VALUES ($1, 'TestJob', $2, 0, NOW(), NOW(), 'poison-payload-test')",
+        )
+        .bind(job_id)
+        .bind(serde_json::json!({"unexpected": true}))
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig::default(),
+        ));
+
+        let row: (i32, String) = wait_for(|| async {
+            sqlx::query_as(
+                "SELECT error_count, last_error_message FROM dead_letter_jobs
+                 WHERE original_job_id = $1",
+            )
+            .bind(job_id)
+            .fetch_optional(&db)
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(
+            row.0, 1,
+            "poison payload must dead-letter on the first attempt"
+        );
+        assert!(row.1.contains("not deserializable"), "{}", row.1);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0, "job row must be deleted after dead-lettering");
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// The `jobs_lock_pair_check` CHECK constraint pairs the lock columns: a
+    /// row must carry both `locked_by` and `locked_at` or neither.
+    #[sqlx::test]
+    async fn test_jobs_lock_columns_are_paired(db: sqlx::PgPool) {
+        let error = sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, locked_by)
+             VALUES ($1, 'TestJob', '{}', 0, NOW(), NOW(), 'lock-pair-test', 'x')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&db)
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("jobs_lock_pair_check"),
+            "{error}"
+        );
+
+        let error = sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, locked_at)
+             VALUES ($1, 'TestJob', '{}', 0, NOW(), NOW(), 'lock-pair-test', NOW())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&db)
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("jobs_lock_pair_check"),
+            "{error}"
+        );
+
+        // Both NULL is the normal unlocked state: the enqueue path is unaffected.
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+             VALUES ($1, 'TestJob', '{}', 0, NOW(), NOW(), 'lock-pair-test')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&db)
+        .await
+        .unwrap();
     }
 
     /// Test that `fetch_next_job` picks up a stale lock with an unprefixed owner.

@@ -109,7 +109,7 @@ macro_rules! impl_job_registry {
                     $(
                         <$job_type>::NAME => <$job_type>::run_from_value(payload, app_state, cancellation_token).await,
                     )*
-                    _ => Err($crate::color_eyre::eyre::eyre!("Unknown job type: {}", job.name)),
+                    _ => Err($crate::jobs::UnknownJobType(job.name.clone()).into()),
                 }
             }
 

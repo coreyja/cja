@@ -408,15 +408,15 @@ impl Durable {
 
         loop {
             // Between-steps shutdown boundary (deploy): abort, release, and
-            // either requeue on a fresh row (progress was made) or error so
-            // cja's backoff retries — the run resumes at the last persist.
-            // A shutdown never marks the run cancelled or failed.
+            // either requeue on a fresh row (progress was made) or yield so
+            // cja releases the row uncharged — the run resumes at the last
+            // persist. A shutdown never marks the run cancelled or failed.
             if attempt.shutdown.is_cancelled() {
                 return self
                     .retry_or_requeue(
                         state,
                         &attempt,
-                        cja::color_eyre::eyre::eyre!("shutdown requested between steps"),
+                        cja::jobs::JobYield::new("shutdown requested between steps").into(),
                     )
                     .await;
             }
@@ -1267,16 +1267,18 @@ impl Attempt<'_> {
                 }
                 () = self.shutdown.cancelled() => {
                     // Deploy shutdown: drop the in-flight future, release the
-                    // lease bounded at 1s (inside cja's 2s drain), and Err —
+                    // lease bounded at 1s (inside cja's 2s drain), and yield —
                     // the caller routes through `fail_retryable`, whose
-                    // release is then a conditional no-op. Returning Ok
-                    // here would hit cja's delete-on-Ok and orphan the run.
+                    // release is then a conditional no-op, and the no-progress
+                    // path reaches cja as a `JobYield` that releases the job
+                    // row uncharged. Returning Ok here would hit cja's
+                    // delete-on-Ok and orphan the run.
                     let _ = tokio::time::timeout(
                         RELEASE_BOUND,
                         db::release_lease(self.db, self.run_id, &self.me),
                     )
                     .await;
-                    return Err(cja::color_eyre::eyre::eyre!("shutdown requested mid-step"));
+                    return Err(cja::jobs::JobYield::new("shutdown requested mid-step").into());
                 }
             }
         }
