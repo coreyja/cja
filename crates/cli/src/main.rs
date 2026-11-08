@@ -1730,18 +1730,51 @@ DROP FUNCTION IF EXISTS update_updated_at_column ();
 
 #[cfg(test)]
 mod tests {
-    use super::generate_spawn_tasks;
+    use super::{generate_cargo_toml, generate_main_rs};
 
     #[test]
-    fn generated_job_worker_has_shutdown_token_and_config() {
-        let generated = generate_spawn_tasks(false, true);
-        assert!(
-            generated.contains("// TODO: wire to a shutdown signal (see cja::tasks::Supervisor)")
-        );
-        assert!(
-            generated
-                .contains("cja::jobs::CancellationToken::new(),\n            Default::default(),")
-        );
-        assert!(generated.contains("cja::jobs::worker::job_worker("));
+    fn generated_boot_path_uses_cja_migrations() {
+        for (no_cron, no_jobs, no_sessions) in
+            [(false, false, false), (true, false, false), (true, true, false), (true, true, true)]
+        {
+            let main_rs = generate_main_rs(no_cron, no_jobs, no_sessions);
+            assert!(
+                main_rs.contains("cja::db::run_migrations(&pool)"),
+                "{no_cron}/{no_jobs}/{no_sessions}"
+            );
+            assert!(
+                main_rs.contains("set_ignore_missing(true)"),
+                "app migrator must tolerate cja's rows: {no_cron}/{no_jobs}/{no_sessions}"
+            );
+            assert!(!main_rs.contains("color_eyre::Result"));
+            assert!(!main_rs.contains("pg_advisory_lock"));
+            assert!(!main_rs.contains("sqlx::query!")); // runtime SQL only: compiles without a DB
+            assert!(!main_rs.contains("tokio::spawn")); // everything goes through the Supervisor
+        }
+    }
+
+    #[test]
+    fn full_featured_wiring_matches_current_api() {
+        let main_rs = generate_main_rs(false, false, false);
+        assert!(main_rs.contains("Supervisor::new(ShutdownBudget::from_env())"));
+        assert!(main_rs.contains("cja::jobs::worker::job_worker("));
+        assert!(main_rs.contains("cja::impl_job_registry!(crate::AppState, ExampleJob)"));
+        assert!(main_rs.contains("impl Job<crate::AppState> for ExampleJob"));
+        assert!(main_rs.contains("CronRegistry::new()"));
+        assert!(main_rs.contains("Worker::new(app_state, build_registry())"));
+        assert!(!main_rs.contains("TODO"));
+    }
+
+    #[test]
+    fn cargo_toml_defaults_to_git_dependency() {
+        let toml = generate_cargo_toml("myapp", None, "main", false, false, false);
+        assert!(toml.contains(r#"cja = { git = "https://github.com/coreyja/cja", branch = "main" }"#));
+        assert!(toml.contains(
+            r#"sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono", "migrate"] }"#
+        ));
+
+        // --branch without --github overrides the default repo's branch
+        let custom = generate_cargo_toml("myapp", None, "dev", false, false, false);
+        assert!(custom.contains(r#"cja = { git = "https://github.com/coreyja/cja", branch = "dev" }"#));
     }
 }
