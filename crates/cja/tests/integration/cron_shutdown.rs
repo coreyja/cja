@@ -10,7 +10,7 @@ async fn shutdown_finishes_the_active_cron_and_records_its_completion(pool: sqlx
 }
 
 #[sqlx::test]
-async fn shutdown_preserves_an_active_cron_failure(pool: sqlx::PgPool) {
+async fn shutdown_finishes_the_active_cron_even_when_it_fails(pool: sqlx::PgPool) {
     check_active_cron_shutdown(pool, true).await;
 }
 
@@ -47,15 +47,13 @@ async fn check_active_cron_shutdown(pool: sqlx::PgPool, fail: bool) {
         "cancellation must wait for the active callback"
     );
     release.notify_one();
-    let result = tokio::time::timeout(Duration::from_secs(2), worker)
+    // Whether the callback returned Ok or Err, its error is logged inside
+    // `tick` and swallowed: the worker still completes promptly once released
+    // and shut down.
+    tokio::time::timeout(Duration::from_secs(2), worker)
         .await
         .unwrap()
         .unwrap();
-    if fail {
-        assert!(result.unwrap_err().to_string().contains("SMTP unavailable"));
-    } else {
-        result.unwrap();
-    }
     let recorded: i64 =
         sqlx::query_scalar("SELECT count(*) FROM crons WHERE name = 'active_email'")
             .fetch_one(&pool)
@@ -73,8 +71,5 @@ async fn already_cancelled_worker_does_not_start_a_tick(pool: sqlx::PgPool) {
     pool.close().await;
     let shutdown = CancellationToken::new();
     shutdown.cancel();
-    Worker::new(state, CronRegistry::new())
-        .run(shutdown)
-        .await
-        .unwrap();
+    Worker::new(state, CronRegistry::new()).run(shutdown).await;
 }

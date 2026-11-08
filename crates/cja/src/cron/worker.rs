@@ -6,7 +6,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState as AS;
 
-use super::registry::{CronRegistry, TickError};
+use super::registry::{CronRegistry, recoverable};
+
+/// Observable summary of one tick, for tests. `Worker::run` discards it;
+/// every failure inside a tick is logged, never propagated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TickOutcome {
+    /// The `crons` map read failed; this tick was skipped and no cron ran.
+    pub(crate) map_read_failed: bool,
+    /// Registered crons whose tick returned `Err` (logged, then skipped).
+    pub(crate) failed: usize,
+}
 
 /// Worker that executes cron jobs on a schedule
 ///
@@ -55,6 +65,10 @@ impl<AppState: AS> Worker<AppState> {
     /// - Any currently running tick completes before shutdown
     /// - The sleep between ticks can be interrupted for faster shutdown
     ///
+    /// Tick errors are logged, never propagated: a cron whose callback or
+    /// claim fails does not end the loop, and the next tick runs normally.
+    /// `run` therefore returns only on shutdown.
+    ///
     /// # Arguments
     ///
     /// * `shutdown_token` - Cancellation token for graceful shutdown
@@ -68,19 +82,20 @@ impl<AppState: AS> Worker<AppState> {
     /// let worker_token = shutdown_token.clone();
     ///
     /// tokio::spawn(async move {
-    ///     worker.run(worker_token).await.unwrap();
+    ///     worker.run(worker_token).await;
     /// });
     ///
     /// // Later, trigger shutdown
     /// shutdown_token.cancel();
     /// ```
-    pub async fn run(self, shutdown_token: CancellationToken) -> Result<(), TickError> {
+    pub async fn run(self, shutdown_token: CancellationToken) {
         tracing::debug!(cron_worker_id = %self.id, "Starting Cron loop");
         while !shutdown_token.is_cancelled() {
             // Dropping tick on cancellation can interrupt a direct callback
             // after its side effect but before last_run_at is persisted.
             // Finish the current tick, including its error or completion write.
-            self.tick().await?;
+            // A tick failure is logged inside `tick` and never ends the loop.
+            self.tick().await;
 
             tokio::select! {
                 () = tokio::time::sleep(self.sleep_duration) => {}
@@ -92,14 +107,12 @@ impl<AppState: AS> Worker<AppState> {
         }
 
         tracing::info!(cron_worker_id = %self.id, "Cron worker shutdown complete");
-        Ok(())
     }
 
-    async fn last_enqueue_map(&self) -> Result<HashMap<String, DateTime<Utc>>, TickError> {
+    async fn last_enqueue_map(&self) -> Result<HashMap<String, DateTime<Utc>>, sqlx::Error> {
         let last_runs = sqlx::query!("SELECT name, last_run_at FROM Crons")
             .fetch_all(self.state.db())
-            .await
-            .map_err(TickError::SqlxError)?;
+            .await?;
 
         let last_run_map: HashMap<String, DateTime<Utc>> = last_runs
             .iter()
@@ -110,18 +123,50 @@ impl<AppState: AS> Worker<AppState> {
     }
 
     #[tracing::instrument(name = "cron.tick", level = "trace", skip_all, fields(cron_worker.id = %self.id))]
-    pub(crate) async fn tick(&self) -> Result<(), TickError> {
-        let last_enqueue_map = self.last_enqueue_map().await?;
+    pub(crate) async fn tick(&self) -> TickOutcome {
+        let mut outcome = TickOutcome::default();
+        let last_enqueue_map = match self.last_enqueue_map().await {
+            Ok(map) => map,
+            Err(error) => {
+                outcome.map_read_failed = true;
+                if recoverable(&error) {
+                    tracing::warn!(
+                        cron_worker.id = %self.id,
+                        operation = "last_enqueue_map",
+                        sqlstate = ?error.as_database_error().and_then(sqlx::error::DatabaseError::code),
+                        cause = %error,
+                        "Cron tick skipped"
+                    );
+                } else {
+                    tracing::error!(
+                        cron_worker.id = %self.id,
+                        operation = "last_enqueue_map",
+                        sqlstate = ?error.as_database_error().and_then(sqlx::error::DatabaseError::code),
+                        cause = %error,
+                        "Cron tick failed"
+                    );
+                }
+                return outcome;
+            }
+        };
         for job in self.registry.jobs.values() {
-            job.tick(
-                self.state.clone(),
-                &last_enqueue_map,
-                self.started_at,
-                self.timezone,
-            )
-            .await?;
+            if let Err(error) = job
+                .tick(
+                    self.state.clone(),
+                    &last_enqueue_map,
+                    self.started_at,
+                    self.timezone,
+                )
+                .await
+            {
+                outcome.failed += 1;
+                tracing::error!(
+                    cron.name = job.name,
+                    cause = %error,
+                    "Cron tick failed; continuing to next cron"
+                );
+            }
         }
-
-        Ok(())
+        outcome
     }
 }

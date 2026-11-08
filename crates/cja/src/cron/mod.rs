@@ -36,12 +36,12 @@
 //! // With timezone and custom poll interval
 //! Worker::new_with_timezone(app_state, registry, Eastern, Duration::from_secs(30))
 //!     .run(shutdown_token)
-//!     .await?;
+//!     .await;
 //!
 //! // Or with defaults (UTC, 60s poll interval)
 //! Worker::new(app_state, registry)
 //!     .run(shutdown_token)
-//!     .await?;
+//!     .await;
 //! ```
 //!
 //! The default poll interval is 60 seconds. To change it, use
@@ -57,7 +57,10 @@
 //!
 //! `register` and `register_with_cron` callbacks are at-most-once per interval:
 //! the claim commits before the callback runs. If it errors or the process dies,
-//! that interval is skipped and the next interval fires normally.
+//! that interval is skipped and the next interval fires normally. A callback
+//! error is logged and the worker keeps running — no process restart is needed
+//! for the next interval. A tick whose `crons` read fails is skipped the same
+//! way and retried on the next poll.
 //! During a rollout, an older scheduler overlapping an upgraded one can still
 //! double-fire.
 //!

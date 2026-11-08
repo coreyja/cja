@@ -192,8 +192,13 @@ execution remains at-least-once under worker lease and retry semantics.
 
 `register` and `register_with_cron` commit the timestamp claim before running
 the callback. They invoke a callback at most once per interval; callback error
-or process death skips the interval, and the next one fires normally. Lock,
-statement, and idle-transaction timeouts are fixed inside the scheduler.
+or process death skips the interval, and the next one fires normally. Each
+cron's tick failure is logged at `error` with the cron name and the loop
+continues with the next cron and the next tick; if the `crons` table cannot be
+read the tick is skipped (recoverable errors log a warning) and retried on the
+next poll; `Worker::run` returns only on shutdown, so a Supervisor-spawned
+cron worker no longer ends the process on cron errors. Lock, statement, and
+idle-transaction timeouts are fixed inside the scheduler.
 During a rollout, an older scheduler overlapping an upgraded one can still
 double-fire.
 
@@ -274,7 +279,8 @@ applies `prepare_routes` — including `RequestUserLayer` — to each.
 
 Cron cancellation takes effect between ticks and during the polling sleep.
 An active tick finishes its callbacks and persists successful `last_run_at`
-updates before returning; callback errors still propagate during shutdown.
+updates before returning; callback errors are logged, not propagated,
+including during shutdown.
 Applications must await workers after cancellation and impose a drain deadline
 when a callback or HTTP response can run indefinitely.
 
