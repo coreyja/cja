@@ -753,7 +753,13 @@ where
 /// whose every attempt fails
 /// permanently-but-retryably (a deterministically panicking tool) cycles
 /// dead-letter → re-enqueue; [`cancel`](fn@cancel) is the operator exit,
-/// and each re-enqueue logs at `warn`.
+/// and each re-enqueue logs at `warn`. That is the `Err` path, whose
+/// backoff stretches each cycle over days; a process-fatal attempt (OOM,
+/// abort, or a panic that aborts) cycles far faster: cja's reclaim
+/// charges the row without backoff, so the job re-runs about every 120s
+/// and dead-letters after 21 claims (~42 minutes), and the sweep then
+/// re-enqueues it at `error_count` 0 — the crash loop repeats until
+/// [`cancel`](fn@cancel).
 ///
 /// # Errors
 /// - [`RunError::Storage`] when the scan, a per-run transaction, or an

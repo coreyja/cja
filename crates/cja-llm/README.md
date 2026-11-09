@@ -388,7 +388,14 @@ woken, latched until the periodic idle poll (or `cancel()`).
   failing tick is logged and the process survives, so propagate the `Err`.
   A new interval cron fires on the first tick after boot — benign here:
   freshly-orphaned runs still hold stale leases until the takeover window
-  passes, and job-backed runs are skipped by the job check.
+  passes, and job-backed runs are skipped by the job check. A run whose
+  every attempt fails permanently-but-retryably cycles dead-letter →
+  re-enqueue: the `Err` path's backoff stretches each cycle over days,
+  but a process-fatal attempt (OOM, abort, or a panic that aborts) is
+  faster — cja's reclaim charges the row without backoff, so the job
+  re-runs about every 120s and dead-letters after 21 claims (~42
+  minutes), and the sweep then re-enqueues it at `error_count` 0. The
+  crash loop repeats until `cancel()`, the operator exit.
 - **Ops sizing**: a long agent run occupies one worker slot for its
   duration — size worker count accordingly. Worst-case resume delay after
   an ungraceful death is cja's reclaim window (~120s), not the run lease;

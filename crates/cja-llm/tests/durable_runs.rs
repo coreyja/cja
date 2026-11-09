@@ -3102,3 +3102,79 @@ async fn recover_orphans_returns_while_one_run_row_is_locked() {
         "recover_orphans still blocked on one locked run row after 10s"
     );
 }
+
+/// The skip-and-continue half of the LC-1 fix, which the pin above cannot
+/// tell from ending the sweep (it accepts `Ok` or `Err`): a run row held
+/// `FOR UPDATE` past the lock budget must be SKIPPED — the sweep returns
+/// `Ok` having reached every later candidate — and the next sweep after
+/// the hold is released must recover it (the rustdoc's "the next tick
+/// retries it" claim). Replacing the skip's `continue` with
+/// `return Err` (starvation: the oldest held row ends every tick before
+/// any later candidate is reached) must turn this test red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recover_orphans_skips_a_held_row_and_reaches_later_candidates() {
+    let env = setup(&[&COUNTER]).await;
+    let older = durable::start(&env.state, "counter", "older")
+        .await
+        .expect("start older");
+    let younger = durable::start(&env.state, "counter", "younger")
+        .await
+        .expect("start younger");
+    delete_jobs_for(&env.db, older).await;
+    delete_jobs_for(&env.db, younger).await;
+    set_running(&env.db, older, None).await;
+    set_running(&env.db, younger, None).await;
+    // `orphan_candidates` orders by `created_at`; both runs were created
+    // within this test, so age the held one to make the order (and thus
+    // which row the sweep hits first) deterministic.
+    sqlx::query("UPDATE agent_runs SET created_at = NOW() - interval '1 hour' WHERE id = $1")
+        .bind(older.0)
+        .execute(&env.db)
+        .await
+        .expect("age the older run");
+
+    let mut hold = env.db.begin().await.expect("begin hold");
+    sqlx::query("SELECT id FROM agent_runs WHERE id = $1 FOR UPDATE")
+        .bind(older.0)
+        .fetch_one(&mut *hold)
+        .await
+        .expect("hold older row");
+
+    // 15s is comfortably over the 5s per-row lock budget: the sweep must
+    // wait out the budget on `older`, skip it, and still finish the
+    // younger candidate within the timeout.
+    let swept = tokio::time::timeout(
+        Duration::from_secs(15),
+        durable::recover_orphans(&env.state),
+    )
+    .await
+    .expect("sweep returned within 15s");
+    assert_eq!(
+        swept.expect("sweep ok despite the held row"),
+        vec![younger],
+        "the held orphan is skipped and the later candidate recovered"
+    );
+    assert_eq!(jobs_for(&env.db, younger).await, 1, "younger re-enqueued");
+    assert_eq!(jobs_for(&env.db, older).await, 0, "held row not enqueued");
+
+    hold.rollback().await.expect("release hold");
+    let reswept = durable::recover_orphans(&env.state)
+        .await
+        .expect("resweep ok");
+    assert_eq!(reswept, vec![older], "the next sweep recovers the held run");
+    assert_eq!(jobs_for(&env.db, older).await, 1, "older re-enqueued");
+}
+
+/// The registration shown in the `recover_orphans` rustdoc and the
+/// README's "Orphan recovery" bullet must compile exactly as documented:
+/// it is copied code with no other compile coverage, so a `register`
+/// signature change would otherwise break the docs silently. No database
+/// is touched — `CronRegistry::register` only records the closure.
+#[test]
+fn documented_orphan_recovery_registration_compiles() {
+    let interval = Duration::from_secs(300);
+    let mut cron_registry = cja::cron::CronRegistry::<TestState>::new();
+    cron_registry.register("recover_orphaned_agent_runs", None, interval, |state, _| {
+        Box::pin(async move { cja_llm::durable::recover_orphans(&state).await.map(|_| ()) })
+    });
+}

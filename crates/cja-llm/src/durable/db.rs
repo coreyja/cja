@@ -530,8 +530,9 @@ where
 /// ADVISORY prefilter — no [`super::AdvanceRunJob`] row yet. The prefilter
 /// runs on this scan's snapshot and may race either way; the authoritative
 /// job check ([`has_advancing_job`]) runs later, under the run's row lock
-/// in a fresh statement. A live lease implies an active attempt implies a
-/// job row, so the lease predicate only avoids locking
+/// in a fresh statement. A live lease means an active owner (an orphaned
+/// run can hold one — the sweep's live-lease test leg), so the sweep
+/// leaves that row alone; the lease predicate only avoids locking
 /// actively-progressing rows. Returns run ids ONLY: the kind is read
 /// under the row lock (a `kind` bound here would be shadowed by the
 /// lock's result before any read).
@@ -567,9 +568,9 @@ pub(super) async fn orphan_candidates(
 /// `worker.rs`'s `WRITE_BOUND` exists for) cannot stall the sweep — and,
 /// because the sweep runs as a cron callback that the cron worker awaits
 /// in series with no timeout, every other cron and shutdown with it.
-/// Sized with orders of magnitude of margin over the concurrency
-/// harness's poll for blocked waiters (~hundreds of ms) and well under
-/// its 10s join budget.
+/// Sized with about an order of magnitude of margin over the
+/// concurrency harness's poll for blocked waiters (~hundreds of ms) and
+/// well under its 10s join budget.
 const LOCK_BOUND: Duration = Duration::from_secs(5);
 
 /// Lock one candidate run in its OWN statement (EPQ re-checks the status
