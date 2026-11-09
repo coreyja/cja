@@ -18,6 +18,14 @@ const TAILWIND_MAX_DOWNLOAD: u64 = 160 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Age at which an abandoned staging directory is treated as a leftover
+/// from a crashed install and removed. A live install holds its staging
+/// directory only for the unpack-and-rename (the download completes in
+/// memory first), so an hour is far beyond any live install — including a
+/// concurrent install of a *different* key, whose staging dir is not
+/// covered by this key's lock.
+const STALE_STAGE_AGE: Duration = Duration::from_hours(1);
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Tool {
     Tsc,
@@ -299,6 +307,63 @@ fn resolve_override(
     Ok(candidate)
 }
 
+fn remove_dir_or_file(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// Deletes leftovers from previous failed or crashed installs: this key's
+/// `{key}.stale-*` entries (kept when an install fails so the previous
+/// cache survives) and `.cja-tool-*` staging dirs abandoned by a crash.
+/// Call only while holding the per-key `{key}.lock`.
+///
+/// This is housekeeping, never a precondition, and it cannot fail the
+/// install: every step is best-effort. A parent that can't be listed —
+/// write and search permission without read — still supports the whole
+/// install (lock, staging, rename), so enumeration failures skip the reap
+/// and the install proceeds; the next install retries it. Likewise a
+/// leftover that can't be removed — an unreadable mixed-owner entry in a
+/// writable parent, a staging dir another key's install owns — is
+/// skipped.
+fn reap_leftovers(spec: &ToolSpec, parent: &Path) {
+    let stale_prefix = format!("{}.stale-", spec.key());
+    // An unlistable parent is a skipped cleanup, never a failed install:
+    // the lock, staging, and rename don't need read permission.
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let key_leftover = name.starts_with(&stale_prefix);
+        let stage = name.starts_with(".cja-tool-");
+        if !key_leftover && !stage {
+            continue;
+        }
+        let path = entry.path();
+        if key_leftover {
+            // This key's own leftovers, under its lock. Best-effort like
+            // staging dirs: an entry that can't be removed must not fail a
+            // build that would otherwise succeed.
+            let _ = remove_dir_or_file(&path);
+            continue;
+        }
+        // Staging dirs: only crash leftovers — a live install holds its
+        // staging dir only for the unpack-and-rename window, and the shared
+        // parent is not covered by this key's lock. Too fresh, raced away,
+        // or unreadable: skip.
+        let old_enough = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|m| m.elapsed().is_ok_and(|age| age >= STALE_STAGE_AGE));
+        if matches!(old_enough, Ok(true)) {
+            let _ = remove_dir_or_file(&path);
+        }
+    }
+}
+
 fn resolve_locked(
     spec: &ToolSpec,
     env: &ToolEnv,
@@ -326,32 +391,31 @@ fn resolve_locked(
             spec.tool.override_env()
         ));
     }
+    let parent = root.parent().ok_or_else(|| {
+        format!(
+            "{} cache entry {} for {} has no parent",
+            spec.name,
+            root.display(),
+            spec.url
+        )
+    })?;
+    reap_leftovers(spec, parent);
     let mut stale = None;
     if root.exists() {
-        let path = root
-            .parent()
-            .ok_or_else(|| {
-                format!(
-                    "{} cache entry {} for {} has no parent",
+        let path = parent.join(format!(
+            "{}.stale-{}-{}",
+            spec.key(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!(
+                    "timestamp {} cache {} from {}: {e}",
                     spec.name,
                     root.display(),
                     spec.url
-                )
-            })?
-            .join(format!(
-                "{}.stale-{}-{}",
-                spec.key(),
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| format!(
-                        "timestamp {} cache {} from {}: {e}",
-                        spec.name,
-                        root.display(),
-                        spec.url
-                    ))?
-                    .as_nanos()
-            ));
+                ))?
+                .as_nanos()
+        ));
         fs::rename(root, &path).map_err(|e| {
             format!(
                 "move corrupt cache {}: {e}; remove it and retry",
@@ -364,12 +428,9 @@ fn resolve_locked(
     match result {
         Ok(()) => {
             if let Some(path) = stale {
-                let result = if path.is_dir() {
-                    fs::remove_dir_all(&path)
-                } else {
-                    fs::remove_file(&path)
-                };
-                result.map_err(|e| format!("remove stale cache {}: {e}", path.display()))?;
+                // Housekeeping after a successful install must not fail the
+                // build; the next install's reap retries it.
+                let _ = remove_dir_or_file(&path);
             }
             Ok(spec.executable(root))
         }
@@ -1169,6 +1230,189 @@ mod tests {
         );
         let hit = resolve(&spec, &env, |_| panic!("valid cache must not download")).unwrap();
         assert_eq!(hit, path);
+    }
+
+    #[test]
+    fn install_reaps_stale_entries_and_old_staging_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tar_bytes(false);
+        let spec = tar_spec(&archive);
+        let env = env(dir.path());
+        let cache = dir.path().join("cache/cja");
+        let stale = cache.join(format!("{}.stale-4242-99", spec.key()));
+        fs::create_dir_all(&stale).unwrap();
+        let old_stage = cache.join(".cja-tool-abandoned");
+        fs::create_dir_all(&old_stage).unwrap();
+        fs::write(old_stage.join("package"), b"partial unpack").unwrap();
+        // Backdate the staging dir past STALE_STAGE_AGE (1h). `set_modified`
+        // works on a directory fd on Unix; creating the inner file first keeps
+        // its mtime older than the dir's if the platform re-stamps.
+        let past = std::time::SystemTime::now() - Duration::from_hours(2);
+        fs::File::open(&old_stage)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        let path = resolve(&spec, &env, |_| Ok(archive.clone())).unwrap();
+
+        assert!(path.is_file());
+        assert!(!stale.exists(), "stale entry should be reaped");
+        assert!(!old_stage.exists(), "old staging dir should be reaped");
+    }
+
+    #[test]
+    fn fresh_staging_dirs_of_concurrent_installs_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tar_bytes(false);
+        let spec = tar_spec(&archive);
+        let env = env(dir.path());
+        let cache = dir.path().join("cache/cja");
+        let live_stage = cache.join(".cja-tool-live");
+        fs::create_dir_all(&live_stage).unwrap();
+
+        let path = resolve(&spec, &env, |_| Ok(archive.clone())).unwrap();
+
+        assert!(path.is_file());
+        assert!(
+            live_stage.exists(),
+            "a recent staging dir must not be reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unremovable_stale_entries_do_not_fail_the_install() {
+        // A `{key}.stale-*` entry holding a 0555 subdirectory cannot be
+        // removed (unlinking inside it needs write permission). Housekeeping
+        // must skip it, not fail a build that would otherwise succeed.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tar_bytes(false);
+        let spec = tar_spec(&archive);
+        let env = env(dir.path());
+        let cache = dir.path().join("cache/cja");
+        let stale = cache.join(format!("{}.stale-4242-99", spec.key()));
+        let sealed = stale.join("sealed");
+        fs::create_dir_all(&sealed).unwrap();
+        fs::write(sealed.join("kept"), b"leftover").unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let path = resolve(&spec, &env, |_| Ok(archive.clone())).unwrap();
+
+        assert!(path.is_file(), "reaping must never fail the install");
+        assert!(sealed.exists(), "the unremovable leftover is skipped, kept");
+
+        // Restore so the tempdir's own cleanup can remove it.
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unremovable_corrupt_entry_does_not_fail_a_successful_install() {
+        // A corrupt `{key}` entry holding a 0555 subdirectory renames to
+        // `{key}.stale-*` fine — rename needs parent write permission, not
+        // permission inside the entry — and the install then succeeds.
+        // Removing the just-replaced entry is housekeeping after a
+        // successful install: it must be best-effort, never a failed
+        // build. The leftover survives for the next install's reap.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tar_bytes(false);
+        let spec = tar_spec(&archive);
+        let env = env(dir.path());
+        let cache = dir.path().join("cache/cja");
+        let root = cache.join(spec.key());
+        let sealed = root.join("sealed");
+        fs::create_dir_all(&sealed).unwrap();
+        fs::write(sealed.join("kept"), b"corrupt").unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let path = resolve(&spec, &env, |_| Ok(archive.clone())).unwrap();
+
+        assert!(
+            path.is_file(),
+            "a successful install must not fail on cleanup"
+        );
+        let stale_prefix = format!("{}.stale-", spec.key());
+        let mut stale_siblings: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(stale_prefix.as_str()))
+            })
+            .collect();
+        assert_eq!(
+            stale_siblings.len(),
+            1,
+            "the replaced entry must land in exactly one stale rename"
+        );
+        let stale_sealed = stale_siblings.remove(0).join("sealed");
+        assert!(
+            stale_sealed.exists(),
+            "the permission must hold; otherwise this test passes vacuously \
+             (and fails loudly as root)"
+        );
+
+        // Restore so the tempdir's own cleanup can remove it.
+        fs::set_permissions(&stale_sealed, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_cache_parent_does_not_block_a_writable_install() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec(b"binary");
+        let env = env(dir.path());
+        let cache = dir.path().join("cache/cja");
+        fs::create_dir_all(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o300)).unwrap();
+        assert!(
+            fs::read_dir(&cache).is_err(),
+            "test needs an unreadable parent"
+        );
+        fs::write(cache.join("probe"), b"write permission works").unwrap();
+        fs::remove_file(cache.join("probe")).unwrap();
+        let stage = tempfile::Builder::new()
+            .prefix(".cja-tool-")
+            .tempdir_in(&cache)
+            .expect("staging still works without list permission");
+        fs::write(stage.path().join("binary"), b"binary").unwrap();
+        fs::rename(stage.path().join("binary"), cache.join("probe")).unwrap();
+        fs::remove_file(cache.join("probe")).unwrap();
+        drop(stage);
+
+        let result = resolve(&spec, &env, |_| Ok(b"binary".to_vec()));
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let path = result.expect("optional cleanup must not block a writable install");
+        assert_eq!(fs::read(path).unwrap(), b"binary");
+    }
+
+    #[test]
+    fn offline_resolve_never_reaps_stale_entries() {
+        // The reap is deliberately after the offline early-returns: an
+        // offline resolve must not mutate the cache, so leftovers survive
+        // for the next online install to reap.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec(b"binary");
+        let mut env = env(dir.path());
+        env.offline = true;
+        let cache = dir.path().join("cache/cja");
+        let stale = cache.join(format!("{}.stale-4242-99", spec.key()));
+        fs::create_dir_all(&stale).unwrap();
+
+        let error = resolve(&spec, &env, |_| panic!("offline")).unwrap_err();
+
+        assert!(error.contains("unavailable offline"), "{error}");
+        assert!(
+            stale.exists(),
+            "an offline resolve must not mutate the cache"
+        );
     }
 
     #[test]
