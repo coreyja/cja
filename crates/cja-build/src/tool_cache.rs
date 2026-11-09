@@ -320,17 +320,22 @@ fn remove_dir_or_file(path: &Path) -> std::io::Result<()> {
 /// cache survives) and `.cja-tool-*` staging dirs abandoned by a crash.
 /// Call only while holding the per-key `{key}.lock`.
 ///
-/// This is housekeeping, never a precondition: every removal is
-/// best-effort, and a leftover that can't be removed — an unreadable
-/// mixed-owner entry in a writable parent, a staging dir another key's
-/// install owns — is skipped while the install proceeds. The next install
-/// retries the reap. Only listing the cache parent propagates, because a
-/// parent that can't be read will fail the install anyway.
-fn reap_leftovers(spec: &ToolSpec, parent: &Path) -> Result<(), String> {
+/// This is housekeeping, never a precondition, and it cannot fail the
+/// install: every step is best-effort. A parent that can't be listed —
+/// write and search permission without read — still supports the whole
+/// install (lock, staging, rename), so enumeration failures skip the reap
+/// and the install proceeds; the next install retries it. Likewise a
+/// leftover that can't be removed — an unreadable mixed-owner entry in a
+/// writable parent, a staging dir another key's install owns — is
+/// skipped.
+fn reap_leftovers(spec: &ToolSpec, parent: &Path) {
     let stale_prefix = format!("{}.stale-", spec.key());
-    let entries = fs::read_dir(parent).map_err(|e| format!("list {}: {e}", parent.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("list {}: {e}", parent.display()))?;
+    // An unlistable parent is a skipped cleanup, never a failed install:
+    // the lock, staging, and rename don't need read permission.
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let key_leftover = name.starts_with(&stale_prefix);
@@ -357,7 +362,6 @@ fn reap_leftovers(spec: &ToolSpec, parent: &Path) -> Result<(), String> {
             let _ = remove_dir_or_file(&path);
         }
     }
-    Ok(())
 }
 
 fn resolve_locked(
@@ -395,7 +399,7 @@ fn resolve_locked(
             spec.url
         )
     })?;
-    reap_leftovers(spec, parent)?;
+    reap_leftovers(spec, parent);
     let mut stale = None;
     if root.exists() {
         let path = parent.join(format!(
