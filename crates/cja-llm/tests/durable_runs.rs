@@ -3066,3 +3066,39 @@ async fn recover_orphans_leaves_job_backed_and_waiting_runs_alone() {
     );
     assert_eq!(status_of(&env.db, leg_f).await, RunStatus::Running);
 }
+
+/// Lifecycle pin: one run row held `FOR UPDATE` by another transaction must
+/// not pin `recover_orphans` indefinitely. The sweep is a cron callback, and
+/// the cron worker awaits callbacks in series with no timeout (`Worker::tick`,
+/// `tick_claimed`), so an unbounded lock wait here stops every other cron in
+/// the app and holds up shutdown. `worker.rs` treats this row lock as a real
+/// hazard (`WRITE_BOUND`), and the cron claim bounds its own (`lock_timeout`,
+/// `NOWAIT`). The assertion is only that the sweep returns, `Ok` or `Err`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recover_orphans_returns_while_one_run_row_is_locked() {
+    let env = setup(&[&COUNTER]).await;
+    let run = durable::start(&env.state, "counter", "x")
+        .await
+        .expect("start");
+    delete_jobs_for(&env.db, run).await;
+    set_running(&env.db, run, None).await;
+
+    let mut hold = env.db.begin().await.expect("begin hold");
+    sqlx::query("SELECT id FROM agent_runs WHERE id = $1 FOR UPDATE")
+        .bind(run.0)
+        .fetch_one(&mut *hold)
+        .await
+        .expect("hold run row");
+
+    let swept = tokio::time::timeout(
+        Duration::from_secs(10),
+        durable::recover_orphans(&env.state),
+    )
+    .await;
+    hold.rollback().await.expect("release hold");
+
+    assert!(
+        swept.is_ok(),
+        "recover_orphans still blocked on one locked run row after 10s"
+    );
+}
