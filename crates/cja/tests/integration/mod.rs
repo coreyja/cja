@@ -6,6 +6,8 @@ mod cron_shutdown;
 mod job_telemetry;
 #[cfg(feature = "jobs")]
 mod jobs;
+#[cfg(feature = "jobs")]
+mod scaffold_boot;
 mod server_hosts;
 mod server_shutdown;
 mod sessions;

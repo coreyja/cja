@@ -19,6 +19,15 @@ The router mounts these routes at its merge path:
 | `POST /auth/discoverable/start` | No body required (the JS client sends `{}`) | WebAuthn assertion challenge with empty `allowCredentials` and a top-level `mediation: "conditional"` hint |
 | `POST /auth/discoverable/finish` | WebAuthn assertion credential JSON, including `response.userHandle` | `200` on success |
 
+**Sessions and your tables.** On every successful registration or login,
+cja-passkey *deletes* the anonymous session row and inserts an authenticated
+one with a new `session_id`. If your app keeps rows that reference
+`sessions(session_id)`, declare them `ON DELETE CASCADE`: pre-login state tied
+to the old session is discarded at login (this is the session-fixation
+defense), atomically with the login transaction. A `NO ACTION`/`RESTRICT` FK
+with a live row will make login fail. Only the framework-known columns carry
+over (`created_at` preserved; `user_id` set; `challenge_state` cleared).
+
 Registration requests `residentKey: "preferred"` and
 `requireResidentKey: false`. This encourages discoverable credentials on capable
 authenticators while allowing older or nonresident security keys to register.
@@ -66,8 +75,10 @@ fallbackButton.onclick = () => passkeys.loginWithUsername({ username: "alice" })
 The client uses a click-driven browser credential prompt; it does not use
 conditional-mediation autofill. The server's `mediation` hint is not passed to
 `navigator.credentials.get` by this client. Starting a new challenge replaces
-the previous one in the same session; successful finish clears it. The session
-ID remains the same across login.
+the previous one in the same session; a successful finish clears it, **replaces
+the session with a fresh row (new session id)**, and re-issues the session
+cookie — a pre-login cookie never authenticates. A failed finish (400/401)
+leaves the challenge in place.
 
 **Breaking JS API change:** existing callers of `.login({ username })` must
 change to `.loginWithUsername({ username })` when bumping their pinned cja

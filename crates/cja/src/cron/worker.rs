@@ -113,14 +113,18 @@ impl<AppState: AS> Worker<AppState> {
     }
 
     async fn last_enqueue_map(&self) -> Result<HashMap<String, DateTime<Utc>>, sqlx::Error> {
-        let last_runs = sqlx::query!("SELECT name, last_run_at FROM Crons")
-            .fetch_all(self.state.db())
-            .await?;
+        // Runtime query (not `query!`): with `DATABASE_URL` set and
+        // `SQLX_OFFLINE` unset, the macro live-checks the query against that
+        // database at compile time. That is exactly the state the
+        // scaffolded-app run instructions create, on a database that has no
+        // `crons` table until boot-time migrations run — so a macro here
+        // would break compiling a freshly scaffolded app.
+        let last_runs =
+            sqlx::query_as::<_, (String, DateTime<Utc>)>("SELECT name, last_run_at FROM crons")
+                .fetch_all(self.state.db())
+                .await?;
 
-        let last_run_map: HashMap<String, DateTime<Utc>> = last_runs
-            .iter()
-            .map(|row| (row.name.clone(), row.last_run_at))
-            .collect();
+        let last_run_map: HashMap<String, DateTime<Utc>> = last_runs.into_iter().collect();
 
         Ok(last_run_map)
     }
