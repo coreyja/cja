@@ -740,23 +740,29 @@ where
 /// A failing tick is logged and survived (cja#84), and the next tick
 /// retries the sweep.
 ///
-/// Per run: take the row lock (`FOR UPDATE`) in one statement, check for
-/// the job row in a LATER statement of the same transaction (a
+/// Per run: take the row lock (`FOR UPDATE`) in one statement — bounded by
+/// a short transaction-scoped `lock_timeout`, so a row held by another
+/// transaction (an idle operator session, say) is skipped this tick
+/// instead of stalling the sweep, and with it the cron loop — then check
+/// for the job row in a LATER statement of the same transaction (a
 /// `NOT EXISTS` inside the locking statement evaluates on the pre-wait
 /// snapshot and two callers can both enqueue), then enqueue a fresh
 /// [`AdvanceRunJob`] and wake the worker after commit. Runs whose job row
-/// still exists (locked, or released and backing off) and `waiting` runs
-/// are left alone. A run whose every attempt fails
+/// still exists (locked, or released and backing off), `waiting` runs, and
+/// runs whose row is held past the lock budget are left alone. A run
+/// whose every attempt fails
 /// permanently-but-retryably (a deterministically panicking tool) cycles
 /// dead-letter → re-enqueue; [`cancel`](fn@cancel) is the operator exit,
 /// and each re-enqueue logs at `warn`.
 ///
 /// # Errors
 /// - [`RunError::Storage`] when the scan, a per-run transaction, or an
-///   enqueue fails. The loop keeps `?` deliberately: every failure here is
-///   database-level and none is specific to one row, so per-row isolation
-///   buys nothing — on `Err`, runs handled before the failure are already
-///   committed and woken, and the next tick picks up the rest.
+///   enqueue fails. The loop keeps `?` deliberately: every failure that
+///   escapes is database-level (a row held past the lock budget is not an
+///   `Err` — it is skipped and retried on the next tick, so one held row
+///   never ends the tick before later candidates are reached), so per-row
+///   isolation buys nothing — on `Err`, runs handled before the failure
+///   are already committed and woken, and the next tick picks up the rest.
 pub async fn recover_orphans<S>(state: &S) -> Result<Vec<RunId>, RunError>
 where
     S: HasDurable + Clone + 'static,
@@ -768,10 +774,27 @@ where
     for run_id in candidates {
         let mut tx = db.begin().await?;
         // 1) Row lock in its own statement; `None` = row gone or no longer
-        //    queued/running (EPQ re-check) — skip.
-        let Some(kind) = db::lock_active_run(&mut tx, run_id).await? else {
-            tx.rollback().await?;
-            continue;
+        //    queued/running (EPQ re-check) — skip. The wait is bounded by
+        //    the transaction-scoped `lock_timeout`: a row held by another
+        //    transaction past the budget raises SQLSTATE `55P03`, ALSO a
+        //    skip — one held row must neither stall the sweep behind it
+        //    nor, as a cron callback, the whole cron loop. The next tick
+        //    retries it.
+        let kind = match db::lock_active_run(&mut tx, run_id).await {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                tx.rollback().await?;
+                continue;
+            }
+            Err(err) if db::is_lock_not_available(&err) => {
+                tx.rollback().await?;
+                tracing::warn!(
+                    run.id = %run_id,
+                    "run row lock held past the sweep budget; skipping this tick"
+                );
+                continue;
+            }
+            Err(err) => return Err(err.into()),
         };
         // 2) Job check in a LATER statement (fresh snapshot).
         if db::has_advancing_job(&mut tx, run_id).await? {

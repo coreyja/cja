@@ -562,15 +562,39 @@ pub(super) async fn orphan_candidates(
     .await
 }
 
+/// Bound on the per-run row-lock wait, so a row held by another
+/// transaction (an idle operator session, say — the same hazard
+/// `worker.rs`'s `WRITE_BOUND` exists for) cannot stall the sweep — and,
+/// because the sweep runs as a cron callback that the cron worker awaits
+/// in series with no timeout, every other cron and shutdown with it.
+/// Sized with orders of magnitude of margin over the concurrency
+/// harness's poll for blocked waiters (~hundreds of ms) and well under
+/// its 10s join budget.
+const LOCK_BOUND: Duration = Duration::from_secs(5);
+
 /// Lock one candidate run in its OWN statement (EPQ re-checks the status
 /// predicate against the post-lock row version). `None` = the row vanished
-/// or transitioned to waiting/terminal while we waited — skip it. Returns
-/// the run's kind (used only for the enqueue context string and the
-/// re-enqueue log).
+/// or transitioned to waiting/terminal while we waited — skip it. The
+/// wait is bounded by [`LOCK_BOUND`] (a transaction-scoped `lock_timeout`,
+/// the same pattern the cron claim uses): on expiry Postgres raises
+/// SQLSTATE `55P03` (`lock_not_available`), which the caller treats as
+/// "skip this run this tick" ([`is_lock_not_available`]) rather than a
+/// sweep failure. Returns the run's kind (used only for the enqueue
+/// context string and the re-enqueue log).
 pub(super) async fn lock_active_run(
     tx: &mut sqlx::PgConnection,
     run_id: Uuid,
 ) -> sqlx::Result<Option<String>> {
+    // SET LOCAL scopes the timeout to this transaction; it therefore also
+    // covers the later job check and enqueue, whose lock waits are not
+    // expected (cja's job inserts do not conflict on a unique key) and
+    // would surface as an `Err` the next tick retries anyway.
+    sqlx::query(&format!(
+        "SET LOCAL lock_timeout = '{}s'",
+        LOCK_BOUND.as_secs()
+    ))
+    .execute(&mut *tx)
+    .await?;
     let statuses: Vec<String> = [RunStatus::Queued, RunStatus::Running]
         .iter()
         .map(RunStatus::as_str)
@@ -608,6 +632,17 @@ pub(super) async fn has_advancing_job(
     .bind(run_id.to_string())
     .fetch_one(tx)
     .await
+}
+
+/// Whether the error is Postgres SQLSTATE `55P03` (`lock_not_available`):
+/// a statement exceeded the transaction's `lock_timeout` waiting on a
+/// lock. The cron claim classifies the same code as recoverable
+/// (`cron/registry.rs`); for the sweep it means another transaction holds
+/// the run's row — skip that run this tick and let the next sweep retry.
+pub(super) fn is_lock_not_available(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "55P03")
 }
 
 #[cfg(all(test, feature = "durable"))]
