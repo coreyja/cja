@@ -334,9 +334,10 @@ impl Default for RunLimits {
     }
 }
 
-/// The idempotency key handed to every tool execution: which run, and which
-/// tool call. Provider call ids are unique only per conversation, so the run
-/// id scopes them.
+/// The idempotency key handed to every tool execution: which run, which
+/// turn, and which tool call. Provider call ids are unique only within a
+/// turn's response, so the run id AND the turn scope them — some backends
+/// reuse ids like `call_0` across turns.
 ///
 /// A *receipt*, not execution deduplication: exactly-once tools must persist
 /// their own attempt record keyed by this value before side effects. A tool
@@ -345,6 +346,11 @@ impl Default for RunLimits {
 pub struct ToolCallKey {
     /// The run the tool call belongs to.
     pub run_id: RunId,
+    /// The turn the call belongs to (the persisted turn count, i.e.
+    /// `agent_runs.turns`): provider call ids are unique only within a
+    /// turn's response, and some backends reuse ids like `call_0` across
+    /// turns — the turn scopes them. Stable across crash-resume.
+    pub turn: usize,
     /// The provider's tool call id.
     pub call_id: String,
 }
@@ -715,6 +721,102 @@ where
         }
         None => Err(RunError::NotFound(run)),
     }
+}
+
+/// Re-enqueue orphaned runs: `queued`/`running` runs with a dead lease and
+/// no `AdvanceRunJob` row. A run's only job row can vanish when cja
+/// dead-letters it (20 zero-progress failures, a caught panic, lease
+/// reclaims after crashes, an undeserializable payload after a deploy, or
+/// an unknown job name past its age limit) — the run would otherwise sit
+/// `running` forever with nothing to advance it, visible only to
+/// [`cancel`](fn@cancel). Register as a cron, e.g. every few minutes:
+///
+/// ```rust,ignore
+/// cron_registry.register("recover_orphaned_agent_runs", None, interval, |state, _| {
+///     Box::pin(async move { cja_llm::durable::recover_orphans(&state).await.map(|_| ()) })
+/// });
+/// ```
+///
+/// A failing tick is logged and survived (cja#84), and the next tick
+/// retries the sweep.
+///
+/// Per run: take the row lock (`FOR UPDATE`) in one statement — bounded by
+/// a short transaction-scoped `lock_timeout`, so a row held by another
+/// transaction (an idle operator session, say) is skipped this tick
+/// instead of stalling the sweep, and with it the cron loop — then check
+/// for the job row in a LATER statement of the same transaction (a
+/// `NOT EXISTS` inside the locking statement evaluates on the pre-wait
+/// snapshot and two callers can both enqueue), then enqueue a fresh
+/// [`AdvanceRunJob`] and wake the worker after commit. Runs whose job row
+/// still exists (locked, or released and backing off), `waiting` runs, and
+/// runs whose row is held past the lock budget are left alone. A run
+/// whose every attempt fails
+/// permanently-but-retryably (a deterministically panicking tool) cycles
+/// dead-letter → re-enqueue; [`cancel`](fn@cancel) is the operator exit,
+/// and each re-enqueue logs at `warn`. That is the `Err` path, whose
+/// backoff stretches each cycle over days; a process-fatal attempt (OOM,
+/// abort, or a panic that aborts) cycles far faster: cja's reclaim
+/// charges the row without backoff, so the job re-runs about every 120s
+/// and dead-letters after 21 claims (~42 minutes), and the sweep then
+/// re-enqueues it at `error_count` 0 — the crash loop repeats until
+/// [`cancel`](fn@cancel).
+///
+/// # Errors
+/// - [`RunError::Storage`] when the scan, a per-run transaction, or an
+///   enqueue fails. The loop keeps `?` deliberately: every failure that
+///   escapes is database-level (a row held past the lock budget is not an
+///   `Err` — it is skipped and retried on the next tick, so one held row
+///   never ends the tick before later candidates are reached), so per-row
+///   isolation buys nothing — on `Err`, runs handled before the failure
+///   are already committed and woken, and the next tick picks up the rest.
+pub async fn recover_orphans<S>(state: &S) -> Result<Vec<RunId>, RunError>
+where
+    S: HasDurable + Clone + 'static,
+{
+    let db = state.db();
+    let takeover = state.durable().lease_takeover_window();
+    let candidates = db::orphan_candidates(db, takeover).await?;
+    let mut recovered = Vec::new();
+    for run_id in candidates {
+        let mut tx = db.begin().await?;
+        // 1) Row lock in its own statement; `None` = row gone or no longer
+        //    queued/running (EPQ re-check) — skip. The wait is bounded by
+        //    the transaction-scoped `lock_timeout`: a row held by another
+        //    transaction past the budget raises SQLSTATE `55P03`, ALSO a
+        //    skip — one held row must neither stall the sweep behind it
+        //    nor, as a cron callback, the whole cron loop. The next tick
+        //    retries it.
+        let kind = match db::lock_active_run(&mut tx, run_id).await {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                tx.rollback().await?;
+                continue;
+            }
+            Err(err) if db::is_lock_not_available(&err) => {
+                tx.rollback().await?;
+                tracing::warn!(
+                    run.id = %run_id,
+                    "run row lock held past the sweep budget; skipping this tick"
+                );
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        // 2) Job check in a LATER statement (fresh snapshot).
+        if db::has_advancing_job(&mut tx, run_id).await? {
+            tx.rollback().await?;
+            continue;
+        }
+        // 3) Enqueue on the same transaction, commit, wake after commit.
+        //    The context string distinguishes sweep-driven enqueues from
+        //    `start`/`answer`/requeue ones in the `jobs` table.
+        enqueue_on_tx::<S>(&mut tx, run_id, format!("agent-run-recovered:{kind}")).await?;
+        tx.commit().await?;
+        tracing::warn!(run.id = %run_id, run.kind = %kind, "orphaned run re-enqueued");
+        state.job_enqueued();
+        recovered.push(RunId(run_id));
+    }
+    Ok(recovered)
 }
 
 /// Read one run row. An unknown stored status or fail reason fails the read
