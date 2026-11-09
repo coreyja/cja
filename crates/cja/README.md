@@ -461,15 +461,17 @@ This runs the framework's migrations using SQLx's built-in advisory locking. Do 
 
 ### Alternative: Copy Migrations
 
-The `cja init` CLI command copies framework migrations into your project:
+If your app keeps its own copies of cja's migration files (in its `migrations/`
+directory), keep them in sync with the framework when upgrading CJA. The
+`cja sync-migrations` CLI command copies the real files from the cja version
+you have locked in your lockfile:
 
 ```bash
-cja init my-project
+cja sync-migrations
 ```
 
-If using this approach, you're responsible for keeping them in sync when upgrading CJA.
-
-**Known issue:** `cja init` does not currently copy the `dead_letter_jobs` migration. Without it, job retry exhaustion will crash. Either copy it manually from `crates/cja/migrations/20260206200552_AddDeadLetterJobs.sql` or use `cja::db::run_migrations()` instead.
+Both migrators share the `_sqlx_migrations` table; if you also run your own
+migrations, see the "App migrations" section of the `cja::db` module docs.
 
 ## Tracing & Observability
 

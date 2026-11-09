@@ -36,31 +36,6 @@ fn test_init_help_shows_all_options() {
 }
 
 #[test]
-fn test_init_branch_requires_github_flag() {
-    let temp = assert_fs::TempDir::new().unwrap();
-
-    // Create minimal Cargo.toml
-    temp.child("Cargo.toml")
-        .write_str(
-            r#"[package]
-name = "test"
-version = "0.1.0"
-"#,
-        )
-        .unwrap();
-
-    // Using --branch without --github should fail
-    let mut cmd = Command::cargo_bin("cja").unwrap();
-    cmd.args(["init", "--branch", "develop"])
-        .current_dir(&temp)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "the following required arguments were not provided",
-        ));
-}
-
-#[test]
 fn test_init_invalid_cargo_toml() {
     let temp = assert_fs::TempDir::new().unwrap();
 
@@ -105,7 +80,7 @@ fn test_init_with_github_flag_accepts_custom_repo() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Use GitHub version instead of crates.io",
+            "Git repository for the cja dependency",
         ));
 }
 
@@ -116,7 +91,7 @@ fn test_init_github_flag_has_default_value() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "defaults to https://github.com/coreyja/cja",
+            "default: https://github.com/coreyja/cja",
         ));
 }
 
