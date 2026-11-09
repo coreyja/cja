@@ -1313,7 +1313,10 @@ mod tests {
         let cache = dir.path().join("cache/cja");
         fs::create_dir_all(&cache).unwrap();
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o300)).unwrap();
-        assert!(fs::read_dir(&cache).is_err(), "test needs an unreadable parent");
+        assert!(
+            fs::read_dir(&cache).is_err(),
+            "test needs an unreadable parent"
+        );
         fs::write(cache.join("probe"), b"write permission works").unwrap();
         fs::remove_file(cache.join("probe")).unwrap();
         let stage = tempfile::Builder::new()
