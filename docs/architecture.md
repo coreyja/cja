@@ -162,11 +162,15 @@ enqueue() → INSERT INTO jobs (with priority, payload, context)
         → On returned error or caught panic (error_count < max_retries):
             UPDATE jobs SET error_count += 1,
               run_at = NOW() + 2^(error_count+1) seconds
+        → On JobYield: UPDATE jobs SET locked_by = NULL, locked_at = NULL (no charge)
+        → On unknown job name: release uncharged, run_at = NOW() + 30s
+           (hourly past 1h of row age; dead-letter past 14 days);
+           on undeserializable payload: dead-letter without retries
         → On terminal failure or terminal expired lease:
             INSERT INTO dead_letter_jobs with final count + DELETE FROM jobs
 ```
 
-The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not. When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent.
+The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not; a `JobYield` error and an unknown job name release uncharged (unknown names: 30s, hourly past 1h of row age, dead-letter past 14 days). When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent.
 
 `JobWorkerConfig.idle_poll_gate` optionally shares a process-local `IdlePollGate` among workers. Its permits limit periodic idle claims; a worker keeps a permit across empty sleeps and releases it before running a job or its heartbeat. A successful autocommit `Job::enqueue` calls `AppState::job_enqueued`, which an app may override to wake one parked worker for one extra claim. Direct SQL, other processes, transactional enqueue, due retries, and expired leases do not provide this local wake; the periodic claimers discover them. Notifications may coalesce or be lost, so SQL remains authoritative with the same priority order.
 
@@ -223,6 +227,8 @@ double-fire.
 | `error_count` | `INTEGER NOT NULL DEFAULT 0` | Number of failed attempts |
 | `last_error_message` | `TEXT` | Most recent error |
 | `last_failed_at` | `TIMESTAMPTZ` | Most recent failure timestamp |
+
+The `jobs` table carries a `jobs_lock_pair_check` CHECK constraint (`(locked_by IS NULL) = (locked_at IS NULL)`): a row must hold both lock columns or neither.
 
 ### `dead_letter_jobs`
 

@@ -298,8 +298,10 @@ a path must enqueue.
   `shutdown_drain_timeout` (default 2s; keep any custom drain ≥ the 1s
   release bound). The run is then handed back the same way any retryable
   error is: after persisted progress, via a fresh job row picked up
-  immediately; otherwise by erroring the job attempt so cja's backoff
-  retries it (first retry at ~2s). In both cases the post-deploy worker
+  immediately; otherwise by yielding the attempt (`cja::jobs::JobYield`)
+  so cja releases the row uncharged — no failure is charged and no
+  backoff is applied; a first-attempt row is immediately claimable
+  again. In both cases the post-deploy worker
   claims the unleased row and resumes at the last persist. If the handler
   is dropped anyway or the process is `SIGKILL`ed,
   recovery falls back to lease expiry (90s) / cja reclaim (~120s) — delayed,
@@ -364,8 +366,9 @@ someone re-enqueues or `cancel()`s it.
 - **Ops sizing**: a long agent run occupies one worker slot for its
   duration — size worker count accordingly. Worst-case resume delay after
   an ungraceful death is cja's reclaim window (~120s), not the run lease;
-  after a graceful shutdown it is ~2s (a fresh job row when the attempt
-  had made progress, otherwise cja's first backoff retry).
+  after a graceful shutdown the run resumes immediately (a fresh job row
+  when the attempt had made progress, otherwise the uncharged yield
+  leaves the row claimable at its existing `run_at`).
 - **Tool authority**: app tools run in-process with the app's full
   authority, driven by model output — file-style tools must validate paths
   (reject absolute and `..`); execution-style tools need a subprocess

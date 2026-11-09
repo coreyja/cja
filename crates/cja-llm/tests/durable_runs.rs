@@ -1402,7 +1402,22 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
     assert_eq!(
         jobs_for(&env.db, run).await,
         1,
-        "the job row survives shutdown (retry scheduled, not deleted)"
+        "the job row survives shutdown (released uncharged, not deleted)"
+    );
+    // The handler's shutdown arm is a `JobYield`: the row must be uncharged
+    // and immediately claimable, not backed off.
+    let (error_count, due): (i32, bool) = sqlx::query_as(
+        "SELECT error_count, run_at <= NOW() FROM jobs
+         WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(run.0.to_string())
+    .fetch_one(&env.db)
+    .await
+    .expect("job row");
+    assert_eq!(
+        (error_count, due),
+        (0, true),
+        "shutdown yield must leave error_count at 0 and run_at in the past"
     );
 
     // A fresh worker with a fresh token completes the run without any
@@ -1417,8 +1432,9 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
             Instant::now() < deadline,
             "run did not complete after shutdown"
         );
-        // The worker's retry backoff is 2s at error_count 1; drive the
-        // attempt directly to keep the test fast, exactly like a retry does.
+        // The yield leaves the row claimable at once (run_at in the past,
+        // error_count 0), so drive the attempt directly to keep the test
+        // fast, exactly like a post-deploy worker does.
         let _ = drive(&env.state, run).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

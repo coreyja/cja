@@ -10,9 +10,11 @@ use super::HasDurable;
 /// plain struct — no type parameter.
 ///
 /// A queued payload can survive a deploy: any field added later must land
-/// with `#[serde(default)]`, or old rows fail to deserialize, retry
-/// deterministically into dead-letter, and orphan their runs. Keep [`Self::NAME`]
-/// stable — renaming it strands in-flight rows as permanent `Unknown job type`s.
+/// with `#[serde(default)]`, or old rows fail to deserialize and dead-letter
+/// on the first dispatch, orphaning their runs. Keep [`Self::NAME`] stable —
+/// renaming it strands in-flight rows as permanent `Unknown job type`s
+/// (released uncharged on an age-scaled delay — 30s, then hourly — and
+/// dead-lettered past 14 days).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdvanceRunJob {
     /// The run to advance.
