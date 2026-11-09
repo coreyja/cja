@@ -1302,6 +1302,36 @@ mod tests {
         fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_cache_parent_does_not_block_a_writable_install() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec(b"binary");
+        let env = env(dir.path());
+        let cache = dir.path().join("cache/cja");
+        fs::create_dir_all(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o300)).unwrap();
+        assert!(fs::read_dir(&cache).is_err(), "test needs an unreadable parent");
+        fs::write(cache.join("probe"), b"write permission works").unwrap();
+        fs::remove_file(cache.join("probe")).unwrap();
+        let stage = tempfile::Builder::new()
+            .prefix(".cja-tool-")
+            .tempdir_in(&cache)
+            .expect("staging still works without list permission");
+        fs::write(stage.path().join("binary"), b"binary").unwrap();
+        fs::rename(stage.path().join("binary"), cache.join("probe")).unwrap();
+        fs::remove_file(cache.join("probe")).unwrap();
+        drop(stage);
+
+        let result = resolve(&spec, &env, |_| Ok(b"binary".to_vec()));
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let path = result.expect("optional cleanup must not block a writable install");
+        assert_eq!(fs::read(path).unwrap(), b"binary");
+    }
+
     #[test]
     fn offline_resolve_never_reaps_stale_entries() {
         // The reap is deliberately after the offline early-returns: an
