@@ -428,8 +428,9 @@ fn resolve_locked(
     match result {
         Ok(()) => {
             if let Some(path) = stale {
-                remove_dir_or_file(&path)
-                    .map_err(|e| format!("remove stale cache {}: {e}", path.display()))?;
+                // Housekeeping after a successful install must not fail the
+                // build; the next install's reap retries it.
+                let _ = remove_dir_or_file(&path);
             }
             Ok(spec.executable(root))
         }
@@ -1304,6 +1305,59 @@ mod tests {
 
         // Restore so the tempdir's own cleanup can remove it.
         fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unremovable_corrupt_entry_does_not_fail_a_successful_install() {
+        // A corrupt `{key}` entry holding a 0555 subdirectory renames to
+        // `{key}.stale-*` fine — rename needs parent write permission, not
+        // permission inside the entry — and the install then succeeds.
+        // Removing the just-replaced entry is housekeeping after a
+        // successful install: it must be best-effort, never a failed
+        // build. The leftover survives for the next install's reap.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tar_bytes(false);
+        let spec = tar_spec(&archive);
+        let env = env(dir.path());
+        let cache = dir.path().join("cache/cja");
+        let root = cache.join(spec.key());
+        let sealed = root.join("sealed");
+        fs::create_dir_all(&sealed).unwrap();
+        fs::write(sealed.join("kept"), b"corrupt").unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let path = resolve(&spec, &env, |_| Ok(archive.clone())).unwrap();
+
+        assert!(
+            path.is_file(),
+            "a successful install must not fail on cleanup"
+        );
+        let stale_prefix = format!("{}.stale-", spec.key());
+        let mut stale_siblings: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(stale_prefix.as_str()))
+            })
+            .collect();
+        assert_eq!(
+            stale_siblings.len(),
+            1,
+            "the replaced entry must land in exactly one stale rename"
+        );
+        let stale_sealed = stale_siblings.remove(0).join("sealed");
+        assert!(
+            stale_sealed.exists(),
+            "the permission must hold; otherwise this test passes vacuously \
+             (and fails loudly as root)"
+        );
+
+        // Restore so the tempdir's own cleanup can remove it.
+        fs::set_permissions(&stale_sealed, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(unix)]
