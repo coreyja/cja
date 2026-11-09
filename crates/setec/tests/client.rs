@@ -80,6 +80,8 @@ async fn status_codes_map_to_typed_errors() {
         (403, "access denied"),
         (412, "version claimed"),
         (400, "bad name"),
+        (429, "slow down"),
+        (408, "timed out"),
         (500, "boom"),
         (502, "bad gateway"),
     ];
@@ -99,7 +101,7 @@ async fn status_codes_map_to_typed_errors() {
                 assert_eq!(b, "bad name");
                 assert!(!err.is_retryable());
             }
-            (500 | 502, Error::Server { status: s, body: b }) => {
+            (429 | 408 | 500 | 502, Error::Server { status: s, body: b }) => {
                 assert_eq!(s.as_u16(), status);
                 assert_eq!(b, body);
                 assert!(err.is_retryable());
