@@ -320,13 +320,12 @@ fn remove_dir_or_file(path: &Path) -> std::io::Result<()> {
 /// cache survives) and `.cja-tool-*` staging dirs abandoned by a crash.
 /// Call only while holding the per-key `{key}.lock`.
 ///
-/// Error policy splits by ownership. `{key}.stale-*` failures propagate:
-/// the entries are this key's, protected by the lock, and a cache
-/// directory that can't be cleaned will likely fail the install anyway.
-/// `.cja-tool-*` failures are skipped: the shared parent is not covered by
-/// this key's lock, those dirs may belong to a concurrent install of
-/// another key, and this build does not depend on them — reaping them is
-/// opportunistic housekeeping, never a precondition.
+/// This is housekeeping, never a precondition: every removal is
+/// best-effort, and a leftover that can't be removed — an unreadable
+/// mixed-owner entry in a writable parent, a staging dir another key's
+/// install owns — is skipped while the install proceeds. The next install
+/// retries the reap. Only listing the cache parent propagates, because a
+/// parent that can't be read will fail the install anyway.
 fn reap_leftovers(spec: &ToolSpec, parent: &Path) -> Result<(), String> {
     let stale_prefix = format!("{}.stale-", spec.key());
     let entries = fs::read_dir(parent).map_err(|e| format!("list {}: {e}", parent.display()))?;
@@ -340,19 +339,22 @@ fn reap_leftovers(spec: &ToolSpec, parent: &Path) -> Result<(), String> {
             continue;
         }
         let path = entry.path();
-        if stage {
-            // Only crash leftovers: a live install holds its staging dir
-            // only for the unpack-and-rename window. Any error here is
-            // skipped (best-effort) — see the doc comment.
-            let old_enough = fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .map(|m| m.elapsed().is_ok_and(|age| age >= STALE_STAGE_AGE));
-            if matches!(old_enough, Ok(true)) {
-                let _ = remove_dir_or_file(&path);
-            }
-        } else {
-            remove_dir_or_file(&path)
-                .map_err(|e| format!("reap stale cache entry {}: {e}", path.display()))?;
+        if key_leftover {
+            // This key's own leftovers, under its lock. Best-effort like
+            // staging dirs: an entry that can't be removed must not fail a
+            // build that would otherwise succeed.
+            let _ = remove_dir_or_file(&path);
+            continue;
+        }
+        // Staging dirs: only crash leftovers — a live install holds its
+        // staging dir only for the unpack-and-rename window, and the shared
+        // parent is not covered by this key's lock. Too fresh, raced away,
+        // or unreadable: skip.
+        let old_enough = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|m| m.elapsed().is_ok_and(|age| age >= STALE_STAGE_AGE));
+        if matches!(old_enough, Ok(true)) {
+            let _ = remove_dir_or_file(&path);
         }
     }
     Ok(())
@@ -1269,6 +1271,56 @@ mod tests {
         assert!(
             live_stage.exists(),
             "a recent staging dir must not be reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unremovable_stale_entries_do_not_fail_the_install() {
+        // A `{key}.stale-*` entry holding a 0555 subdirectory cannot be
+        // removed (unlinking inside it needs write permission). Housekeeping
+        // must skip it, not fail a build that would otherwise succeed.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tar_bytes(false);
+        let spec = tar_spec(&archive);
+        let env = env(dir.path());
+        let cache = dir.path().join("cache/cja");
+        let stale = cache.join(format!("{}.stale-4242-99", spec.key()));
+        let sealed = stale.join("sealed");
+        fs::create_dir_all(&sealed).unwrap();
+        fs::write(sealed.join("kept"), b"leftover").unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let path = resolve(&spec, &env, |_| Ok(archive.clone())).unwrap();
+
+        assert!(path.is_file(), "reaping must never fail the install");
+        assert!(sealed.exists(), "the unremovable leftover is skipped, kept");
+
+        // Restore so the tempdir's own cleanup can remove it.
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn offline_resolve_never_reaps_stale_entries() {
+        // The reap is deliberately after the offline early-returns: an
+        // offline resolve must not mutate the cache, so leftovers survive
+        // for the next online install to reap.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = file_spec(b"binary");
+        let mut env = env(dir.path());
+        env.offline = true;
+        let cache = dir.path().join("cache/cja");
+        let stale = cache.join(format!("{}.stale-4242-99", spec.key()));
+        fs::create_dir_all(&stale).unwrap();
+
+        let error = resolve(&spec, &env, |_| panic!("offline")).unwrap_err();
+
+        assert!(error.contains("unavailable offline"), "{error}");
+        assert!(
+            stale.exists(),
+            "an offline resolve must not mutate the cache"
         );
     }
 

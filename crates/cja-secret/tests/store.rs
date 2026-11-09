@@ -193,9 +193,53 @@ async fn last_refreshed_advances_on_successful_refresh_only() {
     );
 }
 
-// --- Escalation ---------------------------------------------------------------
-// MAX_CONSECUTIVE_REFRESH_FAILURES is private; it is 3 at the default 1h poll
-// interval, so the tests below hardcode 3 failed rounds (t=60m..180m).
+// A dead tailnet node fails EVERY secret's dial, so only unanimous
+// transport failures escalate; a round where any secret was served proves
+// the transport works. MAX_CONSECUTIVE_REFRESH_FAILURES is private; it is 3
+// at the default 1h poll interval, so the tests below hardcode 3 failed
+// rounds (t=60m..180m).
+
+#[tokio::test(start_paused = true)]
+async fn a_partially_failed_round_never_escalates() {
+    // Only one of the two tracked secrets fails; the other keeps serving,
+    // which proves the transport works. That must never end the process,
+    // no matter how long it lasts.
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    fake.fail_transport("attic/app/api-key", "half the dials broken");
+    let shutdown = CancellationToken::new();
+    let mut task = std::pin::pin!(tokio::spawn(refresher.run(shutdown.clone())));
+    tokio::task::yield_now().await; // let the refresher arm its interval at t=0
+    let signing_boot = secrets.signing.last_refreshed();
+    let api_boot = secrets.api_key.last_refreshed();
+
+    // Five rounds with one transport failure — past the threshold of 3.
+    // The healthy secret keeps marking, proving the polls fired.
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_mins(60)).await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        secrets.signing.last_refreshed() - signing_boot,
+        Duration::from_mins(300)
+    );
+
+    // Still alive: the failed secret recovers and marks on the next poll.
+    fake.heal("attic/app/api-key");
+    tokio::time::advance(Duration::from_mins(60)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        secrets.api_key.last_refreshed() > api_boot,
+        "run must survive partial failures and serve the recovered secret"
+    );
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_mins(60), task.as_mut())
+        .await
+        .expect("run never stopped after cancel")
+        .unwrap();
+    assert!(result.is_ok(), "a partial outage must not end the process");
+}
 
 #[tokio::test(start_paused = true)]
 async fn run_ends_after_consecutive_transport_failures() {
@@ -203,6 +247,7 @@ async fn run_ends_after_consecutive_transport_failures() {
     let fake = fake();
     let (_secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
     fake.fail_transport("attic/app/api-key", "tailnet node deleted");
+    fake.fail_transport("attic/app/signing", "tailnet node deleted");
     let shutdown = CancellationToken::new();
     let mut task = std::pin::pin!(tokio::spawn(refresher.run(shutdown.clone())));
     tokio::task::yield_now().await; // let the refresher arm its interval at t=0
@@ -227,8 +272,10 @@ async fn a_successful_refresh_resets_the_failure_count() {
     tokio::task::yield_now().await; // let the refresher arm its interval at t=0
     let boot = secrets.api_key.last_refreshed();
 
-    // Two failed polls (t=60m, t=120m): only successful refreshes mark.
+    // Two failed polls (t=60m, t=120m): only successful refreshes mark. Both
+    // secrets fail — a dead node fails every dial.
     fake.fail_transport("attic/app/api-key", "flap");
+    fake.fail_transport("attic/app/signing", "flap");
     tokio::time::advance(Duration::from_mins(60)).await;
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_mins(60)).await;
@@ -239,6 +286,7 @@ async fn a_successful_refresh_resets_the_failure_count() {
     // proves the ticker fires under this driving pattern, so the failed
     // rounds above fired too.
     fake.heal("attic/app/api-key");
+    fake.heal("attic/app/signing");
     tokio::time::advance(Duration::from_mins(60)).await;
     tokio::task::yield_now().await;
     assert_eq!(
@@ -248,6 +296,7 @@ async fn a_successful_refresh_resets_the_failure_count() {
 
     // Two more failed polls (t=240m, t=300m): never three consecutive.
     fake.fail_transport("attic/app/api-key", "flap again");
+    fake.fail_transport("attic/app/signing", "flap again");
     tokio::time::advance(Duration::from_mins(60)).await;
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_mins(60)).await;
@@ -274,6 +323,7 @@ async fn host_transport_never_escalates_to_a_process_restart() {
     let fake = fake();
     let (secrets, refresher) = fake.host_store().load::<AppSecrets>().await.unwrap();
     fake.fail_transport("attic/app/api-key", "tailscaled down");
+    fake.fail_transport("attic/app/signing", "tailscaled down");
     let shutdown = CancellationToken::new();
     let mut task = std::pin::pin!(tokio::spawn(refresher.run(shutdown.clone())));
     tokio::task::yield_now().await; // let the refresher arm its interval at t=0
@@ -288,6 +338,7 @@ async fn host_transport_never_escalates_to_a_process_restart() {
     // Then heal: proving the heal poll ran also proves the failed rounds
     // fired under the same ticker, and `run` must still be alive to serve it.
     fake.heal("attic/app/api-key");
+    fake.heal("attic/app/signing");
     tokio::time::advance(Duration::from_mins(60)).await;
     tokio::task::yield_now().await;
     assert!(secrets.api_key.last_refreshed() > boot);
@@ -298,6 +349,48 @@ async fn host_transport_never_escalates_to_a_process_restart() {
         .expect("run never stopped after cancel")
         .unwrap();
     assert!(result.is_ok(), "host transport must not end the process");
+}
+
+#[tokio::test(start_paused = true)]
+async fn alternating_total_and_answered_failures_never_escalate() {
+    // Total-outage rounds (every secret fails transport) alternate with
+    // rounds setec answered (an unparseable rotation): the answered rounds
+    // reset the count, so three failed rounds never run consecutively.
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    let shutdown = CancellationToken::new();
+    let mut task = std::pin::pin!(tokio::spawn(refresher.run(shutdown.clone())));
+    tokio::task::yield_now().await; // let the refresher arm its interval at t=0
+    let boot = secrets.signing.last_refreshed();
+
+    for round in 0..5 {
+        if round % 2 == 0 {
+            fake.fail_transport("attic/app/api-key", "node flap");
+            fake.fail_transport("attic/app/signing", "node flap");
+        } else {
+            fake.heal("attic/app/api-key");
+            fake.heal("attic/app/signing");
+            // Unparseable rotation: setec answered, the failure is a parse
+            // error, not a dead transport.
+            fake.rotate("attic/app/api-key", b"\xff\xfe");
+        }
+        tokio::time::advance(Duration::from_mins(60)).await;
+        tokio::task::yield_now().await;
+    }
+
+    // The answered rounds (t=120m, t=240m) still mark signing, proving the
+    // polls fired; three total-outage rounds happened, never consecutively.
+    assert_eq!(
+        secrets.signing.last_refreshed() - boot,
+        Duration::from_mins(240)
+    );
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_mins(60), task.as_mut())
+        .await
+        .expect("run never stopped after cancel")
+        .unwrap();
+    assert!(result.is_ok());
 }
 
 // --- Against a fake setec HTTP server ---------------------------------------

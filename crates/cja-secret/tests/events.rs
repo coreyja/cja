@@ -23,9 +23,17 @@ struct WithOptional {
     optional: Option<Secret<String>>,
 }
 
-/// Records every event that carries an `event_type`, with its fields.
+/// One recorded event: its level plus its fields.
+#[derive(Clone, Debug)]
+struct RecordedEvent {
+    level: tracing::Level,
+    fields: BTreeMap<String, String>,
+}
+
+/// Records every event that carries an `event_type`, with its level and
+/// fields.
 #[derive(Clone, Default)]
-struct Recorder(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+struct Recorder(Arc<Mutex<Vec<RecordedEvent>>>);
 
 struct FieldVisitor<'a>(&'a mut BTreeMap<String, String>);
 
@@ -48,7 +56,10 @@ impl<S: tracing::Subscriber> Layer<S> for Recorder {
         let mut fields = BTreeMap::new();
         event.record(&mut FieldVisitor(&mut fields));
         if fields.contains_key("event_type") {
-            self.0.lock().unwrap().push(fields);
+            self.0.lock().unwrap().push(RecordedEvent {
+                level: *event.metadata().level(),
+                fields,
+            });
         }
     }
 }
@@ -59,7 +70,18 @@ impl Recorder {
             .lock()
             .unwrap()
             .iter()
-            .filter(|e| e["event_type"] == event_type)
+            .filter(|e| e.fields["event_type"] == event_type)
+            .map(|e| e.fields.clone())
+            .collect()
+    }
+
+    /// Like [`Recorder::of_type`], keeping the level so a test can pin it.
+    fn of_type_with_level(&self, event_type: &str) -> Vec<RecordedEvent> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.fields["event_type"] == event_type)
             .cloned()
             .collect()
     }
@@ -167,7 +189,12 @@ async fn escalation_emits_an_error_event_after_persistent_failures() {
         .await
         .expect("run kept polling past three consecutive failures");
 
-    let escalated = recorder.of_type("secret_refresh_escalated");
+    let escalated = recorder.of_type_with_level("secret_refresh_escalated");
     assert_eq!(escalated.len(), 1, "{escalated:?}");
-    assert_eq!(escalated[0]["consecutive_failures"], "3");
+    assert_eq!(
+        escalated[0].level,
+        tracing::Level::ERROR,
+        "escalation must log at error, not warn"
+    );
+    assert_eq!(escalated[0].fields["consecutive_failures"], "3");
 }
