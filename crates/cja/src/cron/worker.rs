@@ -144,6 +144,17 @@ impl<AppState: AS> Worker<AppState> {
     #[tracing::instrument(name = "cron.tick", level = "trace", skip_all, fields(cron_worker.id = %self.id))]
     pub(crate) async fn tick(&self) -> TickOutcome {
         let mut outcome = TickOutcome::default();
+        // Monotonic anchor for this tick, taken before the database reads:
+        // the map read below can block behind another transaction's table
+        // lock, and callbacks are awaited inline after the reads — in both
+        // cases wall-clock time passes that `db_now` does not know about.
+        // Each job's pre-filter `now` is `db_now` advanced by the time
+        // elapsed since this anchor, so a stale snapshot cannot produce a
+        // pre-filter false negative that `claim_due` (only reached when the
+        // pre-filter passes) never sees. The anchor precedes the time read,
+        // so the advanced `now` can run marginally ahead of the database
+        // clock; the authoritative re-check in `claim_due` absorbs that.
+        let tick_started = Instant::now();
         let (last_enqueue_map, db_now) = match self.last_enqueue_map().await {
             Ok(pair) => pair,
             Err(error) => {
@@ -168,12 +179,6 @@ impl<AppState: AS> Worker<AppState> {
                 return outcome;
             }
         };
-        // Monotonic anchor for this tick. Callbacks are awaited inline, so a
-        // cron early in the loop can run long after `db_now` was read; each
-        // job below gets `db_now` advanced by the elapsed time so a stale
-        // snapshot cannot produce a pre-filter false negative that
-        // `claim_due` (only reached when the pre-filter passes) never sees.
-        let tick_started = Instant::now();
         for job in self.registry.jobs.values() {
             let now = db_now
                 + chrono::Duration::from_std(tick_started.elapsed())

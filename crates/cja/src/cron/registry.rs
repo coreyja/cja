@@ -345,10 +345,12 @@ impl<AppState: AS> CronJob<AppState> {
     /// Runs this cron's claim-and-fire path if it is due at `now`.
     ///
     /// `now` is the tick's database time advanced by the monotonic time
-    /// elapsed since that database read; this method performs no clock
-    /// reads of its own. The advancement matters because a cron earlier in
-    /// the tick can run a callback that outlives the tick-start snapshot:
-    /// a stale `now` would read as not-due for this cron — a false negative
+    /// elapsed since that database read began; this method performs no
+    /// clock reads of its own. The advancement matters because time passes
+    /// after the read begins without `db_now` knowing — the map read can
+    /// block behind a table lock, and a cron earlier in the tick can run a
+    /// callback that outlives the tick-start snapshot: a stale `now`
+    /// would read as not-due for this cron — a false negative
     /// that `claim_due` never corrects, since it is only reached when this
     /// pre-filter passes. `claim_due` remains the authoritative decision
     /// and re-checks against a fresh `clock_timestamp()`.
