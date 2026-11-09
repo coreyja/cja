@@ -325,6 +325,30 @@ fn skip_recoverable(name: &str, operation: &str, error: &sqlx::Error) -> bool {
 }
 
 impl<AppState: AS> CronJob<AppState> {
+    /// Whether this cron is due at `now`, treating a `last_run_at` ahead of
+    /// `now` as due: a future stamp must not stall the cron. Callers that own
+    /// the authoritative decision log the warning; `should_run` itself stays
+    /// a pure schedule predicate.
+    fn is_due(
+        &self,
+        last_run: Option<&chrono::DateTime<Utc>>,
+        now: chrono::DateTime<Utc>,
+        worker_started_at: chrono::DateTime<Utc>,
+        timezone: Tz,
+    ) -> bool {
+        last_run.is_some_and(|at| *at > now)
+            || self
+                .schedule
+                .should_run(last_run, now, worker_started_at, timezone)
+    }
+
+    /// Runs this cron's claim-and-fire path if it is due at `now`.
+    ///
+    /// `now` is the database time read at the start of this tick; this method
+    /// performs no clock reads of its own. `now` is a tick-start snapshot, so
+    /// for crons later in a long tick it can lag — accepted because
+    /// `claim_due` is the authoritative decision and reads a fresh
+    /// `clock_timestamp()`.
     #[tracing::instrument(
         name = "cron_job.tick",
         level = "trace",
@@ -338,18 +362,14 @@ impl<AppState: AS> CronJob<AppState> {
         &self,
         app_state: AppState,
         last_enqueue_map: &HashMap<String, chrono::DateTime<Utc>>,
+        now: chrono::DateTime<Utc>,
         worker_started_at: chrono::DateTime<Utc>,
         timezone: Tz,
     ) -> Result<(), TickError> {
         let last_enqueue = last_enqueue_map.get(self.name);
         let context = format!("Cron@{}", app_state.version());
-        let now = Utc::now();
 
-        let should_run = self
-            .schedule
-            .should_run(last_enqueue, now, worker_started_at, timezone);
-
-        if should_run {
+        if self.is_due(last_enqueue, now, worker_started_at, timezone) {
             return self
                 .tick_claimed(&app_state, &context, worker_started_at, timezone)
                 .await;
@@ -460,10 +480,15 @@ impl<AppState: AS> CronJob<AppState> {
                 Err(err) if skip_recoverable(self.name, "database time", &err) => return Ok(None),
                 Err(err) => return Err(TickError::SqlxError(err)),
             };
-        if !self
-            .schedule
-            .should_run(last_run.as_ref(), claim_time, worker_started_at, timezone)
-        {
+        if last_run.is_some_and(|at| at > claim_time) {
+            tracing::warn!(
+                cron.name = self.name,
+                last_run = ?last_run,
+                claim_time = ?claim_time,
+                "Cron last_run_at is ahead of the database clock; treating as due"
+            );
+        }
+        if !self.is_due(last_run.as_ref(), claim_time, worker_started_at, timezone) {
             return Ok(None);
         }
         Ok(Some(Claim {
@@ -603,6 +628,29 @@ impl<AppState: AS> CronRegistry<AppState> {
         }
     }
 
+    /// Insert `cron_job`, panicking if its name is already registered.
+    ///
+    /// Callback and job crons share one name namespace; a duplicate is a
+    /// static registration bug, so it fails at startup instead of silently
+    /// replacing the first cron.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a cron with `cron_job.name` is already registered.
+    fn insert_unique(&mut self, cron_job: CronJob<AppState>) {
+        assert!(
+            !self.jobs.contains_key(cron_job.name),
+            "duplicate cron registration: cron name `{}` is already registered",
+            cron_job.name
+        );
+        self.jobs.insert(cron_job.name, cron_job);
+    }
+
+    /// Registers a callback cron at a fixed interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a cron with `name` is already registered.
     #[tracing::instrument(name = "cron.register", skip_all, fields(cron_job.name = name, cron_job.interval = ?interval))]
     pub fn register<FnError: Error + Send + Sync + 'static>(
         &mut self,
@@ -627,9 +675,17 @@ impl<AppState: AS> CronRegistry<AppState> {
             #[cfg(all(test, feature = "jobs"))]
             pause_after_commit: None,
         };
-        self.jobs.insert(name, cron_job);
+        self.insert_unique(cron_job);
     }
 
+    /// Registers a callback cron on a cron expression.
+    ///
+    /// Returns an error when `cron_expr` does not parse; the registry is
+    /// untouched in that case.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a cron with `name` is already registered.
     #[tracing::instrument(name = "cron.register_with_cron", skip_all, fields(cron_job.name = name, cron_job.cron = cron_expr))]
     pub fn register_with_cron<FnError: Error + Send + Sync + 'static>(
         &mut self,
@@ -655,10 +711,15 @@ impl<AppState: AS> CronRegistry<AppState> {
             #[cfg(all(test, feature = "jobs"))]
             pause_after_commit: None,
         };
-        self.jobs.insert(name, cron_job);
+        self.insert_unique(cron_job);
         Ok(())
     }
 
+    /// Registers a job cron at a fixed interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a cron with `J::NAME` is already registered.
     #[cfg(feature = "jobs")]
     #[tracing::instrument(name = "cron.register_job", skip_all, fields(cron_job.name = J::NAME, cron_job.interval = ?interval))]
     pub fn register_job<J: Job<AppState>>(
@@ -667,21 +728,26 @@ impl<AppState: AS> CronRegistry<AppState> {
         description: Option<&'static str>,
         interval: Duration,
     ) {
-        self.jobs.insert(
-            J::NAME,
-            CronJob {
-                name: J::NAME,
-                description,
-                action: CronAction::Job(Box::new(job)),
-                schedule: Schedule::Interval(IntervalSchedule(interval)),
-                #[cfg(all(test, feature = "jobs"))]
-                pause_after_claim: None,
-                #[cfg(all(test, feature = "jobs"))]
-                pause_after_commit: None,
-            },
-        );
+        self.insert_unique(CronJob {
+            name: J::NAME,
+            description,
+            action: CronAction::Job(Box::new(job)),
+            schedule: Schedule::Interval(IntervalSchedule(interval)),
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_claim: None,
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_commit: None,
+        });
     }
 
+    /// Registers a job cron on a cron expression.
+    ///
+    /// Returns an error when `cron_expr` does not parse; the registry is
+    /// untouched in that case.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a cron with `J::NAME` is already registered.
     #[cfg(feature = "jobs")]
     #[tracing::instrument(name = "cron.register_job_with_cron", skip_all, fields(cron_job.name = J::NAME, cron_job.cron = cron_expr))]
     pub fn register_job_with_cron<J: Job<AppState>>(
@@ -691,19 +757,16 @@ impl<AppState: AS> CronRegistry<AppState> {
         cron_expr: &str,
     ) -> Result<(), cron::error::Error> {
         let schedule = cron_expr.parse::<cron::Schedule>()?;
-        self.jobs.insert(
-            J::NAME,
-            CronJob {
-                name: J::NAME,
-                description,
-                action: CronAction::Job(Box::new(job)),
-                schedule: Schedule::Cron(CronSchedule(Box::new(schedule))),
-                #[cfg(all(test, feature = "jobs"))]
-                pause_after_claim: None,
-                #[cfg(all(test, feature = "jobs"))]
-                pause_after_commit: None,
-            },
-        );
+        self.insert_unique(CronJob {
+            name: J::NAME,
+            description,
+            action: CronAction::Job(Box::new(job)),
+            schedule: Schedule::Cron(CronSchedule(Box::new(schedule))),
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_claim: None,
+            #[cfg(all(test, feature = "jobs"))]
+            pause_after_commit: None,
+        });
         Ok(())
     }
 
@@ -900,6 +963,22 @@ mod test {
                 .cloned()
                 .collect()
         }
+
+        /// WARN events from `cja::cron::registry` for `cron.name == name`,
+        /// mirroring `fire_receipts` (filter level + field, not message).
+        fn warns_for(&self, name: &str) -> Vec<CapturedEvent> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event.target == "cja::cron::registry"
+                        && event.level == tracing::Level::WARN
+                        && event.fields.get("cron.name").map(String::as_str) == Some(name)
+                })
+                .cloned()
+                .collect()
+        }
     }
 
     /// The exact event shape Eyes classifies as `cron.fire`.
@@ -927,6 +1006,39 @@ mod test {
         .bind(name)
         .bind(by)
         .fetch_one(db)
+        .await
+        .unwrap()
+    }
+
+    async fn db_now(db: &sqlx::PgPool) -> chrono::DateTime<Utc> {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    /// A pool whose connections resolve unqualified `clock_timestamp()` to a
+    /// shadowing function 30 seconds ahead. Postgres implicitly searches
+    /// `pg_catalog` before the rest of the `search_path` unless `pg_catalog`
+    /// is named explicitly in it, so the shadow works only because this
+    /// `search_path` names `pg_catalog` explicitly, after `skew`: the
+    /// resolution order is then `skew`, `public`, `pg_catalog`, and
+    /// unqualified `clock_timestamp()` finds the shadow while
+    /// `pg_catalog.clock_timestamp()` stays real.
+    async fn skewed_pool(db: &sqlx::PgPool) -> sqlx::PgPool {
+        sqlx::query("CREATE SCHEMA skew").execute(db).await.unwrap();
+        sqlx::query(
+            "CREATE FUNCTION skew.clock_timestamp() RETURNS timestamptz LANGUAGE sql
+             AS $$ SELECT pg_catalog.clock_timestamp() + interval '30 seconds' $$",
+        )
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::PgPool::connect_with(
+            (*db.connect_options())
+                .clone()
+                .options([("search_path", "skew,public,pg_catalog")]),
+        )
         .await
         .unwrap()
     }
@@ -2242,6 +2354,7 @@ mod test {
             .tick(
                 app_state.clone(),
                 &last_enqueue_map,
+                db_now(&db).await,
                 worker_started_at,
                 chrono_tz::UTC,
             )
@@ -2296,6 +2409,7 @@ mod test {
             .tick(
                 app_state.clone(),
                 &last_enqueue_map,
+                db_now(&db).await,
                 worker_started_at,
                 chrono_tz::UTC,
             )
@@ -2421,45 +2535,255 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn test_tick_handles_future_last_run_time(db: sqlx::PgPool) {
-        let app_state = TestAppState {
+    async fn future_stamp_fires_warns_and_restamps(db: sqlx::PgPool) {
+        let state = TestAppState {
             db: db.clone(),
             cookie_key: CookieKey::generate(),
         };
         let mut registry = CronRegistry::new();
-        registry.register_job(TestJob, None, Duration::from_secs(1));
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(state, registry);
 
-        let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
-
-        let future_time = Utc::now() + chrono::Duration::hours(1);
-        let mut last_enqueue_map = HashMap::new();
-        last_enqueue_map.insert(TestJob::NAME.to_string(), future_time);
-        let worker_started_at = Utc::now();
-
-        let result = cron_job
-            .tick(
-                app_state.clone(),
-                &last_enqueue_map,
-                worker_started_at,
-                chrono_tz::UTC,
-            )
-            .await;
-
-        // With future last_run time, the job should not run
-        assert!(result.is_ok());
-
-        let cron_count = sqlx::query!(
-            "SELECT COUNT(*) as count FROM Crons WHERE name = $1",
-            TestJob::NAME
+        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() + interval '1 day', clock_timestamp(), clock_timestamp())
+             RETURNING last_run_at",
         )
-        .fetch_one(&app_state.db)
+        .bind(uuid::Uuid::new_v4())
+        .bind(TestJob::NAME)
+        .fetch_one(&db)
         .await
         .unwrap();
+
+        let capture = EventCapture::default();
+        let before = db_now(&db).await;
         assert_eq!(
-            cron_count.count.unwrap(),
-            0,
-            "Should not have created cron record with future last_run time"
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
         );
+        let after = db_now(&db).await;
+
+        let job_count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM jobs WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(job_count.count.unwrap(), 1);
+        let stamp = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "SELECT last_run_at FROM crons WHERE name = $1",
+        )
+        .bind(TestJob::NAME)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(stamp >= before && stamp <= after);
+        let receipts = capture.fire_receipts(TestJob::NAME);
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert_fire_receipt(&receipts[0], TestJob::NAME, Some(stamped));
+        let warns = capture.warns_for(TestJob::NAME);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+
+        // The restamped row is now in the past and the interval has not
+        // elapsed: no re-fire and no repeated warning.
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(capture.fire_receipts(TestJob::NAME).len(), 1);
+        assert_eq!(capture.warns_for(TestJob::NAME).len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn future_stamp_on_cron_expression_fires_warns_and_restamps(db: sqlx::PgPool) {
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry
+            .register_job_with_cron(TestJob, None, "0 0 3 * * * *")
+            .unwrap();
+        let worker = crate::cron::Worker::new(state, registry);
+
+        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() + interval '1 day', clock_timestamp(), clock_timestamp())
+             RETURNING last_run_at",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(TestJob::NAME)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        let capture = EventCapture::default();
+        let before = db_now(&db).await;
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        let after = db_now(&db).await;
+
+        let job_count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM jobs WHERE name = $1",
+            TestJob::NAME
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(job_count.count.unwrap(), 1);
+        let stamp = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "SELECT last_run_at FROM crons WHERE name = $1",
+        )
+        .bind(TestJob::NAME)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(stamp >= before && stamp <= after);
+        let receipts = capture.fire_receipts(TestJob::NAME);
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert_fire_receipt(&receipts[0], TestJob::NAME, Some(stamped));
+        let warns = capture.warns_for(TestJob::NAME);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+
+        // The restamped row is in the past and the next slot (03:00) is at
+        // least minutes away: no re-fire and no repeated warning.
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(capture.fire_receipts(TestJob::NAME).len(), 1);
+        assert_eq!(capture.warns_for(TestJob::NAME).len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn tick_uses_the_provided_now_not_the_app_clock(db: sqlx::PgPool) {
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_secs(60));
+        let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
+        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() - interval '61 seconds', clock_timestamp(), clock_timestamp())
+             RETURNING last_run_at",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(TestJob::NAME)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let mut last_enqueue_map = HashMap::new();
+        last_enqueue_map.insert(TestJob::NAME.to_string(), stamped);
+
+        // The passed `now` says 51s elapsed: not due. An implementation that
+        // ignores `now` and reads `Utc::now()` sees 61s elapsed and fires.
+        // App and DB clocks share a host in CI, so only a passed-in `now`
+        // that differs from the real clock can discriminate here.
+        cron_job
+            .tick(
+                state.clone(),
+                &last_enqueue_map,
+                db_now(&db).await - chrono::Duration::seconds(10),
+                Utc::now(),
+                chrono_tz::UTC,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // A fresh database time: 61s elapsed, due.
+        cron_job
+            .tick(
+                state.clone(),
+                &last_enqueue_map,
+                db_now(&db).await,
+                Utc::now(),
+                chrono_tz::UTC,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test]
+    async fn pre_filter_uses_database_clock_when_app_clock_lags(db: sqlx::PgPool) {
+        let skewed = skewed_pool(&db).await;
+        let state = TestAppState {
+            db: skewed.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_secs(60));
+        // Every clock read in the tick path (per-tick DB time, map read,
+        // claim time, restamp) goes through the skewed pool; assertions go
+        // through the plain pool.
+        let worker = crate::cron::Worker::new(state, registry);
+
+        // Through the skewed pool the stamp lands ≈ real-now − 31s: not in
+        // the app clock's future (so the future-stamp override cannot rescue
+        // a partial fix), and 61s stale for the database clock.
+        sqlx::query(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() - interval '61 seconds', clock_timestamp(), clock_timestamp())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(TestJob::NAME)
+        .execute(&skewed)
+        .await
+        .unwrap();
+
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(capture.fire_receipts(TestJob::NAME).len(), 1);
+        // The stamp is in the past for both clocks: no future-stamp warning.
+        assert!(capture.warns_for(TestJob::NAME).is_empty());
     }
 
     #[sqlx::test]
@@ -2486,6 +2810,7 @@ mod test {
             .tick(
                 app_state.clone(),
                 &last_enqueue_map,
+                db_now(&db).await,
                 worker_started_at,
                 chrono_tz::UTC,
             )
@@ -2537,6 +2862,7 @@ mod test {
             .tick(
                 app_state.clone(),
                 &last_enqueue_map,
+                db_now(&db).await,
                 worker_started_at,
                 chrono_tz::UTC,
             )
@@ -2557,6 +2883,83 @@ mod test {
         );
 
         assert!(result.is_err());
+    }
+
+    fn ok_callback()
+    -> impl Fn(
+        TestAppState,
+        String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>
+    + Send
+    + Sync
+    + 'static {
+        |_app_state, _context| Box::pin(async { Ok::<(), std::io::Error>(()) })
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate cron registration")]
+    fn duplicate_callback_registration_panics() {
+        let mut registry = CronRegistry::<TestAppState>::new();
+        registry.register("dup", None, Duration::from_mins(1), ok_callback());
+        registry.register("dup", None, Duration::from_mins(1), ok_callback());
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate cron registration")]
+    fn duplicate_callback_registration_with_cron_panics() {
+        let mut registry = CronRegistry::<TestAppState>::new();
+        registry
+            .register_with_cron("dup", None, "0 * * * * * *", ok_callback())
+            .unwrap();
+        // A valid expression: the duplicate, not the parse, must panic.
+        registry
+            .register_with_cron("dup", None, "0 * * * * * *", ok_callback())
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate cron registration")]
+    fn duplicate_job_registration_panics() {
+        let mut registry = CronRegistry::<TestAppState>::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate cron registration")]
+    fn duplicate_job_registration_with_cron_panics() {
+        let mut registry = CronRegistry::<TestAppState>::new();
+        registry
+            .register_job_with_cron(TestJob, None, "0 * * * * * *")
+            .unwrap();
+        registry
+            .register_job_with_cron(TestJob, None, "0 * * * * * *")
+            .unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate cron registration")]
+    fn callback_and_job_names_share_one_namespace_panics() {
+        let mut registry = CronRegistry::<TestAppState>::new();
+        registry.register(TestJob::NAME, None, Duration::from_mins(1), ok_callback());
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+    }
+
+    #[test]
+    fn duplicate_with_invalid_expression_is_a_parse_error() {
+        // Parse happens before the insert, so an invalid expression is an
+        // error — not a panic — and leaves the registry untouched.
+        let mut registry = CronRegistry::<TestAppState>::new();
+        registry.register("dup", None, Duration::from_mins(1), ok_callback());
+        let result = registry.register_with_cron("dup", None, "not a cron", ok_callback());
+        assert!(result.is_err());
+        assert_eq!(registry.jobs.len(), 1);
+
+        let mut job_registry = CronRegistry::<TestAppState>::new();
+        job_registry.register_job(TestJob, None, Duration::from_mins(1));
+        let result = job_registry.register_job_with_cron(TestJob, None, "not a cron");
+        assert!(result.is_err());
+        assert_eq!(job_registry.jobs.len(), 1);
     }
 
     #[sqlx::test]

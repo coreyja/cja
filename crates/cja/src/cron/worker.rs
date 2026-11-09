@@ -112,7 +112,16 @@ impl<AppState: AS> Worker<AppState> {
         tracing::info!(cron_worker_id = %self.id, "Cron worker shutdown complete");
     }
 
-    async fn last_enqueue_map(&self) -> Result<HashMap<String, DateTime<Utc>>, sqlx::Error> {
+    async fn last_enqueue_map(
+        &self,
+    ) -> Result<(HashMap<String, DateTime<Utc>>, DateTime<Utc>), sqlx::Error> {
+        // Tick time first, then the row snapshot. A row committed after this
+        // read can carry a stamp later than `db_now`; the pre-filter passes
+        // such a stamp through as due and the claim re-check — with a fresh
+        // clock_timestamp() — decides.
+        let db_now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+            .fetch_one(self.state.db())
+            .await?;
         // Runtime query (not `query!`): with `DATABASE_URL` set and
         // `SQLX_OFFLINE` unset, the macro live-checks the query against that
         // database at compile time. That is exactly the state the
@@ -126,14 +135,14 @@ impl<AppState: AS> Worker<AppState> {
 
         let last_run_map: HashMap<String, DateTime<Utc>> = last_runs.into_iter().collect();
 
-        Ok(last_run_map)
+        Ok((last_run_map, db_now))
     }
 
     #[tracing::instrument(name = "cron.tick", level = "trace", skip_all, fields(cron_worker.id = %self.id))]
     pub(crate) async fn tick(&self) -> TickOutcome {
         let mut outcome = TickOutcome::default();
-        let last_enqueue_map = match self.last_enqueue_map().await {
-            Ok(map) => map,
+        let (last_enqueue_map, db_now) = match self.last_enqueue_map().await {
+            Ok(pair) => pair,
             Err(error) => {
                 outcome.map_read_failed = true;
                 if recoverable(&error) {
@@ -161,6 +170,7 @@ impl<AppState: AS> Worker<AppState> {
                 .tick(
                     self.state.clone(),
                     &last_enqueue_map,
+                    db_now,
                     self.started_at,
                     self.timezone,
                 )
