@@ -232,11 +232,16 @@ fn tool_body(ctx: &mut rig_core::tool::ToolContext) -> Result<(), rig_core::tool
     let key: cja_llm::durable::ToolCallKey = ctx
         .require()
         .map_err(|e| rig_core::tool::ToolExecutionError::other(e.to_string()))?;
-    // key.run_id + key.call_id — a *receipt*, not deduplication: persist
-    // your own attempt record keyed by it before any side effect.
+    // key.run_id + key.turn + key.call_id — a *receipt*, not deduplication:
+    // persist your own attempt record keyed by it before any side effect.
     Ok(())
 }
 ```
+
+The turn (the persisted turn count) scopes the provider's call id: call
+ids are unique only within a turn's response, and some backends reuse ids
+like `call_0` across turns — without the turn, the second call would look
+like a replay of the first.
 
 ### Asking semantics
 
@@ -263,9 +268,13 @@ one step (a model response or tool answer) and then hits a retryable
 error hands the run to a *fresh* `AdvanceRunJob` (release + enqueue in one
 transaction, then `Ok`), so cja deletes the errored row and the fresh row
 starts at `error_count = 0` — a long run that hits a transient blip per
-step never escalates the `2^(n+1)`s backoff and can never dead-letter its
-only job row. Zero-progress failures keep the plain `Err` path, so only
-*consecutive* failures escalate (first retry at ~2s). A duplicate job
+step never escalates the `2^(n+1)`s backoff and never dead-letters its
+only job row through the error path. Crashes and lost job leases still
+charge the same row via cja's reclaim, so the row can dead-letter —
+[`durable::recover_orphans`](#registration-drift-shutdown-wiring-and-ops)
+is the backstop that re-enqueues such orphans. Zero-progress failures
+keep the plain `Err` path, so only *consecutive* failures escalate (first
+retry at ~2s). A duplicate job
 that finds the row leased by a live owner
 errors (backoff) instead of completing — it can never delete the job the
 live owner depends on. A worker that loses its lease mid-run stops
@@ -346,11 +355,13 @@ loudly (`fail_reason = corrupt_state`) instead of corrupting.
 `start` and `answer` enqueue `AdvanceRunJob` through cja's
 `Job::enqueue_on` **on the same transaction as the row write**, and call
 `state.job_enqueued()` only after commit — the same span/receipt/INSERT as
-every cja enqueue. If you ever enqueue `AdvanceRunJob` yourself (recovery
-tooling after a dead-letter), use `enqueue_on` on your own connection and
-wake after commit the same way. The failure mode of skipping this is
-silent: a `queued`/`running` run with no job to advance it, latched until
-someone re-enqueues or `cancel()`s it.
+every cja enqueue. If you ever enqueue `AdvanceRunJob` yourself, use
+`enqueue_on` on your own connection and wake after commit the same way.
+For the one sanctioned recovery case — a dead-lettered job row orphaning
+its run — `durable::recover_orphans` is the built-in sweep; register it
+as a cron (below) instead of hand-enqueueing. The failure mode of
+skipping the wake is silent: a `queued`/`running` run with no worker
+woken, latched until the periodic idle poll (or `cancel()`).
 
 ### Registration drift, shutdown wiring, and ops
 
@@ -363,6 +374,28 @@ someone re-enqueues or `cancel()`s it.
   reference `main.rs` in `crates/home-server`). An unwired token means
   `SIGTERM` kills the process mid-step — recovery still works (lease
   expiry), just slower.
+- **Orphan recovery**: register a cron calling `durable::recover_orphans`
+  every few minutes — it re-enqueues `queued`/`running` runs with a dead
+  lease and no `AdvanceRunJob` row (dead-lettered, or vanished through a
+  payload that no longer deserializes after a deploy), leaving job-backed
+  and `waiting` runs alone:
+  ```rust
+  cron_registry.register("recover_orphaned_agent_runs", None, interval, |state, _| {
+      Box::pin(async move { cja_llm::durable::recover_orphans(&state).await.map(|_| ()) })
+  });
+  ```
+  All enqueues go through the enqueue/wake contract above. Since cja#84 a
+  failing tick is logged and the process survives, so propagate the `Err`.
+  A new interval cron fires on the first tick after boot — benign here:
+  freshly-orphaned runs still hold stale leases until the takeover window
+  passes, and job-backed runs are skipped by the job check. A run whose
+  every attempt fails permanently-but-retryably cycles dead-letter →
+  re-enqueue: the `Err` path's backoff stretches each cycle over days,
+  but a process-fatal attempt (OOM, abort, or a panic that aborts) is
+  faster — cja's reclaim charges the row without backoff, so the job
+  re-runs about every 120s and dead-letters after 21 claims (~42
+  minutes), and the sweep then re-enqueues it at `error_count` 0. The
+  crash loop repeats until `cancel()`, the operator exit.
 - **Ops sizing**: a long agent run occupies one worker slot for its
   duration — size worker count accordingly. Worst-case resume delay after
   an ungraceful death is cja's reclaim window (~120s), not the run lease;
