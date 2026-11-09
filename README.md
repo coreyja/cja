@@ -65,7 +65,7 @@ cargo run -p cja-site
 Generate a new CJA project with the CLI:
 
 ```bash
-cargo install cja-cli
+cargo install --git https://github.com/coreyja/cja cja-cli
 cja new my-project
 ```
 

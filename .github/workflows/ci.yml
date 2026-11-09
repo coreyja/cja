@@ -137,6 +137,31 @@ jobs:
           grep -q 'test warm_tailwind_rust_source ... ok' "$RUNNER_TEMP/tailwind-rerun.log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/tailwind-rerun.log"
 
+  scaffold-check:
+    name: Scaffold compiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve Rust toolchain
+        run: |
+          ver="$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          echo "Resolved toolchain: $ver"
+          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      - name: Compile freshly generated projects
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p cja-cli --test scaffold -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/scaffold.log"
+          grep -q 'test generated_projects_compile ... ok' "$RUNNER_TEMP/scaffold.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/scaffold.log"
+
   passkey-browser:
     name: Passkey browser
     # Pinned: ubuntu-latest moved to 26.04, and `playwright install chromium`

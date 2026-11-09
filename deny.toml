@@ -9,8 +9,9 @@ deny = [
   #{ name = "ansi_term", version = "=0.11.0", wrappers = [] },
 
   # openssl is allowed only as a transitive dep of webauthn-rs-core
-  # (used internally for attestation verification). Direct use is banned.
-  { name = "openssl", wrappers = ["webauthn-attestation-ca", "webauthn-rs-core"] },
+  # (used internally for attestation verification), and as a dev-dep of
+  # cja-passkey (test-only soft-authenticator signing; never ships in binaries).
+  { name = "openssl", wrappers = ["webauthn-attestation-ca", "webauthn-rs-core", "cja-passkey"] },
 
   # EOL TLS stacks: rustls < 0.23 and rustls-webpki < 0.103.16 never get the
   # distrusted-intermediate SPKI checks (rustls/webpki#546). Keep them out of
