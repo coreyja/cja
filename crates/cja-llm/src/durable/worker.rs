@@ -7,9 +7,10 @@
 //! advertise, `model.call`, `model_response`) → `CallTools` (execute via the
 //! built agent's toolset, `run.answer`) → `Done`. Every `Err` return from the
 //! job goes through [`Durable::retry_or_requeue`]: after persisted progress
-//! it hands the run to a fresh job row, otherwise it releases the lease
-//! (via [`Durable::fail_retryable`]) so cja's backoff can retry
-//! immediately.
+//! it hands the run to a fresh job row, otherwise it releases the lease and
+//! errors so cja's backoff retries the same row — except a deploy-shutdown
+//! notice, which returns [`cja::jobs::JobYield`] and is released uncharged
+//! and immediately claimable by a post-deploy worker.
 //!
 //! No panics or unwraps anywhere on this path: a panic is caught by cja's
 //! worker and retried 20× into dead-letter on a permanent condition,
@@ -242,10 +243,12 @@ struct Attempt<'a> {
     /// response or tool answer committed), set by [`Attempt::persist`].
     /// A later retryable error then hands the run to a fresh job row
     /// ([`Durable::retry_or_requeue`]) instead of letting cja's backoff
-    /// escalate on the run's only job: errors separated by progress must
-    /// never add up to a dead-letter. The pre-call checkpoint persist is
-    /// deliberately NOT progress — a failure before any step completed has
-    /// made none.
+    /// escalate on the run's only job: progress-separated `Err`s never
+    /// dead-letter it. Crashes and lost job leases still charge the same
+    /// row (cja's reclaim), so the row can dead-letter —
+    /// [`super::recover_orphans`] re-enqueues such orphans. The pre-call
+    /// checkpoint persist is deliberately NOT progress — a failure before
+    /// any step completed has made none.
     progress: std::sync::atomic::AtomicBool,
 }
 
@@ -306,8 +309,8 @@ impl Durable {
         }
 
         // Unknown kind is permanent: every retry would re-read the same row
-        // forever (and, past the unknown-name age limit, dead-letter the
-        // job, orphaning the run). Fail the run, complete the job.
+        // forever (and eventually dead-letter the job, orphaning the run).
+        // Fail the run, complete the job.
         let Some(kind) = self.kind_named(&row.kind) else {
             let snap = RunSnapshot::from_row(&row);
             self.finish_run(
@@ -522,10 +525,12 @@ impl Durable {
     /// job row instead of erroring: release + enqueue in one transaction,
     /// wake the worker, return `Ok`. cja deletes the errored row on `Ok`,
     /// and the fresh row starts at `error_count = 0` — so errors separated
-    /// by successful steps never escalate cja's `2^(n+1)`s backoff and can
-    /// never dead-letter the run's only job row (which would orphan the
-    /// run: one `AdvanceRunJob` row exists from `start`/`answer` until the
-    /// run suspends or finishes, and every `Err` return charges it).
+    /// by successful steps never escalate cja's `2^(n+1)`s backoff and
+    /// never dead-letter it through the error path (a shutdown
+    /// [`cja::jobs::JobYield`] takes this path released and uncharged).
+    /// Crashes and lost job leases still charge the same row via cja's
+    /// reclaim; a dead-lettered row orphans the run until
+    /// [`super::recover_orphans`] re-enqueues it.
     /// Zero-progress attempts keep the plain `Err` path (release + cja
     /// backoff): only consecutive no-progress failures may escalate. A
     /// crash between this transaction's commit and cja's delete of the old
@@ -1035,6 +1040,10 @@ impl Attempt<'_> {
         run: &mut AgentRun,
         calls: Vec<PendingToolCall>,
     ) -> StepOutcome {
+        // Every call in one turn's batch belongs to the same turn; rig does
+        // not consume a turn when a re-issued attempt fails, so this is
+        // stable across crash-resume.
+        let turn = run.turn();
         for call in calls {
             match call {
                 PendingToolCall::Execute(exec) if exec.name().as_str() == Ask::NAME => {
@@ -1044,6 +1053,7 @@ impl Attempt<'_> {
                     let mut ctx = ToolContext::new();
                     if let Err(e) = ctx.insert(ToolCallKey {
                         run_id: RunId(self.run_id),
+                        turn,
                         call_id: exec.id().wire().to_string(),
                     }) {
                         return StepOutcome::Retry(cja::color_eyre::eyre::eyre!(
