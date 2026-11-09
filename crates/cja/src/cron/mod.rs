@@ -67,6 +67,24 @@
 //! During a rollout, an older scheduler overlapping an upgraded one can still
 //! double-fire.
 //!
+//! The pre-filter and the claim re-check both run on database time
+//! (`clock_timestamp()`). For any cron with a `crons` row, host/DB clock
+//! skew can no longer delay or advance a fire. The one remaining app-clock
+//! input is the first slot of a *never-run* cron expression, which anchors on
+//! the worker's start time.
+//!
+//! A `last_run_at` ahead of the database clock is treated as due by the
+//! claim re-check, logged at WARN (target `cja::cron::registry`, field
+//! `cron.name`), and restamped with the claim time. **Stamping `last_run_at`
+//! into the future no longer pauses a cron** — it fires on the next tick
+//! instead. The old pause-by-future-stamp runbook is dead; pausing now
+//! requires app-level means (`CRON_DISABLED`, app config, or the
+//! first-class per-cron pause tracked in DEV-2227).
+//!
+//! Registering two crons with the same name (callback or job — one shared
+//! namespace) panics at registration instead of silently replacing the
+//! first.
+//!
 //! # Queue Pileup Warning
 //!
 //! If a cron job takes longer to run than its scheduling interval, the queue

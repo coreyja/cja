@@ -329,8 +329,8 @@ let mut registry = CronRegistry::new();
 // Interval-based (every 60 seconds)
 registry.register_job(MyJob, Some("description"), Duration::from_secs(60));
 
-// Cron expression
-registry.register_job_with_cron(MyJob, Some("description"), "0 */5 * * * *".parse()?);
+// Cron expression — a second job type, since each name registers once
+registry.register_job_with_cron(OtherJob, Some("description"), "0 */5 * * * *");
 ```
 
 Job registrations (`register_job` and `register_job_with_cron`) commit exactly
@@ -348,6 +348,10 @@ ends the process. Its claim has already committed, so the restart does not
 retry it immediately, but a callback that always panics ends the process
 again each interval. During a rollout, an older scheduler overlapping an
 upgraded one can still double-fire.
+
+Duplicate cron names panic at registration — callback and job names share one
+namespace, so each cron name registers exactly once. A `last_run_at` ahead of
+the database clock fires on the next tick and no longer pauses the cron.
 
 ### Running the Cron Worker
 
