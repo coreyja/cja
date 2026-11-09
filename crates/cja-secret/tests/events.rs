@@ -6,9 +6,11 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use cja_secret::{FakeSetec, Secret, Secrets};
+use tokio_util::sync::CancellationToken;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::{Layer, layer::SubscriberExt as _};
 
@@ -147,4 +149,25 @@ async fn refresh_failure_event_carries_the_kept_version() {
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert_eq!(failed[0]["secret.name"], "arena/required");
     assert_eq!(failed[0]["secret.version"], "1");
+}
+
+#[tokio::test(start_paused = true)]
+async fn escalation_emits_an_error_event_after_persistent_failures() {
+    let recorder = Recorder::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(recorder.clone()));
+    let fake = FakeSetec::new([("arena/required", b"r".as_slice())]);
+    let (_secrets, refresher) = fake.store().load::<WithOptional>().await.unwrap();
+    fake.fail_transport("arena/required", "tailnet node deleted");
+    let shutdown = CancellationToken::new();
+    let mut task = std::pin::pin!(tokio::spawn(refresher.run(shutdown)));
+    tokio::task::yield_now().await;
+
+    let _ = tokio::time::timeout(Duration::from_mins(60 * 3 + 5), task.as_mut())
+        .await
+        .expect("run kept polling past three consecutive failures");
+
+    let escalated = recorder.of_type("secret_refresh_escalated");
+    assert_eq!(escalated.len(), 1, "{escalated:?}");
+    assert_eq!(escalated[0]["consecutive_failures"], "3");
 }

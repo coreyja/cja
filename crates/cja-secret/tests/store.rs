@@ -193,6 +193,113 @@ async fn last_refreshed_advances_on_successful_refresh_only() {
     );
 }
 
+// --- Escalation ---------------------------------------------------------------
+// MAX_CONSECUTIVE_REFRESH_FAILURES is private; it is 3 at the default 1h poll
+// interval, so the tests below hardcode 3 failed rounds (t=60m..180m).
+
+#[tokio::test(start_paused = true)]
+async fn run_ends_after_consecutive_transport_failures() {
+    // MAX_CONSECUTIVE_REFRESH_FAILURES is 3 with the default 1h poll interval.
+    let fake = fake();
+    let (_secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    fake.fail_transport("attic/app/api-key", "tailnet node deleted");
+    let shutdown = CancellationToken::new();
+    let mut task = std::pin::pin!(tokio::spawn(refresher.run(shutdown.clone())));
+    tokio::task::yield_now().await; // let the refresher arm its interval at t=0
+
+    let outcome = tokio::time::timeout(Duration::from_mins(60 * 3 + 5), task.as_mut()).await;
+    let error = outcome
+        .expect("run kept polling past three consecutive failures")
+        .expect("refresher task panicked")
+        .expect_err("run should end with Err after persistent transport failures");
+    assert!(
+        format!("{error:#}").contains("failed to refresh"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_successful_refresh_resets_the_failure_count() {
+    let fake = fake();
+    let (secrets, refresher) = fake.store().load::<AppSecrets>().await.unwrap();
+    let shutdown = CancellationToken::new();
+    let mut task = std::pin::pin!(tokio::spawn(refresher.run(shutdown.clone())));
+    tokio::task::yield_now().await; // let the refresher arm its interval at t=0
+    let boot = secrets.api_key.last_refreshed();
+
+    // Two failed polls (t=60m, t=120m): only successful refreshes mark.
+    fake.fail_transport("attic/app/api-key", "flap");
+    tokio::time::advance(Duration::from_mins(60)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_mins(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(secrets.api_key.last_refreshed() - boot, Duration::ZERO);
+
+    // A successful poll at t=180m resets the count. Proving it ran also
+    // proves the ticker fires under this driving pattern, so the failed
+    // rounds above fired too.
+    fake.heal("attic/app/api-key");
+    tokio::time::advance(Duration::from_mins(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        secrets.api_key.last_refreshed() - boot,
+        Duration::from_mins(180)
+    );
+
+    // Two more failed polls (t=240m, t=300m): never three consecutive.
+    fake.fail_transport("attic/app/api-key", "flap again");
+    tokio::time::advance(Duration::from_mins(60)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_mins(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        secrets.api_key.last_refreshed() - boot,
+        Duration::from_mins(180),
+        "failed polls must not mark checked_at"
+    );
+
+    // Still running: a clean cancel returns Ok.
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_mins(60), task.as_mut())
+        .await
+        .expect("run never stopped after cancel")
+        .unwrap();
+    assert!(result.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn host_transport_never_escalates_to_a_process_restart() {
+    // Transport::Host has no in-process node to rejoin; a restart fixes
+    // nothing, so sustained transport failures must keep serving values.
+    let fake = fake();
+    let (secrets, refresher) = fake.host_store().load::<AppSecrets>().await.unwrap();
+    fake.fail_transport("attic/app/api-key", "tailscaled down");
+    let shutdown = CancellationToken::new();
+    let mut task = std::pin::pin!(tokio::spawn(refresher.run(shutdown.clone())));
+    tokio::task::yield_now().await; // let the refresher arm its interval at t=0
+    let boot = secrets.api_key.last_refreshed();
+
+    // Five failed rounds — past the tailnet threshold of 3.
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_mins(60)).await;
+        tokio::task::yield_now().await;
+    }
+
+    // Then heal: proving the heal poll ran also proves the failed rounds
+    // fired under the same ticker, and `run` must still be alive to serve it.
+    fake.heal("attic/app/api-key");
+    tokio::time::advance(Duration::from_mins(60)).await;
+    tokio::task::yield_now().await;
+    assert!(secrets.api_key.last_refreshed() > boot);
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_mins(60), task.as_mut())
+        .await
+        .expect("run never stopped after cancel")
+        .unwrap();
+    assert!(result.is_ok(), "host transport must not end the process");
+}
+
 // --- Against a fake setec HTTP server ---------------------------------------
 
 #[derive(Debug, Secrets)]
