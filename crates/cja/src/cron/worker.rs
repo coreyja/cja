@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -165,12 +168,21 @@ impl<AppState: AS> Worker<AppState> {
                 return outcome;
             }
         };
+        // Monotonic anchor for this tick. Callbacks are awaited inline, so a
+        // cron early in the loop can run long after `db_now` was read; each
+        // job below gets `db_now` advanced by the elapsed time so a stale
+        // snapshot cannot produce a pre-filter false negative that
+        // `claim_due` (only reached when the pre-filter passes) never sees.
+        let tick_started = Instant::now();
         for job in self.registry.jobs.values() {
+            let now = db_now
+                + chrono::Duration::from_std(tick_started.elapsed())
+                    .unwrap_or_else(|_| chrono::Duration::zero());
             if let Err(error) = job
                 .tick(
                     self.state.clone(),
                     &last_enqueue_map,
-                    db_now,
+                    now,
                     self.started_at,
                     self.timezone,
                 )

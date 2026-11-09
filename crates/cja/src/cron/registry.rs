@@ -344,11 +344,14 @@ impl<AppState: AS> CronJob<AppState> {
 
     /// Runs this cron's claim-and-fire path if it is due at `now`.
     ///
-    /// `now` is the database time read at the start of this tick; this method
-    /// performs no clock reads of its own. `now` is a tick-start snapshot, so
-    /// for crons later in a long tick it can lag — accepted because
-    /// `claim_due` is the authoritative decision and reads a fresh
-    /// `clock_timestamp()`.
+    /// `now` is the tick's database time advanced by the monotonic time
+    /// elapsed since that database read; this method performs no clock
+    /// reads of its own. The advancement matters because a cron earlier in
+    /// the tick can run a callback that outlives the tick-start snapshot:
+    /// a stale `now` would read as not-due for this cron — a false negative
+    /// that `claim_due` never corrects, since it is only reached when this
+    /// pre-filter passes. `claim_due` remains the authoritative decision
+    /// and re-checks against a fresh `clock_timestamp()`.
     #[tracing::instrument(
         name = "cron_job.tick",
         level = "trace",
@@ -2672,6 +2675,200 @@ mod test {
         );
         assert_eq!(capture.fire_receipts(TestJob::NAME).len(), 1);
         assert_eq!(capture.warns_for(TestJob::NAME).len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn future_stamp_on_callback_cron_fires_warns_and_restamps(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = CronRegistry::new();
+        let seen = calls.clone();
+        registry.register(
+            "failing_callback",
+            None,
+            Duration::from_mins(1),
+            move |_, _| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), std::io::Error>(std::io::Error::other("boom"))
+                })
+            },
+        );
+        let worker = crate::cron::Worker::new(state, registry);
+
+        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() + interval '1 day', clock_timestamp(), clock_timestamp())
+             RETURNING last_run_at",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind("failing_callback")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        // The callback errors, but the claim commits first: the row is
+        // restamped and the tick counts one failure.
+        let capture = EventCapture::default();
+        let before = db_now(&db).await;
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome {
+                failed: 1,
+                ..TickOutcome::default()
+            }
+        );
+        let after = db_now(&db).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let warns = capture.warns_for("failing_callback");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        let receipts = capture.fire_receipts("failing_callback");
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert_fire_receipt(&receipts[0], "failing_callback", Some(stamped));
+        let stamp = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "SELECT last_run_at FROM crons WHERE name = $1",
+        )
+        .bind("failing_callback")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(stamp >= before && stamp <= after);
+
+        // The restamped row is now in the past and the interval has not
+        // elapsed: the callback is not invoked again and the warning does
+        // not repeat.
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(capture.warns_for("failing_callback").len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn slow_callback_does_not_delay_a_later_cron_in_the_same_tick(db: sqlx::PgPool) {
+        type Calls = Arc<Mutex<std::collections::HashMap<&'static str, usize>>>;
+        type SlowName = Arc<Mutex<Option<&'static str>>>;
+        type RunOrder = Arc<Mutex<Vec<&'static str>>>;
+
+        // Both callbacks share one body: count the run, record the order,
+        // then sleep only when the shared role holder names this callback
+        // as the slow one.
+        fn probe_callback(
+            name: &'static str,
+            calls: Calls,
+            slow_name: SlowName,
+            run_order: RunOrder,
+        ) -> impl Fn(
+            TestAppState,
+            String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>
+        + Send
+        + Sync
+        + 'static {
+            move |_, _| {
+                let calls = calls.clone();
+                let slow_name = slow_name.clone();
+                let run_order = run_order.clone();
+                Box::pin(async move {
+                    *calls.lock().unwrap().entry(name).or_insert(0) += 1;
+                    run_order.lock().unwrap().push(name);
+                    if *slow_name.lock().unwrap() == Some(name) {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    Ok::<(), std::io::Error>(())
+                })
+            }
+        }
+
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let calls: Calls = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let slow_name: SlowName = Arc::new(Mutex::new(None));
+        let run_order: RunOrder = Arc::new(Mutex::new(Vec::new()));
+
+        let mut registry = CronRegistry::new();
+        registry.register(
+            "probe_a",
+            None,
+            Duration::from_secs(60),
+            probe_callback(
+                "probe_a",
+                calls.clone(),
+                slow_name.clone(),
+                run_order.clone(),
+            ),
+        );
+        registry.register(
+            "probe_b",
+            None,
+            Duration::from_secs(60),
+            probe_callback(
+                "probe_b",
+                calls.clone(),
+                slow_name.clone(),
+                run_order.clone(),
+            ),
+        );
+
+        // HashMap iteration order is stable for an unmodified map, so the
+        // order read here is the order `Worker::tick` iterates. The
+        // first-iterated cron becomes the slow one; the second is the late
+        // one that must still fire in this tick.
+        let mut order = registry.jobs.keys().copied();
+        let first = order.next().unwrap();
+        let late = order.next().unwrap();
+        assert_ne!(first, late);
+        *slow_name.lock().unwrap() = Some(first);
+
+        // The slow cron is well past due; the late cron is NOT due at the
+        // tick-start snapshot (58s of a 60s interval, 2s of margin) but IS
+        // due once the slow callback's 5s sleep has elapsed.
+        sqlx::query(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() - interval '2 hours', clock_timestamp(), clock_timestamp())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(first)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() - interval '58 seconds', clock_timestamp(), clock_timestamp())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(late)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let worker = crate::cron::Worker::new(state, registry);
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+
+        // The slow cron ran first (proving the iteration order matched),
+        // and the late cron still fired despite the 5s callback ahead of
+        // it: its pre-filter `now` must include the elapsed sleep time.
+        assert_eq!(*run_order.lock().unwrap(), vec![first, late]);
+        let ran = calls.lock().unwrap().clone();
+        assert_eq!(ran.get(first), Some(&1), "slow cron should have run");
+        assert_eq!(
+            ran.get(late),
+            Some(&1),
+            "late cron should have run after the slow callback's sleep"
+        );
     }
 
     #[sqlx::test]

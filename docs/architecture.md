@@ -179,11 +179,17 @@ The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting ato
 ```
 CronRegistry (name → schedule + job or callback)
   → Worker tick loop
-    → Cheap schedule pre-filter
+    → Cheap schedule pre-filter on database time
     → Lock crons row; re-check due against database time
       → Job: insert queue row + stamp cron in one transaction
       → Callback: commit cron stamp, then invoke callback
 ```
+
+The pre-filter and the claim re-check both run on database time
+(`clock_timestamp()`). A `last_run_at` ahead of the database clock fires on
+the next tick with a WARN and is restamped with the claim time; it no longer
+pauses the cron. Registering two crons with the same name — callback and job
+names share one namespace — panics at registration.
 
 Cron jobs are regular `Job` implementations — the cron system just handles scheduling the enqueue.
 
