@@ -2872,6 +2872,70 @@ mod test {
     }
 
     #[sqlx::test]
+    async fn blocked_map_read_does_not_delay_a_due_cron(db: sqlx::PgPool) {
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_secs(120));
+        let worker = crate::cron::Worker::new(state, registry);
+
+        sqlx::query(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() - interval '110 seconds', clock_timestamp(), clock_timestamp())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(TestJob::NAME)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // A table lock delays the map read but not the preceding SELECT
+        // clock_timestamp(). By the time the map arrives, this cron is due.
+        let mut lock = db.begin().await.unwrap();
+        sqlx::query("LOCK TABLE crons IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let tick = tokio::spawn(async move { worker.tick().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND wait_event_type = 'Lock'
+                          AND query LIKE 'SELECT name, last_run_at FROM crons%'
+                    )",
+                )
+                .fetch_one(&db)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cron map query never blocked on the table lock");
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        lock.rollback().await.unwrap();
+
+        assert_eq!(tick.await.unwrap(), TickOutcome::default());
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE name = $1")
+            .bind(TestJob::NAME)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "the cron became due while the map read was blocked"
+        );
+    }
+
+    #[sqlx::test]
     async fn tick_uses_the_provided_now_not_the_app_clock(db: sqlx::PgPool) {
         let state = TestAppState {
             db: db.clone(),
