@@ -21,6 +21,8 @@ pub enum CookieKeyError {
     Missing,
     #[error("COOKIE_KEY is not valid base64: {0}")]
     InvalidBase64(#[from] DecodeError),
+    #[error("COOKIE_KEY decodes to {len} bytes; it must be at least 32")]
+    TooShort { len: usize },
 }
 
 impl CookieKey {
@@ -53,9 +55,18 @@ impl CookieKey {
 /// env value, `allow_ephemeral` whether a missing key may be replaced by a
 /// generated ephemeral one (the constructor passes `cfg!(debug_assertions)`).
 fn resolve(value: Option<String>, allow_ephemeral: bool) -> Result<CookieKey, CookieKeyError> {
+    // `openssl rand -base64 64` wraps at 64 characters, and deploy config
+    // often spells "unset" as an empty value.
+    let value = value
+        .map(|value| value.split_ascii_whitespace().collect::<String>())
+        .filter(|value| !value.is_empty());
     if let Some(value) = value {
         tracing::info!("Using cookie key from environment");
         let decoded = base64::engine::general_purpose::STANDARD.decode(value.as_bytes())?;
+        // `Key::derive_from` panics below 32 bytes.
+        if decoded.len() < 32 {
+            return Err(CookieKeyError::TooShort { len: decoded.len() });
+        }
         Ok(CookieKey(tower_cookies::Key::derive_from(&decoded)))
     } else if allow_ephemeral {
         tracing::warn!(
@@ -110,5 +121,41 @@ mod tests {
         let release = resolve(Some(encoded.clone()), false).unwrap();
         let debug = resolve(Some(encoded), true).unwrap();
         assert!(masters_equal(&release, &debug));
+    }
+
+    #[test]
+    fn wrapped_base64_is_accepted() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
+        let (first, rest) = encoded.split_at(64);
+        let wrapped = format!("{first}\n{rest}");
+        let plain = resolve(Some(encoded.clone()), false).unwrap();
+        let from_wrapped = resolve(Some(wrapped), false).unwrap();
+        assert!(masters_equal(&plain, &from_wrapped));
+    }
+
+    #[test]
+    fn blank_key_counts_as_missing() {
+        assert!(matches!(
+            resolve(Some(String::new()), false),
+            Err(CookieKeyError::Missing)
+        ));
+        assert!(matches!(
+            resolve(Some(" \n".to_string()), false),
+            Err(CookieKeyError::Missing)
+        ));
+        assert!(resolve(Some(String::new()), true).is_ok());
+    }
+
+    #[test]
+    fn short_key_is_an_error_not_a_panic() {
+        use base64::Engine as _;
+        let short = base64::engine::general_purpose::STANDARD.encode([7u8; 31]);
+        assert!(matches!(
+            resolve(Some(short), false),
+            Err(CookieKeyError::TooShort { len: 31 })
+        ));
+        let minimum = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        assert!(resolve(Some(minimum), false).is_ok());
     }
 }

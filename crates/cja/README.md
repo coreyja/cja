@@ -438,16 +438,6 @@ impl cja::server::session::AppSession for MySession {
 }
 ```
 
-### Session lifecycle
-
-The `Session` extractor refreshes `sessions.updated_at` at most once per
-`ACTIVITY_REFRESH_MIN_INTERVAL`, so the timestamp tracks real activity without
-a write per request. Schedule `cja::server::session::prune(pool, idle)` from a
-cron to delete idle sessions (the scaffold registers a daily 4am example);
-`idle` must exceed `ACTIVITY_REFRESH_MIN_INTERVAL` — the function refuses
-smaller values. The logout route lives in cja-passkey (`POST /auth/logout`):
-it deletes the session row and clears the cookie.
-
 Then use the `Session<MySession>` extractor in handlers:
 
 ```rust
@@ -455,6 +445,16 @@ async fn handler(session: cja::server::session::Session<MySession>) -> impl Into
     format!("Session ID: {}", session.0.inner().session_id)
 }
 ```
+
+### Session lifecycle
+
+The `Session` extractor refreshes `sessions.updated_at` at most once per
+`ACTIVITY_REFRESH_MIN_INTERVAL`, so the timestamp tracks real activity without
+a write per request. Schedule `cja::server::session::prune(pool, idle)` from a
+cron to delete idle sessions (the scaffold registers a daily 4am example);
+`idle` must be at least twice `ACTIVITY_REFRESH_MIN_INTERVAL` — the function
+refuses smaller values. The logout route lives in cja-passkey (`POST /auth/logout`):
+it deletes the session row and clears the cookie.
 
 ### Maud Templating
 

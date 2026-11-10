@@ -1689,6 +1689,12 @@ async fn logout_deletes_row_clears_cookie_and_invalidates() {
         set_cookie.contains("Expires=Thu, 01 Jan 1970"),
         "cookie must be expired, got: {set_cookie}"
     );
+    for attribute in ["__Host-session_id=", "Path=/", "Secure", "HttpOnly"] {
+        assert!(
+            set_cookie.contains(attribute),
+            "missing {attribute}: {set_cookie}"
+        );
+    }
 
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE session_id = $1")
         .bind(authed_id)

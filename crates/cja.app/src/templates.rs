@@ -121,7 +121,7 @@ impl Job<AppState> for SendEmail {
     )?;
 
     // Keep the sessions table bounded: delete sessions idle 30+ days.
-    // Log-and-continue: a failed prune must not stop the cron worker.
+    // prune returns an eyre error; cron callbacks need a std Error, so log it.
     registry.register_with_cron(
         "prune-sessions",
         Some("Delete sessions idle for 30+ days"),

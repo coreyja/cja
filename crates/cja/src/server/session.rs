@@ -55,9 +55,10 @@ pub const ACTIVITY_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Durati
 /// Delete sessions whose `updated_at` is older than `idle`. Returns rows deleted.
 ///
 /// Schedule from a cron (the scaffold registers a daily 4am `prune-sessions`
-/// example). `idle` must be comfortably above [`ACTIVITY_REFRESH_MIN_INTERVAL`]:
-/// `updated_at` advances at most once per interval, so a smaller `idle` would
-/// delete sessions in active use — this function refuses such values.
+/// example). `updated_at` advances at most once per
+/// [`ACTIVITY_REFRESH_MIN_INTERVAL`], so a session can look up to one interval
+/// older than its last request. `idle` must be at least twice the interval;
+/// this function refuses smaller values.
 /// Deleting a row cascades consumer rows that reference `sessions(session_id)`
 /// with `ON DELETE CASCADE` (see the cja-passkey README framework contract);
 /// a pruned user simply appears anonymous on their next request.
@@ -65,9 +66,9 @@ pub const ACTIVITY_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Durati
 /// To stop a scheduled prune, use the `CRON_DISABLED` env var or remove the
 /// registration.
 pub async fn prune(pool: &sqlx::PgPool, idle: std::time::Duration) -> crate::Result<u64> {
-    if idle <= ACTIVITY_REFRESH_MIN_INTERVAL {
+    if idle < ACTIVITY_REFRESH_MIN_INTERVAL * 2 {
         return Err(color_eyre::eyre::eyre!(
-            "prune idle ({idle:?}) must exceed ACTIVITY_REFRESH_MIN_INTERVAL \
+            "prune idle ({idle:?}) must be at least twice ACTIVITY_REFRESH_MIN_INTERVAL \
              ({:?}): updated_at is refreshed at most once per interval, so a \
              smaller idle would delete sessions in active use",
             ACTIVITY_REFRESH_MIN_INTERVAL

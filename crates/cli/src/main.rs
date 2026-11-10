@@ -1320,8 +1320,8 @@ fn generate_cron_module(no_sessions: bool) -> String {
     } else {
         r#"
         // Keep the sessions table bounded: delete sessions idle 30+ days,
-        // daily at 4am. Log-and-continue: a failed prune must not stop the
-        // cron worker.
+        // daily at 4am. `prune` returns an eyre error, which cron callbacks
+        // cannot return (they need a `std::error::Error`), so log it here.
         registry
             .register_with_cron(
                 "prune-sessions",

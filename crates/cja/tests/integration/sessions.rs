@@ -424,13 +424,18 @@ async fn prune_deletes_only_idle_sessions() {
 }
 
 #[tokio::test]
-async fn prune_rejects_idle_at_or_below_refresh_interval() {
+async fn prune_rejects_idle_below_twice_refresh_interval() {
     let (pool, _guard) = crate::common::db::setup_test_db().await.unwrap();
 
-    let at = cja::server::session::prune(&pool, ACTIVITY_REFRESH_MIN_INTERVAL).await;
-    assert!(at.is_err(), "prune(idle == interval) must refuse");
-    let below = cja::server::session::prune(&pool, std::time::Duration::from_secs(60)).await;
-    assert!(below.is_err(), "prune(idle < interval) must refuse");
+    let just_below = (ACTIVITY_REFRESH_MIN_INTERVAL * 2)
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap();
+    let result = cja::server::session::prune(&pool, just_below).await;
+    assert!(result.is_err(), "prune(idle just below 2x) must refuse");
+    let result = cja::server::session::prune(&pool, ACTIVITY_REFRESH_MIN_INTERVAL).await;
+    assert!(result.is_err(), "prune(idle == interval) must refuse");
+    let result = cja::server::session::prune(&pool, ACTIVITY_REFRESH_MIN_INTERVAL * 2).await;
+    assert!(result.is_ok(), "prune(idle == 2x) must run");
 }
 
 // -------- DEV-2192: throttled activity refresh --------
