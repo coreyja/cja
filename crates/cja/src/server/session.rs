@@ -108,7 +108,10 @@ pub async fn prune(pool: &sqlx::PgPool, idle: std::time::Duration) -> crate::Res
 pub struct CJASession {
     /// Unique identifier for this session
     pub session_id: uuid::Uuid,
-    /// Timestamp of last activity (updated on each request)
+    /// Timestamp of last activity. Bumped by the `update_sessions_updated_at`
+    /// DB trigger on every UPDATE; the `Session` extractor refreshes it at
+    /// most once per [`ACTIVITY_REFRESH_MIN_INTERVAL`] while the session is
+    /// in use, so it doubles as the idle clock for [`prune`].
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Timestamp when the session was first created
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -432,8 +435,35 @@ impl<A: AppState + Send + Sync, S: AppSession + Send + Sync> FromRequestParts<A>
         };
 
         match S::from_db(state.db(), session_id).await {
-            Ok(Some(session)) => Ok(Session(session)),
-            _ => create_session::<A, S>(state, &cookies).await,
+            Ok(Some(session)) => {
+                touch_if_stale(state.db(), session.inner()).await;
+                Ok(Session(session))
+            }
+            Ok(None) => create_session::<A, S>(state, &cookies).await,
+            Err(err) => {
+                tracing::error!("failed to load session {session_id}: {err:#}");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
         }
+    }
+}
+
+/// Refresh `updated_at` at most once per [`ACTIVITY_REFRESH_MIN_INTERVAL`]
+/// so [`prune`] measures real activity. Best-effort: a failure is logged,
+/// never fatal for the request (pinned by `failed_activity_refresh_...`).
+async fn touch_if_stale(pool: &sqlx::PgPool, session: &CJASession) {
+    if session.updated_at + ACTIVITY_REFRESH_MIN_INTERVAL > chrono::Utc::now() {
+        return;
+    }
+    let refreshed = sqlx::query(
+        "UPDATE sessions SET updated_at = now() \
+         WHERE session_id = $1 AND updated_at < now() - make_interval(secs => $2)",
+    )
+    .bind(session.session_id)
+    .bind(ACTIVITY_REFRESH_MIN_INTERVAL.as_secs_f64())
+    .execute(pool)
+    .await;
+    if let Err(err) = refreshed {
+        tracing::warn!("session activity refresh failed (non-fatal): {err:#}");
     }
 }
