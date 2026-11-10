@@ -1031,18 +1031,19 @@ mod test {
                 .collect()
         }
 
-        /// Every captured event that names cron `name` (via the `cron.name`
-        /// or `task_name` field), any target or level — for asserting a
-        /// paused cron's per-tick log budget.
-        fn events_for_cron(&self, name: &str) -> Vec<CapturedEvent> {
+        /// Every captured event with a `cja::` target, any fields, any
+        /// level — for asserting a paused cron's per-tick log budget. A
+        /// budget test registers exactly one cron, so every `cja::` event
+        /// in its tick belongs to that cron, including log lines that name
+        /// the cron in prose only. Not filtered by parent span: sqlx
+        /// slow-query WARNs share the cron span, and the target filter
+        /// already excludes them.
+        fn cja_events(&self) -> Vec<CapturedEvent> {
             self.0
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|event| {
-                    event.fields.get("cron.name").map(String::as_str) == Some(name)
-                        || event.fields.get("task_name").map(String::as_str) == Some(name)
-                })
+                .filter(|event| event.target.starts_with("cja::"))
                 .cloned()
                 .collect()
         }
@@ -3604,7 +3605,7 @@ mod test {
             TickOutcome::default()
         );
 
-        let events = capture.events_for_cron(TestJob::NAME);
+        let events = capture.cja_events();
         let skips: Vec<_> = events
             .iter()
             .filter(|event| {
@@ -3615,10 +3616,13 @@ mod test {
             .collect();
         assert_eq!(skips.len(), 1, "{events:?}");
         assert_eq!(skips[0].level, tracing::Level::DEBUG, "{:?}", skips[0]);
+        // tracing orders ERROR < WARN < INFO < DEBUG < TRACE, so
+        // `>= DEBUG` means "DEBUG or TRACE only": INFO, WARN and ERROR all
+        // fail this.
         assert!(
             events
                 .iter()
-                .all(|event| event.level <= tracing::Level::DEBUG),
+                .all(|event| event.level >= tracing::Level::DEBUG),
             "a paused cron must log nothing above DEBUG: {events:?}"
         );
     }
@@ -4071,8 +4075,17 @@ mod test {
         // 55P03 — the recoverable arm of the pause check. It must fail
         // closed: skip the claim (logged at WARN), enqueue nothing, write
         // nothing. `missing_cron_pauses_table_fails_due_crons_loudly`
-        // reaches only the non-recoverable arm; a fail-open rewrite of
-        // this arm would fire the paused cron and pass every other test.
+        // reaches only the non-recoverable arm. The `operation` and
+        // `sqlstate` assertions pin the mechanism itself: deleting the
+        // `lock_timeout` setting would let `statement_timeout` cancel the
+        // read with 57014 ~4s later, taking the same recoverable arm and
+        // logging the same single WARN. A same-transaction fail-open of
+        // this arm shows up as a failed tick (55P03 aborts the claim
+        // transaction server-side; the next statement errors 25P02,
+        // non-recoverable) — caught by the tick-outcome assertion below —
+        // and a fail-open that goes on to claim in a fresh transaction
+        // would fire the paused cron — caught by the jobs and
+        // `last_run_at` assertions after it.
         let mut registry = CronRegistry::new();
         registry.register_job(TestJob, None, Duration::from_mins(1));
         let worker = crate::cron::Worker::new(
@@ -4108,6 +4121,25 @@ mod test {
         );
         assert_eq!(observed_stamp, seeded, "failed claim writes nothing");
         assert_eq!(observed_warns.len(), 1, "{observed_warns:?}");
+        assert_eq!(
+            observed_warns[0]
+                .fields
+                .get("operation")
+                .map(String::as_str),
+            Some("pause check"),
+            "{:?}",
+            observed_warns[0]
+        );
+        let sqlstate = observed_warns[0]
+            .fields
+            .get("sqlstate")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            sqlstate.contains("55P03"),
+            "expected the 1s lock_timeout cancellation 55P03: {sqlstate} in {:?}",
+            observed_warns[0]
+        );
     }
 
     #[sqlx::test]

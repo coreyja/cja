@@ -203,16 +203,17 @@ commit one more fire; a pause stops new enqueues only — rows already in
 cja ignore the table entirely. The operator statements:
 
 ```sql
--- Pause a cron that has already fired (a typo matches nothing: INSERT 0 0)
+-- Pause a cron that has already fired (a typo matches nothing: INSERT 0 0).
+-- Re-running a pause replaces the existing expiry — run Inspect first if
+-- someone else may have paused the cron
 INSERT INTO cron_pauses (name, paused_until)
 SELECT name, now() + interval '4 hours' FROM crons WHERE name = 'TurnRetentionJob'
 ON CONFLICT (name) DO UPDATE
   SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()
 RETURNING name, paused_until;
 
--- Pause a cron that has never fired ('infinity' pauses indefinitely;
--- re-running a pause replaces the existing expiry). A typo is undetectable
--- in this form: Inspect shows last_run_at NULL for a never-fired cron and
+-- Pause a cron that has never fired ('infinity' pauses indefinitely).
+-- A typo is undetectable in this form: Inspect shows last_run_at NULL for a never-fired cron and
 -- for a typo alike — compare RETURNING name character by character against
 -- the registry source; any later crons-row check must use the registry name
 -- (never the text you typed) and can only report after the cron already fired.
