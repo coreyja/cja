@@ -353,7 +353,8 @@ impl<AppState: AS> CronJob<AppState> {
     /// would read as not-due for this cron — a false negative
     /// that `claim_due` never corrects, since it is only reached when this
     /// pre-filter passes. `claim_due` remains the authoritative decision
-    /// and re-checks against a fresh `clock_timestamp()`.
+    /// and re-checks against a fresh `clock_timestamp()` and the per-cron
+    /// pause state.
     #[tracing::instrument(
         name = "cron_job.tick",
         level = "trace",
@@ -409,6 +410,34 @@ impl<AppState: AS> CronJob<AppState> {
         tracing::info!(task_name = self.name, last_run = ?last_run, "Enqueuing Task");
     }
 
+    /// Whether cron `name` is paused, read inside the caller's claim
+    /// transaction against the database clock (`clock_timestamp()`) — the
+    /// single authority for paused-ness.
+    #[cfg(feature = "jobs")]
+    async fn is_paused(tx: &mut sqlx::PgConnection, name: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM cron_pauses
+                WHERE name = $1 AND paused_until > clock_timestamp()
+            )",
+        )
+        .bind(name)
+        .fetch_one(tx)
+        .await
+    }
+
+    /// Claim this cron's due interval, if it is due and not paused.
+    ///
+    /// The transaction's first decision after timeout setup is the
+    /// per-cron pause check (`cron_pauses`, compared against
+    /// `clock_timestamp()`); it is the single authority for paused-ness —
+    /// the pre-filter never consults it, so a scheduler whose map read
+    /// predates the pause commit is still blocked here. A paused cron
+    /// writes nothing: no row lock, no first-row insert, no restamp. A
+    /// claim that already passed this check when a pause commits may still
+    /// finish and enqueue one more fire (`statement_timeout` is per
+    /// statement, so the remaining claim work has no shared bound) — see
+    /// the operator runbook in `crates/cja/src/cron/mod.rs`.
     #[cfg(feature = "jobs")]
     async fn claim_due(
         &self,
@@ -433,6 +462,23 @@ impl<AppState: AS> CronJob<AppState> {
                 }
                 return Err(TickError::SqlxError(err));
             }
+        }
+        // One source of truth for "is this cron paused": this query, inside
+        // the claim transaction, compared against the database clock. The
+        // pre-filter never consults it. Checked before the crons row lock
+        // and first-row insert, so a paused cron writes nothing and a
+        // never-run cron stays never-run. DEBUG, not WARN: a paused cron
+        // is steady state and arena ticks every 2s. A claim that already
+        // passed this check may still commit one fire after a pause
+        // commits — see the operator runbook in crates/cja/src/cron/mod.rs.
+        let paused = match Self::is_paused(&mut tx, self.name).await {
+            Ok(paused) => paused,
+            Err(err) if skip_recoverable(self.name, "pause check", &err) => return Ok(None),
+            Err(err) => return Err(TickError::SqlxError(err)),
+        };
+        if paused {
+            tracing::debug!(cron.name = self.name, "Cron paused; skipping claim");
+            return Ok(None);
         }
         let existing = sqlx::query_as::<_, (chrono::DateTime<Utc>,)>(
             "SELECT last_run_at FROM crons WHERE name = $1 FOR UPDATE NOWAIT",
@@ -984,6 +1030,23 @@ mod test {
                 .cloned()
                 .collect()
         }
+
+        /// Every captured event with a `cja::` target, any fields, any
+        /// level — for asserting a paused cron's per-tick log budget. A
+        /// budget test registers exactly one cron, so every `cja::` event
+        /// in its tick belongs to that cron, including log lines that name
+        /// the cron in prose only. Not filtered by parent span: sqlx
+        /// slow-query WARNs share the cron span, and the target filter
+        /// already excludes them.
+        fn cja_events(&self) -> Vec<CapturedEvent> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.target.starts_with("cja::"))
+                .cloned()
+                .collect()
+        }
     }
 
     /// The exact event shape Eyes classifies as `cron.fire`.
@@ -1020,6 +1083,47 @@ mod test {
             .fetch_one(db)
             .await
             .unwrap()
+    }
+
+    /// Insert a crons row stamped into the past (creating it), returning the
+    /// stamp. `backdate` only updates existing rows; tests that assert "no
+    /// fire" must start from a row that exists with zero prior fires.
+    async fn seed(db: &sqlx::PgPool, name: &str, by: &str) -> chrono::DateTime<Utc> {
+        sqlx::query_scalar(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() - $3::text::interval, clock_timestamp(), clock_timestamp())
+             RETURNING last_run_at",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(name)
+        .bind(by)
+        .fetch_one(db)
+        .await
+        .unwrap()
+    }
+
+    /// Pause cron `name` until `until`, a SQL expression evaluated by the
+    /// database (e.g. `"clock_timestamp() + interval '1 hour'"`), so expiry
+    /// transitions are driven by data — mirroring the documented operator SQL.
+    async fn pause(db: &sqlx::PgPool, name: &str, until: &str) {
+        sqlx::query(&format!(
+            "INSERT INTO cron_pauses (name, paused_until)
+             VALUES ($1, {until})
+             ON CONFLICT (name) DO UPDATE
+             SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()"
+        ))
+        .bind(name)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    async fn resume(db: &sqlx::PgPool, name: &str) {
+        sqlx::query("DELETE FROM cron_pauses WHERE name = $1")
+            .bind(name)
+            .execute(db)
+            .await
+            .unwrap();
     }
 
     /// A pool whose connections resolve unqualified `clock_timestamp()` to a
@@ -2589,6 +2693,15 @@ mod test {
         assert_fire_receipt(&receipts[0], TestJob::NAME, Some(stamped));
         let warns = capture.warns_for(TestJob::NAME);
         assert_eq!(warns.len(), 1, "{warns:?}");
+        // Firing, warning and restamping never creates a pause: skew and a
+        // pause can never be confused for one another.
+        let pause_rows =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cron_pauses WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(pause_rows, 0);
 
         // The restamped row is now in the past and the interval has not
         // elapsed: no re-fire and no repeated warning.
@@ -3402,6 +3515,669 @@ mod test {
         .await
         .unwrap();
         assert_eq!(job_count.count.unwrap(), 1);
+    }
+
+    async fn jobs_named(db: &sqlx::PgPool, name: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE name = $1")
+            .bind(name)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    async fn last_run_at(db: &sqlx::PgPool, name: &str) -> chrono::DateTime<Utc> {
+        sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "SELECT last_run_at FROM crons WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_one(db)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn paused_job_cron_silent_while_sibling_fires(db: sqlx::PgPool) {
+        let other = sqlx::PgPool::connect_with((*db.connect_options()).clone())
+            .await
+            .unwrap();
+        let make_worker = |pool| {
+            let mut registry = CronRegistry::new();
+            registry.register_job(TestJob, None, Duration::from_mins(1));
+            registry.register_job(SecondTestJob, None, Duration::from_mins(1));
+            crate::cron::Worker::new(
+                TestAppState {
+                    db: pool,
+                    cookie_key: CookieKey::generate(),
+                },
+                registry,
+            )
+        };
+        let first = make_worker(db.clone());
+        let second = make_worker(other);
+
+        let paused_seed = seed(&db, TestJob::NAME, "2 minutes").await;
+        seed(&db, SecondTestJob::NAME, "2 minutes").await;
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+
+        // Sequential ticks on two schedulers sharing the database, with the
+        // pause committed before either tick: both schedulers' claims must
+        // consult the committed pause, so it holds everywhere at once while
+        // the sibling keeps firing. The interleaving where a scheduler's
+        // map read predates the pause commit is covered by
+        // `pause_committed_after_stale_pre_filter_blocks_the_claim`.
+        let capture = EventCapture::default();
+        assert_eq!(
+            first.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        assert_eq!(second.tick().await, TickOutcome::default());
+
+        let paused_count = jobs_named(&db, TestJob::NAME).await;
+        let sibling_count = jobs_named(&db, SecondTestJob::NAME).await;
+        assert_eq!((paused_count, sibling_count), (0, 1));
+        assert!(capture.fire_receipts(TestJob::NAME).is_empty());
+        // Not restamped: a pause writes nothing, including `last_run_at`.
+        assert_eq!(last_run_at(&db, TestJob::NAME).await, paused_seed);
+    }
+
+    #[sqlx::test]
+    async fn paused_cron_tick_logs_nothing_above_debug(db: sqlx::PgPool) {
+        // A paused cron is steady state, so its per-tick log budget is
+        // DEBUG and below (arena ticks every 2s). The skip event must be
+        // captured first, so this test cannot pass merely because capture
+        // missed the event.
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        seed(&db, TestJob::NAME, "2 minutes").await;
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+
+        let events = capture.cja_events();
+        let skips: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str)
+                    == Some("Cron paused; skipping claim")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(skips.len(), 1, "{events:?}");
+        assert_eq!(skips[0].level, tracing::Level::DEBUG, "{:?}", skips[0]);
+        // tracing orders ERROR < WARN < INFO < DEBUG < TRACE, so
+        // `>= DEBUG` means "DEBUG or TRACE only": INFO, WARN and ERROR all
+        // fail this.
+        assert!(
+            events
+                .iter()
+                .all(|event| event.level >= tracing::Level::DEBUG),
+            "a paused cron must log nothing above DEBUG: {events:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn paused_callback_cron_silent_while_sibling_fires(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls: [Arc<AtomicUsize>; 2] =
+            [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let mut registry = CronRegistry::new();
+        registry.register(
+            "paused_callback",
+            None,
+            Duration::from_mins(1),
+            make_counter(calls[0].clone()),
+        );
+        registry.register(
+            "sibling_callback",
+            None,
+            Duration::from_mins(1),
+            make_counter(calls[1].clone()),
+        );
+        fn make_counter(
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> impl Fn(
+            TestAppState,
+            String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>
+        + Send
+        + Sync
+        + 'static {
+            move |_, _| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<(), std::io::Error>(())
+                })
+            }
+        }
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        let paused_stamp = seed(&db, "paused_callback", "2 minutes").await;
+        seed(&db, "sibling_callback", "2 minutes").await;
+        pause(
+            &db,
+            "paused_callback",
+            "clock_timestamp() + interval '1 hour'",
+        )
+        .await;
+
+        assert_eq!(worker.tick().await, TickOutcome::default());
+
+        let paused_calls = calls[0].load(Ordering::SeqCst);
+        let sibling_calls = calls[1].load(Ordering::SeqCst);
+        assert_eq!((paused_calls, sibling_calls), (0, 1));
+        // The paused row is not restamped: a pause writes nothing.
+        assert_eq!(last_run_at(&db, "paused_callback").await, paused_stamp);
+    }
+
+    #[sqlx::test]
+    async fn pause_committed_after_stale_pre_filter_blocks_the_claim(db: sqlx::PgPool) {
+        type Calls = Arc<Mutex<std::collections::HashMap<&'static str, usize>>>;
+        fn counting_callback(
+            name: &'static str,
+            calls: Calls,
+        ) -> impl Fn(
+            TestAppState,
+            String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>
+        + Send
+        + Sync
+        + 'static {
+            move |_, _| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    *calls.lock().unwrap().entry(name).or_insert(0) += 1;
+                    Ok::<(), std::io::Error>(())
+                })
+            }
+        }
+
+        let calls: Calls = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut registry = CronRegistry::new();
+        registry.register(
+            "stale_first",
+            None,
+            Duration::from_mins(1),
+            counting_callback("stale_first", calls.clone()),
+        );
+        registry.register(
+            "stale_second",
+            None,
+            Duration::from_mins(1),
+            counting_callback("stale_second", calls.clone()),
+        );
+
+        // Deterministic: `Worker::tick` reads the map once before its loop,
+        // then walks `registry.jobs.values()` and awaits each cron inline, so
+        // the second cron's claim cannot start until the hook is released —
+        // and the pause below commits before that release.
+        let mut order = registry.jobs.keys().copied();
+        let first = order.next().unwrap();
+        let second = order.next().unwrap();
+        assert_ne!(first, second);
+
+        let first_stamp = seed(&db, first, "2 minutes").await;
+        let second_stamp = seed(&db, second, "2 minutes").await;
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let hook = Arc::new(CallbackPause {
+            committed: sender,
+            release: tokio::sync::Notify::new(),
+        });
+        registry.jobs.get_mut(first).unwrap().pause_after_commit = Some(hook.clone());
+
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+        let capture = EventCapture::default();
+        let dispatch = capture.dispatch();
+        let task = tokio::spawn(async move { worker.tick().with_subscriber(dispatch).await });
+
+        // The hook fires after the first cron's claim committed: the tick's
+        // map read is done and stale, and the worker parks holding no locks.
+        tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        pause(&db, second, "clock_timestamp() + interval '1 hour'").await;
+        hook.release.notify_one();
+        assert_eq!(task.await.unwrap(), TickOutcome::default());
+
+        // Counted by name, so HashMap iteration order cannot flip the pair.
+        // The paused cron never runs its callback, so its entry may be absent.
+        let calls_of = |name: &'static str| calls.lock().unwrap().get(name).copied().unwrap_or(0);
+        assert_eq!((calls_of(first), calls_of(second)), (1, 0));
+        assert!(capture.fire_receipts(second).is_empty());
+        assert_eq!(last_run_at(&db, second).await, second_stamp);
+        assert_ne!(last_run_at(&db, first).await, first_stamp);
+    }
+
+    #[sqlx::test]
+    async fn paused_cron_with_no_crons_row_stays_rowless_and_reports_none_after_resume(
+        db: sqlx::PgPool,
+    ) {
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+
+        // Capture every observed value first so a red run shows all of them.
+        let observed_jobs = jobs_named(&db, TestJob::NAME).await;
+        let observed_rows =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM crons WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let observed_receipts = capture.fire_receipts(TestJob::NAME).len();
+        assert_eq!(observed_jobs, 0, "paused cron must not enqueue");
+        assert_eq!(
+            observed_rows, 0,
+            "pause must leave a never-run cron never-run"
+        );
+        assert_eq!(observed_receipts, 0);
+
+        resume(&db, TestJob::NAME).await;
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        let receipts = capture.fire_receipts(TestJob::NAME);
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        // First fire after resume reports `last_run = None` — the Eyes
+        // first-fire contract survives a pause that preceded any fire.
+        assert_fire_receipt(&receipts[0], TestJob::NAME, None);
+        assert_eq!(jobs_named(&db, TestJob::NAME).await, 1);
+    }
+
+    #[sqlx::test]
+    async fn resume_fires_once_not_once_per_missed_slot(db: sqlx::PgPool) {
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        seed(&db, TestJob::NAME, "2 minutes").await;
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+        assert_eq!(worker.tick().await, TickOutcome::default());
+        let paused_jobs = jobs_named(&db, TestJob::NAME).await;
+        assert_eq!(paused_jobs, 0, "pause holds even though the row is due");
+
+        // Three slots elapse while paused.
+        sqlx::query(
+            "UPDATE crons SET last_run_at = clock_timestamp() - interval '3 minutes' WHERE name = $1",
+        )
+        .bind(TestJob::NAME)
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
+        let still_paused = jobs_named(&db, TestJob::NAME).await;
+        assert_eq!(still_paused, 0, "still paused");
+
+        resume(&db, TestJob::NAME).await;
+        assert_eq!(worker.tick().await, TickOutcome::default());
+        let after_resume = jobs_named(&db, TestJob::NAME).await;
+        assert_eq!(
+            after_resume, 1,
+            "one catch-up fire, not one per missed slot"
+        );
+        assert_eq!(worker.tick().await, TickOutcome::default());
+        assert_eq!(jobs_named(&db, TestJob::NAME).await, 1);
+    }
+
+    #[sqlx::test]
+    async fn already_expired_pause_row_does_not_block(db: sqlx::PgPool) {
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        seed(&db, TestJob::NAME, "2 minutes").await;
+        pause(
+            &db,
+            TestJob::NAME,
+            "clock_timestamp() - interval '1 second'",
+        )
+        .await;
+
+        assert_eq!(worker.tick().await, TickOutcome::default());
+        assert_eq!(jobs_named(&db, TestJob::NAME).await, 1);
+        // Expired rows linger, inert — nothing deletes them.
+        let lingering =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cron_pauses WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(lingering, 1);
+    }
+
+    #[sqlx::test]
+    async fn pause_expiry_unblocks_without_a_wall_clock(db: sqlx::PgPool) {
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        seed(&db, TestJob::NAME, "2 minutes").await;
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+        assert_eq!(worker.tick().await, TickOutcome::default());
+        let held = jobs_named(&db, TestJob::NAME).await;
+        assert_eq!(held, 0, "pause in force");
+
+        // The pause expires on the database clock — the same transition real
+        // time would produce, without racing it.
+        sqlx::query(
+            "UPDATE cron_pauses SET paused_until = clock_timestamp() - interval '1 second' WHERE name = $1",
+        )
+        .bind(TestJob::NAME)
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(worker.tick().await, TickOutcome::default());
+        assert_eq!(jobs_named(&db, TestJob::NAME).await, 1);
+        let lingering =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cron_pauses WHERE name = $1")
+                .bind(TestJob::NAME)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(lingering, 1, "expired row lingers, inert");
+    }
+
+    #[sqlx::test]
+    async fn paused_cron_with_future_last_run_at_does_not_fire_warn_or_restamp(db: sqlx::PgPool) {
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp() + interval '1 day', clock_timestamp(), clock_timestamp())
+             RETURNING last_run_at",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(TestJob::NAME)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        let observed_jobs = jobs_named(&db, TestJob::NAME).await;
+        let observed_warns = capture.warns_for(TestJob::NAME).len();
+        let observed_receipts = capture.fire_receipts(TestJob::NAME).len();
+        let observed_stamp = last_run_at(&db, TestJob::NAME).await;
+        assert_eq!(observed_jobs, 0, "pause beats the future-stamp override");
+        assert_eq!(observed_warns, 0, "no future-stamp warning while paused");
+        assert_eq!(observed_receipts, 0);
+        assert_eq!(observed_stamp, stamped, "not restamped while paused");
+
+        // After resume, DEV-2191's future-stamp behavior returns unchanged.
+        resume(&db, TestJob::NAME).await;
+        let before = db_now(&db).await;
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        let after = db_now(&db).await;
+        assert_eq!(jobs_named(&db, TestJob::NAME).await, 1);
+        let restamped = last_run_at(&db, TestJob::NAME).await;
+        assert!(restamped >= before && restamped <= after);
+        let receipts = capture.fire_receipts(TestJob::NAME);
+        assert_eq!(receipts.len(), 1, "{receipts:?}");
+        assert_fire_receipt(&receipts[0], TestJob::NAME, Some(stamped));
+        assert_eq!(capture.warns_for(TestJob::NAME).len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn pause_comparison_resolves_clock_timestamp_in_the_claim_session(db: sqlx::PgPool) {
+        // The pause is in force on the real clock for 15 more seconds, but
+        // the claim session resolves `clock_timestamp()` to the shadow 30s
+        // ahead: the pause must read as expired there and the cron must
+        // fire. A host-clock comparison (decoding `paused_until` into Rust
+        // and comparing `Utc::now()`) would see 15s remaining and hold the
+        // pause — this test fails it. Note it over-pins: it shadows
+        // `clock_timestamp()` specifically, so a `now()` implementation
+        // would also fail; accepted, since the file's clock discipline is
+        // `clock_timestamp()` throughout.
+        let skewed = skewed_pool(&db).await;
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_secs(60));
+        // Every clock read in the tick path goes through the skewed pool;
+        // assertions go through the plain pool.
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: skewed.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        seed(&db, TestJob::NAME, "2 minutes").await;
+        pause(
+            &db,
+            TestJob::NAME,
+            "clock_timestamp() + interval '15 seconds'",
+        )
+        .await;
+
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        assert_eq!(jobs_named(&db, TestJob::NAME).await, 1);
+        assert_eq!(capture.fire_receipts(TestJob::NAME).len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn missing_cron_pauses_table_fails_due_crons_loudly(db: sqlx::PgPool) {
+        // Both crons are seeded due: a not-due cron never reaches the claim,
+        // which is what consults the table.
+        seed(&db, TestJob::NAME, "2 minutes").await;
+        seed(&db, SecondTestJob::NAME, "2 minutes").await;
+        sqlx::query("DROP TABLE cron_pauses")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        registry.register_job(SecondTestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome {
+                failed: 2,
+                ..TickOutcome::default()
+            }
+        );
+
+        let observed_test = jobs_named(&db, TestJob::NAME).await;
+        let observed_second = jobs_named(&db, SecondTestJob::NAME).await;
+        assert_eq!((observed_test, observed_second), (0, 0));
+        assert!(capture.fire_receipts(TestJob::NAME).is_empty());
+        assert!(capture.fire_receipts(SecondTestJob::NAME).is_empty());
+    }
+
+    #[sqlx::test]
+    async fn pause_check_fails_closed_on_recoverable_error(db: sqlx::PgPool) {
+        // An ACCESS EXCLUSIVE lock on cron_pauses makes the claim's pause
+        // read block until the claim's 1s lock_timeout cancels it with
+        // 55P03 — the recoverable arm of the pause check. It must fail
+        // closed: skip the claim (logged at WARN), enqueue nothing, write
+        // nothing. `missing_cron_pauses_table_fails_due_crons_loudly`
+        // reaches only the non-recoverable arm. The `operation` and
+        // `sqlstate` assertions pin the mechanism itself: deleting the
+        // `lock_timeout` setting would let `statement_timeout` cancel the
+        // read with 57014 ~4s later, taking the same recoverable arm and
+        // logging the same single WARN. A same-transaction fail-open of
+        // this arm shows up as a failed tick (55P03 aborts the claim
+        // transaction server-side; the next statement errors 25P02,
+        // non-recoverable) — caught by the tick-outcome assertion below —
+        // and a fail-open that goes on to claim in a fresh transaction
+        // would fire the paused cron — caught by the jobs and
+        // `last_run_at` assertions after it.
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        let seeded = seed(&db, TestJob::NAME, "2 minutes").await;
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+        let mut holder = db.begin().await.unwrap();
+        sqlx::query("LOCK TABLE cron_pauses IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        holder.commit().await.unwrap();
+
+        // Capture every observed value first so a red run shows all of them.
+        let observed_jobs = jobs_named(&db, TestJob::NAME).await;
+        let observed_stamp = last_run_at(&db, TestJob::NAME).await;
+        let observed_warns = capture.warns_for(TestJob::NAME);
+        assert_eq!(
+            observed_jobs, 0,
+            "recoverable pause-check error must not enqueue"
+        );
+        assert_eq!(observed_stamp, seeded, "failed claim writes nothing");
+        assert_eq!(observed_warns.len(), 1, "{observed_warns:?}");
+        assert_eq!(
+            observed_warns[0]
+                .fields
+                .get("operation")
+                .map(String::as_str),
+            Some("pause check"),
+            "{:?}",
+            observed_warns[0]
+        );
+        let sqlstate = observed_warns[0]
+            .fields
+            .get("sqlstate")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            sqlstate.contains("55P03"),
+            "expected the 1s lock_timeout cancellation 55P03: {sqlstate} in {:?}",
+            observed_warns[0]
+        );
+    }
+
+    #[sqlx::test]
+    async fn boot_probe_names_the_fix_when_cron_pauses_is_missing(db: sqlx::PgPool) {
+        sqlx::query("DROP TABLE cron_pauses")
+            .execute(&db)
+            .await
+            .unwrap();
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+        // Pre-cancel: the loop never executes, but the probe runs first.
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let capture = EventCapture::default();
+        worker.run(token).with_subscriber(capture.dispatch()).await;
+
+        let errors: Vec<_> = capture
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.target == "cja::cron::worker" && event.level == tracing::Level::ERROR
+            })
+            .cloned()
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let message = errors[0].fields.get("message").cloned();
+        let message = message.unwrap_or_default();
+        assert!(message.contains("cron_pauses"), "{message}");
+        assert!(message.contains("sync-migrations"), "{message}");
     }
 }
 

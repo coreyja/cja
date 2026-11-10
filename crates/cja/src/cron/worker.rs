@@ -95,6 +95,7 @@ impl<AppState: AS> Worker<AppState> {
     /// shutdown.cancel();
     /// ```
     pub async fn run(self, shutdown_token: CancellationToken) {
+        verify_cron_pauses_schema(self.state.db()).await;
         tracing::debug!(cron_worker_id = %self.id, "Starting Cron loop");
         while !shutdown_token.is_cancelled() {
             // Dropping tick on cancellation can interrupt a direct callback
@@ -210,5 +211,40 @@ impl<AppState: AS> Worker<AppState> {
             }
         }
         outcome
+    }
+}
+
+/// One-shot schema probe at worker start, like `verify_jobs_schema`
+/// (crates/cja/src/jobs/worker.rs) but log-only. The ERROR can be transient
+/// if another instance is still migrating. If this app keeps its own copies
+/// of cja's migrations and has not copied `AddCronPauses`, every due cron's
+/// claim fails on every tick with `relation "cron_pauses" does not exist`.
+/// Log one ERROR naming the fix at boot instead of leaving the per-tick
+/// errors as the only signal. Log-only: `run` returns `()`.
+async fn verify_cron_pauses_schema(db: &sqlx::PgPool) {
+    let Err(error) = sqlx::query("SELECT name, paused_until, paused_at FROM cron_pauses LIMIT 0")
+        .execute(db)
+        .await
+    else {
+        return;
+    };
+    let mismatch = error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| matches!(code.as_ref(), "42P01" | "42703"));
+    if mismatch {
+        tracing::error!(
+            %error,
+            "The cron schema is missing cja migrations (cron_pauses). Cron claims will \
+             fail every tick until it is applied. If this app keeps its own copies of \
+             cja's migrations, copy the missing files (`cja sync-migrations`) and run \
+             them; if you use `cja::db::run_migrations(&pool)` at boot, check which \
+             migrator actually ran."
+        );
+    } else {
+        tracing::warn!(
+            %error,
+            "Could not verify the cron_pauses schema at startup; continuing"
+        );
     }
 }
