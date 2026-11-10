@@ -410,18 +410,6 @@ impl<AppState: AS> CronJob<AppState> {
         tracing::info!(task_name = self.name, last_run = ?last_run, "Enqueuing Task");
     }
 
-    /// Claim this cron's due interval, if it is due and not paused.
-    ///
-    /// The transaction's first decision after timeout setup is the
-    /// per-cron pause check (`cron_pauses`, compared against
-    /// `clock_timestamp()`); it is the single authority for paused-ness —
-    /// the pre-filter never consults it, so a scheduler whose map read
-    /// predates the pause commit is still blocked here. A paused cron
-    /// writes nothing: no row lock, no first-row insert, no restamp. A
-    /// claim that already passed this check when a pause commits may still
-    /// finish and enqueue one more fire (`statement_timeout` is per
-    /// statement, so the remaining claim work has no shared bound) — see
-    /// the operator runbook in `crates/cja/src/cron/mod.rs`.
     /// Whether cron `name` is paused, read inside the caller's claim
     /// transaction against the database clock (`clock_timestamp()`) — the
     /// single authority for paused-ness.
@@ -438,6 +426,18 @@ impl<AppState: AS> CronJob<AppState> {
         .await
     }
 
+    /// Claim this cron's due interval, if it is due and not paused.
+    ///
+    /// The transaction's first decision after timeout setup is the
+    /// per-cron pause check (`cron_pauses`, compared against
+    /// `clock_timestamp()`); it is the single authority for paused-ness —
+    /// the pre-filter never consults it, so a scheduler whose map read
+    /// predates the pause commit is still blocked here. A paused cron
+    /// writes nothing: no row lock, no first-row insert, no restamp. A
+    /// claim that already passed this check when a pause commits may still
+    /// finish and enqueue one more fire (`statement_timeout` is per
+    /// statement, so the remaining claim work has no shared bound) — see
+    /// the operator runbook in `crates/cja/src/cron/mod.rs`.
     #[cfg(feature = "jobs")]
     async fn claim_due(
         &self,
@@ -3770,6 +3770,7 @@ mod test {
 
         seed(&db, TestJob::NAME, "2 minutes").await;
         pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+        assert_eq!(worker.tick().await, TickOutcome::default());
         let paused_jobs = jobs_named(&db, TestJob::NAME).await;
         assert_eq!(paused_jobs, 0, "pause holds even though the row is due");
 
