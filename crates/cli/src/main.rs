@@ -1036,53 +1036,62 @@ use tracing::info;
     imports
 }
 
-fn generate_app_skeleton() -> &'static str {
-    r#"
+fn generate_app_skeleton(no_sessions: bool) -> String {
+    let cookie_key = if no_sessions {
+        r"        // No sessions in this app: an ephemeral key is fine (release
+        // builds without COOKIE_KEY refuse when deriving from the env).
+        let cookie_key = CookieKey::generate();
+"
+    } else {
+        r"        let cookie_key = CookieKey::from_env_or_generate()?;
+"
+    };
+    format!(
+        r#"
 #[derive(Clone)]
-struct AppState {
+struct AppState {{
     db: sqlx::PgPool,
     cookie_key: CookieKey,
-}
+}}
 
-impl AppState {
-    async fn from_env() -> cja::Result<Self> {
+impl AppState {{
+    async fn from_env() -> cja::Result<Self> {{
         let db = setup_db_pool().await?;
-        let cookie_key = CookieKey::from_env_or_generate()?;
+{cookie_key}
+        Ok(Self {{ db, cookie_key }})
+    }}
+}}
 
-        Ok(Self { db, cookie_key })
-    }
-}
-
-impl cja::app_state::AppState for AppState {
-    fn version(&self) -> &'static str {
+impl cja::app_state::AppState for AppState {{
+    fn version(&self) -> &'static str {{
         concat!(
             env!("CARGO_PKG_VERSION"),
             " (",
             env!("VERGEN_GIT_SHA"),
             ")"
         )
-    }
+    }}
 
-    fn db(&self) -> &sqlx::PgPool {
+    fn db(&self) -> &sqlx::PgPool {{
         &self.db
-    }
+    }}
 
-    fn cookie_key(&self) -> &CookieKey {
+    fn cookie_key(&self) -> &CookieKey {{
         &self.cookie_key
-    }
-}
+    }}
+}}
 
-fn main() -> cja::Result<()> {
+fn main() -> cja::Result<()> {{
     // Create and run the tokio runtime
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()?
-        .block_on(async { run_application().await })
-}
+        .block_on(async {{ run_application().await }})
+}}
 
 #[tracing::instrument(err)]
-pub async fn setup_db_pool() -> cja::Result<PgPool> {
+pub async fn setup_db_pool() -> cja::Result<PgPool> {{
     let database_url = std::env::var("DATABASE_URL").wrap_err("DATABASE_URL must be set")?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -1104,22 +1113,23 @@ pub async fn setup_db_pool() -> cja::Result<PgPool> {
     migrations.run(&pool).await?;
 
     Ok(pool)
-}
+}}
 
-fn routes(app_state: AppState) -> axum::Router {
+fn routes(app_state: AppState) -> axum::Router {{
     axum::Router::new()
         .route("/", axum::routing::get(root))
         .with_state(app_state)
-}
+}}
 
 /// Check if a feature is enabled based on environment variables
-fn is_feature_enabled(feature: &str) -> bool {
-    let env_var_name = format!("{feature}_DISABLED");
+fn is_feature_enabled(feature: &str) -> bool {{
+    let env_var_name = format!("{{feature}}_DISABLED");
     let value = std::env::var(&env_var_name).unwrap_or_else(|_| "false".to_string());
 
     value != "true"
-}
+}}
 "#
+    )
 }
 
 fn generate_session_handler(no_sessions: bool) -> &'static str {
@@ -1304,16 +1314,51 @@ mod jobs {
 "#
 }
 
-fn generate_cron_module() -> &'static str {
-    r#"
-mod cron {
+fn generate_cron_module(no_sessions: bool) -> String {
+    let prune = if no_sessions {
+        String::new()
+    } else {
+        r#"
+        // Keep the sessions table bounded: delete sessions idle 30+ days,
+        // daily at 4am. Log-and-continue: a failed prune must not stop the
+        // cron worker.
+        registry
+            .register_with_cron(
+                "prune-sessions",
+                Some("Delete sessions idle for 30+ days"),
+                "0 0 4 * * * *", // 7-field cja cron: sec min hour dom mon dow year
+                |state, _| {
+                    Box::pin(async move {
+                        // Field access, not state.db(): the AppState *trait*
+                        // is not in scope in this module and the generated
+                        // struct has no inherent db(). The private field is
+                        // visible from this child module.
+                        if let Err(err) = cja::server::session::prune(
+                            &state.db,
+                            Duration::from_secs(30 * 24 * 3600),
+                        )
+                        .await
+                        {
+                            tracing::error!("prune-sessions failed: {err:#}");
+                        }
+                        Ok::<(), std::convert::Infallible>(())
+                    })
+                },
+            )?;
+
+"#
+        .to_string()
+    };
+    format!(
+        r#"
+mod cron {{
     use std::time::Duration;
 
-    use cja::cron::{CancellationToken, CronRegistry, Worker};
+    use cja::cron::{{CancellationToken, CronRegistry, Worker}};
 
     use crate::AppState;
 
-    fn build_registry() -> CronRegistry<AppState> {
+    fn build_registry() -> cja::Result<CronRegistry<AppState>> {{
         let mut registry = CronRegistry::new();
 
         // Enqueue the example job once a minute. Interval crons fire once at
@@ -1321,22 +1366,22 @@ mod cron {
         // See the cja::cron docs for cron-expression schedules
         // (register_job_with_cron) and plain callbacks (register / register_with_cron).
         registry.register_job(
-            crate::jobs::ExampleJob {
+            crate::jobs::ExampleJob {{
                 message: "hello from cron".to_string(),
-            },
+            }},
             Some("Example cron"),
             Duration::from_mins(1),
         );
+{prune}        Ok(registry)
+    }}
 
-        registry
-    }
-
-    pub async fn run(app_state: AppState, shutdown: CancellationToken) -> cja::Result<()> {
-        Worker::new(app_state, build_registry()).run(shutdown).await;
+    pub async fn run(app_state: AppState, shutdown: CancellationToken) -> cja::Result<()> {{
+        Worker::new(app_state, build_registry()?).run(shutdown).await;
         Ok(())
-    }
-}
+    }}
+}}
 "#
+    )
 }
 
 fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
@@ -1346,7 +1391,7 @@ fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
     content.push_str(&generate_imports(no_sessions, no_jobs));
 
     // Add app skeleton (AppState, main, setup_db_pool, routes, feature flag)
-    content.push_str(generate_app_skeleton());
+    content.push_str(&generate_app_skeleton(no_sessions));
 
     // Add session handler
     content.push_str(generate_session_handler(no_sessions));
@@ -1361,7 +1406,7 @@ fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
 
     // Add cron module if cron is enabled
     if !no_cron && !no_jobs {
-        content.push_str(generate_cron_module());
+        content.push_str(&generate_cron_module(no_sessions));
     }
 
     content
@@ -1392,6 +1437,26 @@ mod tests {
             assert!(!main_rs.contains("pg_advisory_lock"));
             assert!(!main_rs.contains("sqlx::query!")); // runtime SQL only: compiles without a DB
             assert!(!main_rs.contains("tokio::spawn")); // everything goes through the Supervisor
+            // Sessions path derives the cookie key from COOKIE_KEY (release
+            // builds refuse without it); --no-sessions uses an ephemeral key.
+            if no_sessions {
+                assert!(
+                    main_rs.contains("CookieKey::generate()"),
+                    "no-sessions scaffold must generate an ephemeral key: \
+                     {no_cron}/{no_jobs}/{no_sessions}"
+                );
+                assert!(
+                    !main_rs.contains("from_env_or_generate"),
+                    "no-sessions scaffold must not require COOKIE_KEY: \
+                     {no_cron}/{no_jobs}/{no_sessions}"
+                );
+            } else {
+                assert!(
+                    main_rs.contains("CookieKey::from_env_or_generate()?"),
+                    "sessions scaffold must derive the key from COOKIE_KEY: \
+                     {no_cron}/{no_jobs}/{no_sessions}"
+                );
+            }
         }
     }
 
@@ -1403,7 +1468,9 @@ mod tests {
         assert!(main_rs.contains("cja::impl_job_registry!(crate::AppState, ExampleJob)"));
         assert!(main_rs.contains("impl Job<crate::AppState> for ExampleJob"));
         assert!(main_rs.contains("CronRegistry::new()"));
-        assert!(main_rs.contains("Worker::new(app_state, build_registry())"));
+        assert!(main_rs.contains("fn build_registry() -> cja::Result<CronRegistry<AppState>>"));
+        assert!(main_rs.contains("Worker::new(app_state, build_registry()?)"));
+        assert!(main_rs.contains("\"prune-sessions\""));
         assert!(!main_rs.contains("TODO"));
     }
 
