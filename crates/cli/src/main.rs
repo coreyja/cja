@@ -1147,15 +1147,18 @@ struct SiteSession {
 
 #[async_trait::async_trait]
 impl AppSession for SiteSession {
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
+    async fn from_db(
+        pool: &sqlx::PgPool,
+        session_id: uuid::Uuid,
+    ) -> cja::Result<Option<Self>> {
         let inner = sqlx::query_as::<_, CJASession>(
             "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
         )
         .bind(session_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(Self { inner })
+        Ok(inner.map(|inner| Self { inner }))
     }
 
     async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {

@@ -11,22 +11,22 @@ struct TestSession {
 
 #[async_trait::async_trait]
 impl AppSession for TestSession {
-    async fn from_db(pool: &PgPool, session_id: Uuid) -> cja::Result<Self> {
+    async fn from_db(pool: &PgPool, session_id: Uuid) -> cja::Result<Option<Self>> {
         let row = sqlx::query(
             "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
         )
         .bind(session_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(Self {
+        Ok(row.map(|row| Self {
             inner: CJASession {
                 session_id: row.get("session_id"),
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
             },
             user_id: None,
-        })
+        }))
     }
 
     async fn create(pool: &PgPool) -> cja::Result<Self> {
@@ -68,7 +68,8 @@ async fn test_session_creation() {
     // Verify session was persisted
     let loaded = TestSession::from_db(&pool, session.inner.session_id)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("session row exists");
     assert_eq!(loaded.inner.session_id, session.inner.session_id);
 }
 
@@ -81,7 +82,10 @@ async fn test_session_lifecycle() {
     let session_id = session.inner.session_id;
 
     // Load it back
-    let loaded = TestSession::from_db(&pool, session_id).await.unwrap();
+    let loaded = TestSession::from_db(&pool, session_id)
+        .await
+        .unwrap()
+        .expect("session row exists");
     assert_eq!(loaded.inner.session_id, session_id);
     assert_eq!(loaded.inner.created_at, session.inner.created_at);
 
@@ -94,7 +98,10 @@ async fn test_session_lifecycle() {
         .unwrap();
 
     // Load again and verify update
-    let updated = TestSession::from_db(&pool, session_id).await.unwrap();
+    let updated = TestSession::from_db(&pool, session_id)
+        .await
+        .unwrap()
+        .expect("session row exists");
     assert!(updated.inner.updated_at > loaded.inner.updated_at);
 }
 
@@ -105,7 +112,9 @@ async fn test_session_not_found() {
     let random_id = Uuid::new_v4();
     let result = TestSession::from_db(&pool, random_id).await;
 
-    assert!(result.is_err());
+    // A missing row is `Ok(None)`, never an `Err`: the extractor creates a
+    // fresh session on `None` and 500s only on genuine load failures.
+    assert!(result.unwrap().is_none());
 }
 
 #[tokio::test]
