@@ -13,6 +13,7 @@ where
         )
         .route("/auth/start", axum::routing::post(auth::start::<S>))
         .route("/auth/finish", axum::routing::post(auth::finish::<S>))
+        .route("/auth/logout", axum::routing::post(auth::logout::<S>))
         .route(
             "/auth/discoverable/start",
             axum::routing::post(auth::start_discoverable::<S>),
