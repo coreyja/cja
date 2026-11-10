@@ -109,21 +109,38 @@ impl Job<AppState> for SendEmail {
                     (feature_card(
                         "Cron Scheduling",
                         "Interval or cron expression scheduling with timezone awareness. Distributed locking ensures single execution across instances.",
-                        r#"let mut registry = CronRegistry::new();
+                        r#"fn build_registry() -> cja::Result<CronRegistry<AppState>> {
+    let mut registry = CronRegistry::new();
 
-registry.register_job(
-    CleanupJob,
-    Some("Remove expired sessions"),
-    Duration::from_secs(3600),
-);
+    registry.register_with_cron(
+        "daily-report", None,
+        "0 0 9 * * *",  // 9am daily
+        |state, _| Box::pin(async move {
+            generate_report(state).await
+        }),
+    )?;
 
-registry.register_with_cron(
-    "daily-report", None,
-    "0 0 9 * * *",  // 9am daily
-    |state, _| Box::pin(async move {
-        generate_report(state).await
-    }),
-)?;"#,
+    // Keep the sessions table bounded: delete sessions idle 30+ days.
+    // Log-and-continue: a failed prune must not stop the cron worker.
+    registry.register_with_cron(
+        "prune-sessions",
+        Some("Delete sessions idle for 30+ days"),
+        "0 0 4 * * * *",  // 4am daily
+        |state, _| {
+            Box::pin(async move {
+                if let Err(err) = cja::server::session::prune(
+                    &state.db,
+                    Duration::from_secs(30 * 24 * 3600),
+                ).await {
+                    tracing::error!("prune-sessions failed: {err:#}");
+                }
+                Ok::<(), std::convert::Infallible>(())
+            })
+        },
+    )?;
+
+    Ok(registry)
+}"#,
                         &cron_icon(),
                     ))
                     (feature_card(
