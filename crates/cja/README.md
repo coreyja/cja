@@ -418,8 +418,13 @@ struct MySession {
 
 #[async_trait::async_trait]
 impl cja::server::session::AppSession for MySession {
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
-        // Load from database...
+    async fn from_db(
+        pool: &sqlx::PgPool,
+        session_id: uuid::Uuid,
+    ) -> cja::Result<Option<Self>> {
+        // Load from database with fetch_optional; Ok(None) for a missing
+        // row (the extractor then creates a session), Err only for real
+        // failures (the extractor 500s).
     }
     async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
         // Create new session...
@@ -432,6 +437,16 @@ impl cja::server::session::AppSession for MySession {
     }
 }
 ```
+
+### Session lifecycle
+
+The `Session` extractor refreshes `sessions.updated_at` at most once per
+`ACTIVITY_REFRESH_MIN_INTERVAL`, so the timestamp tracks real activity without
+a write per request. Schedule `cja::server::session::prune(pool, idle)` from a
+cron to delete idle sessions (the scaffold registers a daily 4am example);
+`idle` must exceed `ACTIVITY_REFRESH_MIN_INTERVAL` — the function refuses
+smaller values. The logout route lives in cja-passkey (`POST /auth/logout`):
+it deletes the session row and clears the cookie.
 
 Then use the `Session<MySession>` extractor in handlers:
 
