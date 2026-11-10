@@ -59,7 +59,7 @@ use tower_service::Service;
 
 pub mod cookies {
     mod cookie_key;
-    pub use cookie_key::CookieKey;
+    pub use cookie_key::{CookieKey, CookieKeyError};
 
     mod cookie_jar;
     pub use cookie_jar::CookieJar;

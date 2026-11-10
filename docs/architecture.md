@@ -67,7 +67,7 @@ server/
   mod.rs           — run_server(), middleware stack (request-user + tracing + cookies)
   app.rs           — App: default router + per-host routers, host dispatch
   cookies/
-    cookie_key.rs  — CookieKey (from COOKIE_KEY env or auto-generated)
+    cookie_key.rs  — CookieKey (from COOKIE_KEY env; release builds refuse without it — sessionless apps use generate())
     cookie_jar.rs  — CookieJar Axum extractor
   session.rs       — CJASession, AppSession trait, Session<A> extractor
   page.rs          — Page wrapper for HTML responses

@@ -120,7 +120,7 @@
 //! |----------|----------|---------|-------------|
 //! | `DATABASE_URL` | Yes | — | `PostgreSQL` connection string |
 //! | `PORT` | No | `3000` | HTTP server port |
-//! | `COOKIE_KEY` | No | Auto-generated | Base64-encoded 64-byte cookie encryption key. **Must be set in production** for session persistence across restarts. |
+//! | `COOKIE_KEY` | Yes, in release builds of session-using apps | Ephemeral (debug builds only) | Base64-encoded 64-byte cookie encryption key. Release builds of apps using the `Session` extractor fail at boot without it; sessionless apps can use `CookieKey::generate()` instead. |
 //! | `SERVER_DISABLED` | No | `false` | Set to `"true"` to skip starting the HTTP server |
 //! | `JOBS_DISABLED` | No | `false` | Set to `"true"` to skip starting the job worker |
 //! | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |
