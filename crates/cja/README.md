@@ -160,7 +160,7 @@ let pool = sqlx::postgres::PgPoolOptions::new()
     .connect(&std::env::var("DATABASE_URL")?)
     .await?;
 
-// Run CJA's built-in migrations (jobs, crons, sessions, dead_letter_jobs)
+// Run CJA's built-in migrations (jobs, crons, cron_pauses, sessions, dead_letter_jobs)
 cja::db::run_migrations(&pool).await?;
 ```
 
@@ -453,7 +453,7 @@ PreEscaped(r#"<svg>...</svg>"#.to_string())
 
 ## Migrations
 
-CJA ships migrations for its core tables (jobs, crons, sessions, dead_letter_jobs). Two approaches:
+CJA ships migrations for its core tables (jobs, crons, cron_pauses, sessions, dead_letter_jobs). Two approaches:
 
 ### Recommended: `cja::db::run_migrations()`
 

@@ -47,6 +47,15 @@ async fn generated_boot_path_passes_worker_schema_check() {
     .unwrap();
     assert!(exists, "app migration never applied");
 
+    // Scaffolds boot with the new framework table too (DEV-2227): the pause
+    // claim consults it, so a scaffold missing it would fail every due cron.
+    let cron_pauses: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public.cron_pauses')::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(cron_pauses.is_some(), "cron_pauses never applied");
+
     // Pre-cancel the token: the worker verifies the schema, then exits Ok
     // without claiming anything (job_worker runs verify_jobs_schema before
     // its loop, worker.rs:780, and the loop's select breaks on a cancelled

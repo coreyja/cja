@@ -59,7 +59,7 @@
 //!     .connect(&std::env::var("DATABASE_URL")?)
 //!     .await?;
 //!
-//! // Run CJA's built-in migrations (jobs, crons, sessions, dead_letter_jobs)
+//! // Run CJA's built-in migrations (jobs, crons, cron_pauses, sessions, dead_letter_jobs)
 //! cja::db::run_migrations(&pool).await?;
 //! ```
 //!

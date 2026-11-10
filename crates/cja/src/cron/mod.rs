@@ -77,13 +77,95 @@
 //! claim re-check, logged at WARN (target `cja::cron::registry`, field
 //! `cron.name`), and restamped with the claim time. **Stamping `last_run_at`
 //! into the future no longer pauses a cron** — it fires on the next tick
-//! instead. The old pause-by-future-stamp runbook is dead; pausing now
-//! requires app-level means (`CRON_DISABLED`, app config, or the
-//! first-class per-cron pause tracked in DEV-2227).
+//! instead. The old pause-by-future-stamp runbook is dead; use the
+//! first-class per-cron pause instead — see ["Pausing a cron at
+//! runtime"](#pausing-a-cron-at-runtime) below.
 //!
 //! Registering two crons with the same name (callback or job — one shared
 //! namespace) panics at registration instead of silently replacing the
 //! first.
+//!
+//! # Pausing a cron at runtime
+//!
+//! Any single cron can be paused and resumed with SQL against the app's
+//! database — no deploy, no restart. The pause is consulted inside the cron
+//! claim against the database clock, so host/DB clock skew can neither
+//! create nor clear it, and it stops the cron on every scheduler sharing the
+//! database. It takes effect for any claim that begins after it commits.
+//!
+//! A claim that already passed its pause check when your statement commits
+//! can still finish and enqueue one more fire after you see success — for a
+//! destructive job, re-check the queue a few seconds after pausing before
+//! concluding nothing is queued. A pause stops new enqueues only: rows
+//! already in the `jobs` queue (and their retries) keep running, and a
+//! callback cron already past its claim commit runs to completion.
+//!
+//! Pause a cron that has already fired — the name is read from `crons`
+//! itself, so a typo matches nothing and returns zero rows (`INSERT 0 0`)
+//! instead of silently pausing nothing:
+//!
+//! ```sql
+//! INSERT INTO cron_pauses (name, paused_until)
+//! SELECT name, now() + interval '4 hours' FROM crons WHERE name = 'TurnRetentionJob'
+//! ON CONFLICT (name) DO UPDATE
+//!   SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()
+//! RETURNING name, paused_until;
+//! ```
+//!
+//! Pause a cron that has never fired (no `crons` row exists yet). SQL cannot
+//! detect a typo here — the registry is not in the database — so copy the
+//! name exactly from the registry or the deploy, and check after the next
+//! deploy that no `crons` row appears for it while the pause is in force
+//! (`SELECT last_run_at FROM crons WHERE name = 'FreshJob'` — a row
+//! appearing means the pause did not match):
+//!
+//! ```sql
+//! INSERT INTO cron_pauses (name, paused_until)
+//! VALUES ('FreshJob', now() + interval '4 hours')
+//! ON CONFLICT (name) DO UPDATE
+//!   SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()
+//! RETURNING name, paused_until;
+//! ```
+//!
+//! `'infinity'` in place of the `now() + interval` expression pauses
+//! indefinitely. Always compute the expiry on the database (`now() +
+//! interval '...'`), never paste a timestamp from your laptop.
+//!
+//! Resume — `DELETE 0` means no pause row existed: mistyped pause, or
+//! already resumed:
+//!
+//! ```sql
+//! DELETE FROM cron_pauses WHERE name = 'TurnRetentionJob';
+//! ```
+//!
+//! Inspect — a pause row whose `last_run_at` is NULL names a cron that has
+//! never fired, or a typo (if the cron has fired before, it is a typo):
+//!
+//! ```sql
+//! SELECT p.name, p.paused_at, p.paused_until,
+//!       p.paused_until > clock_timestamp() AS in_force,
+//!       c.last_run_at
+//! FROM cron_pauses p LEFT JOIN crons c ON c.name = p.name
+//! ORDER BY p.name;
+//! ```
+//!
+//! While a pause is in force the cron emits no `Enqueuing Task` receipt and
+//! its `last_run_at` stops advancing while siblings' keep moving — that is
+//! how you confirm it live. On resume an overdue cron fires **once** on the
+//! next tick (not once per missed interval) and then resumes cadence; a cron
+//! paused before its first fire still reports `last_run = None` on that
+//! first fire. Expired rows linger harmlessly (`in_force = false`).
+//! Schedulers still running a cja older than this feature ignore the table
+//! entirely.
+//!
+//! Two cautions: (1) receipt-based missed-run monitors (e.g. eyes
+//! `cron_missed` on apps with eyes telemetry) will correctly see a paused
+//! cron as not firing — silence or expect that alert for the pause's
+//! duration; (2) a `last_run_at` ahead of `now()` with no `cron_pauses` row
+//! in force is clock skew, not a pause: the cron still fires, WARNs and
+//! restamps on its own. Use
+//! `SELECT name, last_run_at FROM crons WHERE last_run_at > now();` to tell
+//! the two apart.
 //!
 //! # Queue Pileup Warning
 //!

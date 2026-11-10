@@ -1,7 +1,8 @@
 //! Database utilities and migration management.
 //!
 //! CJA ships with migrations for its core tables (`jobs`, `dead_letter_jobs`,
-//! `crons`, `sessions`). Use [`run_migrations`] to apply them on startup.
+//! `crons`, `cron_pauses`, `sessions`). Use [`run_migrations`] to apply them
+//! on startup.
 //!
 //! # Migration Locations
 //!
@@ -33,7 +34,8 @@
 
 /// Run CJA's built-in database migrations.
 ///
-/// This applies all framework migrations (jobs, crons, sessions, `dead_letter_jobs`)
+/// This applies all framework migrations (jobs, crons, `cron_pauses`,
+/// sessions, `dead_letter_jobs`)
 /// using `SQLx`'s built-in advisory locking for safe concurrent startup.
 ///
 /// Tolerates foreign rows in `_sqlx_migrations` (your app's own migrations,

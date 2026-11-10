@@ -1089,7 +1089,7 @@ pub async fn setup_db_pool() -> cja::Result<PgPool> {
         .connect(&database_url)
         .await?;
 
-    // cja's framework tables: jobs, dead_letter_jobs, crons, sessions.
+    // cja's framework tables: jobs, dead_letter_jobs, crons, cron_pauses, sessions.
     cja::db::run_migrations(&pool).await?;
 
     // This app's own migrations, from `migrations/` at the crate root. Both
