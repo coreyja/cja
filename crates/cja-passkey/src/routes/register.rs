@@ -74,12 +74,7 @@ where
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    PasskeySession::set_challenge_state(state.db(), *session.session_id(), challenge_json)
-        .await
-        .map_err(|err| {
-            tracing::error!("set_challenge_state failed: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    super::store_challenge_state(state.db(), *session.session_id(), challenge_json).await?;
 
     Ok(Json(challenge))
 }
@@ -173,8 +168,17 @@ where
     )
     .await
     {
-        tracing::warn!("user::create failed (likely race): {err}");
-        return Err(StatusCode::CONFLICT);
+        let unique = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+            .and_then(sqlx::Error::as_database_error)
+            .is_some_and(sqlx::error::DatabaseError::is_unique_violation);
+        if unique {
+            tracing::warn!("user::create unique violation (registration race): {err:#}");
+            return Err(StatusCode::CONFLICT);
+        }
+        tracing::error!("user::create failed: {err:#}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     credential::create(
         &mut **tx,

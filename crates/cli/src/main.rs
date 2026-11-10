@@ -1147,15 +1147,18 @@ struct SiteSession {
 
 #[async_trait::async_trait]
 impl AppSession for SiteSession {
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
+    async fn from_db(
+        pool: &sqlx::PgPool,
+        session_id: uuid::Uuid,
+    ) -> cja::Result<Option<Self>> {
         let inner = sqlx::query_as::<_, CJASession>(
             "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1",
         )
         .bind(session_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(Self { inner })
+        Ok(inner.map(|inner| Self { inner }))
     }
 
     async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
@@ -1301,16 +1304,51 @@ mod jobs {
 "#
 }
 
-fn generate_cron_module() -> &'static str {
-    r#"
-mod cron {
+fn generate_cron_module(no_sessions: bool) -> String {
+    let prune = if no_sessions {
+        String::new()
+    } else {
+        r#"
+        // Keep the sessions table bounded: delete sessions idle 30+ days,
+        // daily at 4am. `prune` returns an eyre error, which cron callbacks
+        // cannot return (they need a `std::error::Error`), so log it here.
+        registry
+            .register_with_cron(
+                "prune-sessions",
+                Some("Delete sessions idle for 30+ days"),
+                "0 0 4 * * * *", // 7-field cja cron: sec min hour dom mon dow year
+                |state, _| {
+                    Box::pin(async move {
+                        // Field access, not state.db(): the AppState *trait*
+                        // is not in scope in this module and the generated
+                        // struct has no inherent db(). The private field is
+                        // visible from this child module.
+                        if let Err(err) = cja::server::session::prune(
+                            &state.db,
+                            Duration::from_secs(30 * 24 * 3600),
+                        )
+                        .await
+                        {
+                            tracing::error!("prune-sessions failed: {err:#}");
+                        }
+                        Ok::<(), std::convert::Infallible>(())
+                    })
+                },
+            )?;
+
+"#
+        .to_string()
+    };
+    format!(
+        r#"
+mod cron {{
     use std::time::Duration;
 
-    use cja::cron::{CancellationToken, CronRegistry, Worker};
+    use cja::cron::{{CancellationToken, CronRegistry, Worker}};
 
     use crate::AppState;
 
-    fn build_registry() -> CronRegistry<AppState> {
+    fn build_registry() -> cja::Result<CronRegistry<AppState>> {{
         let mut registry = CronRegistry::new();
 
         // Enqueue the example job once a minute. Interval crons fire once at
@@ -1318,22 +1356,22 @@ mod cron {
         // See the cja::cron docs for cron-expression schedules
         // (register_job_with_cron) and plain callbacks (register / register_with_cron).
         registry.register_job(
-            crate::jobs::ExampleJob {
+            crate::jobs::ExampleJob {{
                 message: "hello from cron".to_string(),
-            },
+            }},
             Some("Example cron"),
             Duration::from_mins(1),
         );
+{prune}        Ok(registry)
+    }}
 
-        registry
-    }
-
-    pub async fn run(app_state: AppState, shutdown: CancellationToken) -> cja::Result<()> {
-        Worker::new(app_state, build_registry()).run(shutdown).await;
+    pub async fn run(app_state: AppState, shutdown: CancellationToken) -> cja::Result<()> {{
+        Worker::new(app_state, build_registry()?).run(shutdown).await;
         Ok(())
-    }
-}
+    }}
+}}
 "#
+    )
 }
 
 fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
@@ -1358,7 +1396,7 @@ fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
 
     // Add cron module if cron is enabled
     if !no_cron && !no_jobs {
-        content.push_str(generate_cron_module());
+        content.push_str(&generate_cron_module(no_sessions));
     }
 
     content
@@ -1400,7 +1438,9 @@ mod tests {
         assert!(main_rs.contains("cja::impl_job_registry!(crate::AppState, ExampleJob)"));
         assert!(main_rs.contains("impl Job<crate::AppState> for ExampleJob"));
         assert!(main_rs.contains("CronRegistry::new()"));
-        assert!(main_rs.contains("Worker::new(app_state, build_registry())"));
+        assert!(main_rs.contains("fn build_registry() -> cja::Result<CronRegistry<AppState>>"));
+        assert!(main_rs.contains("Worker::new(app_state, build_registry()?)"));
+        assert!(main_rs.contains("\"prune-sessions\""));
         assert!(!main_rs.contains("TODO"));
     }
 

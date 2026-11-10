@@ -29,6 +29,59 @@ pub fn save_session_cookie<A: AppState>(jar: &CookieJar<A>, session_id: uuid::Uu
     jar.add(cookie.into());
 }
 
+/// Clear the framework session cookie so the browser drops it. Same attributes
+/// as [`save_session_cookie`] (a `__Host-` replacement cookie must repeat
+/// `Path=/` + `Secure`), with `Expires` at the epoch.
+///
+/// Pairs with deleting the session row server-side (see cja-passkey's
+/// `POST /auth/logout`): an expired `Set-Cookie` works deterministically even
+/// when the request carried no cookie, where `CookieJar::remove` needs the
+/// matching original.
+pub fn clear_session_cookie<A: AppState>(jar: &CookieJar<A>) {
+    let cookie = tower_cookies::Cookie::build((SESSION_COOKIE_NAME, ""))
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(tower_cookies::cookie::SameSite::Lax)
+        .expires(tower_cookies::cookie::time::OffsetDateTime::UNIX_EPOCH);
+
+    jar.add(cookie.into());
+}
+
+/// Minimum time between `updated_at` refreshes performed by the `Session`
+/// extractor. Keeps [`prune`]'s idle clock accurate without a write per request.
+pub const ACTIVITY_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Delete sessions whose `updated_at` is older than `idle`. Returns rows deleted.
+///
+/// Schedule from a cron (the scaffold registers a daily 4am `prune-sessions`
+/// example). `updated_at` advances at most once per
+/// [`ACTIVITY_REFRESH_MIN_INTERVAL`], so a session can look up to one interval
+/// older than its last request. `idle` must be at least twice the interval;
+/// this function refuses smaller values.
+/// Deleting a row cascades consumer rows that reference `sessions(session_id)`
+/// with `ON DELETE CASCADE` (see the cja-passkey README framework contract);
+/// a pruned user simply appears anonymous on their next request.
+///
+/// To stop a scheduled prune, use the `CRON_DISABLED` env var or remove the
+/// registration.
+pub async fn prune(pool: &sqlx::PgPool, idle: std::time::Duration) -> crate::Result<u64> {
+    if idle < ACTIVITY_REFRESH_MIN_INTERVAL * 2 {
+        return Err(color_eyre::eyre::eyre!(
+            "prune idle ({idle:?}) must be at least twice ACTIVITY_REFRESH_MIN_INTERVAL \
+             ({:?}): updated_at is refreshed at most once per interval, so a \
+             smaller idle would delete sessions in active use",
+            ACTIVITY_REFRESH_MIN_INTERVAL
+        ));
+    }
+    let result =
+        sqlx::query("DELETE FROM sessions WHERE updated_at < now() - make_interval(secs => $1)")
+            .bind(idle.as_secs_f64())
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected())
+}
+
 /// Core session data that all sessions must contain.
 ///
 /// This struct represents the minimal session information stored in the database.
@@ -55,7 +108,10 @@ pub fn save_session_cookie<A: AppState>(jar: &CookieJar<A>, session_id: uuid::Uu
 pub struct CJASession {
     /// Unique identifier for this session
     pub session_id: uuid::Uuid,
-    /// Timestamp of last activity (updated on each request)
+    /// Timestamp of last activity. Bumped by the `update_sessions_updated_at`
+    /// DB trigger on every UPDATE; the `Session` extractor refreshes it at
+    /// most once per [`ACTIVITY_REFRESH_MIN_INTERVAL`] while the session is
+    /// in use, so it doubles as the idle clock for [`prune`].
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Timestamp when the session was first created
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -160,25 +216,27 @@ pub struct CJASession {
 ///
 /// #[async_trait::async_trait]
 /// impl AppSession for UserSession {
-///     async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
+///     async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Option<Self>> {
 ///         // Query your session data including any custom fields
 ///         // In a real app, you'd have extended the sessions table with these columns
 ///         let row = sqlx::query_as::<_, CJASession>(
 ///             "SELECT session_id, created_at, updated_at FROM sessions WHERE session_id = $1"
 ///         )
 ///         .bind(session_id)
-///         .fetch_one(pool)
+///         .fetch_optional(pool)
 ///         .await?;
-///         
+///
+///         // `Ok(None)` means "no such session" — the extractor will create one.
+///         // A missing row MUST be `Ok(None)`, never an `Err`.
 ///         // For this example, we're just using default values for custom fields
 ///         // In a real app, you'd query your extended session data here
-///         Ok(Self {
-///             inner: row,
+///         Ok(row.map(|inner| Self {
+///             inner,
 ///             user_id: None,
 ///             preferences: serde_json::json!({}),
-///         })
+///         }))
 ///     }
-///     
+///
 ///     async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
 ///         let row = sqlx::query_as::<_, CJASession>(
 ///             "INSERT INTO sessions DEFAULT VALUES RETURNING session_id, created_at, updated_at"
@@ -219,7 +277,7 @@ pub struct CJASession {
 /// #
 /// # #[async_trait::async_trait]
 /// # impl AppSession for UserSession {
-/// #     async fn from_db(_: &sqlx::PgPool, _: uuid::Uuid) -> cja::Result<Self> { todo!() }
+/// #     async fn from_db(_: &sqlx::PgPool, _: uuid::Uuid) -> cja::Result<Option<Self>> { todo!() }
 /// #     async fn create(_: &sqlx::PgPool) -> cja::Result<Self> { todo!() }
 /// #     fn from_inner(inner: CJASession) -> Self { Self { inner, user_id: None } }
 /// #     fn inner(&self) -> &CJASession { &self.inner }
@@ -238,8 +296,11 @@ pub trait AppSession: Sized {
     /// Load a session from the database by its ID.
     ///
     /// This method should fetch the session record and any associated data
-    /// from your sessions table.
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> crate::Result<Self>;
+    /// from your sessions table. Return `Ok(None)` when no row exists for
+    /// `session_id` (the extractor then creates a fresh session); return
+    /// `Err` only for genuine failures (pool outage, decode error), which the
+    /// extractor surfaces as a 500. A missing row must never be an `Err`.
+    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> crate::Result<Option<Self>>;
 
     /// Create a new session in the database.
     ///
@@ -292,7 +353,7 @@ pub trait AppSession: Sized {
 /// #
 /// # #[async_trait::async_trait]
 /// # impl AppSession for UserSession {
-/// #     async fn from_db(_: &sqlx::PgPool, _: uuid::Uuid) -> cja::Result<Self> { todo!() }
+/// #     async fn from_db(_: &sqlx::PgPool, _: uuid::Uuid) -> cja::Result<Option<Self>> { todo!() }
 /// #     async fn create(_: &sqlx::PgPool) -> cja::Result<Self> { todo!() }
 /// #     fn from_inner(inner: CJASession) -> Self {
 /// #         Self { inner, user_id: None, login_count: 0 }
@@ -373,10 +434,36 @@ impl<A: AppState + Send + Sync, S: AppSession + Send + Sync> FromRequestParts<A>
             return create_session(state, &cookies).await;
         };
 
-        let Ok(session) = S::from_db(state.db(), session_id).await.map(Session) else {
-            return create_session(state, &cookies).await;
-        };
+        match S::from_db(state.db(), session_id).await {
+            Ok(Some(session)) => {
+                touch_if_stale(state.db(), session.inner()).await;
+                Ok(Session(session))
+            }
+            Ok(None) => create_session::<A, S>(state, &cookies).await,
+            Err(err) => {
+                tracing::error!("failed to load session {session_id}: {err:#}");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    }
+}
 
-        Ok(session)
+/// Refresh `updated_at` at most once per [`ACTIVITY_REFRESH_MIN_INTERVAL`]
+/// so [`prune`] measures real activity. Best-effort: a failure is logged,
+/// never fatal for the request (pinned by `failed_activity_refresh_...`).
+async fn touch_if_stale(pool: &sqlx::PgPool, session: &CJASession) {
+    if session.updated_at + ACTIVITY_REFRESH_MIN_INTERVAL > chrono::Utc::now() {
+        return;
+    }
+    let refreshed = sqlx::query(
+        "UPDATE sessions SET updated_at = now() \
+         WHERE session_id = $1 AND updated_at < now() - make_interval(secs => $2)",
+    )
+    .bind(session.session_id)
+    .bind(ACTIVITY_REFRESH_MIN_INTERVAL.as_secs_f64())
+    .execute(pool)
+    .await;
+    if let Err(err) = refreshed {
+        tracing::warn!("session activity refresh failed (non-fatal): {err:#}");
     }
 }

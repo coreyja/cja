@@ -16,6 +16,34 @@ pub struct AuthStartRequest {
     pub username: String,
 }
 
+/// Delete the current session row and clear the session cookie.
+///
+/// Also the revocation story for stolen cookies: the row (and, via the
+/// `ON DELETE CASCADE` contract, its consumer rows) is gone, so the old
+/// cookie value no longer authenticates even though it was never rotated.
+pub async fn logout<S>(
+    State(state): State<S>,
+    Session(session): Session<PasskeySession>,
+    jar: CookieJar<S>,
+) -> Result<StatusCode, StatusCode>
+where
+    S: AppState,
+{
+    sqlx::query("DELETE FROM sessions WHERE session_id = $1")
+        .bind(*session.session_id())
+        .execute(state.db())
+        .await
+        .map_err(|err| {
+            tracing::error!(
+                "logout: failed to delete session {}: {err:#}",
+                session.session_id()
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    cja::server::session::clear_session_cookie(&jar);
+    Ok(StatusCode::OK)
+}
+
 pub async fn start_discoverable<S>(
     State(state): State<S>,
     Session(session): Session<PasskeySession>,
@@ -38,12 +66,7 @@ where
                 StatusCode::INTERNAL_SERVER_ERROR
             },
         )?;
-    PasskeySession::set_challenge_state(state.db(), *session.session_id(), challenge_json)
-        .await
-        .map_err(|err| {
-            tracing::error!("set_challenge_state failed: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    super::store_challenge_state(state.db(), *session.session_id(), challenge_json).await?;
     Ok(Json(challenge))
 }
 
@@ -101,12 +124,7 @@ where
         tracing::error!("serialize ChallengeState: {err}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    PasskeySession::set_challenge_state(state.db(), *session.session_id(), challenge_json)
-        .await
-        .map_err(|err| {
-            tracing::error!("set_challenge_state failed: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    super::store_challenge_state(state.db(), *session.session_id(), challenge_json).await?;
 
     Ok(Json(challenge))
 }

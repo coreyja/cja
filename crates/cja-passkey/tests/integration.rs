@@ -1652,3 +1652,387 @@ async fn login_write_failure_leaves_session_anonymous_and_challenge_live() {
     );
     assert_eq!(last_used_after, last_used, "last_used_at must roll back");
 }
+
+// -------- DEV-2192: logout --------
+
+#[tokio::test]
+async fn logout_deletes_row_clears_cookie_and_invalidates() {
+    let (pool, _guard) = setup_test_db().await;
+    let anon_id = create_anonymous_session(&pool).await;
+    let state = make_state(pool.clone());
+    let cookie = make_session_cookie(anon_id, &state.cookie_key);
+    let soft = SoftPasskey::new();
+
+    let (status, _) = register_over_http(make_router(state.clone()), &cookie, &soft, "alice").await;
+    assert_eq!(status, 200);
+
+    // The authenticated (rotated) session's cookie.
+    let authed_id = authenticated_session_id(&pool).await;
+    let old_cookie = make_session_cookie(authed_id, &state.cookie_key);
+    let app = make_router(state.clone());
+    let response = app
+        .oneshot(json_request(
+            "/auth/logout",
+            &serde_json::json!({}),
+            Some(&old_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let set_cookie = response
+        .headers()
+        .get_all(http::header::SET_COOKIE)
+        .iter()
+        .find_map(|v| v.to_str().ok())
+        .expect("logout must clear the cookie");
+    assert!(
+        set_cookie.contains("Expires=Thu, 01 Jan 1970"),
+        "cookie must be expired, got: {set_cookie}"
+    );
+    for attribute in ["__Host-session_id=", "Path=/", "Secure", "HttpOnly"] {
+        assert!(
+            set_cookie.contains(attribute),
+            "missing {attribute}: {set_cookie}"
+        );
+    }
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE session_id = $1")
+        .bind(authed_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "logout must delete the session row");
+
+    let (status, body) = me_status(&state, Some(&old_cookie)).await;
+    assert_eq!((status, body.as_str()), (401, ""), "old cookie must 401");
+}
+
+#[tokio::test]
+async fn logout_without_cookie_is_idempotent() {
+    let (pool, _guard) = setup_test_db().await;
+    let state = make_state(pool.clone());
+    let app = make_router(state.clone());
+
+    let response = app
+        .oneshot(json_request("/auth/logout", &serde_json::json!({}), None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // The extractor minted an anonymous session; logout deleted it. The
+    // table ends empty.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "logout must clean up the extractor's session too");
+}
+
+// -------- DEV-2192: /start vs a vanished session row --------
+
+/// A `/start` racing a concurrent DELETE of its session row must not return
+/// 200: the challenge was never stored.
+#[tokio::test]
+async fn start_returns_precondition_failed_when_session_row_vanishes() {
+    for (path, body, seed_alice) in [
+        ("/auth/discoverable/start", serde_json::json!({}), false),
+        (
+            "/auth/start",
+            serde_json::json!({ "username": "alice" }),
+            true,
+        ),
+        (
+            "/register/start",
+            serde_json::json!({ "username": "bob" }),
+            false,
+        ),
+    ] {
+        let (pool, _guard) = setup_test_db().await;
+        let state = make_state(pool.clone());
+
+        // /auth/start 404s before the write unless the user exists WITH a
+        // credential.
+        if seed_alice {
+            let reg_cookie_session = create_anonymous_session(&pool).await;
+            let reg_cookie = make_session_cookie(reg_cookie_session, &state.cookie_key);
+            let soft = SoftPasskey::new();
+            let (status, _) =
+                register_over_http(make_router(state.clone()), &reg_cookie, &soft, "alice").await;
+            assert_eq!(status, 200);
+        }
+
+        // Fresh anonymous session so the throttled refresh skips and the
+        // blocked statement is deterministically the handler's UPDATE.
+        let sid = create_anonymous_session(&pool).await;
+        let cookie = make_session_cookie(sid, &state.cookie_key);
+        let app = make_router(state.clone());
+
+        // Hold the row, spawn the POST, wait until it blocks, delete the
+        // row, commit, then observe the response.
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM sessions WHERE session_id = $1 FOR UPDATE")
+            .bind(sid)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let app_clone = app.clone();
+        let cookie_clone = cookie.clone();
+        let body_clone = body.clone();
+        let spawned = tokio::spawn(async move {
+            app_clone
+                .oneshot(json_request(path, &body_clone, Some(&cookie_clone)))
+                .await
+                .unwrap()
+                .status()
+        });
+
+        wait_for_lock_waiters(&pool, 1).await;
+
+        sqlx::query("DELETE FROM sessions WHERE session_id = $1")
+            .bind(sid)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(30), spawned)
+            .await
+            .expect("start must complete after the lock is released")
+            .unwrap();
+        assert_eq!(
+            status.as_u16(),
+            412,
+            "{path}: vanished-row start must be 412, got {status}"
+        );
+    }
+}
+
+// -------- DEV-2192: user deletion vs session FK --------
+
+#[tokio::test]
+async fn deleting_user_nulls_session_user_id() {
+    let (pool, _guard) = setup_test_db().await;
+    let user_id = insert_user(&pool, "alice").await;
+    let session_id = create_anonymous_session(&pool).await;
+    sqlx::query("UPDATE sessions SET user_id = $1 WHERE session_id = $2")
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query("DELETE FROM passkey_users WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let survives: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(survives, 1, "session must survive its user's deletion");
+    let user: Option<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM sessions WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(user, None, "user_id must be set NULL (anonymous)");
+}
+
+// -------- DEV-2192: register/finish error split --------
+
+/// Fail exactly `user::create` (BEFORE INSERT on `passkey_users`): a genuine
+/// failure is a 500, not a 409.
+#[tokio::test]
+async fn register_user_create_failure_returns_500() {
+    let (pool, _guard) = setup_test_db().await;
+    let session_id = create_anonymous_session(&pool).await;
+    sqlx::query(
+        "CREATE FUNCTION test_fail_user_create() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected user create failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_fail_user_create BEFORE INSERT ON passkey_users \
+         FOR EACH ROW EXECUTE FUNCTION test_fail_user_create()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = make_state(pool.clone());
+    let cookie = make_session_cookie(session_id, &state.cookie_key);
+    let soft = SoftPasskey::new();
+    let (status, _headers) = register_over_http(make_router(state), &cookie, &soft, "alice").await;
+    assert_eq!(status, 500, "non-unique user::create failure must be 500");
+}
+
+/// The losing side of the registration race (username inserted between
+/// /register/start and /register/finish) still gets 409.
+#[tokio::test]
+async fn register_unique_violation_still_409() {
+    let (pool, _guard) = setup_test_db().await;
+    let session_id = create_anonymous_session(&pool).await;
+    let state = make_state(pool.clone());
+    let cookie = make_session_cookie(session_id, &state.cookie_key);
+    let soft = SoftPasskey::new();
+    let app = make_router(state.clone());
+
+    let start = app
+        .clone()
+        .oneshot(json_request(
+            "/register/start",
+            &serde_json::json!({ "username": "alice" }),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 200);
+    let challenge = response_json(start).await["publicKey"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The other registration wins the race.
+    insert_user(&pool, "alice").await;
+
+    let finish = app
+        .oneshot(json_request(
+            "/register/finish",
+            &soft.registration_response(&challenge),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(finish.status(), 409, "unique violation must stay 409");
+}
+
+// -------- DEV-2192: finish verifies against the locked challenge --------
+
+/// Hold the session row, start a finish, replace `challenge_state` from the
+/// holder, commit: the finish must verify against the LOCKED challenge (B),
+/// not the extractor snapshot (A) — so it 401s.
+#[tokio::test]
+async fn finish_verifies_against_locked_challenge_not_snapshot() {
+    let (pool, _guard) = setup_test_db().await;
+    let reg_session = create_anonymous_session(&pool).await;
+    let state = make_state(pool.clone());
+    let reg_cookie = make_session_cookie(reg_session, &state.cookie_key);
+    let soft = SoftPasskey::new();
+    let (status, _) =
+        register_over_http(make_router(state.clone()), &reg_cookie, &soft, "alice").await;
+    assert_eq!(status, 200);
+
+    let credential_json: serde_json::Value =
+        sqlx::query_scalar("SELECT credential_json FROM passkey_credentials")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let alice_id: Uuid =
+        sqlx::query_scalar("SELECT user_id FROM passkey_users WHERE username = 'alice'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let passkey: webauthn_rs::prelude::Passkey = serde_json::from_value(credential_json).unwrap();
+
+    // Fresh anonymous session; /auth/start stores challenge A. The start
+    // also refreshed updated_at, so the extractor's throttled refresh skips
+    // and the block lands on lock_challenge_state.
+    let sid = create_anonymous_session(&pool).await;
+    let cookie = make_session_cookie(sid, &state.cookie_key);
+    let app = make_router(state.clone());
+    let start = app
+        .clone()
+        .oneshot(json_request(
+            "/auth/start",
+            &serde_json::json!({ "username": "alice" }),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), 200);
+    let challenge_a = response_json(start).await["publicKey"]["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Mint challenge B directly.
+    let webauthn = state.passkey_config.webauthn.clone();
+    let (_challenge_b, auth_state) = webauthn
+        .start_passkey_authentication(std::slice::from_ref(&passkey))
+        .unwrap();
+    let challenge_b_json = serde_json::to_value(ChallengeState::Authentication {
+        auth_state,
+        user_id: alice_id,
+    })
+    .unwrap();
+
+    // Hold the row, spawn the finish against challenge A, wait for the
+    // block, swap in B, commit.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM sessions WHERE session_id = $1 FOR UPDATE")
+        .bind(sid)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let app_clone = app.clone();
+    let cookie_clone = cookie.clone();
+    let assertion = soft.assertion_response(&challenge_a, None);
+    let spawned = tokio::spawn(async move {
+        app_clone
+            .oneshot(json_request(
+                "/auth/finish",
+                &assertion,
+                Some(&cookie_clone),
+            ))
+            .await
+            .unwrap()
+            .status()
+    });
+
+    wait_for_lock_waiters(&pool, 1).await;
+
+    sqlx::query("UPDATE sessions SET challenge_state = $1 WHERE session_id = $2")
+        .bind(&challenge_b_json)
+        .bind(sid)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    holder.commit().await.unwrap();
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(30), spawned)
+        .await
+        .expect("finish must complete after the lock is released")
+        .unwrap();
+    assert_eq!(
+        status.as_u16(),
+        401,
+        "verification must run against the locked challenge B (401), not the \
+         snapshot A (would be 200)"
+    );
+
+    let survives: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE session_id = $1")
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(survives, 1, "session row must survive the failed finish");
+    let challenge: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT challenge_state FROM sessions WHERE session_id = $1")
+            .bind(sid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        challenge,
+        Some(challenge_b_json),
+        "challenge B must survive (rollback preserved it)"
+    );
+}

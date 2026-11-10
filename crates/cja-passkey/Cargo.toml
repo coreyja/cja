@@ -41,3 +41,6 @@ http-body-util = "0.1"
 openssl = "0.10"
 serde_cbor_2 = "0.13"
 base64.workspace = true
+# request_user_identity.rs: global capture subscriber + trace layer
+tracing-subscriber = { workspace = true }
+tower-http = { version = "0.6.6", features = ["trace"] }
