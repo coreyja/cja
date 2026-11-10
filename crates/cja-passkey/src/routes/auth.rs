@@ -66,12 +66,7 @@ where
                 StatusCode::INTERNAL_SERVER_ERROR
             },
         )?;
-    PasskeySession::set_challenge_state(state.db(), *session.session_id(), challenge_json)
-        .await
-        .map_err(|err| {
-            tracing::error!("set_challenge_state failed: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    super::store_challenge_state(state.db(), *session.session_id(), challenge_json).await?;
     Ok(Json(challenge))
 }
 
@@ -129,12 +124,7 @@ where
         tracing::error!("serialize ChallengeState: {err}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    PasskeySession::set_challenge_state(state.db(), *session.session_id(), challenge_json)
-        .await
-        .map_err(|err| {
-            tracing::error!("set_challenge_state failed: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    super::store_challenge_state(state.db(), *session.session_id(), challenge_json).await?;
 
     Ok(Json(challenge))
 }

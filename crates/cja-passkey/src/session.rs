@@ -93,17 +93,21 @@ impl AppSession for PasskeySession {
 }
 
 impl PasskeySession {
+    /// Store a challenge on the session row. Returns rows affected: a
+    /// concurrent rotation/deletion of the row makes this 0 — callers must
+    /// not report success in that case (see `routes::store_challenge_state`).
     pub async fn set_challenge_state(
         pool: &sqlx::PgPool,
         session_id: uuid::Uuid,
         state: serde_json::Value,
-    ) -> cja::Result<()> {
-        sqlx::query("UPDATE sessions SET challenge_state = $1::jsonb WHERE session_id = $2")
-            .bind(state)
-            .bind(session_id)
-            .execute(pool)
-            .await?;
-        Ok(())
+    ) -> cja::Result<u64> {
+        let result =
+            sqlx::query("UPDATE sessions SET challenge_state = $1::jsonb WHERE session_id = $2")
+                .bind(state)
+                .bind(session_id)
+                .execute(pool)
+                .await?;
+        Ok(result.rows_affected())
     }
 
     /// Lock the session row and read its challenge state, making the `WebAuthn`
