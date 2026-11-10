@@ -84,8 +84,12 @@ fn make_session_cookie(session_id: Uuid, key: &cja::server::cookies::CookieKey) 
 
 // -------- capture (trimmed copy of request_user_event.rs) --------
 
+/// `finished processing request` events, in emission order: the
+/// (field, value) pairs actually recorded.
+type EventList = Vec<Vec<(String, String)>>;
+
 #[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<Vec<(String, String)>>>>);
+struct Capture(Arc<Mutex<EventList>>);
 
 /// Serializes the per-scenario tests so windowing the shared buffer is safe.
 static SERIALIZE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -105,7 +109,7 @@ fn capture() -> &'static Capture {
 impl Capture {
     /// A handler-side assertion panic must not poison the capture for the
     /// remaining scenarios.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Vec<(String, String)>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, EventList> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -171,7 +175,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
 // -------- tests --------
 
 /// A `/me` router layered exactly as `cja_passkey::server` does:
-/// routes -> (RequestUserLayer, TraceLayer) -> CookieManagerLayer -> state.
+/// routes -> (`RequestUserLayer`, `TraceLayer`) -> `CookieManagerLayer` -> state.
 fn me_router(state: TestAppState) -> axum::Router {
     async fn protected(user: CurrentUser) -> String {
         user.0.username

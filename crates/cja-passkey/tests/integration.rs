@@ -1839,7 +1839,7 @@ async fn deleting_user_nulls_session_user_id() {
 
 // -------- DEV-2192: register/finish error split --------
 
-/// Fail exactly `user::create` (BEFORE INSERT on passkey_users): a genuine
+/// Fail exactly `user::create` (BEFORE INSERT on `passkey_users`): a genuine
 /// failure is a 500, not a 409.
 #[tokio::test]
 async fn register_user_create_failure_returns_500() {

@@ -172,7 +172,7 @@ where
             .chain()
             .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
             .and_then(sqlx::Error::as_database_error)
-            .is_some_and(|db| db.is_unique_violation());
+            .is_some_and(sqlx::error::DatabaseError::is_unique_violation);
         if unique {
             tracing::warn!("user::create unique violation (registration race): {err:#}");
             return Err(StatusCode::CONFLICT);

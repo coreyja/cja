@@ -50,8 +50,7 @@ pub fn clear_session_cookie<A: AppState>(jar: &CookieJar<A>) {
 
 /// Minimum time between `updated_at` refreshes performed by the `Session`
 /// extractor. Keeps [`prune`]'s idle clock accurate without a write per request.
-pub const ACTIVITY_REFRESH_MIN_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(60 * 60);
+pub const ACTIVITY_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// Delete sessions whose `updated_at` is older than `idle`. Returns rows deleted.
 ///

@@ -404,10 +404,9 @@ async fn prune_deletes_only_idle_sessions() {
     let idle = TestSession::create(&pool).await.unwrap();
     backdate_session(&pool, idle.inner.session_id, "40 days").await;
 
-    let deleted =
-        cja::server::session::prune(&pool, std::time::Duration::from_secs(30 * 24 * 3600))
-            .await
-            .unwrap();
+    let deleted = cja::server::session::prune(&pool, std::time::Duration::from_hours(30 * 24))
+        .await
+        .unwrap();
     assert_eq!(deleted, 1);
 
     let idle_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE session_id = $1")
