@@ -1030,6 +1030,22 @@ mod test {
                 .cloned()
                 .collect()
         }
+
+        /// Every captured event that names cron `name` (via the `cron.name`
+        /// or `task_name` field), any target or level — for asserting a
+        /// paused cron's per-tick log budget.
+        fn events_for_cron(&self, name: &str) -> Vec<CapturedEvent> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event.fields.get("cron.name").map(String::as_str) == Some(name)
+                        || event.fields.get("task_name").map(String::as_str) == Some(name)
+                })
+                .cloned()
+                .collect()
+        }
     }
 
     /// The exact event shape Eyes classifies as `cron.fire`.
@@ -3542,8 +3558,12 @@ mod test {
         seed(&db, SecondTestJob::NAME, "2 minutes").await;
         pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
 
-        // Sequential ticks on two schedulers: the pause must hold on every
-        // scheduler within one tick of the pause committing.
+        // Sequential ticks on two schedulers sharing the database, with the
+        // pause committed before either tick: both schedulers' claims must
+        // consult the committed pause, so it holds everywhere at once while
+        // the sibling keeps firing. The interleaving where a scheduler's
+        // map read predates the pause commit is covered by
+        // `pause_committed_after_stale_pre_filter_blocks_the_claim`.
         let capture = EventCapture::default();
         assert_eq!(
             first.tick().with_subscriber(capture.dispatch()).await,
@@ -3557,6 +3577,50 @@ mod test {
         assert!(capture.fire_receipts(TestJob::NAME).is_empty());
         // Not restamped: a pause writes nothing, including `last_run_at`.
         assert_eq!(last_run_at(&db, TestJob::NAME).await, paused_seed);
+    }
+
+    #[sqlx::test]
+    async fn paused_cron_tick_logs_nothing_above_debug(db: sqlx::PgPool) {
+        // A paused cron is steady state, so its per-tick log budget is
+        // DEBUG and below (arena ticks every 2s). The skip event must be
+        // captured first, so this test cannot pass merely because capture
+        // missed the event.
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        seed(&db, TestJob::NAME, "2 minutes").await;
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+
+        let events = capture.events_for_cron(TestJob::NAME);
+        let skips: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str)
+                    == Some("Cron paused; skipping claim")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(skips.len(), 1, "{events:?}");
+        assert_eq!(skips[0].level, tracing::Level::DEBUG, "{:?}", skips[0]);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.level <= tracing::Level::DEBUG),
+            "a paused cron must log nothing above DEBUG: {events:?}"
+        );
     }
 
     #[sqlx::test]
@@ -3998,6 +4062,52 @@ mod test {
         assert_eq!((observed_test, observed_second), (0, 0));
         assert!(capture.fire_receipts(TestJob::NAME).is_empty());
         assert!(capture.fire_receipts(SecondTestJob::NAME).is_empty());
+    }
+
+    #[sqlx::test]
+    async fn pause_check_fails_closed_on_recoverable_error(db: sqlx::PgPool) {
+        // An ACCESS EXCLUSIVE lock on cron_pauses makes the claim's pause
+        // read block until the claim's 1s lock_timeout cancels it with
+        // 55P03 — the recoverable arm of the pause check. It must fail
+        // closed: skip the claim (logged at WARN), enqueue nothing, write
+        // nothing. `missing_cron_pauses_table_fails_due_crons_loudly`
+        // reaches only the non-recoverable arm; a fail-open rewrite of
+        // this arm would fire the paused cron and pass every other test.
+        let mut registry = CronRegistry::new();
+        registry.register_job(TestJob, None, Duration::from_mins(1));
+        let worker = crate::cron::Worker::new(
+            TestAppState {
+                db: db.clone(),
+                cookie_key: CookieKey::generate(),
+            },
+            registry,
+        );
+
+        let seeded = seed(&db, TestJob::NAME, "2 minutes").await;
+        pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
+        let mut holder = db.begin().await.unwrap();
+        sqlx::query("LOCK TABLE cron_pauses IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let capture = EventCapture::default();
+        assert_eq!(
+            worker.tick().with_subscriber(capture.dispatch()).await,
+            TickOutcome::default()
+        );
+        holder.commit().await.unwrap();
+
+        // Capture every observed value first so a red run shows all of them.
+        let observed_jobs = jobs_named(&db, TestJob::NAME).await;
+        let observed_stamp = last_run_at(&db, TestJob::NAME).await;
+        let observed_warns = capture.warns_for(TestJob::NAME);
+        assert_eq!(
+            observed_jobs, 0,
+            "recoverable pause-check error must not enqueue"
+        );
+        assert_eq!(observed_stamp, seeded, "failed claim writes nothing");
+        assert_eq!(observed_warns.len(), 1, "{observed_warns:?}");
     }
 
     #[sqlx::test]

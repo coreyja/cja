@@ -210,14 +210,21 @@ ON CONFLICT (name) DO UPDATE
   SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()
 RETURNING name, paused_until;
 
--- Pause a cron that has never fired ('infinity' pauses indefinitely)
+-- Pause a cron that has never fired ('infinity' pauses indefinitely;
+-- re-running a pause replaces the existing expiry). A typo is undetectable
+-- in this form: Inspect shows last_run_at NULL for a never-fired cron and
+-- for a typo alike — compare RETURNING name character by character against
+-- the registry source; any later crons-row check must use the registry name
+-- (never the text you typed) and can only report after the cron already fired.
 INSERT INTO cron_pauses (name, paused_until)
 VALUES ('FreshJob', now() + interval '4 hours')
 ON CONFLICT (name) DO UPDATE
   SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()
 RETURNING name, paused_until;
 
--- Resume (DELETE 0: mistyped pause, or already resumed)
+-- Resume (DELETE 0: no row matched this name — check the spelling first, then
+-- Inspect; a mistyped resume leaves the real pause in force, possibly
+-- indefinitely, and a silenced cron_missed will not tell you)
 DELETE FROM cron_pauses WHERE name = 'TurnRetentionJob';
 
 -- Inspect (in_force; a NULL last_run_at means never fired or a typo)
@@ -226,6 +233,12 @@ SELECT p.name, p.paused_at, p.paused_until,
        c.last_run_at
 FROM cron_pauses p LEFT JOIN crons c ON c.name = p.name
 ORDER BY p.name;
+
+-- Tell a future last_run_at apart from a pause: in_force true means a pause,
+-- anything else (false or NULL) means skew (the cron fires, WARNs, restamps)
+SELECT c.name, c.last_run_at, p.paused_until > clock_timestamp() AS in_force
+FROM crons c LEFT JOIN cron_pauses p ON p.name = c.name
+WHERE c.last_run_at > now();
 ```
 
 Cron jobs are regular `Job` implementations — the cron system just handles scheduling the enqueue.

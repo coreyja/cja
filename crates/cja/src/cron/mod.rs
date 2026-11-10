@@ -112,12 +112,16 @@
 //! RETURNING name, paused_until;
 //! ```
 //!
-//! Pause a cron that has never fired (no `crons` row exists yet). SQL cannot
-//! detect a typo here — the registry is not in the database — so copy the
-//! name exactly from the registry or the deploy, and check after the next
-//! deploy that no `crons` row appears for it while the pause is in force
-//! (`SELECT last_run_at FROM crons WHERE name = 'FreshJob'` — a row
-//! appearing means the pause did not match):
+//! Pause a cron that has never fired (no `crons` row exists yet). SQL
+//! cannot detect a typo in this form: the registry is not in the database,
+//! and Inspect shows `last_run_at` NULL for a never-fired cron and for a
+//! typo alike. Compare the `RETURNING name` output character by character
+//! against the name in the registry source — that comparison is the only
+//! typo check there is. Any later check for a `crons` row
+//! (`SELECT last_run_at FROM crons WHERE name = 'FreshJob'`) must use the
+//! name copied from the registry, never the text you typed in the pause —
+//! and it can only report a mismatch after the cron has already fired,
+//! because the row and its enqueue commit together:
 //!
 //! ```sql
 //! INSERT INTO cron_pauses (name, paused_until)
@@ -129,10 +133,15 @@
 //!
 //! `'infinity'` in place of the `now() + interval` expression pauses
 //! indefinitely. Always compute the expiry on the database (`now() +
-//! interval '...'`), never paste a timestamp from your laptop.
+//! interval '...'`), never paste a timestamp from your laptop. Re-running
+//! a pause replaces the existing expiry — a 4-hour statement shortens an
+//! `'infinity'` pause someone else set — so run Inspect first if someone
+//! else may have paused the cron.
 //!
-//! Resume — `DELETE 0` means no pause row existed: mistyped pause, or
-//! already resumed:
+//! Resume — `DELETE 0` means no row matched this name. Check the name you
+//! typed first, then run Inspect: a mistyped resume leaves the real pause
+//! in force, possibly indefinitely, and a silenced `cron_missed` monitor
+//! will not tell you:
 //!
 //! ```sql
 //! DELETE FROM cron_pauses WHERE name = 'TurnRetentionJob';
@@ -161,11 +170,17 @@
 //! Two cautions: (1) receipt-based missed-run monitors (e.g. eyes
 //! `cron_missed` on apps with eyes telemetry) will correctly see a paused
 //! cron as not firing — silence or expect that alert for the pause's
-//! duration; (2) a `last_run_at` ahead of `now()` with no `cron_pauses` row
-//! in force is clock skew, not a pause: the cron still fires, WARNs and
-//! restamps on its own. Use
-//! `SELECT name, last_run_at FROM crons WHERE last_run_at > now();` to tell
-//! the two apart.
+//! duration; (2) a `last_run_at` ahead of `now()` with no pause in force
+//! is clock skew, not a pause: the cron still fires, WARNs and
+//! restamps on its own. To tell the two apart, read `in_force` next to the
+//! future stamp — `true` means a pause, anything else (false or NULL)
+//! means skew:
+//!
+//! ```sql
+//! SELECT c.name, c.last_run_at, p.paused_until > clock_timestamp() AS in_force
+//! FROM crons c LEFT JOIN cron_pauses p ON p.name = c.name
+//! WHERE c.last_run_at > now();
+//! ```
 //!
 //! # Queue Pileup Warning
 //!
