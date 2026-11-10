@@ -215,7 +215,7 @@ See `crates/cja.app/` in the repository for a complete working example.
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | Yes | — | PostgreSQL connection string |
 | `PORT` | No | `3000` | HTTP server port |
-| `COOKIE_KEY` | Yes, in release builds of session-using apps | Ephemeral (debug builds only) | Base64-encoded 64-byte cookie encryption key. Release builds of apps using the `Session` extractor fail at boot without it; sessionless apps can use `CookieKey::generate()` instead. |
+| `COOKIE_KEY` | No | Ephemeral, generated at boot | Base64-encoded cookie encryption key, at least 32 bytes decoded. Unset or blank generates a new key on each boot, in release builds too, and logs a warning. Set it if sessions need to survive restarts and deploys. |
 | `SERVER_DISABLED` | No | `false` | Set to `"true"` to skip starting the HTTP server |
 | `JOBS_DISABLED` | No | `false` | Set to `"true"` to skip starting the job worker |
 | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |

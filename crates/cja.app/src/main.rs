@@ -23,9 +23,7 @@ pub(crate) struct AppState {
 impl AppState {
     async fn from_env() -> color_eyre::Result<Self> {
         let db = setup_db_pool().await?;
-        // cja-site serves no sessions; an ephemeral key avoids the
-        // release-build COOKIE_KEY requirement.
-        let cookie_key = CookieKey::generate();
+        let cookie_key = CookieKey::from_env_or_generate()?;
 
         Ok(Self { db, cookie_key })
     }

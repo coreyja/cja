@@ -1036,62 +1036,53 @@ use tracing::info;
     imports
 }
 
-fn generate_app_skeleton(no_sessions: bool) -> String {
-    let cookie_key = if no_sessions {
-        r"        // No sessions in this app: an ephemeral key is fine (release
-        // builds without COOKIE_KEY refuse when deriving from the env).
-        let cookie_key = CookieKey::generate();
-"
-    } else {
-        r"        let cookie_key = CookieKey::from_env_or_generate()?;
-"
-    };
-    format!(
-        r#"
+fn generate_app_skeleton() -> &'static str {
+    r#"
 #[derive(Clone)]
-struct AppState {{
+struct AppState {
     db: sqlx::PgPool,
     cookie_key: CookieKey,
-}}
+}
 
-impl AppState {{
-    async fn from_env() -> cja::Result<Self> {{
+impl AppState {
+    async fn from_env() -> cja::Result<Self> {
         let db = setup_db_pool().await?;
-{cookie_key}
-        Ok(Self {{ db, cookie_key }})
-    }}
-}}
+        let cookie_key = CookieKey::from_env_or_generate()?;
 
-impl cja::app_state::AppState for AppState {{
-    fn version(&self) -> &'static str {{
+        Ok(Self { db, cookie_key })
+    }
+}
+
+impl cja::app_state::AppState for AppState {
+    fn version(&self) -> &'static str {
         concat!(
             env!("CARGO_PKG_VERSION"),
             " (",
             env!("VERGEN_GIT_SHA"),
             ")"
         )
-    }}
+    }
 
-    fn db(&self) -> &sqlx::PgPool {{
+    fn db(&self) -> &sqlx::PgPool {
         &self.db
-    }}
+    }
 
-    fn cookie_key(&self) -> &CookieKey {{
+    fn cookie_key(&self) -> &CookieKey {
         &self.cookie_key
-    }}
-}}
+    }
+}
 
-fn main() -> cja::Result<()> {{
+fn main() -> cja::Result<()> {
     // Create and run the tokio runtime
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()?
-        .block_on(async {{ run_application().await }})
-}}
+        .block_on(async { run_application().await })
+}
 
 #[tracing::instrument(err)]
-pub async fn setup_db_pool() -> cja::Result<PgPool> {{
+pub async fn setup_db_pool() -> cja::Result<PgPool> {
     let database_url = std::env::var("DATABASE_URL").wrap_err("DATABASE_URL must be set")?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -1113,23 +1104,22 @@ pub async fn setup_db_pool() -> cja::Result<PgPool> {{
     migrations.run(&pool).await?;
 
     Ok(pool)
-}}
+}
 
-fn routes(app_state: AppState) -> axum::Router {{
+fn routes(app_state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/", axum::routing::get(root))
         .with_state(app_state)
-}}
+}
 
 /// Check if a feature is enabled based on environment variables
-fn is_feature_enabled(feature: &str) -> bool {{
-    let env_var_name = format!("{{feature}}_DISABLED");
+fn is_feature_enabled(feature: &str) -> bool {
+    let env_var_name = format!("{feature}_DISABLED");
     let value = std::env::var(&env_var_name).unwrap_or_else(|_| "false".to_string());
 
     value != "true"
-}}
+}
 "#
-    )
 }
 
 fn generate_session_handler(no_sessions: bool) -> &'static str {
@@ -1391,7 +1381,7 @@ fn generate_main_rs(no_cron: bool, no_jobs: bool, no_sessions: bool) -> String {
     content.push_str(&generate_imports(no_sessions, no_jobs));
 
     // Add app skeleton (AppState, main, setup_db_pool, routes, feature flag)
-    content.push_str(&generate_app_skeleton(no_sessions));
+    content.push_str(generate_app_skeleton());
 
     // Add session handler
     content.push_str(generate_session_handler(no_sessions));
@@ -1437,26 +1427,6 @@ mod tests {
             assert!(!main_rs.contains("pg_advisory_lock"));
             assert!(!main_rs.contains("sqlx::query!")); // runtime SQL only: compiles without a DB
             assert!(!main_rs.contains("tokio::spawn")); // everything goes through the Supervisor
-            // Sessions path derives the cookie key from COOKIE_KEY (release
-            // builds refuse without it); --no-sessions uses an ephemeral key.
-            if no_sessions {
-                assert!(
-                    main_rs.contains("CookieKey::generate()"),
-                    "no-sessions scaffold must generate an ephemeral key: \
-                     {no_cron}/{no_jobs}/{no_sessions}"
-                );
-                assert!(
-                    !main_rs.contains("from_env_or_generate"),
-                    "no-sessions scaffold must not require COOKIE_KEY: \
-                     {no_cron}/{no_jobs}/{no_sessions}"
-                );
-            } else {
-                assert!(
-                    main_rs.contains("CookieKey::from_env_or_generate()?"),
-                    "sessions scaffold must derive the key from COOKIE_KEY: \
-                     {no_cron}/{no_jobs}/{no_sessions}"
-                );
-            }
         }
     }
 
