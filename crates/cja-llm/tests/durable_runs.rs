@@ -46,6 +46,19 @@ async fn add(a: i32, b: i32) -> Result<i32, rig_core::tool::ToolExecutionError> 
 /// Every `ToolCallKey` the `keyed_add` tool ever received, across attempts.
 static SEEN_KEYS: Mutex<Vec<ToolCallKey>> = Mutex::new(Vec::new());
 
+/// The keys recorded for ONE run: run ids are unique per test, so this is
+/// race-free while the log itself stays process-global. Never clear
+/// `SEEN_KEYS` — a `clear()` races every parallel test.
+fn keys_for(run: RunId) -> Vec<ToolCallKey> {
+    SEEN_KEYS
+        .lock()
+        .expect("key log lock")
+        .iter()
+        .filter(|key| key.run_id == run)
+        .cloned()
+        .collect()
+}
+
 #[rig_tool(description = "Record the durable tool call key, then add")]
 async fn keyed_add(
     #[rig(context)] context: &mut rig_core::tool::ToolContext,
@@ -644,7 +657,6 @@ async fn tool_output_nul_is_sanitized_and_crash_resume_identical() {
 /// re-committed the same NUL until dead-letter orphaned the run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn model_content_nul_fails_the_run_unstorable() {
-    SEEN_KEYS.lock().expect("key log").clear();
     let env = setup(&[&KEYED]).await;
     // The tool call, then the model's reply carrying a NUL in its text.
     env.fake.tool_call(
@@ -685,7 +697,7 @@ async fn model_content_nul_fails_the_run_unstorable() {
         "the poisoned reply was never re-requested"
     );
     assert_eq!(
-        SEEN_KEYS.lock().expect("key log").len(),
+        keys_for(run).len(),
         1,
         "the tool executed exactly once — never re-executed"
     );
@@ -889,6 +901,11 @@ async fn cancel_paths() {
         .await
         .expect("cancel queued");
     assert_eq!(status_of(&env.db, queued).await, RunStatus::Cancelled);
+    assert_eq!(
+        view_of(&env.db, queued).await.error.as_deref(),
+        Some("cancelled by request"),
+        "a direct cancel writes the same error text as the worker paths"
+    );
     drive(&env.state, queued).await.expect("job no-ops Ok");
     assert_eq!(
         status_of(&env.db, queued).await,
@@ -919,6 +936,11 @@ async fn cancel_paths() {
             .expect("row");
     assert_eq!(call_id, None, "pending_call_id cleared");
     assert_eq!(question, None, "pending_question cleared");
+    assert_eq!(
+        view_of(&env.db, waiting).await.error.as_deref(),
+        Some("cancelled by request"),
+        "a direct cancel writes the same error text as the worker paths"
+    );
     assert!(matches!(
         durable::answer(&env.state, waiting, "no").await,
         Err(RunError::NotWaiting(..))
@@ -974,6 +996,11 @@ async fn cancel_paths() {
         .await
         .expect("cancel orphan");
     assert_eq!(status_of(&env.db, orphan).await, RunStatus::Cancelled);
+    assert_eq!(
+        view_of(&env.db, orphan).await.error.as_deref(),
+        Some("cancelled by request"),
+        "a direct cancel writes the same error text as the worker paths"
+    );
 
     // Idempotent + terminal refusals + missing.
     durable::cancel(&env.state, orphan)
@@ -1402,7 +1429,22 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
     assert_eq!(
         jobs_for(&env.db, run).await,
         1,
-        "the job row survives shutdown (retry scheduled, not deleted)"
+        "the job row survives shutdown (released uncharged, not deleted)"
+    );
+    // The handler's shutdown arm is a `JobYield`: the row must be uncharged
+    // and immediately claimable, not backed off.
+    let (error_count, due): (i32, bool) = sqlx::query_as(
+        "SELECT error_count, run_at <= NOW() FROM jobs
+         WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(run.0.to_string())
+    .fetch_one(&env.db)
+    .await
+    .expect("job row");
+    assert_eq!(
+        (error_count, due),
+        (0, true),
+        "shutdown yield must leave error_count at 0 and run_at in the past"
     );
 
     // A fresh worker with a fresh token completes the run without any
@@ -1417,8 +1459,9 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
             Instant::now() < deadline,
             "run did not complete after shutdown"
         );
-        // The worker's retry backoff is 2s at error_count 1; drive the
-        // attempt directly to keep the test fast, exactly like a retry does.
+        // The yield leaves the row claimable at once (run_at in the past,
+        // error_count 0), so drive the attempt directly to keep the test
+        // fast, exactly like a post-deploy worker does.
         let _ = drive(&env.state, run).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1654,11 +1697,14 @@ async fn read_api_and_parsing_round_trips() {
         durable::get_run(&env.db, run).await,
         Err(RunError::Storage(_))
     ));
-    sqlx::query("UPDATE agent_runs SET status = 'succeeded', fail_reason = 'boom' WHERE id = $1")
-        .bind(run.0)
-        .execute(&env.db)
-        .await
-        .expect("corrupt fail_reason");
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'failed', fail_reason = 'boom', finished_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(run.0)
+    .execute(&env.db)
+    .await
+    .expect("corrupt fail_reason");
     assert!(matches!(
         durable::get_run(&env.db, run).await,
         Err(RunError::Storage(_))
@@ -1763,10 +1809,13 @@ async fn stored_errors_are_content_free() {
     let _ = &corrupt_error;
 
     // (c) corrupted run_state: the Corrupt variant renders only the serde
-    // classification + position (no source that quotes the value).
+    // classification + position (no source that quotes the value). The
+    // row was `failed` with `fail_reason = 'gateway'`; the new biconditional
+    // CHECK requires clearing it on the way to `waiting`.
     sqlx::query(
         "UPDATE agent_runs SET status = 'waiting', pending_call_id = 'x', \
-                 pending_question = 'y', run_state = '{\"format\": 999}' WHERE id = $1",
+                 pending_question = 'y', fail_reason = NULL, run_state = '{\"format\": 999}' \
+                 WHERE id = $1",
     )
     .bind(run2.0)
     .execute(&env2.db)
@@ -1793,8 +1842,6 @@ async fn stored_errors_are_content_free() {
 
 #[tokio::test]
 async fn tool_call_key_idempotency() {
-    SEEN_KEYS.lock().expect("key log").clear();
-
     // Reference: one tool call, key matches the scripted call id.
     let env = setup(&[&KEYED]).await;
     script_keyed(&env.fake);
@@ -1802,7 +1849,7 @@ async fn tool_call_key_idempotency() {
         .await
         .expect("start");
     drive(&env.state, run).await.expect("drive");
-    let keys = SEEN_KEYS.lock().expect("key log").clone();
+    let keys = keys_for(run);
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].run_id, run);
     assert_eq!(keys[0].call_id, "call_1");
@@ -1816,7 +1863,6 @@ async fn tool_call_key_idempotency() {
     let run2 = durable::start(&env2.state, "keyed", "add 2 and 3")
         .await
         .expect("start");
-    SEEN_KEYS.lock().expect("key log").clear();
     env2.state.durable.fail_after_persist(3);
     let mut attempts = 0;
     loop {
@@ -1827,7 +1873,7 @@ async fn tool_call_key_idempotency() {
             break;
         }
     }
-    let keys = SEEN_KEYS.lock().expect("key log").clone();
+    let keys = keys_for(run2);
     assert!(
         keys.len() >= 2,
         "the tool re-executed after the crash (at-least-once): {keys:?}"
@@ -1835,12 +1881,93 @@ async fn tool_call_key_idempotency() {
     for key in &keys {
         assert_eq!(key.run_id, run2);
         assert_eq!(key.call_id, "call_1", "identical key on every execution");
+        assert_eq!(
+            key.turn, keys[0].turn,
+            "same logical call, same turn across crash-resume"
+        );
     }
 
     // Final transcript identical to the reference shape.
     let rows = transcript_rows(&env2.db, run2).await;
     let roles: Vec<_> = rows.iter().map(|(_, role, _)| role.as_str()).collect();
     assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+}
+
+/// A backend that reuses a call id (`call_0`) across turns must not make
+/// the second call look like a replay of the first: `ToolCallKey` scopes
+/// the provider call id by turn, so both tool calls execute and their
+/// receipts differ. Without the turn in the key, an exactly-once tool
+/// would hand turn 2's `call_0` the receipt persisted for turn 1's
+/// `call_0` and skip its side effect.
+#[tokio::test]
+async fn reused_call_id_across_turns_gets_distinct_keys() {
+    let env = setup(&[&KEYED]).await;
+    // Two tool-call replies, BOTH with id "call_0", then a final reply.
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_0",
+        "keyed_add",
+        &serde_json::json!({"a": 1, "b": 2}),
+    );
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_0",
+        "keyed_add",
+        &serde_json::json!({"a": 3, "b": 4}),
+    );
+    env.fake.chat_completion(models::DEFAULT, "done");
+
+    let run = durable::start(&env.state, "keyed", "reuse the id")
+        .await
+        .expect("start");
+    drive(&env.state, run).await.expect("drive");
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
+    assert_eq!(env.fake.requests().len(), 3, "exactly three model requests");
+
+    let keys = keys_for(run);
+    assert_eq!(keys.len(), 2, "both tool calls executed: {keys:?}");
+    for key in &keys {
+        assert_eq!(key.run_id, run);
+        assert_eq!(key.call_id, "call_0", "the reused provider id");
+    }
+    assert!(
+        keys[0].turn < keys[1].turn,
+        "the two calls belong to different turns: {keys:?}"
+    );
+    assert_ne!(
+        keys[0], keys[1],
+        "the turn makes the receipts distinct — the load-bearing assertion"
+    );
+
+    // Both calls actually executed: the two tool-result user messages (seq
+    // 2 and 4) carry the DISTINCT results of the two calls (3 and 7).
+    let rows = transcript_rows(&env.db, run).await;
+    let roles: Vec<_> = rows.iter().map(|(_, role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "user",
+            "assistant"
+        ]
+    );
+    let result_at = |seq: i64| {
+        let row = rows
+            .iter()
+            .find(|(s, role, _)| *s == seq && role == "user")
+            .unwrap_or_else(|| panic!("tool result row at seq {seq}"))
+            .2
+            .clone();
+        serde_json::to_string(&row["content"][0]["content"]).expect("result content json")
+    };
+    let first = result_at(2);
+    let second = result_at(4);
+    assert_ne!(first, second, "distinct tool results: {first} vs {second}");
+    assert!(first.contains('3'), "first call added 1+2: {first}");
+    assert!(second.contains('7'), "second call added 3+4: {second}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2591,4 +2718,463 @@ async fn cancel_racing_claim_never_reports_existing_run_as_not_found() {
             .await
             .expect("existing run");
     assert!(requested, "the live worker must receive the cancellation");
+}
+
+// ---------------------------------------------------------------------------
+// 17. Orphan recovery (`durable::recover_orphans`)
+// ---------------------------------------------------------------------------
+
+/// Simulate cja dead-lettering every `AdvanceRunJob` row of one run,
+/// mirroring `dead_letter_owned`'s INSERT column list exactly (a future
+/// column addition here must fail loudly in this test, not silently in
+/// prod): copy each row into `dead_letter_jobs`, then delete it.
+async fn dead_letter_jobs_for(db: &sqlx::PgPool, run: RunId) {
+    let mut tx = db.begin().await.expect("begin dead-letter simulation");
+    sqlx::query(
+        "INSERT INTO dead_letter_jobs (original_job_id, name, payload, context, priority, \
+         error_count, last_error_message, created_at) \
+         SELECT job_id, name, payload, context, priority, 20, 'simulated dead-letter', created_at \
+         FROM jobs WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(run.0.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert dead-letter rows");
+    sqlx::query("DELETE FROM jobs WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1")
+        .bind(run.0.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("delete job rows");
+    tx.commit().await.expect("commit dead-letter simulation");
+}
+
+/// A run whose every `AdvanceRunJob` row was dead-lettered sits `running`
+/// with no job and a dead lease: `recover_orphans` re-enqueues it and the
+/// run completes from its persisted progress — not from scratch.
+#[tokio::test]
+async fn recover_orphans_reenqueues_a_dead_lettered_run_and_completes() {
+    let env = setup(&[&COUNTER]).await;
+    // Attempt 1: the tool-call reply commits the tool turn (progress),
+    // then a retryable 503 hits the second model call — the attempt ends
+    // via `retry_or_requeue` (release + fresh job row, `Ok`).
+    env.fake.tool_call(
+        models::DEFAULT,
+        "call_1",
+        "add",
+        &serde_json::json!({"a": 2, "b": 3}),
+    );
+    env.fake.status(503, r#"{"error":"upstream down"}"#);
+    let run = durable::start(&env.state, "counter", "add 2 and 3")
+        .await
+        .expect("start");
+    drive(&env.state, run)
+        .await
+        .expect("requeue attempt ends Ok");
+
+    // Partial progress persisted: running, and the transcript carries the
+    // committed tool turn — prompt, assistant tool call, tool result.
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Running);
+    let rows = transcript_rows(&env.db, run).await;
+    let roles: Vec<_> = rows.iter().map(|(_, role, _)| role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user"]);
+    assert_eq!(
+        jobs_for(&env.db, run).await,
+        2,
+        "the start() row and the requeue row both exist"
+    );
+
+    // cja dead-letters the run's only job rows (20 zero-progress failures
+    // is the real trigger; the simulation mirrors the row move exactly).
+    dead_letter_jobs_for(&env.db, run).await;
+    assert_eq!(jobs_for(&env.db, run).await, 0, "the orphan shape");
+
+    let recovered = durable::recover_orphans(&env.state).await.expect("sweep");
+    assert_eq!(recovered, vec![run], "exactly the orphaned run");
+    assert_eq!(jobs_for(&env.db, run).await, 1, "one fresh job row");
+
+    // The recovered run completes from its persisted progress: the tool
+    // result is NOT re-executed, the 503 consumed no turn.
+    env.fake.chat_completion(models::DEFAULT, "5");
+    drive(&env.state, run).await.expect("drive to completion");
+    let view = view_of(&env.db, run).await;
+    assert_eq!(view.status, RunStatus::Succeeded);
+    assert_eq!(view.output.as_deref(), Some("5"));
+    assert_eq!(view.turns, 2, "the 503 consumed no turn");
+    let rows = transcript_rows(&env.db, run).await;
+    let roles: Vec<_> = rows.iter().map(|(_, role, _)| role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+    assert_eq!(
+        env.fake.requests().len(),
+        3,
+        "two scripted replies + the 503 — the tool turn was never re-issued"
+    );
+}
+
+/// Two concurrent sweeps on one orphan enqueue exactly ONE job: the row
+/// lock is taken in one statement and the job check runs in a LATER
+/// statement of the same transaction, so the second caller's check sees
+/// the first caller's committed enqueue. (Inlining the check into the
+/// locking statement evaluates it on the pre-wait snapshot — both callers
+/// enqueue — and must turn this test red.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recover_orphans_enqueues_exactly_once_under_concurrency() {
+    let env = setup(&[&COUNTER]).await;
+    let run = durable::start(&env.state, "counter", "x")
+        .await
+        .expect("start");
+    sqlx::query("DELETE FROM jobs WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1")
+        .bind(run.0.to_string())
+        .execute(&env.db)
+        .await
+        .expect("delete job row");
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'running', locked_by = NULL, locked_at = NULL \
+         WHERE id = $1",
+    )
+    .bind(run.0)
+    .execute(&env.db)
+    .await
+    .expect("orphan shape");
+
+    // Hold the run row FOR UPDATE so both sweeps block on the lock AFTER
+    // their candidate scans snapshotted (and before either can enqueue).
+    let mut hold = env.db.begin().await.expect("begin hold");
+    sqlx::query("SELECT id FROM agent_runs WHERE id = $1 FOR UPDATE")
+        .bind(run.0)
+        .fetch_one(&mut *hold)
+        .await
+        .expect("hold run row");
+
+    let state_a = env.state.clone();
+    let state_b = env.state.clone();
+    let sweep_a = tokio::spawn(async move { durable::recover_orphans(&state_a).await });
+    let sweep_b = tokio::spawn(async move { durable::recover_orphans(&state_b).await });
+
+    // Deadline-bounded poll until BOTH sweeps are blocked on the lock: a
+    // one-shot snapshot after a fixed sleep would prove only "not
+    // finished", not "blocked on the lock". `pg_stat_activity` counts
+    // queue-behind-waiters correctly (pg_blocking_pids undercounts: the
+    // second waiter queues behind the first waiter, not the holder). The
+    // probe's ILIKE match must hit within the first 1KB of the statement
+    // (pg_stat_activity.query truncates there), so it matches
+    // `agent_runs`, which sits at the front of the lock statement.
+    let blocked = wait_until(|| async {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+             AND query ILIKE '%agent_runs%'",
+        )
+        .fetch_one(&env.db)
+        .await
+        .expect("count blocked");
+        (count >= 2).then_some(count)
+    })
+    .await;
+    assert_eq!(blocked, 2, "exactly both sweeps blocked, nothing else");
+
+    hold.commit().await.expect("release hold");
+
+    // Timeline: the poll observes both waiters within ~hundreds of ms;
+    // after the commit each contender acquires in ms — a 10s join timeout
+    // covers that window with orders of magnitude of margin.
+    let a = tokio::time::timeout(Duration::from_secs(10), sweep_a)
+        .await
+        .expect("sweep a joined")
+        .expect("sweep a task")
+        .expect("sweep a ok");
+    let b = tokio::time::timeout(Duration::from_secs(10), sweep_b)
+        .await
+        .expect("sweep b joined")
+        .expect("sweep b task")
+        .expect("sweep b ok");
+
+    assert_eq!(jobs_for(&env.db, run).await, 1, "exactly one enqueue");
+    let winners = usize::from(a == vec![run]) + usize::from(b == vec![run]);
+    assert_eq!(
+        winners, 1,
+        "exactly one sweep recovered the run: {a:?} {b:?}"
+    );
+    assert!(a.is_empty() || b.is_empty(), "the loser skipped it");
+}
+
+/// Delete every `AdvanceRunJob` row for the run (the orphan half of a
+/// fixture; `drive()` runs the job directly and never deletes rows).
+async fn delete_jobs_for(db: &sqlx::PgPool, run: RunId) {
+    sqlx::query("DELETE FROM jobs WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1")
+        .bind(run.0.to_string())
+        .execute(db)
+        .await
+        .expect("delete job rows");
+}
+
+/// The run-half of every orphan fixture: `running` with the lease shaped
+/// as requested (`None` = released/dead: both columns NULL).
+async fn set_running(db: &sqlx::PgPool, run: RunId, lease: Option<(&str, &str)>) {
+    let (locked_by, locked_at) = match lease {
+        Some((by, age)) => (format!("'{by}'"), format!("NOW() - interval '{age}'")),
+        None => ("NULL".to_owned(), "NULL".to_owned()),
+    };
+    sqlx::query(&format!(
+        "UPDATE agent_runs SET status = 'running', locked_by = {locked_by}, \
+         locked_at = {locked_at} WHERE id = $1"
+    ))
+    .bind(run.0)
+    .execute(db)
+    .await
+    .expect("set running shape");
+}
+
+/// The sweep leaves job-backed and `waiting` runs alone, recovers exactly
+/// the orphans, and never touches other job types' rows. Six legs:
+///
+/// - A: job row released and backing off (`run_at` in the future) — alive.
+/// - B: job row locked by a dead worker (post-crash shape) — alive.
+/// - C: `waiting` (no job row on purpose between suspension and answer).
+/// - D: only an unrelated-name job with the same `run_id` payload — the
+///   name scoping in both the prefilter and the check must not treat it
+///   as an advancing job, so D IS an orphan and must be recovered.
+/// - E: live run lease, no job row — the dead-lease predicate holds it
+///   out of the candidate scan.
+/// - F: expired run lease, no job row — the crash-then-dead-letter shape;
+///   with `locked_by` set, only the `locked_at < NOW() - takeover`
+///   disjunct makes F a candidate. The only leg covering it.
+#[tokio::test]
+async fn recover_orphans_leaves_job_backed_and_waiting_runs_alone() {
+    let env = setup(&[&COUNTER]).await;
+
+    // A: released job, genuinely backing off.
+    let leg_a = durable::start(&env.state, "counter", "a")
+        .await
+        .expect("start a");
+    set_running(&env.db, leg_a, None).await;
+    sqlx::query(
+        "UPDATE jobs SET run_at = NOW() + interval '30 seconds', error_count = 3 \
+         WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(leg_a.0.to_string())
+    .execute(&env.db)
+    .await
+    .expect("backing-off job row");
+
+    // B: job row locked by a dead worker (both leases died with the
+    // process; `jobs_lock_pair_check` requires both lock columns or
+    // neither).
+    let leg_b = durable::start(&env.state, "counter", "b")
+        .await
+        .expect("start b");
+    set_running(&env.db, leg_b, None).await;
+    sqlx::query(
+        "UPDATE jobs SET locked_by = 'dead-worker', locked_at = NOW() \
+         WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(leg_b.0.to_string())
+    .execute(&env.db)
+    .await
+    .expect("dead-locked job row");
+
+    // C: waiting — no job row on purpose. The DELETE is load-bearing:
+    // `drive()` runs the job directly and never deletes the `start()` row,
+    // and with that row present a wrongly-inclusive status filter would be
+    // masked by the job check returning true.
+    let leg_c = durable::start(&env.state, "counter", "c")
+        .await
+        .expect("start c");
+    env.fake.tool_call(
+        models::DEFAULT,
+        "c1",
+        "ask",
+        &serde_json::json!({"question": "q?"}),
+    );
+    drive(&env.state, leg_c).await.expect("suspend c");
+    assert_eq!(status_of(&env.db, leg_c).await, RunStatus::Waiting);
+    delete_jobs_for(&env.db, leg_c).await;
+
+    // D: only an unrelated-name job carrying the run id in its payload.
+    let leg_d = durable::start(&env.state, "counter", "d")
+        .await
+        .expect("start d");
+    delete_jobs_for(&env.db, leg_d).await;
+    sqlx::query(
+        "INSERT INTO jobs (job_id, name, payload, context, priority) \
+         VALUES (gen_random_uuid(), 'UnrelatedJob', jsonb_build_object('run_id', $1::text), \
+         'test', 0)",
+    )
+    .bind(leg_d.0.to_string())
+    .execute(&env.db)
+    .await
+    .expect("unrelated job row");
+
+    // E: live run lease, no job row.
+    let leg_e = durable::start(&env.state, "counter", "e")
+        .await
+        .expect("start e");
+    delete_jobs_for(&env.db, leg_e).await;
+    set_running(&env.db, leg_e, Some(("live-owner", "0 seconds"))).await;
+
+    // F: expired lease, no job row — recovered through the third disjunct.
+    let leg_f = durable::start(&env.state, "counter", "f")
+        .await
+        .expect("start f");
+    delete_jobs_for(&env.db, leg_f).await;
+    set_running(&env.db, leg_f, Some(("dead-worker", "1 hour"))).await;
+
+    let recovered = durable::recover_orphans(&env.state).await.expect("sweep");
+
+    // The recovered set is exactly {D, F}, compared as a SET (candidate
+    // ordering is `created_at`-based and not part of the contract).
+    let mut ids: Vec<uuid::Uuid> = recovered.iter().map(|r| r.0).collect();
+    ids.sort_unstable();
+    let mut expected = [leg_d.0, leg_f.0];
+    expected.sort_unstable();
+    assert_eq!(ids, expected, "exactly D and F recovered: {recovered:?}");
+
+    // Job rows: A/B unchanged, C none, D/F one fresh each, E none.
+    assert_eq!(
+        jobs_for(&env.db, leg_a).await,
+        1,
+        "A's backing-off row untouched"
+    );
+    assert_eq!(
+        jobs_for(&env.db, leg_b).await,
+        1,
+        "B's locked row untouched"
+    );
+    assert_eq!(jobs_for(&env.db, leg_c).await, 0, "C stays jobless");
+    assert_eq!(jobs_for(&env.db, leg_d).await, 1, "D re-enqueued");
+    assert_eq!(jobs_for(&env.db, leg_e).await, 0, "E untouched");
+    assert_eq!(jobs_for(&env.db, leg_f).await, 1, "F re-enqueued");
+    let unrelated: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE name = 'UnrelatedJob'")
+            .fetch_one(&env.db)
+            .await
+            .expect("unrelated count");
+    assert_eq!(
+        unrelated, 1,
+        "the sweep never touches other job types' rows"
+    );
+
+    // Statuses: the sweep only enqueues — every run's state is its own.
+    assert_eq!(status_of(&env.db, leg_a).await, RunStatus::Running);
+    assert_eq!(status_of(&env.db, leg_b).await, RunStatus::Running);
+    assert_eq!(status_of(&env.db, leg_c).await, RunStatus::Waiting);
+    assert_eq!(status_of(&env.db, leg_d).await, RunStatus::Queued);
+    assert_eq!(status_of(&env.db, leg_e).await, RunStatus::Running);
+    assert_eq!(
+        locked_by_of(&env.db, leg_e).await.as_deref(),
+        Some("live-owner"),
+        "E's live lease is untouched"
+    );
+    assert_eq!(status_of(&env.db, leg_f).await, RunStatus::Running);
+}
+
+/// Lifecycle pin: one run row held `FOR UPDATE` by another transaction must
+/// not pin `recover_orphans` indefinitely. The sweep is a cron callback, and
+/// the cron worker awaits callbacks in series with no timeout (`Worker::tick`,
+/// `tick_claimed`), so an unbounded lock wait here stops every other cron in
+/// the app and holds up shutdown. `worker.rs` treats this row lock as a real
+/// hazard (`WRITE_BOUND`), and the cron claim bounds its own (`lock_timeout`,
+/// `NOWAIT`). The assertion is only that the sweep returns, `Ok` or `Err`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recover_orphans_returns_while_one_run_row_is_locked() {
+    let env = setup(&[&COUNTER]).await;
+    let run = durable::start(&env.state, "counter", "x")
+        .await
+        .expect("start");
+    delete_jobs_for(&env.db, run).await;
+    set_running(&env.db, run, None).await;
+
+    let mut hold = env.db.begin().await.expect("begin hold");
+    sqlx::query("SELECT id FROM agent_runs WHERE id = $1 FOR UPDATE")
+        .bind(run.0)
+        .fetch_one(&mut *hold)
+        .await
+        .expect("hold run row");
+
+    let swept = tokio::time::timeout(
+        Duration::from_secs(10),
+        durable::recover_orphans(&env.state),
+    )
+    .await;
+    hold.rollback().await.expect("release hold");
+
+    assert!(
+        swept.is_ok(),
+        "recover_orphans still blocked on one locked run row after 10s"
+    );
+}
+
+/// The skip-and-continue half of the LC-1 fix, which the pin above cannot
+/// tell from ending the sweep (it accepts `Ok` or `Err`): a run row held
+/// `FOR UPDATE` past the lock budget must be SKIPPED — the sweep returns
+/// `Ok` having reached every later candidate — and the next sweep after
+/// the hold is released must recover it (the rustdoc's "the next tick
+/// retries it" claim). Replacing the skip's `continue` with
+/// `return Err` (starvation: the oldest held row ends every tick before
+/// any later candidate is reached) must turn this test red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recover_orphans_skips_a_held_row_and_reaches_later_candidates() {
+    let env = setup(&[&COUNTER]).await;
+    let older = durable::start(&env.state, "counter", "older")
+        .await
+        .expect("start older");
+    let younger = durable::start(&env.state, "counter", "younger")
+        .await
+        .expect("start younger");
+    delete_jobs_for(&env.db, older).await;
+    delete_jobs_for(&env.db, younger).await;
+    set_running(&env.db, older, None).await;
+    set_running(&env.db, younger, None).await;
+    // `orphan_candidates` orders by `created_at`; both runs were created
+    // within this test, so age the held one to make the order (and thus
+    // which row the sweep hits first) deterministic.
+    sqlx::query("UPDATE agent_runs SET created_at = NOW() - interval '1 hour' WHERE id = $1")
+        .bind(older.0)
+        .execute(&env.db)
+        .await
+        .expect("age the older run");
+
+    let mut hold = env.db.begin().await.expect("begin hold");
+    sqlx::query("SELECT id FROM agent_runs WHERE id = $1 FOR UPDATE")
+        .bind(older.0)
+        .fetch_one(&mut *hold)
+        .await
+        .expect("hold older row");
+
+    // 15s is comfortably over the 5s per-row lock budget: the sweep must
+    // wait out the budget on `older`, skip it, and still finish the
+    // younger candidate within the timeout.
+    let swept = tokio::time::timeout(
+        Duration::from_secs(15),
+        durable::recover_orphans(&env.state),
+    )
+    .await
+    .expect("sweep returned within 15s");
+    assert_eq!(
+        swept.expect("sweep ok despite the held row"),
+        vec![younger],
+        "the held orphan is skipped and the later candidate recovered"
+    );
+    assert_eq!(jobs_for(&env.db, younger).await, 1, "younger re-enqueued");
+    assert_eq!(jobs_for(&env.db, older).await, 0, "held row not enqueued");
+
+    hold.rollback().await.expect("release hold");
+    let reswept = durable::recover_orphans(&env.state)
+        .await
+        .expect("resweep ok");
+    assert_eq!(reswept, vec![older], "the next sweep recovers the held run");
+    assert_eq!(jobs_for(&env.db, older).await, 1, "older re-enqueued");
+}
+
+/// The registration shown in the `recover_orphans` rustdoc and the
+/// README's "Orphan recovery" bullet must compile exactly as documented:
+/// it is copied code with no other compile coverage, so a `register`
+/// signature change would otherwise break the docs silently. No database
+/// is touched — `CronRegistry::register` only records the closure.
+#[test]
+fn documented_orphan_recovery_registration_compiles() {
+    let interval = Duration::from_secs(300);
+    let mut cron_registry = cja::cron::CronRegistry::<TestState>::new();
+    cron_registry.register("recover_orphaned_agent_runs", None, interval, |state, _| {
+        Box::pin(async move { cja_llm::durable::recover_orphans(&state).await.map(|_| ()) })
+    });
 }

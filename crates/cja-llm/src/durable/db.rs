@@ -504,7 +504,8 @@ where
              locked_at = CASE WHEN d.action = 'cancel_now' THEN NULL ELSE r.locked_at END,
              cancel_requested =
                  CASE WHEN d.action = 'request' THEN TRUE ELSE r.cancel_requested END,
-             finished_at = CASE WHEN d.action = 'cancel_now' THEN NOW() ELSE r.finished_at END
+             finished_at = CASE WHEN d.action = 'cancel_now' THEN NOW() ELSE r.finished_at END,
+             error = CASE WHEN d.action = 'cancel_now' THEN $6 ELSE r.error END
          FROM decision d
          WHERE r.id = d.id
          RETURNING d.action, d.status",
@@ -514,6 +515,7 @@ where
     .bind(RunStatus::Running.as_str())
     .bind(takeover_micros)
     .bind(RunStatus::Cancelled.as_str())
+    .bind("cancelled by request")
     .fetch_optional(db)
     .await?;
     Ok(row.map(|(action, status)| match action.as_str() {
@@ -522,6 +524,126 @@ where
         "noop" => CancelOutcome::AlreadyCancelled,
         _ => CancelOutcome::Terminal(status),
     }))
+}
+
+/// Candidate orphaned runs: queued/running with a dead lease and — an
+/// ADVISORY prefilter — no [`super::AdvanceRunJob`] row yet. The prefilter
+/// runs on this scan's snapshot and may race either way; the authoritative
+/// job check ([`has_advancing_job`]) runs later, under the run's row lock
+/// in a fresh statement. A live lease means an active owner (an orphaned
+/// run can hold one — the sweep's live-lease test leg), so the sweep
+/// leaves that row alone; the lease predicate only avoids locking
+/// actively-progressing rows. Returns run ids ONLY: the kind is read
+/// under the row lock (a `kind` bound here would be shadowed by the
+/// lock's result before any read).
+pub(super) async fn orphan_candidates(
+    db: &sqlx::PgPool,
+    takeover: Duration,
+) -> sqlx::Result<Vec<uuid::Uuid>> {
+    let takeover_micros = i64::try_from(takeover.as_micros()).unwrap_or(i64::MAX);
+    let candidates: Vec<String> = [RunStatus::Queued, RunStatus::Running]
+        .iter()
+        .map(RunStatus::as_str)
+        .map(str::to_owned)
+        .collect();
+    sqlx::query_scalar(
+        "SELECT r.id FROM agent_runs r
+         WHERE r.status = ANY($1)
+           AND (r.locked_by IS NULL OR r.locked_at IS NULL
+                OR r.locked_at < NOW() - $2::bigint * interval '1 microsecond')
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs j
+             WHERE j.name = $3 AND j.payload->>'run_id' = r.id::text)
+         ORDER BY r.created_at",
+    )
+    .bind(&candidates)
+    .bind(takeover_micros)
+    .bind(super::job::AdvanceRunJob::NAME)
+    .fetch_all(db)
+    .await
+}
+
+/// Bound on the per-run row-lock wait, so a row held by another
+/// transaction (an idle operator session, say — the same hazard
+/// `worker.rs`'s `WRITE_BOUND` exists for) cannot stall the sweep — and,
+/// because the sweep runs as a cron callback that the cron worker awaits
+/// in series with no timeout, every other cron and shutdown with it.
+/// Sized with about an order of magnitude of margin over the
+/// concurrency harness's poll for blocked waiters (~hundreds of ms) and
+/// well under its 10s join budget.
+const LOCK_BOUND: Duration = Duration::from_secs(5);
+
+/// Lock one candidate run in its OWN statement (EPQ re-checks the status
+/// predicate against the post-lock row version). `None` = the row vanished
+/// or transitioned to waiting/terminal while we waited — skip it. The
+/// wait is bounded by [`LOCK_BOUND`] (a transaction-scoped `lock_timeout`,
+/// the same pattern the cron claim uses): on expiry Postgres raises
+/// SQLSTATE `55P03` (`lock_not_available`), which the caller treats as
+/// "skip this run this tick" ([`is_lock_not_available`]) rather than a
+/// sweep failure. Returns the run's kind (used only for the enqueue
+/// context string and the re-enqueue log).
+pub(super) async fn lock_active_run(
+    tx: &mut sqlx::PgConnection,
+    run_id: Uuid,
+) -> sqlx::Result<Option<String>> {
+    // SET LOCAL scopes the timeout to this transaction; it therefore also
+    // covers the later job check and enqueue, whose lock waits are not
+    // expected (cja's job inserts do not conflict on a unique key) and
+    // would surface as an `Err` the next tick retries anyway.
+    sqlx::query(&format!(
+        "SET LOCAL lock_timeout = '{}s'",
+        LOCK_BOUND.as_secs()
+    ))
+    .execute(&mut *tx)
+    .await?;
+    let statuses: Vec<String> = [RunStatus::Queued, RunStatus::Running]
+        .iter()
+        .map(RunStatus::as_str)
+        .map(str::to_owned)
+        .collect();
+    sqlx::query_scalar(
+        "SELECT kind FROM agent_runs
+         WHERE id = $1 AND status = ANY($2)
+         FOR UPDATE",
+    )
+    .bind(run_id)
+    .bind(&statuses)
+    .fetch_optional(tx)
+    .await
+}
+
+/// Whether an [`super::AdvanceRunJob`] row exists for the run. MUST run
+/// as a LATER statement of the same transaction than the lock
+/// ([`lock_active_run`]): inside the locking statement it evaluates on
+/// the pre-wait snapshot and two concurrent callers can both enqueue
+/// (READ COMMITTED takes the subquery's snapshot before waiting for the
+/// row lock). Scoped to the job NAME so an unrelated job with a `run_id`
+/// payload field cannot make a run look alive.
+pub(super) async fn has_advancing_job(
+    tx: &mut sqlx::PgConnection,
+    run_id: Uuid,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+           SELECT 1 FROM jobs
+           WHERE name = $1 AND payload->>'run_id' = $2
+         )",
+    )
+    .bind(super::job::AdvanceRunJob::NAME)
+    .bind(run_id.to_string())
+    .fetch_one(tx)
+    .await
+}
+
+/// Whether the error is Postgres SQLSTATE `55P03` (`lock_not_available`):
+/// a statement exceeded the transaction's `lock_timeout` waiting on a
+/// lock. The cron claim classifies the same code as recoverable
+/// (`cron/registry.rs`); for the sweep it means another transaction holds
+/// the run's row — skip that run this tick and let the next sweep retry.
+pub(super) fn is_lock_not_available(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "55P03")
 }
 
 #[cfg(all(test, feature = "durable"))]
@@ -551,7 +673,9 @@ mod tests {
     }
 
     /// Insert one run row in the given state; returns its id. A `waiting`
-    /// row carries both pending-ask columns (the CHECK requires them).
+    /// row carries both pending-ask columns (the CHECK requires them), and
+    /// a terminal row carries `finished_at` plus `fail_reason` exactly when
+    /// `failed` (the terminal CHECKs require both).
     async fn insert_run(db: &sqlx::PgPool, status: &str) -> Uuid {
         let id = Uuid::new_v4();
         let (pending_call, pending_question) = if status == "waiting" {
@@ -559,10 +683,14 @@ mod tests {
         } else {
             ("NULL", "NULL")
         };
+        let terminal = matches!(status, "succeeded" | "failed" | "cancelled");
+        let fail_reason = if status == "failed" { "'x'" } else { "NULL" };
+        let finished_at = if terminal { "NOW()" } else { "NULL" };
         sqlx::query(&format!(
             "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state, \
-             pending_call_id, pending_question) \
-             VALUES ($1, 'k', $2, 'in', 'm', 'a', '{{}}'::jsonb, {pending_call}, {pending_question})"
+             pending_call_id, pending_question, fail_reason, finished_at) \
+             VALUES ($1, 'k', $2, 'in', 'm', 'a', '{{}}'::jsonb, \
+             {pending_call}, {pending_question}, {fail_reason}, {finished_at})"
         ))
         .bind(id)
         .bind(status)
@@ -870,23 +998,115 @@ mod tests {
         let db = test_db().await;
         let id = insert_run(&db, "waiting").await;
 
-        let unclean = sqlx::query("UPDATE agent_runs SET status = 'cancelled' WHERE id = $1")
-            .bind(id)
-            .execute(&db)
-            .await;
-        assert!(
-            unclean.is_err(),
-            "the CHECK rejects a cancelled row that still carries a pending ask"
+        let unclean = sqlx::query(
+            "UPDATE agent_runs SET status = 'cancelled', finished_at = NOW() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&db)
+        .await;
+        let err = unclean.expect_err("the CHECK rejects the unclean transition");
+        // `finished_at` is set and no lease is held, so the row violates
+        // exactly ONE check: the pending-ask rule (not the terminal CHECKs).
+        assert_eq!(
+            err.as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("waiting_has_pending_ask")
         );
 
         // Clearing both columns in the SAME update is accepted.
         sqlx::query(
             "UPDATE agent_runs SET status = 'cancelled', \
-             pending_call_id = NULL, pending_question = NULL WHERE id = $1",
+             pending_call_id = NULL, pending_question = NULL, finished_at = NOW() WHERE id = $1",
         )
         .bind(id)
         .execute(&db)
         .await
         .expect("clean transition");
+    }
+
+    /// Insert a run row with an explicit terminal shape: `fail_reason` and
+    /// `locked_by`/`locked_at` only when passed (NULL otherwise), and
+    /// `finished_at` only when set. The terminal-CHECK tests control every
+    /// column that matters; everything else mirrors `insert_run`.
+    async fn insert_terminal_shaped(
+        db: &sqlx::PgPool,
+        status: &str,
+        fail_reason: Option<&str>,
+        finished_at: bool,
+        lease: bool,
+    ) -> sqlx::Result<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query(&format!(
+            "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state, \
+             fail_reason, finished_at, locked_by, locked_at) \
+             VALUES ($1, 'k', $2, 'in', 'm', 'a', '{{}}'::jsonb, $3, {}, {}, {})",
+            if finished_at { "NOW()" } else { "NULL" },
+            if lease { "'x'" } else { "NULL" },
+            if lease { "NOW()" } else { "NULL" },
+        ))
+        .bind(id)
+        .bind(status)
+        .bind(fail_reason)
+        .execute(db)
+        .await?;
+        Ok(id)
+    }
+
+    /// The rejected write's violated constraint name, for name-assertions:
+    /// each must-reject row is shaped to violate exactly one CHECK, so the
+    /// name is deterministic.
+    fn constraint_of(error: &sqlx::Error) -> Option<&str> {
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint)
+    }
+
+    /// `failed ⇔ fail_reason`: a failed row without a reason and a
+    /// non-failed row with one are both rejected, by the same constraint.
+    #[tokio::test]
+    async fn failed_row_requires_fail_reason() {
+        let db = test_db().await;
+
+        // failed with fail_reason NULL (finished_at set, no lease: the other
+        // two terminal CHECKs hold) -> rejected by failed_has_fail_reason.
+        let err = insert_terminal_shaped(&db, "failed", None, true, false)
+            .await
+            .expect_err("failed without a fail_reason");
+        assert_eq!(constraint_of(&err), Some("failed_has_fail_reason"));
+
+        // The biconditional direction: succeeded WITH a fail_reason.
+        let err = insert_terminal_shaped(&db, "succeeded", Some("boom"), true, false)
+            .await
+            .expect_err("succeeded with a fail_reason");
+        assert_eq!(constraint_of(&err), Some("failed_has_fail_reason"));
+
+        // Control: a clean failed row (reason + finished_at, no lease).
+        insert_terminal_shaped(&db, "failed", Some("gateway"), true, false)
+            .await
+            .expect("clean failed row accepted");
+    }
+
+    /// Every terminal row carries `finished_at`.
+    #[tokio::test]
+    async fn terminal_row_requires_finished_at() {
+        let db = test_db().await;
+        // succeeded, fail_reason NULL (failed_has_fail_reason holds), no
+        // lease (terminal_releases_lease holds), finished_at NULL.
+        let err = insert_terminal_shaped(&db, "succeeded", None, false, false)
+            .await
+            .expect_err("terminal row without finished_at");
+        assert_eq!(constraint_of(&err), Some("terminal_has_finished_at"));
+    }
+
+    /// No terminal row holds a lease.
+    #[tokio::test]
+    async fn terminal_row_releases_lease() {
+        let db = test_db().await;
+        // cancelled with finished_at set and fail_reason NULL (both other
+        // CHECKs hold), but the lease held.
+        let err = insert_terminal_shaped(&db, "cancelled", None, true, true)
+            .await
+            .expect_err("terminal row holding a lease");
+        assert_eq!(constraint_of(&err), Some("terminal_releases_lease"));
     }
 }

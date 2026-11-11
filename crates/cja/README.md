@@ -160,7 +160,7 @@ let pool = sqlx::postgres::PgPoolOptions::new()
     .connect(&std::env::var("DATABASE_URL")?)
     .await?;
 
-// Run CJA's built-in migrations (jobs, crons, sessions, dead_letter_jobs)
+// Run CJA's built-in migrations (jobs, crons, cron_pauses, sessions, dead_letter_jobs)
 cja::db::run_migrations(&pool).await?;
 ```
 
@@ -215,7 +215,7 @@ See `crates/cja.app/` in the repository for a complete working example.
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | Yes | — | PostgreSQL connection string |
 | `PORT` | No | `3000` | HTTP server port |
-| `COOKIE_KEY` | No | Auto-generated | Base64-encoded 64-byte cookie encryption key. **Must be set in production** for session persistence across restarts. |
+| `COOKIE_KEY` | No | Ephemeral, generated at boot | Base64-encoded cookie encryption key, at least 32 bytes decoded. Unset or blank generates a new key on each boot, in release builds too, and logs a warning. Set it if sessions need to survive restarts and deploys. |
 | `SERVER_DISABLED` | No | `false` | Set to `"true"` to skip starting the HTTP server |
 | `JOBS_DISABLED` | No | `false` | Set to `"true"` to skip starting the job worker |
 | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |
@@ -329,8 +329,8 @@ let mut registry = CronRegistry::new();
 // Interval-based (every 60 seconds)
 registry.register_job(MyJob, Some("description"), Duration::from_secs(60));
 
-// Cron expression
-registry.register_job_with_cron(MyJob, Some("description"), "0 */5 * * * *".parse()?);
+// Cron expression — a second job type, since each name registers once
+registry.register_job_with_cron(OtherJob, Some("description"), "0 */5 * * * *");
 ```
 
 Job registrations (`register_job` and `register_job_with_cron`) commit exactly
@@ -340,23 +340,46 @@ crash before commit rolls everything back, so the next tick retries. Job
 execution remains at-least-once under worker lease and retry semantics.
 
 Callback registrations (`register` and `register_with_cron`) claim at most once
-per interval: the timestamp commits before invocation. A callback error or
-process death skips that interval; the next interval fires normally. During a
-rollout, an older scheduler overlapping an upgraded one can still double-fire.
+per interval: the timestamp commits before invocation. A callback error is
+logged and the worker keeps running — the next interval fires without a
+restart. Process death still skips that interval; the next interval fires
+after restart. A panicking callback is not caught: under the Supervisor it
+ends the process. Its claim has already committed, so the restart does not
+retry it immediately, but a callback that always panics ends the process
+again each interval. During a rollout, an older scheduler overlapping an
+upgraded one can still double-fire.
+
+Duplicate cron names panic at registration — callback and job names share one
+namespace, so each cron name registers exactly once. A `last_run_at` ahead of
+the database clock fires on the next tick and no longer pauses the cron.
 
 ### Running the Cron Worker
 
 ```rust
 // Default: UTC timezone, 60-second poll interval
-Worker::new(app_state, registry).run(shutdown_token).await?;
+Worker::new(app_state, registry).run(shutdown_token).await;
 
 // Custom timezone and poll interval
 Worker::new_with_timezone(app_state, registry, chrono_tz::US::Eastern, Duration::from_secs(10))
     .run(shutdown_token)
-    .await?;
+    .await;
+
+// Inside a `tasks::Supervisor`, whose tasks return `cja::Result<()>`:
+let token = shutdown.clone();
+supervisor.spawn("cron", async move {
+    worker.run(token).await;
+    Ok(())
+});
 ```
 
 Note: `Worker::new()` uses a 60-second poll interval with UTC. The only way to customize the poll interval is `Worker::new_with_timezone()` — there is no `new_with_interval()` method.
+
+Cron expressions are evaluated against local wall-clock time in the worker's
+timezone. Across daylight-saving changes, a time the clock skips (02:30 on
+spring-forward night in the US) fires right after the jump, and a time the
+clock repeats (01:30 on fall-back night) fires once. Sub-hourly expressions
+don't fire again during the repeated hour, so use an interval when a job needs
+elapsed-time cadence.
 
 ### Queue Pileup Warning
 
@@ -395,8 +418,13 @@ struct MySession {
 
 #[async_trait::async_trait]
 impl cja::server::session::AppSession for MySession {
-    async fn from_db(pool: &sqlx::PgPool, session_id: uuid::Uuid) -> cja::Result<Self> {
-        // Load from database...
+    async fn from_db(
+        pool: &sqlx::PgPool,
+        session_id: uuid::Uuid,
+    ) -> cja::Result<Option<Self>> {
+        // Load from database with fetch_optional; Ok(None) for a missing
+        // row (the extractor then creates a session), Err only for real
+        // failures (the extractor 500s).
     }
     async fn create(pool: &sqlx::PgPool) -> cja::Result<Self> {
         // Create new session...
@@ -418,6 +446,16 @@ async fn handler(session: cja::server::session::Session<MySession>) -> impl Into
 }
 ```
 
+### Session lifecycle
+
+The `Session` extractor refreshes `sessions.updated_at` at most once per
+`ACTIVITY_REFRESH_MIN_INTERVAL`, so the timestamp tracks real activity without
+a write per request. Schedule `cja::server::session::prune(pool, idle)` from a
+cron to delete idle sessions (the scaffold registers a daily 4am example);
+`idle` must be at least twice `ACTIVITY_REFRESH_MIN_INTERVAL` — the function
+refuses smaller values. The logout route lives in cja-passkey (`POST /auth/logout`):
+it deletes the session row and clears the cookie.
+
 ### Maud Templating
 
 CJA re-exports [Maud](https://maud.lambda.xyz/) for HTML templating.
@@ -430,7 +468,7 @@ PreEscaped(r#"<svg>...</svg>"#.to_string())
 
 ## Migrations
 
-CJA ships migrations for its core tables (jobs, crons, sessions, dead_letter_jobs). Two approaches:
+CJA ships migrations for its core tables (jobs, crons, cron_pauses, sessions, dead_letter_jobs). Two approaches:
 
 ### Recommended: `cja::db::run_migrations()`
 
@@ -442,15 +480,17 @@ This runs the framework's migrations using SQLx's built-in advisory locking. Do 
 
 ### Alternative: Copy Migrations
 
-The `cja init` CLI command copies framework migrations into your project:
+If your app keeps its own copies of cja's migration files (in its `migrations/`
+directory), keep them in sync with the framework when upgrading CJA. The
+`cja sync-migrations` CLI command copies the real files from the cja version
+you have locked in your lockfile:
 
 ```bash
-cja init my-project
+cja sync-migrations
 ```
 
-If using this approach, you're responsible for keeping them in sync when upgrading CJA.
-
-**Known issue:** `cja init` does not currently copy the `dead_letter_jobs` migration. Without it, job retry exhaustion will crash. Either copy it manually from `crates/cja/migrations/20260206200552_AddDeadLetterJobs.sql` or use `cja::db::run_migrations()` instead.
+Both migrators share the `_sqlx_migrations` table; if you also run your own
+migrations, see the "App migrations" section of the `cja::db` module docs.
 
 ## Tracing & Observability
 

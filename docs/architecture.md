@@ -44,7 +44,7 @@ crates/
   cja-build/        — Compile-time static hashing, type checking, and bundling
   cja.app/          — Example application (canonical usage reference)
   cli/              — `cja` CLI tool (project scaffolding)
-migrations/         — Copy of crates/cja/migrations/ for sqlx CLI
+migrations/         — Partial, best-effort copy of crates/cja/migrations/ (see Migration Locations)
 ```
 
 ### Module Tree (`crates/cja/src/`)
@@ -128,12 +128,12 @@ cja::impl_job_registry!(AppState, NoopJob, CancellableDemoJob);
 ### `AppSession` (`server/session.rs`)
 
 Trait for custom session types backed by the `sessions` table:
-- `from_db(pool, session_id) -> Result<Self>`
+- `from_db(pool, session_id) -> Result<Option<Self>>` (`Ok(None)` = missing row, extractor creates a session; `Err` = load failure, extractor 500s)
 - `create(pool) -> Result<Self>`
 - `from_inner(CJASession) -> Self`
 - `inner(&self) -> &CJASession`
 
-The `Session<A>` extractor automatically loads or creates sessions from the `session_id` cookie.
+The `Session<A>` extractor automatically loads or creates sessions from the `__Host-session_id` cookie (private, `HttpOnly`, `Secure`, `SameSite=Lax`) and refreshes `updated_at` at most once per `ACTIVITY_REFRESH_MIN_INTERVAL`. Lifecycle exits: `cja::server::session::prune(pool, idle)` (cron-schedulable idle deletion), `clear_session_cookie(jar)`, and cja-passkey's `POST /auth/logout` (row delete + cookie clear). cja-passkey replaces the session row (new id) on every successful registration/login, so a pre-authentication cookie never authenticates.
 
 ## Data Flow
 
@@ -162,11 +162,15 @@ enqueue() → INSERT INTO jobs (with priority, payload, context)
         → On returned error or caught panic (error_count < max_retries):
             UPDATE jobs SET error_count += 1,
               run_at = NOW() + 2^(error_count+1) seconds
+        → On JobYield: UPDATE jobs SET locked_by = NULL, locked_at = NULL (no charge)
+        → On unknown job name: release uncharged, run_at = NOW() + 30s
+           (hourly past 1h of row age; dead-letter past 14 days);
+           on undeserializable payload: dead-letter without retries
         → On terminal failure or terminal expired lease:
             INSERT INTO dead_letter_jobs with final count + DELETE FROM jobs
 ```
 
-The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not. When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent.
+The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not; a `JobYield` error and an unknown job name release uncharged (unknown names: 30s, hourly past 1h of row age, dead-letter past 14 days). When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent.
 
 `JobWorkerConfig.idle_poll_gate` optionally shares a process-local `IdlePollGate` among workers. Its permits limit periodic idle claims; a worker keeps a permit across empty sleeps and releases it before running a job or its heartbeat. A successful autocommit `Job::enqueue` calls `AppState::job_enqueued`, which an app may override to wake one parked worker for one extra claim. Direct SQL, other processes, transactional enqueue, due retries, and expired leases do not provide this local wake; the periodic claimers discover them. Notifications may coalesce or be lost, so SQL remains authoritative with the same priority order.
 
@@ -175,10 +179,67 @@ The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting ato
 ```
 CronRegistry (name → schedule + job or callback)
   → Worker tick loop
-    → Cheap schedule pre-filter
+    → Cheap schedule pre-filter on database time
+    → Begin claim; first check cron_pauses against the database clock (paused → skip, write nothing)
     → Lock crons row; re-check due against database time
       → Job: insert queue row + stamp cron in one transaction
       → Callback: commit cron stamp, then invoke callback
+```
+
+The pre-filter and the claim re-check both run on database time
+(`clock_timestamp()`). A `last_run_at` ahead of the database clock fires on
+the next tick with a WARN and is restamped with the claim time; it no longer
+pauses the cron. Registering two crons with the same name — callback and job
+names share one namespace — panics at registration.
+
+Any single cron can be paused and resumed at runtime with SQL against the
+app's database — no deploy, no restart. The `cron_pauses` table (one row per
+paused cron) is consulted inside the cron claim, compared against
+`clock_timestamp()`, so host/DB clock skew can neither create nor clear a
+pause, and it stops the cron on every scheduler sharing the database. A
+claim that already passed its pause check when the pause commits may still
+commit one more fire; a pause stops new enqueues only — rows already in
+`jobs` (and their retries) keep running. Schedulers still running an older
+cja ignore the table entirely. The operator statements:
+
+```sql
+-- Pause a cron that has already fired (a typo matches nothing: INSERT 0 0).
+-- Re-running a pause replaces the existing expiry — run Inspect first if
+-- someone else may have paused the cron
+INSERT INTO cron_pauses (name, paused_until)
+SELECT name, now() + interval '4 hours' FROM crons WHERE name = 'TurnRetentionJob'
+ON CONFLICT (name) DO UPDATE
+  SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()
+RETURNING name, paused_until;
+
+-- Pause a cron that has never fired ('infinity' pauses indefinitely).
+-- A typo is undetectable in this form: Inspect shows last_run_at NULL for a never-fired cron and
+-- for a typo alike — compare RETURNING name character by character against
+-- the registry source; any later crons-row check must use the registry name
+-- (never the text you typed) and can only report after the cron already fired.
+INSERT INTO cron_pauses (name, paused_until)
+VALUES ('FreshJob', now() + interval '4 hours')
+ON CONFLICT (name) DO UPDATE
+  SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()
+RETURNING name, paused_until;
+
+-- Resume (DELETE 0: no row matched this name — check the spelling first, then
+-- Inspect; a mistyped resume leaves the real pause in force, possibly
+-- indefinitely, and a silenced cron_missed will not tell you)
+DELETE FROM cron_pauses WHERE name = 'TurnRetentionJob';
+
+-- Inspect (in_force; a NULL last_run_at means never fired or a typo)
+SELECT p.name, p.paused_at, p.paused_until,
+       p.paused_until > clock_timestamp() AS in_force,
+       c.last_run_at
+FROM cron_pauses p LEFT JOIN crons c ON c.name = p.name
+ORDER BY p.name;
+
+-- Tell a future last_run_at apart from a pause: in_force true means a pause,
+-- anything else (false or NULL) means skew (the cron fires, WARNs, restamps)
+SELECT c.name, c.last_run_at, p.paused_until > clock_timestamp() AS in_force
+FROM crons c LEFT JOIN cron_pauses p ON p.name = c.name
+WHERE c.last_run_at > now();
 ```
 
 Cron jobs are regular `Job` implementations — the cron system just handles scheduling the enqueue.
@@ -192,7 +253,15 @@ execution remains at-least-once under worker lease and retry semantics.
 
 `register` and `register_with_cron` commit the timestamp claim before running
 the callback. They invoke a callback at most once per interval; callback error
-or process death skips the interval, and the next one fires normally. Lock,
+or process death skips the interval, and the next one fires normally. Each
+cron's tick failure is logged at `error` with the cron name and the loop
+continues with the next cron and the next tick; if the `crons` table cannot be
+read the tick is skipped (recoverable errors log a warning) and retried on the
+next poll; `Worker::run` returns only on shutdown, so a Supervisor-spawned
+cron worker no longer ends the process on cron errors. A panicking callback
+is not caught: under the Supervisor it ends the process. Its claim has
+already committed, so the restart does not retry it immediately, but a
+callback that always panics ends the process again each interval. Lock,
 statement, and idle-transaction timeouts are fixed inside the scheduler.
 During a rollout, an older scheduler overlapping an upgraded one can still
 double-fire.
@@ -215,6 +284,8 @@ double-fire.
 | `error_count` | `INTEGER NOT NULL DEFAULT 0` | Number of failed attempts |
 | `last_error_message` | `TEXT` | Most recent error |
 | `last_failed_at` | `TIMESTAMPTZ` | Most recent failure timestamp |
+
+The `jobs` table carries a `jobs_lock_pair_check` CHECK constraint (`(locked_by IS NULL) = (locked_at IS NULL)`): a row must hold both lock columns or neither.
 
 ### `dead_letter_jobs`
 
@@ -240,6 +311,22 @@ double-fire.
 | `last_run_at` | `TIMESTAMPTZ NOT NULL` | Last execution time |
 | `created_at` | `TIMESTAMPTZ NOT NULL` | Entry creation time |
 | `updated_at` | `TIMESTAMPTZ NOT NULL` | Last update time |
+
+### `cron_pauses`
+
+Created by migration `20261110120000_AddCronPauses`. A row means "this cron
+is paused until `paused_until`"; no row means "not paused". Row presence
+plus a database-clock comparison is the whole semantics — nothing about a
+pause is derivable from or confusable with `last_run_at`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `name` | `TEXT PRIMARY KEY` | Cron name, same namespace as `crons.name`. No FK: `crons` rows are created lazily by the first claim, and a pause must be able to precede that first fire |
+| `paused_until` | `TIMESTAMPTZ NOT NULL` | Pause in force while `> clock_timestamp()`; `'infinity'` pauses indefinitely |
+| `paused_at` | `TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()` | When the pause was last set; read by the inspect statement and the worker's boot schema probe |
+
+Expired rows linger, inert. The cron claim (`CronJob::claim_due`) is the
+single authority for paused-ness.
 
 ### `sessions`
 
@@ -274,7 +361,8 @@ applies `prepare_routes` — including `RequestUserLayer` — to each.
 
 Cron cancellation takes effect between ticks and during the polling sleep.
 An active tick finishes its callbacks and persists successful `last_run_at`
-updates before returning; callback errors still propagate during shutdown.
+updates before returning; callback errors are logged, not propagated,
+including during shutdown.
 Applications must await workers after cancellation and impose a drain deadline
 when a callback or HTTP response can run indefinitely.
 
@@ -293,12 +381,12 @@ The budget has to fit the platform's kill window: Cloud Run sends SIGKILL a fixe
 
 ## Migration Locations
 
-Three copies of migrations exist in the repository:
+Three copies of migrations exist in the repository, but only one is authoritative:
 
 | Location | Purpose | Used by |
 |----------|---------|---------|
 | `crates/cja/migrations/` | **Source of truth** | `cja::db::run_migrations()` via `sqlx::migrate!("./migrations")` |
-| `migrations/` (root) | Copy for `sqlx` CLI | `sqlx migrate run` from workspace root |
-| `crates/cja.app/migrations/` | Example app's copy | `sqlx::migrate!()` in `cja.app/src/main.rs` |
+| `migrations/` (root) | Partial, best-effort copy (2 of 8 files) — do not rely on it being complete; it fails on a fresh database under `sqlx migrate run` | nothing |
+| `crates/cja.app/migrations/` | Partial, best-effort copy | `sqlx::migrate!()` in `cja.app/src/main.rs` |
 
-When adding a new framework migration, it must be added to all three locations. The `sqlx::migrate!("./migrations")` macro in `db.rs` resolves the path relative to the crate's `Cargo.toml`, i.e., `crates/cja/migrations/`. The `sqlx::migrate!()` call (no path argument) in `cja.app` similarly resolves to `crates/cja.app/migrations/`.
+CLI-generated apps carry no copies: they call `cja::db::run_migrations()` at boot. The `sqlx::migrate!("./migrations")` macro in `db.rs` resolves the path relative to the crate's `Cargo.toml`, i.e., `crates/cja/migrations/`. The `sqlx::migrate!()` call (no path argument) in `cja.app` similarly resolves to `crates/cja.app/migrations/`.

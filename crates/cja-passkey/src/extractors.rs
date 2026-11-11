@@ -21,6 +21,15 @@ async fn load_user_from_session<A: AppState>(
         tracing::error!("Failed to load user {user_id}: {err}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    // Record only after verification (the user row exists): a record
+    // cannot be withdrawn, so an anonymous session must stay anonymous.
+    // `false` = this stack has no RequestUserLayer (hand-rolled serve
+    // loop); the event stays anonymous rather than mis-attributing.
+    if user.is_some()
+        && !cja::server::trace::record_request_user(user_id, cja::server::trace::AUTH_TYPE_PASSKEY)
+    {
+        tracing::debug!("passkey identity not recorded: request stack lacks RequestUserLayer");
+    }
     Ok(user)
 }
 

@@ -1,6 +1,25 @@
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
+use std::path::Path;
+
+/// The new scaffold contract: `migrations/` holds the app's own migrations
+/// only. cja's framework migrations run at boot via `cja::db::run_migrations`,
+/// so no cja `.sql` files are ever copied into a generated project. The
+/// entry list must be exactly `[".gitkeep"]` — an empty dir would pass a
+/// per-entry check vacuously.
+fn assert_migrations_hold_only_gitkeep(migrations: &Path) {
+    let mut names: Vec<String> = std::fs::read_dir(migrations)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![".gitkeep".to_string()],
+        "migrations/ must contain exactly .gitkeep"
+    );
+}
 
 #[test]
 fn test_new_project_creates_directory() {
@@ -214,37 +233,13 @@ fn test_creates_proper_migration_files() {
         .assert()
         .success();
 
-    // Check for jobs migration
-    temp.child(project_name)
-        .child("migrations")
-        .child("20231210151519_AddJobsTable.sql")
-        .assert(predicate::path::exists());
-
-    // Check for cron migrations
-    temp.child(project_name)
-        .child("migrations")
-        .child("20240228040146_AddCrons.up.sql")
-        .assert(predicate::path::exists());
-
-    temp.child(project_name)
-        .child("migrations")
-        .child("20240228040146_AddCrons.down.sql")
-        .assert(predicate::path::exists());
-
-    // Check for session migrations
-    temp.child(project_name)
-        .child("migrations")
-        .child("20250413182934_AddSessions.up.sql")
-        .assert(predicate::path::exists());
-
-    temp.child(project_name)
-        .child("migrations")
-        .child("20250413182934_AddSessions.down.sql")
-        .assert(predicate::path::exists());
+    // Framework migrations run at boot via cja::db::run_migrations — the
+    // generated migrations/ dir holds only .gitkeep.
+    assert_migrations_hold_only_gitkeep(temp.child(project_name).child("migrations").path());
 }
 
 #[test]
-fn test_no_jobs_skips_job_migration() {
+fn test_no_jobs_carries_no_cja_migration_files() {
     let temp = assert_fs::TempDir::new().unwrap();
     let project_name = "no-job-migrations";
 
@@ -254,15 +249,11 @@ fn test_no_jobs_skips_job_migration() {
         .assert()
         .success();
 
-    // Check that jobs migration is NOT created
-    temp.child(project_name)
-        .child("migrations")
-        .child("20231210151519_AddJobsTable.sql")
-        .assert(predicate::path::exists().not());
+    assert_migrations_hold_only_gitkeep(temp.child(project_name).child("migrations").path());
 }
 
 #[test]
-fn test_no_cron_skips_cron_migrations() {
+fn test_no_cron_carries_no_cja_migration_files() {
     let temp = assert_fs::TempDir::new().unwrap();
     let project_name = "no-cron-migrations";
 
@@ -272,15 +263,11 @@ fn test_no_cron_skips_cron_migrations() {
         .assert()
         .success();
 
-    // Check that cron migrations are NOT created
-    temp.child(project_name)
-        .child("migrations")
-        .child("20240228040146_AddCrons.up.sql")
-        .assert(predicate::path::exists().not());
+    assert_migrations_hold_only_gitkeep(temp.child(project_name).child("migrations").path());
 }
 
 #[test]
-fn test_no_sessions_skips_session_migrations() {
+fn test_no_sessions_carries_no_cja_migration_files() {
     let temp = assert_fs::TempDir::new().unwrap();
     let project_name = "no-session-migrations";
 
@@ -290,11 +277,7 @@ fn test_no_sessions_skips_session_migrations() {
         .assert()
         .success();
 
-    // Check that session migrations are NOT created
-    temp.child(project_name)
-        .child("migrations")
-        .child("20250413182934_AddSessions.up.sql")
-        .assert(predicate::path::exists().not());
+    assert_migrations_hold_only_gitkeep(temp.child(project_name).child("migrations").path());
 }
 
 #[test]

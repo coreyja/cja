@@ -152,13 +152,16 @@ test("resident passkeys authenticate without a username and reject forged ceremo
     expect(startResponse.status()).toBe(200);
     expect((await startResponse.json()).publicKey.allowCredentials).toEqual([]);
     const cookie = startResponse.headers()["set-cookie"];
+    expect(cookie).toContain("__Host-session_id=");
     expect(cookie).toContain("Path=/");
+    expect(cookie).toContain("SameSite=Lax");
+    expect(cookie).toContain("Secure");
     await freshPage.goto("/");
     const before = await snapshot(freshPage);
     expect(before.user_id).toBeNull();
     await clickClient(freshPage, "login");
     const after = await snapshot(freshPage);
-    expect(after.session_id).toBe(before.session_id);
+    expect(after.session_id).not.toBe(before.session_id);
     expect(after.challenge).toBeNull();
     expect(after.credentials.find((c) => c.username === "alice")?.last_used_at).not.toBeNull();
     expect(after.credentials.find((c) => c.username === "alice")?.last_used_at)
@@ -193,7 +196,7 @@ test("resident passkeys authenticate without a username and reject forged ceremo
     expect((await me(freshPage)).status).toBe(401);
     expect(await finish(freshPage, valid.body)).toBe(200);
     expect(await finish(freshPage, valid.body)).toBe(400); // sequential replay
-    expect((await snapshot(freshPage)).session_id).toBe(sessionBefore.session_id);
+    expect((await snapshot(freshPage)).session_id).not.toBe(sessionBefore.session_id);
 
     await fresh.clearCookies();
     await freshPage.reload();

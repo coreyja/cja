@@ -190,6 +190,11 @@ function createPasskeyClient(basePath: string = "") {
     loginWithUsername({ username }: LoginArgs): Promise<unknown> {
       return assertCredential("/auth/start", { username }, "/auth/finish");
     },
+
+    async logout(): Promise<void> {
+      const resp = await postJson(`${basePath}/auth/logout`, {});
+      if (!resp.ok) throw new Error(`auth/logout failed: ${resp.status}`);
+    },
   };
 }
 

@@ -12,12 +12,37 @@ The router mounts these routes at its merge path:
 
 | Method and route | Request | Response |
 | --- | --- | --- |
-| `POST /register/start` | `{ "username": "alice", "display_name": "Alice" }` (`display_name` optional) | WebAuthn creation challenge |
+| `POST /register/start` | `{ "username": "alice", "display_name": "Alice" }` (`display_name` optional) | WebAuthn creation challenge; `412` when the session row no longer exists (rotated/deleted concurrently) |
 | `POST /register/finish` | WebAuthn registration credential JSON | `200` on success |
-| `POST /auth/start` | `{ "username": "alice" }` | WebAuthn assertion challenge with that user's credential IDs; `404` for unknown username or no credentials |
+| `POST /auth/start` | `{ "username": "alice" }` | WebAuthn assertion challenge with that user's credential IDs; `404` for unknown username or no credentials; `412` when the session row no longer exists |
 | `POST /auth/finish` | WebAuthn assertion credential JSON | `200` on success |
-| `POST /auth/discoverable/start` | No body required (the JS client sends `{}`) | WebAuthn assertion challenge with empty `allowCredentials` and a top-level `mediation: "conditional"` hint |
+| `POST /auth/discoverable/start` | No body required (the JS client sends `{}`) | WebAuthn assertion challenge with empty `allowCredentials` and a top-level `mediation: "conditional"` hint; `412` when the session row no longer exists |
 | `POST /auth/discoverable/finish` | WebAuthn assertion credential JSON, including `response.userHandle` | `200` on success |
+| `POST /auth/logout` | No body | `200`; deletes the session row and clears the session cookie (consumer rows cascade, as with login rotation) |
+
+**Sessions and your tables.** On every successful registration or login,
+cja-passkey *deletes* the session row — anonymous **or authenticated alike** —
+and inserts an authenticated one with a new `session_id`. A re-login
+therefore also cascades away the previous authenticated session's consumer
+rows. If your app keeps rows that reference `sessions(session_id)`, declare
+them `ON DELETE CASCADE`: pre-login state tied to the old session is
+discarded at login (this is the session-fixation defense), atomically with
+the login transaction. A `NO ACTION`/`RESTRICT` FK with a live row will make
+login fail. Only the framework-known columns carry over (`created_at`
+preserved; `user_id` set; `challenge_state` cleared).
+
+**Known race: an overlapping request can lose a login.** A request still
+carrying the pre-rotation cookie that lands *after* the finish response finds
+no session row, so the framework extractor mints an anonymous session and its
+`Set-Cookie` wins the browser race — the user appears logged out despite a
+valid authenticated row. The window is roughly one round trip around a
+finish; the JS client serializes its own calls, so this needs app-level
+parallel requests spanning a login. A tombstone for rotated ids was
+considered and rejected: it needs new persistent state plus TTL cleanup,
+couples the framework extractor to passkey rotation, and a successor-mapping
+tombstone would re-open the session-fixation window the rotation exists to
+close. Don't fan out parallel requests across a login boundary; treat an
+unexpected anonymous downgrade as "re-authenticate".
 
 Registration requests `residentKey: "preferred"` and
 `requireResidentKey: false`. This encourages discoverable credentials on capable
@@ -61,13 +86,16 @@ const passkeys = cjaPasskey.createPasskeyClient();
 registerButton.onclick = () => passkeys.register({ username: "alice", displayName: "Alice" });
 loginButton.onclick = () => passkeys.login();
 fallbackButton.onclick = () => passkeys.loginWithUsername({ username: "alice" });
+logoutButton.onclick = () => passkeys.logout();
 ```
 
 The client uses a click-driven browser credential prompt; it does not use
 conditional-mediation autofill. The server's `mediation` hint is not passed to
 `navigator.credentials.get` by this client. Starting a new challenge replaces
-the previous one in the same session; successful finish clears it. The session
-ID remains the same across login.
+the previous one in the same session; a successful finish clears it, **replaces
+the session with a fresh row (new session id)**, and re-issues the session
+cookie — a pre-login cookie never authenticates. A failed finish (400/401)
+leaves the challenge in place.
 
 **Breaking JS API change:** existing callers of `.login({ username })` must
 change to `.loginWithUsername({ username })` when bumping their pinned cja

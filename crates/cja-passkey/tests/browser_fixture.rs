@@ -9,46 +9,8 @@ use cja::server::session::{AppSession, Session};
 use cja_passkey::config::HasPasskeyConfig;
 use cja_passkey::{CurrentUser, PasskeyConfig, PasskeySession, passkey_assets};
 use sqlx::Row;
-use sqlx::postgres::PgPoolOptions;
 use url::Url;
 use uuid::Uuid;
-
-fn database_url(name: &str) -> String {
-    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
-    let (prefix, _) = base
-        .rsplit_once('/')
-        .expect("DATABASE_URL must name a database");
-    format!("{prefix}/{name}")
-}
-
-struct TestDbGuard(String);
-
-impl Drop for TestDbGuard {
-    fn drop(&mut self) {
-        let name = self.0.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("cleanup runtime");
-            rt.block_on(async {
-                let pool = PgPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&database_url("postgres"))
-                    .await
-                    .expect("connect for cleanup");
-                sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()")
-                    .bind(&name)
-                    .execute(&pool)
-                    .await
-                    .expect("terminate fixture connections");
-                sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\""))
-                    .execute(&pool)
-                    .await
-                    .expect("drop fixture database");
-            });
-        })
-        .join()
-        .expect("cleanup thread");
-    }
-}
 
 #[derive(Clone)]
 struct TestState {
@@ -209,23 +171,9 @@ async fn discoverable_browser_round_trip() {
             .any(|asset| asset.logical_name == "passkey-client.js.map")
     );
     assert!(passkey_assets::asset_url("passkey-client.js").starts_with("/assets/passkey-client."));
-    let name = format!("cja_passkey_browser_{}", Uuid::new_v4().simple());
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&database_url("postgres"))
-        .await
-        .expect("connect master database");
-    sqlx::query(&format!("CREATE DATABASE \"{name}\""))
-        .execute(&admin)
+    let (db, guard) = cja::testing::test_db::create_test_database("cja_passkey_browser_")
         .await
         .expect("create fixture database");
-    admin.close().await;
-    let guard = TestDbGuard(name.clone());
-    let db = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url(&name))
-        .await
-        .expect("connect fixture database");
     sqlx::migrate!("../cja/migrations")
         .run(&db)
         .await

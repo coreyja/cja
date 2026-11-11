@@ -73,7 +73,11 @@
 //!
 //! With `max_retries = N`, a job can execute N+1 times. Returned errors,
 //! caught handler panics, and expired leases each count as a failed attempt.
-//! The final incremented count is stored in `dead_letter_jobs`.
+//! A [`JobYield`] error releases the row uncharged; an unknown job name is
+//! released uncharged on an age-scaled delay (30s for the first hour of the
+//! row's life, hourly after that, dead-letter past 14 days); an
+//! undeserializable payload is dead-lettered on first dispatch. The final
+//! incremented count is stored in `dead_letter_jobs`.
 //!
 //! # Idempotency
 //!
@@ -94,6 +98,9 @@
 //!
 //! Long-running jobs can override [`Job::run_with_cancellation`] to exit
 //! gracefully during shutdown by checking the cancellation token periodically.
+//! A cooperative job should return `Err(JobYield::new("shutdown").into())`
+//! when the token fires, so the worker releases its row without charging a
+//! failure.
 //!
 //! # Database Schema
 //!
@@ -228,6 +235,52 @@ pub enum EnqueueError {
     #[error("SerdeJsonError: {0}")]
     SerdeJsonError(#[from] serde_json::Error),
 }
+
+/// A distinguished job outcome: release the row without charging a failure.
+///
+/// Return this from [`Job::run`] or [`Job::run_with_cancellation`] — almost
+/// always because the cancellation token fired during shutdown — and the
+/// worker releases the row's lock while leaving `error_count`, `run_at`, and
+/// the error columns untouched. The job is immediately claimable again
+/// (typically by a post-deploy worker).
+///
+/// Returning `Ok` instead would DELETE the row with the work unfinished;
+/// returning any other `Err` charges a failure attempt and grows the backoff.
+/// A job that yields without checking a token will be re-claimed immediately
+/// and spin — check the token before yielding.
+#[derive(Debug, Error)]
+#[error("job yielded: {reason}")]
+pub struct JobYield {
+    /// Why the job yielded (logged only; never persisted).
+    pub reason: String,
+}
+
+impl JobYield {
+    /// Create a yield with a reason.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// The claimed job's `name` is not in this binary's registry — typically a
+/// newer binary enqueued a job type this one predates. Produced by
+/// [`crate::impl_job_registry!`]; the worker releases the row uncharged on
+/// an age-scaled delay — 30s for the first hour of the row's life, hourly
+/// after that — so a binary that knows the name can claim it soon, and
+/// dead-letters the row past 14 days. Hand-written `JobRegistry` impls
+/// should return this from their fallback arm to get the same treatment.
+#[derive(Debug, Error)]
+#[error("Unknown job type: {0}")]
+pub struct UnknownJobType(pub String);
+
+/// The stored payload cannot be deserialized into the job type. Produced by
+/// [`Job::run_from_value`]; a payload that fails to parse will never parse,
+/// so the worker moves the row straight to `dead_letter_jobs`.
+#[derive(Debug, Error)]
+#[error("job payload is not deserializable")]
+pub struct InvalidJobPayload(#[from] serde_json::Error);
 
 /// A trait for defining background jobs that can be enqueued and processed asynchronously.
 ///
@@ -393,10 +446,24 @@ pub trait Job<AppState: AS>:
     /// ignores the token and calls `run()`, so existing jobs continue to work
     /// without changes.
     ///
+    /// When the token fires, a job body has three options:
+    ///
+    /// - Return `Ok(())` — the worker DELETEs the row, treating the unfinished
+    ///   work as complete. Only correct if the shutdown path finished the work
+    ///   or made it moot.
+    /// - Return a plain `Err` — the worker charges a failure attempt
+    ///   (`error_count + 1`, exponential backoff, eventual dead-letter). This
+    ///   is the normal behavior for real errors.
+    /// - Return `Err(JobYield::new(...).into())` — the worker releases the
+    ///   row's lock without charging anything, leaving `error_count` and
+    ///   `run_at` untouched so a post-deploy worker can claim it at once.
+    ///   This is what a cooperative body should return on shutdown when the
+    ///   work is incomplete.
+    ///
     /// # Example
     ///
     /// ```rust
-    /// # use cja::jobs::{Job, CancellationToken};
+    /// # use cja::jobs::{Job, CancellationToken, JobYield};
     /// # use serde::{Serialize, Deserialize};
     /// # #[derive(Debug, Serialize, Deserialize, Clone)]
     /// # struct LongJob { iterations: u32 }
@@ -425,7 +492,9 @@ pub trait Job<AppState: AS>:
     ///             // Check if shutdown was requested
     ///             if cancellation_token.is_cancelled() {
     ///                 tracing::info!("Job cancelled after {} iterations", i);
-    ///                 return Err(color_eyre::eyre::eyre!("Job cancelled during shutdown"));
+    ///                 // Release the row uncharged; a post-deploy worker
+    ///                 // picks the job back up.
+    ///                 return Err(JobYield::new("cancelled during shutdown").into());
     ///             }
     ///
     ///             // Do some work
@@ -448,13 +517,16 @@ pub trait Job<AppState: AS>:
     /// Internal method used by the job system to deserialize and run jobs.
     ///
     /// You typically won't call this directly - it's used by the job worker.
+    /// A payload that fails to deserialize is wrapped in [`InvalidJobPayload`]
+    /// (its `serde_json::Error` rides along as the source); the worker
+    /// dead-letters such rows on the first dispatch instead of retrying.
     #[instrument(name = "jobs.run_from_value", skip(app_state, cancellation_token), fields(job.name = Self::NAME), err)]
     async fn run_from_value(
         value: serde_json::Value,
         app_state: AppState,
         cancellation_token: CancellationToken,
     ) -> color_eyre::Result<()> {
-        let job: Self = serde_json::from_value(value)?;
+        let job: Self = serde_json::from_value(value).map_err(InvalidJobPayload)?;
 
         job.run_with_cancellation(app_state, cancellation_token)
             .await

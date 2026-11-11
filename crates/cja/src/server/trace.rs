@@ -35,6 +35,13 @@ tokio::task_local! {
     static REQUEST_USER: Slot;
 }
 
+/// `auth_type` vocabulary for [`record_request_user`] and the
+/// `finished processing request` event. The event field is otherwise a free
+/// string; these are its known values.
+pub const AUTH_TYPE_PASSKEY: &str = "passkey";
+pub const AUTH_TYPE_SESSION: &str = "session";
+pub const AUTH_TYPE_TOKEN: &str = "token";
+
 /// Record the authenticated user for the request this code is serving, so
 /// cja's `finished processing request` event carries `user_id` and
 /// `auth_type` for Eyes to count.

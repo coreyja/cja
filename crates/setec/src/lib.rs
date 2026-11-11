@@ -96,12 +96,16 @@ pub enum Error {
 }
 
 impl Error {
-    /// Whether retrying the same request could succeed. Transport failures and
-    /// server errors are transient; everything else is an answer.
+    /// Whether retrying the same request could succeed. Transport failures,
+    /// server errors, 429, and 408 are transient; everything else is an answer.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(_) => true,
-            Self::Server { status, .. } => status.is_server_error(),
+            Self::Server { status, .. } => {
+                status.is_server_error()
+                    || *status == StatusCode::TOO_MANY_REQUESTS
+                    || *status == StatusCode::REQUEST_TIMEOUT
+            }
             Self::NotFound
             | Self::AccessDenied
             | Self::VersionClaimed
@@ -455,5 +459,47 @@ impl RawSecretValue {
             value: SecretBytes::new(bytes),
             version: self.version,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryability_covers_transport_server_errors_429_and_408() {
+        assert!(Error::Transport(Box::new(std::io::Error::other("x"))).is_retryable());
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::REQUEST_TIMEOUT,
+        ] {
+            assert!(
+                Error::Server {
+                    status,
+                    body: String::new()
+                }
+                .is_retryable(),
+                "{status} should be retryable"
+            );
+        }
+        for status in [
+            StatusCode::FORBIDDEN,
+            StatusCode::BAD_REQUEST,
+            StatusCode::PRECONDITION_FAILED,
+        ] {
+            assert!(
+                !Error::Server {
+                    status,
+                    body: String::new()
+                }
+                .is_retryable(),
+                "{status} should not be retryable"
+            );
+        }
+        assert!(!Error::NotFound.is_retryable());
+        assert!(!Error::AccessDenied.is_retryable());
+        assert!(!Error::Decode("x".to_owned()).is_retryable());
     }
 }

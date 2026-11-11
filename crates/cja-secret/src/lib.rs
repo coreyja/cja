@@ -36,7 +36,10 @@
 //! network, for hosts running `tailscaled`. With the `tailnet` feature,
 //! [`Transport::Tailnet`] joins the tailnet in-process as an ephemeral node,
 //! keyless via workload identity federation (see `cja-tailnet`), for platforms
-//! like Cloud Run that can't run `tailscaled`.
+//! like Cloud Run that can't run `tailscaled`. With `Transport::Tailnet`,
+//! three consecutive polls in which every secret failed with a transport
+//! error end the process so a restart rejoins with a fresh node;
+//! `Transport::Host` keeps serving last-good values through any outage.
 
 #[cfg(feature = "testing")]
 use std::collections::HashMap;
@@ -65,6 +68,16 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_hours(1);
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_WAIT: Duration = Duration::from_millis(250);
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(4);
+
+/// Consecutive poll rounds in which every tracked secret failed with a
+/// transport error, after which [`Refresher::run`] gives up and ends the
+/// process, so the platform restarts it and a fresh boot rejoins the
+/// tailnet. A round where any secret was served, or where setec answered
+/// the failure, proves the transport works, so it never counts. With the
+/// default 1-hour poll interval this is ~3 hours of total unreachability —
+/// the signature of a deleted ephemeral node, not a blip. Only transports
+/// a restart can heal (`Transport::Tailnet`) enable this.
+const MAX_CONSECUTIVE_REFRESH_FAILURES: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -137,7 +150,11 @@ pub struct SetecConfig {
     /// The setec server, e.g. `https://setec.example.ts.net`.
     pub server: Url,
     /// How often the refresher checks for newly activated versions. Unchanged
-    /// checks are conditional gets that setec does not audit-log.
+    /// checks are conditional gets that setec does not audit-log. With
+    /// `Transport::Tailnet` the tolerated outage scales with this interval:
+    /// three consecutive fully-unreachable polls end the process (see
+    /// `MAX_CONSECUTIVE_REFRESH_FAILURES`), so a 60s interval means a
+    /// two-to-three-minute total outage restarts the process.
     pub poll_interval: Duration,
     /// How long boot keeps retrying transient failures before giving up.
     /// Permanent failures (not found, access denied) fail immediately.
@@ -157,6 +174,22 @@ pub enum Transport {
     Tailnet(cja_tailnet::TailnetConfig),
 }
 
+/// The escalation threshold for a transport: the number of consecutive
+/// poll rounds in which every tracked secret failed with a transport error
+/// after which `Refresher::run` ends the process, so a restart heals the
+/// transport. Only `Transport::Tailnet` escalates — its ephemeral node is
+/// deleted after enough downtime, and a fresh boot re-joins with a newly
+/// minted key. `Transport::Host` returns `None`: the host's `tailscaled`
+/// owns the node, so a restart can't fix reachability and the refresher
+/// keeps serving last-good values through any outage.
+fn escalation_threshold(transport: &Transport) -> Option<u32> {
+    match transport {
+        Transport::Host => None,
+        #[cfg(feature = "tailnet")]
+        Transport::Tailnet(_) => Some(MAX_CONSECUTIVE_REFRESH_FAILURES),
+    }
+}
+
 impl SetecConfig {
     pub fn new(server: Url) -> Self {
         Self {
@@ -170,6 +203,8 @@ impl SetecConfig {
     /// Reads `SETEC_SERVER` (required), plus `SETEC_POLL_INTERVAL_SECS`,
     /// `SETEC_BOOT_TIMEOUT_SECS`, and `SETEC_TRANSPORT` (`host`, the default,
     /// or `tailnet`, which reads the rest from `TailnetConfig::from_env`).
+    /// Under `tailnet`, `SETEC_POLL_INTERVAL_SECS` also sets the escalation
+    /// tolerance: three consecutive fully-unreachable polls end the process.
     pub fn from_env() -> Result<Self, Error> {
         let server = std::env::var("SETEC_SERVER")
             .map_err(|_| Error::Config("SETEC_SERVER must be set".into()))?;
@@ -220,6 +255,14 @@ pub struct SecretStore {
     absent: Mutex<Vec<&'static str>>,
     /// `host`, `tailnet`, or `fake`; reported in boot events.
     transport: &'static str,
+    /// Consecutive poll rounds in which every tracked secret failed with a
+    /// transport error, after which `Refresher::run` ends the process so a
+    /// restart heals the transport. `Some(..)` only for transports a
+    /// restart can heal (`Transport::Tailnet`, whose boot re-joins with a
+    /// fresh ephemeral node); `None` keeps serving last-good values through
+    /// any outage (`Transport::Host`, fakes built with
+    /// `FakeSetec::host_store`).
+    max_consecutive_failures: Option<u32>,
     #[cfg(feature = "tailnet")]
     tailnet: Option<Arc<cja_tailnet::Tailnet>>,
 }
@@ -281,12 +324,14 @@ impl SecretStore {
             setec::Client::new(config.server.clone(), dialer)
                 .map_err(|e| Error::Config(format!("setec client: {e}")))
         };
+        let max_consecutive_failures = escalation_threshold(&config.transport);
         match config.transport {
             Transport::Host => Ok(Self::from_source(
                 Source::Setec(client(Arc::new(setec::TcpDialer))?),
                 "host",
                 config.poll_interval,
                 config.boot_timeout,
+                max_consecutive_failures,
             )),
             #[cfg(feature = "tailnet")]
             Transport::Tailnet(tailnet_config) => {
@@ -300,6 +345,7 @@ impl SecretStore {
                     "tailnet",
                     config.poll_interval,
                     config.boot_timeout,
+                    max_consecutive_failures,
                 );
                 store.tailnet = Some(tailnet);
                 Ok(store)
@@ -312,6 +358,7 @@ impl SecretStore {
         transport: &'static str,
         poll_interval: Duration,
         boot_timeout: Duration,
+        max_consecutive_failures: Option<u32>,
     ) -> Self {
         Self {
             source: Arc::new(source),
@@ -320,6 +367,7 @@ impl SecretStore {
             tracked: Mutex::new(Vec::new()),
             absent: Mutex::new(Vec::new()),
             transport,
+            max_consecutive_failures,
             #[cfg(feature = "tailnet")]
             tailnet: None,
         }
@@ -346,6 +394,7 @@ impl SecretStore {
             inner: Arc::new(RefresherInner {
                 source: self.source,
                 poll_interval: self.poll_interval,
+                max_consecutive_failures: self.max_consecutive_failures,
                 tracked,
                 #[cfg(feature = "tailnet")]
                 tailnet: self.tailnet,
@@ -469,6 +518,14 @@ pub struct Refresher {
 struct RefresherInner {
     source: Arc<Source>,
     poll_interval: Duration,
+    /// Consecutive poll rounds in which every tracked secret failed with
+    /// a transport error, after which `Refresher::run` ends the process so
+    /// a restart heals the transport. `Some(..)` only for transports a
+    /// restart can heal (`Transport::Tailnet`, whose boot re-joins with a
+    /// fresh ephemeral node); `None` keeps serving last-good values through
+    /// any outage (`Transport::Host`, fakes built with
+    /// `FakeSetec::host_store`).
+    max_consecutive_failures: Option<u32>,
     tracked: Vec<Arc<dyn Tracked>>,
     /// Kept alive for the refresher's connections; left on shutdown.
     #[cfg(feature = "tailnet")]
@@ -497,13 +554,30 @@ impl Refresher {
     }
 
     /// Refreshes every `poll_interval` until `shutdown` is cancelled. Shaped
-    /// for `Supervisor::spawn`; it only returns once shutdown starts. With
-    /// [`Transport::Tailnet`] it then leaves the tailnet, so the ephemeral node
-    /// goes away promptly.
+    /// for `Supervisor::spawn`; it returns once shutdown starts, or with
+    /// `Err` on escalation. With [`Transport::Tailnet`] it leaves the
+    /// tailnet on either exit, so the ephemeral node goes away promptly.
+    ///
+    /// Stores whose transport a restart can heal — `Transport::Tailnet`,
+    /// whose ephemeral node is deleted after enough downtime — escalate a
+    /// total outage: after 3 consecutive polls in which every tracked
+    /// secret failed with a transport error (see
+    /// `MAX_CONSECUTIVE_REFRESH_FAILURES`), this logs at error and returns
+    /// `Err`, which `Supervisor` treats as fatal, ending the process so the
+    /// platform restarts it and a fresh boot rejoins the tailnet. A poll
+    /// where any secret was served, or where setec answered the failures
+    /// (5xx/429/408/permanent), resets the count. If setec itself is down,
+    /// that restart fails boot after its bounded `boot_timeout` and the
+    /// platform keeps restarting until setec returns. Stores whose
+    /// transport a restart cannot heal ([`Transport::Host`]) never
+    /// escalate: failures are logged and last-good values keep being served
+    /// through any outage.
     pub async fn run(self, shutdown: CancellationToken) -> cja::Result<()> {
         let poll_interval = self.inner.poll_interval;
         let mut ticker = tokio::time::interval_at(Instant::now() + poll_interval, poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let max_consecutive_failures = self.inner.max_consecutive_failures;
+        let mut consecutive_failures = 0_u32;
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => {
@@ -514,8 +588,42 @@ impl Refresher {
                     return Ok(());
                 }
                 _ = ticker.tick() => {
-                    // Failures are logged inside refresh and never stop the loop.
-                    let _ = self.refresh().await;
+                    let Some(max) = max_consecutive_failures else {
+                        // A restart can't heal this transport's reachability
+                        // (Transport::Host): failures only log, last-good
+                        // values keep being served through any outage.
+                        let _ = self.refresh().await;
+                        continue;
+                    };
+                    match self.refresh().await {
+                        Err(error)
+                            if is_transport_refresh_failure(
+                                &error,
+                                self.inner.tracked.len(),
+                            ) =>
+                        {
+                            consecutive_failures += 1;
+                            if consecutive_failures >= max {
+                                tracing::error!(
+                                    event_type = "secret_refresh_escalated",
+                                    consecutive_failures,
+                                    max,
+                                    poll_interval = ?poll_interval,
+                                    "setec unreachable for consecutive refreshes; ending the process so a restart rejoins"
+                                );
+                                #[cfg(feature = "tailnet")]
+                                if let Some(tailnet) = &self.inner.tailnet {
+                                    tailnet.shutdown().await;
+                                }
+                                return Err(error.into());
+                            }
+                        }
+                        // A success, a partial failure (some secret was
+                        // still served), or a failure setec answered
+                        // (5xx/429/408/permanent): the transport works, so
+                        // this is not a dead node.
+                        _ => consecutive_failures = 0,
+                    }
                 }
             }
         }
@@ -586,11 +694,37 @@ impl Refresher {
     }
 }
 
+/// Whether a refresh round was a total outage: every tracked secret
+/// failed, and every failure is a transport error — the signature of a
+/// deleted tailnet node, which no dial can get through. A round where any
+/// secret was served, or where setec answered any failure (5xx, 429, 408)
+/// or returned a permanent error (`NotFound`, `AccessDenied`, parse),
+/// proves a dial reached setec, so it never counts: a restart fixes none
+/// of those.
+fn is_transport_refresh_failure(error: &Error, tracked: usize) -> bool {
+    let Error::Refresh(failures) = error else {
+        return false;
+    };
+    failures.len() == tracked
+        && failures.iter().all(|failure| {
+            matches!(
+                failure,
+                Error::Setec {
+                    source: setec::Error::Transport(_),
+                    ..
+                }
+            )
+        })
+}
+
 /// An in-memory stand-in for setec, for tests. Values start at version 1.
 #[cfg(feature = "testing")]
 #[derive(Clone, Default)]
 pub struct FakeSetec {
     values: Arc<Mutex<HashMap<String, SecretValue>>>,
+    /// Secrets whose reads fail as transport errors, modelling a dead
+    /// tailnet node. Maps secret name -> reason.
+    failures: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[cfg(feature = "testing")]
@@ -603,14 +737,51 @@ impl FakeSetec {
         fake
     }
 
-    /// A store reading from this fake, with the default timings.
+    /// A store reading from this fake, with the default timings. Models the
+    /// tailnet transport: sustained total-outage transport failures
+    /// escalate to ending the process, the way `Transport::Tailnet`
+    /// deployments do. Use [`FakeSetec::host_store`] for the
+    /// never-escalating shape.
     pub fn store(&self) -> SecretStore {
         SecretStore::from_source(
             Source::Fake(self.clone()),
             "fake",
             DEFAULT_POLL_INTERVAL,
             DEFAULT_BOOT_TIMEOUT,
+            Some(MAX_CONSECUTIVE_REFRESH_FAILURES),
         )
+    }
+
+    /// A store reading from this fake that models `Transport::Host`:
+    /// transport failures are logged and last-good values keep being served,
+    /// but `Refresher::run` never ends the process — a restart can't fix a
+    /// host dialer's reachability.
+    pub fn host_store(&self) -> SecretStore {
+        SecretStore::from_source(
+            Source::Fake(self.clone()),
+            "fake",
+            DEFAULT_POLL_INTERVAL,
+            DEFAULT_BOOT_TIMEOUT,
+            escalation_threshold(&Transport::Host),
+        )
+    }
+
+    /// Makes every subsequent read of `name` fail as a retryable transport
+    /// error, the way dials fail when the ephemeral tailnet node has been
+    /// deleted, until [`FakeSetec::heal`].
+    pub fn fail_transport(&self, name: &str, reason: &str) {
+        self.failures
+            .lock()
+            .expect("fake failures lock")
+            .insert(name.to_owned(), reason.to_owned());
+    }
+
+    /// Restores normal serving of `name` after [`FakeSetec::fail_transport`].
+    pub fn heal(&self, name: &str) {
+        self.failures
+            .lock()
+            .expect("fake failures lock")
+            .remove(name);
     }
 
     /// Activates a new version of `name`. Loaded handles see it after the
@@ -628,6 +799,12 @@ impl FakeSetec {
     }
 
     fn get(&self, name: &str) -> Result<SecretValue, setec::Error> {
+        if let Some(reason) = self.failures.lock().expect("fake failures lock").get(name) {
+            return Err(setec::Error::Transport(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                reason.clone(),
+            ))));
+        }
         self.values
             .lock()
             .expect("fake secrets lock")
@@ -731,9 +908,120 @@ impl<T: FromSecret> Tracked for Entry<T> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transport_failure(name: &'static str) -> Error {
+        Error::Setec {
+            name,
+            source: setec::Error::Transport(Box::new(std::io::Error::other(
+                "tailnet node deleted",
+            ))),
+        }
+    }
+
+    fn server_failure(name: &'static str, status: setec::StatusCode) -> Error {
+        Error::Setec {
+            name,
+            source: setec::Error::Server {
+                status,
+                body: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn only_transport_failures_count_toward_escalation() {
+        // Rounds that count: every tracked secret failed, and every
+        // failure is a transport error — a dead node is unanimous.
+        assert!(is_transport_refresh_failure(
+            &Error::Refresh(vec![transport_failure("a")]),
+            1
+        ));
+        assert!(is_transport_refresh_failure(
+            &Error::Refresh(vec![transport_failure("a"), transport_failure("b")]),
+            2
+        ));
+        // Rounds that reset. Partial failure — some tracked secret was
+        // still served, so the transport works:
+        assert!(!is_transport_refresh_failure(
+            &Error::Refresh(vec![transport_failure("a")]),
+            2
+        ));
+        // Mixed failure — setec answered another secret's failure:
+        assert!(!is_transport_refresh_failure(
+            &Error::Refresh(vec![
+                transport_failure("a"),
+                server_failure("b", setec::StatusCode::SERVICE_UNAVAILABLE),
+            ]),
+            2
+        ));
+        // Setec answered every failure (5xx, 429)...
+        assert!(!is_transport_refresh_failure(
+            &Error::Refresh(vec![server_failure(
+                "a",
+                setec::StatusCode::SERVICE_UNAVAILABLE
+            )]),
+            1
+        ));
+        assert!(!is_transport_refresh_failure(
+            &Error::Refresh(vec![server_failure(
+                "a",
+                setec::StatusCode::TOO_MANY_REQUESTS
+            )]),
+            1
+        ));
+        // ...or the failure is permanent — none of these prove the
+        // transport is dead, and a restart fixes none of them.
+        assert!(!is_transport_refresh_failure(
+            &Error::Refresh(vec![Error::Setec {
+                name: "a",
+                source: setec::Error::NotFound,
+            }]),
+            1
+        ));
+        assert!(!is_transport_refresh_failure(
+            &Error::BootTimeout {
+                name: "a",
+                timeout: Duration::from_secs(1),
+                last: None,
+            },
+            1
+        ));
+    }
+
+    #[test]
+    fn host_transport_has_no_escalation_threshold() {
+        // A restart can't fix a host dialer's reachability, so `connect`
+        // must never arm escalation for it.
+        assert_eq!(escalation_threshold(&Transport::Host), None);
+    }
+}
+
 #[cfg(all(test, feature = "tailnet"))]
 mod tailnet_accessor_tests {
     use super::*;
+
+    /// `escalation_threshold` must arm escalation for every tailnet
+    /// transport: it is the only production wiring of the gate, so a tailnet
+    /// store that leaves it `None` silently never restarts-to-rejoin.
+    /// `TailnetConfig::new` is pure data — no network, no join.
+    #[test]
+    fn tailnet_transport_escalates_after_max_consecutive_failures() {
+        let config = cja_tailnet::TailnetConfig::new(
+            "test-host",
+            "tag:test",
+            cja_tailnet::Identity::Gcp {
+                client_id: "client-id".into(),
+                audience: "audience".into(),
+            },
+        );
+        assert_eq!(
+            escalation_threshold(&Transport::Tailnet(config)),
+            Some(MAX_CONSECUTIVE_REFRESH_FAILURES)
+        );
+    }
 
     /// `Refresher::tailnet` lends the joined node to other tailnet clients
     /// (e.g. cja-llm) instead of each crate joining its own. Without a join
@@ -752,6 +1040,7 @@ mod tailnet_accessor_tests {
                     .unwrap(),
                 )),
                 poll_interval: DEFAULT_POLL_INTERVAL,
+                max_consecutive_failures: None,
                 tracked: Vec::new(),
                 tailnet: None,
             }),
