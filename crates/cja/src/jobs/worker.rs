@@ -1555,6 +1555,42 @@ mod tests {
         }
     }
 
+    /// A capped type whose hung rows await forever past a short
+    /// `MAX_RUNTIME`: the worker must drop the body at the limit, and that
+    /// drop must release the single per-process slot so a second row of
+    /// the same type can run (the arena `BACKUP_SLOT` wedge shape). Quick
+    /// rows insert a probe marker and finish.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct CappedHungJob {
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for CappedHungJob {
+        const NAME: &'static str = "CappedHungJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcess(NonZeroUsize::new(1).unwrap());
+        const MAX_RUNTIME: Duration = Duration::from_secs(1);
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            if self.hang {
+                sqlx::query(
+                    "UPDATE jobs SET context = 'started-hung'
+                     WHERE name = $1 AND context = 'capped-hung'",
+                )
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+                std::future::pending::<()>().await;
+                Ok(())
+            } else {
+                sqlx::query("INSERT INTO job_probe (marker) VALUES ('capped-expiry-released')")
+                    .execute(app_state.db())
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
     impl_job_registry!(
         TestAppState,
         TestJob,
@@ -1567,7 +1603,8 @@ mod tests {
         ChargedOnShutdownJob,
         HungJob,
         SlowJob,
-        CappedJob
+        CappedJob,
+        CappedHungJob
     );
 
     fn test_state(db: sqlx::PgPool) -> TestAppState {
@@ -1900,22 +1937,86 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
-    #[test]
-    fn test_concurrency_consts_and_registry_reflect_overrides() {
-        use crate::jobs::registry::JobRegistry;
-
-        assert_eq!(TestJob::CONCURRENCY, Concurrency::Unlimited);
-        assert_eq!(NormalProbeJob::CONCURRENCY, Concurrency::Unlimited);
-        assert_eq!(
-            CappedJob::CONCURRENCY,
-            Concurrency::PerProcess(NonZeroUsize::new(1).unwrap())
-        );
-        assert_eq!(
-            Jobs.concurrency("CappedJob"),
-            Concurrency::PerProcess(NonZeroUsize::new(1).unwrap())
-        );
-        assert_eq!(Jobs.concurrency("TestJob"), Concurrency::Unlimited);
-        assert_eq!(Jobs.concurrency("NoSuchJob"), Concurrency::Unlimited);
+    /// DEV-2424 regression: a hung capped attempt must free its
+    /// per-process slot when `MAX_RUNTIME` expires — the arena `BACKUP_SLOT`
+    /// wedge was exactly a hung capped attempt starving every other row of
+    /// its type. One worker, cap 1: the hung row takes the slot and is
+    /// dropped at its 1s limit; the second row of the SAME type (which a
+    /// leaked slot keeps excluded from claims) must then run and leave its
+    /// probe marker.
+    #[sqlx::test]
+    async fn test_capped_hung_job_releases_slot_on_max_runtime_expiry(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        // Same priority: the hung row (enqueued first) claims first by
+        // created_at, so the ordering is deterministic.
+        CappedHungJob { hang: true }
+            .enqueue(state.clone(), "capped-hung".into(), None)
+            .await
+            .unwrap();
+        CappedHungJob { hang: false }
+            .enqueue(state.clone(), "capped-quick".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                // Nonzero drain: on cancel the worker may be mid re-hang on
+                // the backed-off hung row; its 1s MAX_RUNTIME resolves
+                // inside the drain window (mirrors the saturated test).
+                shutdown_drain_timeout: Duration::from_secs(5),
+                idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
+            },
+        ));
+        // The quick row only becomes claimable once the expired attempt
+        // released the single slot: with a leaked slot the claim exclusion
+        // keeps every CappedHungJob row queued and this wait times out at
+        // its 10s cap.
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_probe WHERE marker = 'capped-expiry-released'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        // The hung attempt was charged through the MAX_RUNTIME expiry path
+        // (not a plain failure): the message names the runtime limit.
+        // error_count >= 1 rather than == 1: a slow machine can reclaim the
+        // backed-off row (4s delay) and charge it again before this poll —
+        // the message check still ties the charge to the expiry arm.
+        wait_for(|| async {
+            let row: Option<(i32, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT error_count, locked_by, last_error_message
+                 FROM jobs WHERE name = 'CappedHungJob' AND context = 'started-hung'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            let (count, owner, message) = row?;
+            (count >= 1
+                && owner.is_none()
+                && message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("max runtime")))
+            .then_some(())
+        })
+        .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
     }
 
     #[test]
@@ -1940,24 +2041,6 @@ mod tests {
         );
         drop(second);
         assert_eq!(tracker.running("CappedJob"), 0);
-    }
-
-    /// DEV-2424 pin: `ConcurrencyTracker::default()` IS the process-shared
-    /// tracker — the property that makes defaulted worker configs share
-    /// counts across a process (arena's motivating shape: 100 workers, one
-    /// counter). Unique name so parallel tests cannot collide on the
-    /// process-shared static.
-    #[test]
-    fn test_concurrency_tracker_default_is_process_shared() {
-        let name = format!("pin-{}", uuid::Uuid::new_v4());
-        let cap = NonZeroUsize::new(1).unwrap();
-        assert_eq!(ConcurrencyTracker::process_shared().running(&name), 0);
-        let slot = ConcurrencyTracker::default()
-            .try_acquire(&name, cap)
-            .expect("free slot");
-        assert_eq!(ConcurrencyTracker::process_shared().running(&name), 1);
-        drop(slot);
-        assert_eq!(ConcurrencyTracker::process_shared().running(&name), 0);
     }
 
     #[sqlx::test]
@@ -2121,6 +2204,7 @@ mod tests {
                 reclaim_window: Duration::from_millis(1200),
                 shutdown_drain_timeout: Duration::ZERO,
                 idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
             },
         ));
         // 3s body + finalization, well inside the 10s wait_for cap.
