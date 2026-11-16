@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::app_state::{self};
 
 use super::worker::JobFromDB;
@@ -24,6 +26,15 @@ pub trait JobRegistry<AppState: app_state::AppState> {
     fn job_names() -> &'static [&'static str]
     where
         Self: Sized;
+
+    /// The per-attempt maximum runtime for the named job type, from its
+    /// [`crate::jobs::Job::MAX_RUNTIME`] const. `None` means no limit.
+    ///
+    /// `impl_job_registry!` implements this automatically from the
+    /// registered types' consts. Hand-written `JobRegistry` impls MUST
+    /// implement it (it is required, like `run_job`) — delegate to the job
+    /// types' `MAX_RUNTIME` consts so limits apply.
+    fn max_runtime(&self, name: &str) -> Option<Duration>;
 }
 
 /// A macro for implementing a job registry that handles job dispatch.
@@ -117,6 +128,15 @@ macro_rules! impl_job_registry {
                 use $crate::jobs::Job as _;
 
                 &[$(<$job_type>::NAME),*]
+            }
+
+            fn max_runtime(&self, name: &str) -> Option<std::time::Duration> {
+                use $crate::jobs::Job as _;
+
+                match name {
+                    $(<$job_type>::NAME => <$job_type as $crate::jobs::Job<$state>>::MAX_RUNTIME,)*
+                    _ => None,
+                }
             }
         }
     };
