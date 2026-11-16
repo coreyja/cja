@@ -101,6 +101,7 @@ Defines a background job type. Key members:
 - `run_with_cancellation(&self, app_state, token) -> Result<()>` — override for graceful shutdown support
 - `enqueue(self, app_state, context, priority) -> Result<()>` — inserts job into the `jobs` table
 - `MAX_RUNTIME: Duration` — per-attempt wall-clock limit the worker enforces (default 15 min; override per type with a larger `Duration`)
+- `CONCURRENCY: Concurrency` — per-process concurrency cap enforced at claim (default `Unlimited`; `PerProcess(n)` excludes saturated types from claims)
 
 ### Job enqueue evidence
 
@@ -126,7 +127,7 @@ cja::impl_job_registry!(AppState, NoopJob, CancellableDemoJob);
 // Generates a `Jobs` struct implementing JobRegistry
 ```
 
-The macro also uses each registered type's `MAX_RUNTIME` const to generate the required `max_runtime(name)`, which the worker consults to bound each attempt.
+The macro also uses each registered type's `MAX_RUNTIME` const to generate the required `max_runtime(name)`, which the worker consults to bound each attempt, and each type's `CONCURRENCY` const to generate the required `concurrency(name)`, which the worker consults to exclude saturated types from claims.
 
 ### `AppSession` (`server/session.rs`)
 
@@ -159,6 +160,7 @@ Incoming request
 enqueue() → INSERT INTO jobs (with priority, payload, context)
   → Worker poll loop (every sleep_duration)
     → SELECT ... FOR UPDATE SKIP LOCKED (claims one row and charges an expired lease)
+      → Claim excludes types at their per-process CONCURRENCY cap (saturated types skipped, not parked on)
       → Deserialize payload → JobRegistry::run_job() → Job::run()
         → Heartbeat `locked_at` while the handler runs
         → Body runs under Job::MAX_RUNTIME (default 15m): on expiry, the future is dropped and charged like a returned error
@@ -172,11 +174,13 @@ enqueue() → INSERT INTO jobs (with priority, payload, context)
            on undeserializable payload: dead-letter without retries
         → On terminal failure or terminal expired lease:
             INSERT INTO dead_letter_jobs with final count + DELETE FROM jobs
+        → Per-process concurrency slot released when the attempt finalizes
+           (success, failure, MAX_RUNTIME expiry, yield, lease loss, drain)
 ```
 
-The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not; a `JobYield` error and an unknown job name release uncharged (unknown names: 30s, hourly past 1h of row age, dead-letter past 14 days). When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent. Attempts exceeding `Job::MAX_RUNTIME` are dropped and charged as retryable failures whose error names the limit. Dropping cancels async work only; work inside `spawn_blocking` keeps running.
+The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not; a `JobYield` error and an unknown job name release uncharged (unknown names: 30s, hourly past 1h of row age, dead-letter past 14 days). When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent. Attempts exceeding `Job::MAX_RUNTIME` are dropped and charged as retryable failures whose error names the limit. Dropping cancels async work only; work inside `spawn_blocking` keeps running. A job type may also declare a per-type in-process cap via `Job::CONCURRENCY` (`Concurrency::PerProcess(n)`): enforced at claim through a saturated-name exclusion in the claim SQL (a scan filter; the ordered walk is unchanged only when nothing is saturated), with raced claims released uncharged via `JobYield`. The counts live in memory per process — not cross-instance; the effective limit on an outside resource is cap × instances.
 
-`JobWorkerConfig.idle_poll_gate` optionally shares a process-local `IdlePollGate` among workers. Its permits limit periodic idle claims; a worker keeps a permit across empty sleeps and releases it before running a job or its heartbeat. A successful autocommit `Job::enqueue` calls `AppState::job_enqueued`, which an app may override to wake one parked worker for one extra claim. Direct SQL, other processes, transactional enqueue, due retries, and expired leases do not provide this local wake; the periodic claimers discover them. Notifications may coalesce or be lost, so SQL remains authoritative with the same priority order.
+`JobWorkerConfig.idle_poll_gate` optionally shares a process-local `IdlePollGate` among workers. Its permits limit periodic idle claims; a worker keeps a permit across empty sleeps and releases it before running a job or its heartbeat. A successful autocommit `Job::enqueue` calls `AppState::job_enqueued`, which an app may override to wake one parked worker for one extra claim. Direct SQL, other processes, transactional enqueue, due retries, and expired leases do not provide this local wake; the periodic claimers discover them. Notifications may coalesce or be lost, so SQL remains authoritative with the same priority order. `JobWorkerConfig.type_concurrency` carries the process-shared per-type running counts (default `ConcurrencyTracker::process_shared()`, which is also `ConcurrencyTracker::default()`; inject `ConcurrencyTracker::isolated()` to isolate embedded test fleets).
 
 ### Cron Flow
 

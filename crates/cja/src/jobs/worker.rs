@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
@@ -17,7 +17,7 @@ use tracing::Span;
 use crate::app_state::AppState as AS;
 
 use super::registry::JobRegistry;
-use super::{InvalidJobPayload, JobMaxRuntimeExceeded, JobYield, UnknownJobType};
+use super::{Concurrency, InvalidJobPayload, JobMaxRuntimeExceeded, JobYield, UnknownJobType};
 
 /// Default maximum number of retry attempts before a job is moved to the dead letter queue.
 ///
@@ -135,6 +135,121 @@ impl Drop for WaitingGuard<'_> {
     }
 }
 
+/// Process-local running counts per job type, backing
+/// [`Concurrency::PerProcess`] caps. Clone one instance into every worker
+/// that should share the same counts — [`JobWorkerConfig::default`] wires
+/// the process-shared instance for you.
+///
+/// This bounds in-process resources only. Each worker process counts its
+/// own attempts; the effective fleet-wide limit is cap x processes.
+#[derive(Clone, Debug)]
+pub struct ConcurrencyTracker(Arc<ConcurrencyTrackerInner>);
+
+#[derive(Debug, Default)]
+struct ConcurrencyTrackerInner(Mutex<HashMap<String, usize>>);
+
+impl ConcurrencyTrackerInner {
+    /// Lock the counts, recovering from poisoning instead of panicking:
+    /// the critical sections only insert / decrement `usize`s, so a
+    /// poisoned mutex still holds a structurally valid map — and
+    /// `unwrap()` inside `Drop` during an unwind would double-panic and
+    /// abort the process.
+    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl ConcurrencyTracker {
+    /// A tracker shared by no one else. For tests that embed several
+    /// independent worker fleets in one process. **Never construct one per
+    /// worker in production**: a tracker per worker turns a per-process
+    /// cap into a per-worker cap (the exact outage shape this feature
+    /// exists to prevent). Production code wants [`Self::process_shared`]
+    /// — or just `Default`, which is the same thing.
+    pub fn isolated() -> Self {
+        Self(Arc::new(ConcurrencyTrackerInner::default()))
+    }
+
+    /// The tracker `JobWorkerConfig::default()` uses: one instance per
+    /// process, so every worker task spawned with a defaulted config shares
+    /// the same counts.
+    pub fn process_shared() -> Self {
+        static SHARED: std::sync::LazyLock<Arc<ConcurrencyTrackerInner>> =
+            std::sync::LazyLock::new(|| Arc::new(ConcurrencyTrackerInner::default()));
+        Self(Arc::clone(&SHARED))
+    }
+
+    /// How many attempts of `name` this process currently counts as running.
+    pub fn running(&self, name: &str) -> usize {
+        self.0.counts().get(name).copied().unwrap_or(0)
+    }
+
+    /// Reserve one of the `cap` slots for `name`, if one is free. The
+    /// returned guard decrements the count when dropped; `None` means the
+    /// type is saturated.
+    pub fn try_acquire(&self, name: &str, cap: NonZeroUsize) -> Option<ConcurrencySlot> {
+        let mut counts = self.0.counts();
+        let running = counts.get(name).copied().unwrap_or(0);
+        if running >= cap.get() {
+            return None;
+        }
+        counts.insert(name.to_owned(), running + 1);
+        Some(ConcurrencySlot {
+            tracker: Some(Arc::clone(&self.0)),
+            name: name.to_owned(),
+        })
+    }
+}
+
+impl Default for ConcurrencyTracker {
+    /// The process-shared tracker ([`Self::process_shared`]) — deliberately
+    /// NOT an isolated one, so `Default::default()` keeps every worker in a
+    /// process on one counter. Tests that need isolation pass
+    /// [`ConcurrencyTracker::isolated`] explicitly.
+    fn default() -> Self {
+        Self::process_shared()
+    }
+}
+
+/// The RAII reservation returned by [`ConcurrencyTracker::try_acquire`].
+/// Dropping it releases the slot. `untracked()` guards are inert
+/// (nothing counted, nothing released) and stand in for
+/// [`Concurrency::Unlimited`] types.
+#[must_use = "dropping the slot releases the concurrency permit immediately"]
+pub struct ConcurrencySlot {
+    tracker: Option<Arc<ConcurrencyTrackerInner>>,
+    name: String,
+}
+
+impl ConcurrencySlot {
+    pub(crate) fn untracked() -> Self {
+        Self {
+            tracker: None,
+            name: String::new(),
+        }
+    }
+}
+
+impl Drop for ConcurrencySlot {
+    fn drop(&mut self) {
+        let Some(tracker) = self.tracker.take() else {
+            return;
+        };
+        let mut counts = tracker.counts();
+        if let Some(count) = counts.get_mut(&self.name) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.name);
+            }
+        } else {
+            tracing::warn!(job_type = %self.name,
+                "concurrency slot released without a running count");
+        }
+    }
+}
+
 /// Settings for the sole job worker. The reclaim window must be at least three
 /// heartbeat intervals; a larger window allows more transient DB failures.
 #[derive(Clone, Debug)]
@@ -151,6 +266,16 @@ pub struct JobWorkerConfig {
     pub shutdown_drain_timeout: Duration,
     /// Optional shared admission for idle claims. `None` keeps independent polling.
     pub idle_poll_gate: Option<IdlePollGate>,
+    /// Shared per-process running counts backing
+    /// [`crate::jobs::Concurrency::PerProcess`] caps. The default is the
+    /// process-shared tracker ([`ConcurrencyTracker::process_shared`],
+    /// which is also `ConcurrencyTracker::default`): one tracker per
+    /// process, so every worker spawned with a defaulted config shares
+    /// the same counts. Production full literals must pass `process_shared()`
+    /// (or `Default::default()`); tests embedding independent worker
+    /// fleets in one process should pass
+    /// [`ConcurrencyTracker::isolated`] instead.
+    pub type_concurrency: ConcurrencyTracker,
 }
 
 impl Default for JobWorkerConfig {
@@ -160,6 +285,7 @@ impl Default for JobWorkerConfig {
             reclaim_window: DEFAULT_RECLAIM_WINDOW,
             shutdown_drain_timeout: crate::tasks::ShutdownBudget::from_env().job_drain,
             idle_poll_gate: None,
+            type_concurrency: ConcurrencyTracker::process_shared(),
         }
     }
 }
@@ -383,63 +509,95 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             return Ok(RunJobOutcome::LeaseLost(job.job_id));
         }
 
-        let job_result = {
-            let mut body = std::pin::pin!(self.run_job(&job));
-            let mut next_tick = claimed.claim_sent_at + self.config.heartbeat_interval;
-            type HeartbeatResult = Result<
-                Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
-                tokio::time::error::Elapsed,
-            >;
-            let mut heartbeat: Option<Pin<Box<dyn Future<Output = HeartbeatResult> + Send + '_>>> =
-                None;
-            let mut heartbeat_sent_at = claimed.claim_sent_at;
-            loop {
-                let deadline = tracker.deadline();
-                tokio::select! {
-                    biased;
-                    result = &mut body => break result,
-                    () = tokio::time::sleep_until(deadline) => {
-                        tracing::warn!(job_id = %job.job_id, "Job lease watchdog expired");
-                        self.abandoned_jobs.lock().unwrap().insert(job.job_id);
-                        return Ok(RunJobOutcome::LeaseLost(job.job_id));
-                    }
-                    result = async { heartbeat.as_mut().expect("guarded heartbeat").await }, if heartbeat.is_some() => {
-                        heartbeat = None;
-                        match result {
-                            Ok(Ok(result)) if result.rows_affected() == 1 => {
-                                tracker.last_refresh_sent = heartbeat_sent_at;
-                            }
-                            Ok(Ok(_)) => {
-                                tracing::warn!(job_id = %job.job_id, owner = %self.owner_token, "Job lease ownership lost");
-                                return Ok(RunJobOutcome::LeaseLost(job.job_id));
-                            }
-                            Ok(Err(error)) => tracing::warn!(job_id = %job.job_id, %error, "Job heartbeat failed"),
-                            Err(_) => tracing::warn!(job_id = %job.job_id, "Job heartbeat timed out"),
+        // Per-process concurrency admission (DEV-2424). The claim already
+        // excluded saturated types; try_acquire closes the local race where
+        // another worker in this process took the last slot between our
+        // claim and here. A refusal is a JobYield: the row releases
+        // uncharged (existing branch below) and this worker moves on —
+        // never waiting on a slot while holding a claim.
+        let admitted = match self.registry.concurrency(&job.name) {
+            Concurrency::Unlimited => Ok(ConcurrencySlot::untracked()),
+            Concurrency::PerProcess(cap) => self
+                .config
+                .type_concurrency
+                .try_acquire(&job.name, cap)
+                .ok_or_else(|| {
+                    let name = &job.name;
+                    JobYield::new(format!(
+                        "{name} is at its per-process concurrency cap of {cap}"
+                    ))
+                }),
+        };
+        // `admitted` is matched BY VALUE with a `ref` Ok arm deliberately:
+        // `admitted` keeps owning the slot until `run_next_job` returns, so
+        // the guard is held across the body AND the finalization cascade
+        // below, released by Drop on every exit — success, failure,
+        // MAX_RUNTIME expiry (which drops only the body future inside
+        // run_job), yield, post-admission lease loss, and shutdown drain
+        // (which drops this whole future). Do NOT "simplify" `Ok(ref _slot)`
+        // to `Ok(_slot)`: a by-value binding's scope ends with this arm's
+        // block, dropping the guard BEFORE finalization.
+        let job_result = match admitted {
+            Ok(ref _slot) => {
+                let mut body = std::pin::pin!(self.run_job(&job));
+                let mut next_tick = claimed.claim_sent_at + self.config.heartbeat_interval;
+                type HeartbeatResult = Result<
+                    Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+                    tokio::time::error::Elapsed,
+                >;
+                let mut heartbeat: Option<
+                    Pin<Box<dyn Future<Output = HeartbeatResult> + Send + '_>>,
+                > = None;
+                let mut heartbeat_sent_at = claimed.claim_sent_at;
+                loop {
+                    let deadline = tracker.deadline();
+                    tokio::select! {
+                        biased;
+                        result = &mut body => break result,
+                        () = tokio::time::sleep_until(deadline) => {
+                            tracing::warn!(job_id = %job.job_id, "Job lease watchdog expired");
+                            self.abandoned_jobs.lock().unwrap().insert(job.job_id);
+                            return Ok(RunJobOutcome::LeaseLost(job.job_id));
                         }
-                    }
-                    () = tokio::time::sleep_until(next_tick), if heartbeat.is_none() => {
-                        let sent_at = tokio::time::Instant::now();
-                        next_tick = sent_at + self.config.heartbeat_interval;
-                        #[cfg(test)]
-                        if self.fail_heartbeats.try_update(
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                            |n| n.checked_sub(1),
-                        ).is_ok() {
-                            tracing::warn!(job_id = %job.job_id, "Synthetic heartbeat failure");
-                            continue;
+                        result = async { heartbeat.as_mut().expect("guarded heartbeat").await }, if heartbeat.is_some() => {
+                            heartbeat = None;
+                            match result {
+                                Ok(Ok(result)) if result.rows_affected() == 1 => {
+                                    tracker.last_refresh_sent = heartbeat_sent_at;
+                                }
+                                Ok(Ok(_)) => {
+                                    tracing::warn!(job_id = %job.job_id, owner = %self.owner_token, "Job lease ownership lost");
+                                    return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                                }
+                                Ok(Err(error)) => tracing::warn!(job_id = %job.job_id, %error, "Job heartbeat failed"),
+                                Err(_) => tracing::warn!(job_id = %job.job_id, "Job heartbeat timed out"),
+                            }
                         }
-                        let update = sqlx::query(
-                            "UPDATE jobs SET locked_at = NOW() WHERE job_id = $1 AND locked_by = $2"
-                        )
-                        .bind(job.job_id)
-                        .bind(&self.owner_token)
-                        .execute(self.state.db());
-                        heartbeat_sent_at = sent_at;
-                        heartbeat = Some(Box::pin(tokio::time::timeout(self.config.heartbeat_interval / 3, update)));
+                        () = tokio::time::sleep_until(next_tick), if heartbeat.is_none() => {
+                            let sent_at = tokio::time::Instant::now();
+                            next_tick = sent_at + self.config.heartbeat_interval;
+                            #[cfg(test)]
+                            if self.fail_heartbeats.try_update(
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                                |n| n.checked_sub(1),
+                            ).is_ok() {
+                                tracing::warn!(job_id = %job.job_id, "Synthetic heartbeat failure");
+                                continue;
+                            }
+                            let update = sqlx::query(
+                                "UPDATE jobs SET locked_at = NOW() WHERE job_id = $1 AND locked_by = $2"
+                            )
+                            .bind(job.job_id)
+                            .bind(&self.owner_token)
+                            .execute(self.state.db());
+                            heartbeat_sent_at = sent_at;
+                            heartbeat = Some(Box::pin(tokio::time::timeout(self.config.heartbeat_interval / 3, update)));
+                        }
                     }
                 }
             }
+            Err(yielded) => Err(yielded.into()),
         };
         // The body and all heartbeat futures have ended before finalization.
         if let Err(error) = job_result {
@@ -610,18 +768,35 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         Ok(true)
     }
 
+    /// Job-type names whose per-process concurrency cap is currently
+    /// reached, for the claim query's exclusion list. In-memory only: one
+    /// registry scan per claim, no DB work.
+    fn saturated_job_types(&self) -> Vec<String> {
+        R::job_names()
+            .iter()
+            .filter_map(|name| match self.registry.concurrency(name) {
+                Concurrency::PerProcess(cap) => (self.config.type_concurrency.running(name)
+                    >= cap.get())
+                .then(|| (*name).to_owned()),
+                Concurrency::Unlimited => None,
+            })
+            .collect()
+    }
+
     #[tracing::instrument(name = "worker.fetch_next_job", level = "trace", skip(self),
         fields(worker.id = %self.id, job.id = tracing::field::Empty,
             job.name = tracing::field::Empty, reclaim_window_secs = self.config.reclaim_window.as_secs()), err)]
     async fn fetch_next_job(&self) -> color_eyre::Result<Option<ClaimedJob>> {
         use sqlx::Row;
         let claim_sent_at = tokio::time::Instant::now();
+        let saturated = self.saturated_job_types();
         let row = sqlx::query(
             "WITH candidate AS MATERIALIZED (
                 SELECT job_id, locked_by AS previous_locked_by,
                        error_count AS previous_error_count
                 FROM jobs
                 WHERE run_at <= NOW()
+                  AND name <> ALL($3::text[])
                   AND (locked_by IS NULL OR locked_at < NOW() - $2::bigint * interval '1 microsecond')
                   AND (locked_by IS NULL OR error_count < 2147483647)
                 ORDER BY priority DESC, run_at ASC, created_at ASC
@@ -642,6 +817,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         )
         .bind(&self.owner_token)
         .bind(self.reclaim_window_micros)
+        .bind(&saturated)
         .fetch_optional(self.state.db())
         .await?;
         let Some(row) = row else { return Ok(None) };
@@ -826,6 +1002,23 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// limit. Each retry gets a fresh budget. The timeout cancels **async**
 /// work only — work already inside `spawn_blocking` keeps running after the
 /// drop, so jobs that hand work to blocking threads must bound it themselves.
+///
+/// # Per-Process Concurrency
+///
+/// A job type may declare [`Job::CONCURRENCY`](crate::jobs::Job::CONCURRENCY) =
+/// `Concurrency::PerProcess(n)` to cap how many of its attempts run
+/// concurrently per worker process. The cap is enforced at claim: saturated
+/// types are excluded from the claim query, so a worker claims the next
+/// runnable job of another type instead of parking behind the cap. A claim
+/// that raced a same-process worker for the last slot is released uncharged
+/// via `JobYield`. The slot is released when the attempt finalizes (success,
+/// failure, `MAX_RUNTIME` expiry, yield, lease loss, shutdown drain). Counts
+/// live in memory per process, shared by every worker task via
+/// `JobWorkerConfig::type_concurrency` — process-shared by default
+/// (`ConcurrencyTracker::process_shared()`, which is also `Default`); pass
+/// `ConcurrencyTracker::isolated()` to isolate embedded test fleets. The
+/// cap bounds in-process resources only: with M processes the effective
+/// limit on an outside resource (API, quota) is cap x M.
 ///
 /// # Graceful Shutdown
 ///
@@ -1320,6 +1513,48 @@ mod tests {
         }
     }
 
+    /// A job type capped at one concurrent attempt per process. `hang`
+    /// bodies park on the cancellation token (yielding on shutdown) so a
+    /// test can hold the single slot indefinitely; quick bodies finish at
+    /// once. The `id` matches the enqueue context ("capped-<id>") so tests
+    /// can observe exactly which row ran: the body rewrites the context to
+    /// "started-<id>".
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct CappedJob {
+        id: String,
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for CappedJob {
+        const NAME: &'static str = "CappedJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcess(NonZeroUsize::new(1).unwrap());
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            app_state: TestAppState,
+            cancellation_token: CancellationToken,
+        ) -> color_eyre::Result<()> {
+            sqlx::query(
+                "UPDATE jobs SET context = 'started-' || $1
+                 WHERE name = $2 AND context = 'capped-' || $1",
+            )
+            .bind(&self.id)
+            .bind(Self::NAME)
+            .execute(app_state.db())
+            .await?;
+            if self.hang {
+                cancellation_token.cancelled().await;
+                return Err(JobYield::new("test shutdown").into());
+            }
+            Ok(())
+        }
+    }
+
     impl_job_registry!(
         TestAppState,
         TestJob,
@@ -1331,7 +1566,8 @@ mod tests {
         YieldingJob,
         ChargedOnShutdownJob,
         HungJob,
-        SlowJob
+        SlowJob,
+        CappedJob
     );
 
     fn test_state(db: sqlx::PgPool) -> TestAppState {
@@ -1468,6 +1704,262 @@ mod tests {
         panic!("job {name} never started running");
     }
 
+    /// DEV-2424 regression: with cap 1 and one `CappedJob` attempt running
+    /// (hung), a second `CappedJob` row is not claimed even at higher
+    /// priority, while a lower-priority job of another type is.
+    #[sqlx::test]
+    async fn test_capped_type_saturated_skips_to_other_types(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        let tracker = ConcurrencyTracker::isolated();
+        let config = JobWorkerConfig {
+            heartbeat_interval: Duration::from_millis(300),
+            reclaim_window: Duration::from_millis(1200),
+            // Nonzero drain: the hung body yields on cancel, and the drain
+            // window lets that release complete before the worker exits
+            // (mirrors test_shutdown_yield_releases_uncharged).
+            shutdown_drain_timeout: Duration::from_secs(5),
+            idle_poll_gate: None,
+            type_concurrency: tracker.clone(),
+        };
+        // Phase 1: only capped-a exists. Whichever worker wins the claim
+        // hangs inside the body holding the single slot; the loser idles.
+        CappedJob {
+            id: "a".into(),
+            hang: true,
+        }
+        .enqueue(state.clone(), "capped-a".into(), Some(10))
+        .await
+        .unwrap();
+        let token = CancellationToken::new();
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                tokio::spawn(job_worker(
+                    state.clone(),
+                    Jobs,
+                    Duration::from_millis(20),
+                    20,
+                    token.clone(),
+                    config.clone(),
+                ))
+            })
+            .collect();
+        // started-a is written inside the body, after admission: once seen,
+        // the slot is provably held for as long as this test runs.
+        wait_for(|| async {
+            let started: Option<String> = sqlx::query_scalar(
+                "SELECT context FROM jobs WHERE name = 'CappedJob' AND context = 'started-a'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            started.is_some().then_some(())
+        })
+        .await;
+        // Phase 2: capped-b outranks the probe. The free worker must skip
+        // capped-b (type saturated) and claim the probe instead.
+        CappedJob {
+            id: "b".into(),
+            hang: true,
+        }
+        .enqueue(state.clone(), "capped-b".into(), Some(10))
+        .await
+        .unwrap();
+        NormalProbeJob
+            .enqueue(state.clone(), "normal".into(), None)
+            .await
+            .unwrap();
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_probe")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        let (error_count, locked_by, context): (i32, Option<String>, String) = sqlx::query_as(
+            "SELECT error_count, locked_by, context FROM jobs WHERE context = 'capped-b'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(error_count, 0, "capped-b must never be charged");
+        assert!(locked_by.is_none(), "capped-b must never be claimed");
+        assert_eq!(context, "capped-b", "capped-b must never be dispatched");
+        token.cancel();
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    }
+
+    /// DEV-2424 regression: a claim that raced a same-process worker for
+    /// the last slot (unsaturated at claim time, saturated by admission
+    /// time) must be released uncharged without dispatching the body.
+    /// Deterministic by construction: claim with an empty tracker, then
+    /// hold the slot from the test, then `run_next_job`.
+    #[sqlx::test]
+    async fn test_capped_claim_race_loser_releases_uncharged(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        let tracker = ConcurrencyTracker::isolated();
+        let worker = Worker::new(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
+                type_concurrency: tracker.clone(),
+            },
+        )
+        .unwrap();
+        CappedJob {
+            id: "a".into(),
+            hang: false,
+        }
+        .enqueue(test_state(db.clone()), "capped-a".into(), None)
+        .await
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().expect("claim");
+        // The racing winner takes the last slot between our claim and our
+        // admission.
+        let _winner = tracker
+            .try_acquire(CappedJob::NAME, NonZeroUsize::new(1).unwrap())
+            .expect("slot free");
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(matches!(outcome, RunJobOutcome::Released(_)));
+        let (error_count, locked_by, locked_at, context): (
+            i32,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT error_count, locked_by, locked_at, context FROM jobs WHERE name = 'CappedJob'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(error_count, 0, "a refused claim is never charged");
+        assert!(locked_by.is_none() && locked_at.is_none(), "row released");
+        assert_eq!(context, "capped-a", "body never dispatched");
+    }
+
+    /// DEV-2424: the slot must release when an attempt completes, or a
+    /// cap-1 type deadlocks behind its own success. Two quick `CappedJob`s
+    /// run sequentially under one worker.
+    #[sqlx::test]
+    async fn test_capped_slot_releases_on_completion(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        CappedJob {
+            id: "a".into(),
+            hang: false,
+        }
+        .enqueue(state.clone(), "capped-a".into(), None)
+        .await
+        .unwrap();
+        CappedJob {
+            id: "b".into(),
+            hang: false,
+        }
+        .enqueue(state.clone(), "capped-b".into(), None)
+        .await
+        .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
+            },
+        ));
+        // Both rows gone == both bodies ran AND both finalizations deleted
+        // their rows, so the cancel below cannot race a finalization.
+        wait_for(|| async {
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE name = 'CappedJob'")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            (remaining == 0).then_some(())
+        })
+        .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_concurrency_consts_and_registry_reflect_overrides() {
+        use crate::jobs::registry::JobRegistry;
+
+        assert_eq!(TestJob::CONCURRENCY, Concurrency::Unlimited);
+        assert_eq!(NormalProbeJob::CONCURRENCY, Concurrency::Unlimited);
+        assert_eq!(
+            CappedJob::CONCURRENCY,
+            Concurrency::PerProcess(NonZeroUsize::new(1).unwrap())
+        );
+        assert_eq!(
+            Jobs.concurrency("CappedJob"),
+            Concurrency::PerProcess(NonZeroUsize::new(1).unwrap())
+        );
+        assert_eq!(Jobs.concurrency("TestJob"), Concurrency::Unlimited);
+        assert_eq!(Jobs.concurrency("NoSuchJob"), Concurrency::Unlimited);
+    }
+
+    #[test]
+    fn test_concurrency_tracker_counts_and_releases() {
+        let tracker = ConcurrencyTracker::isolated();
+        let cap = NonZeroUsize::new(1).unwrap();
+        assert_eq!(tracker.running("CappedJob"), 0);
+        let first = tracker.try_acquire("CappedJob", cap).expect("first slot");
+        assert_eq!(tracker.running("CappedJob"), 1);
+        assert!(tracker.try_acquire("CappedJob", cap).is_none(), "saturated");
+        drop(first);
+        assert_eq!(tracker.running("CappedJob"), 0, "guard releases on drop");
+        // Bind, don't inline in assert!: a temporary guard drops at the end
+        // of the assert statement, releasing the slot early.
+        let second = tracker.try_acquire("CappedJob", cap).expect("reusable");
+        // An untracked guard is inert — nothing counted, nothing released.
+        drop(ConcurrencySlot::untracked());
+        assert_eq!(
+            tracker.running("CappedJob"),
+            1,
+            "untracked guard must not touch counts; second slot still held"
+        );
+        drop(second);
+        assert_eq!(tracker.running("CappedJob"), 0);
+    }
+
+    /// DEV-2424 pin: `ConcurrencyTracker::default()` IS the process-shared
+    /// tracker — the property that makes defaulted worker configs share
+    /// counts across a process (arena's motivating shape: 100 workers, one
+    /// counter). Unique name so parallel tests cannot collide on the
+    /// process-shared static.
+    #[test]
+    fn test_concurrency_tracker_default_is_process_shared() {
+        let name = format!("pin-{}", uuid::Uuid::new_v4());
+        let cap = NonZeroUsize::new(1).unwrap();
+        assert_eq!(ConcurrencyTracker::process_shared().running(&name), 0);
+        let slot = ConcurrencyTracker::default()
+            .try_acquire(&name, cap)
+            .expect("free slot");
+        assert_eq!(ConcurrencyTracker::process_shared().running(&name), 1);
+        drop(slot);
+        assert_eq!(ConcurrencyTracker::process_shared().running(&name), 0);
+    }
+
     #[sqlx::test]
     async fn test_panicking_job_is_charged_and_worker_continues(db: sqlx::PgPool) {
         sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
@@ -1491,6 +1983,7 @@ mod tests {
                 reclaim_window: Duration::from_millis(1200),
                 shutdown_drain_timeout: Duration::ZERO,
                 idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
             },
         ));
         wait_for(|| async {
@@ -1551,6 +2044,7 @@ mod tests {
                 reclaim_window: Duration::from_millis(1200),
                 shutdown_drain_timeout: Duration::ZERO,
                 idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
             },
         ));
         wait_until_started(&db, HungJob::NAME).await;
@@ -1682,6 +2176,7 @@ mod tests {
                     reclaim_window: Duration::from_millis(1200),
                     shutdown_drain_timeout: Duration::ZERO,
                     idle_poll_gate: None,
+                    type_concurrency: ConcurrencyTracker::isolated(),
                 },
             ));
             let count: i32 = wait_for(|| async {

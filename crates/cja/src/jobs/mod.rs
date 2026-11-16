@@ -106,7 +106,24 @@
 //!
 //! Multiple [`worker::job_worker`] instances can run safely — the worker SQL
 //! uses `FOR UPDATE SKIP LOCKED` to prevent duplicate processing at the
-//! database level.
+//! database level. Each worker process also tracks running counts per job
+//! type: a type declaring `Job::CONCURRENCY = PerProcess(n)` is excluded
+//! from claims while at its cap, so a saturated type never blocks other
+//! types.
+//!
+//! # Per-Process Concurrency
+//!
+//! A job type may declare `CONCURRENCY = Concurrency::PerProcess(n)` to cap
+//! how many of its attempts run concurrently. The cap is per worker process
+//! (in-memory, shared by all `job_worker` tasks via
+//! `JobWorkerConfig::type_concurrency`, process-shared by default).
+//! Saturated types are skipped at claim (`name <> ALL(...)`), so a worker
+//! claims the next runnable job of another type; a raced claim is released
+//! uncharged via [`JobYield`]; and the slot is released when the attempt
+//! finalizes (success, failure, [`Job::MAX_RUNTIME`] expiry, yield, lease
+//! loss, shutdown drain). The cap bounds in-process resources only — for
+//! outside resources (APIs, quotas) the effective limit is cap × instances,
+//! not the cap.
 //!
 //! # Cancellation Support
 //!
@@ -152,6 +169,7 @@
 //! | `created_at` | TIMESTAMPTZ | Original creation time |
 //! | `failed_at` | TIMESTAMPTZ | When moved to dead letter |
 
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::app_state::AppState as AS;
@@ -240,8 +258,8 @@ pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
 pub use worker::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MAX_RETRIES, DEFAULT_RECLAIM_WINDOW, IdlePollGate,
-    JobWorkerConfig,
+    ConcurrencyTracker, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MAX_RETRIES, DEFAULT_RECLAIM_WINDOW,
+    IdlePollGate, JobWorkerConfig,
 };
 
 /// Default maximum runtime per job attempt ([`Job::MAX_RUNTIME`]).
@@ -320,6 +338,37 @@ pub struct InvalidJobPayload(#[from] serde_json::Error);
 pub struct JobMaxRuntimeExceeded {
     /// The `Job::MAX_RUNTIME` that expired.
     pub limit: Duration,
+}
+
+/// A job type's declared concurrency limit, enforced by the worker at claim
+/// time. See [`Job::CONCURRENCY`].
+///
+/// This enum is `non_exhaustive`: a cross-instance (`Global`) or rate-limit
+/// variant may be added later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Concurrency {
+    /// No limit (the default): any number of attempts of this type may run
+    /// concurrently in this process.
+    Unlimited,
+    /// At most `N` attempts of this job type run concurrently **per worker
+    /// process**. All `job_worker` tasks in the process share one counter
+    /// (via [`crate::jobs::worker::JobWorkerConfig::type_concurrency`], whose
+    /// default is process-shared), so the cap holds across every worker the
+    /// process spawns.
+    ///
+    /// This bounds **in-process** resources (CPU, memory, blocking-pool
+    /// threads an attempt occupies). It is NOT a ticket for outside
+    /// resources: with M processes (instances), the effective limit on an
+    /// external API or quota is `N x M`, because each process counts only
+    /// its own attempts. Use it for semaphore-style in-process limits; do
+    /// not use it to protect a rate-limited third-party API.
+    ///
+    /// Saturated types are excluded from the worker's claim query, so
+    /// workers claim the next runnable job of another type instead of
+    /// parking. Combined with [`Job::MAX_RUNTIME`], a hung attempt releases
+    /// its slot in bounded time.
+    PerProcess(NonZeroUsize),
 }
 
 /// A trait for defining background jobs that can be enqueued and processed asynchronously.
@@ -492,6 +541,27 @@ pub trait Job<AppState: AS>:
     /// threads must bound it themselves (e.g. with their own timeout around
     /// the blocking call) if it must not outlive the attempt.
     const MAX_RUNTIME: Duration = DEFAULT_MAX_RUNTIME;
+
+    /// Maximum number of attempts of this job type that may run concurrently
+    /// in one worker process. Defaults to [`Concurrency::Unlimited`].
+    ///
+    /// Enforced at claim time: a worker whose process already has
+    /// `PerProcess(n)` attempts of this type running will not claim another
+    /// row of this type (it claims the next runnable job of any other type
+    /// instead), and a raced claim is released uncharged. The slot is held
+    /// for the whole attempt — body plus finalization — and released on
+    /// success, failure, [`Job::MAX_RUNTIME`] expiry, yield, lease loss, and
+    /// shutdown drain.
+    ///
+    /// # Caveat
+    ///
+    /// Per **process**: this bounds in-process resources only. The effective
+    /// limit on an outside resource (API, quota) is the cap times your
+    /// instance count. Work already inside `spawn_blocking` is not cancelled
+    /// when an attempt ends; the count tracks attempts, not OS threads, so
+    /// blocking work that outlives its attempt (see `MAX_RUNTIME`'s caveat)
+    /// is invisible to the counter.
+    const CONCURRENCY: Concurrency = Concurrency::Unlimited;
 
     /// Execute the job logic.
     ///
