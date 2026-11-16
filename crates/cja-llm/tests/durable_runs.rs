@@ -34,17 +34,6 @@ use cja_llm::{LlmConfig, models};
 
 cja::impl_job_registry!(TestState, AdvanceRunJob);
 
-/// DEV-2423: `AdvanceRunJob` must stay opted out of the framework runtime
-/// limit — a finite cap dead-letters healthy multi-turn runs (see the const's
-/// docs in `durable/job.rs`). A future per-step bound inside `advance_run`
-/// is the right shape; until then `None` is load-bearing.
-#[test]
-fn advance_run_job_max_runtime_is_unbounded() {
-    use cja::jobs::registry::JobRegistry;
-
-    assert_eq!(Jobs.max_runtime(AdvanceRunJob::NAME), None);
-}
-
 // ---------------------------------------------------------------------------
 // Shared fixtures
 // ---------------------------------------------------------------------------

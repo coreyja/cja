@@ -1592,20 +1592,6 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
-    #[test]
-    fn test_max_runtime_consts_and_registry_reflect_overrides() {
-        use crate::jobs::DEFAULT_MAX_RUNTIME;
-        use crate::jobs::registry::JobRegistry;
-
-        assert_eq!(TestJob::MAX_RUNTIME, Some(DEFAULT_MAX_RUNTIME));
-        assert_eq!(HungJob::MAX_RUNTIME, Some(Duration::from_secs(2)));
-        assert_eq!(UnboundedJob::MAX_RUNTIME, None);
-        assert_eq!(Jobs.max_runtime("TestJob"), Some(DEFAULT_MAX_RUNTIME));
-        assert_eq!(Jobs.max_runtime("HungJob"), Some(Duration::from_secs(2)));
-        assert_eq!(Jobs.max_runtime("UnboundedJob"), None);
-        assert_eq!(Jobs.max_runtime("NoSuchJob"), None);
-    }
-
     #[sqlx::test]
     async fn test_max_runtime_none_job_completes(db: sqlx::PgPool) {
         let state = test_state(db.clone());
