@@ -5,25 +5,25 @@
 //! call, one tool batch, or one ask suspension. The step's final persist
 //! (`Attempt::persist_step_end`) commits the step's state, the run's
 //! NEXT-STEP job row (deduplicating against an existing unlocked row for
-//! the run, so duplicate rows converge instead of multiplying into
-//! parallel chains), and the lease release in ONE transaction, then wakes
-//! the worker; the attempt returns `Ok`. Terminal and waiting states
-//! (done, failed, cancelled, waiting on ask) enqueue nothing. Each
-//! attempt is therefore bounded like any other job — a deploy or shutdown
-//! interrupts at most one step, and the queued next-step rows survive it.
+//! the run so duplicate rows converge instead of multiplying into parallel
+//! chains), and the lease release in ONE transaction, then wakes the
+//! worker; the attempt returns `Ok`. Terminal and waiting states (done,
+//! failed, cancelled, waiting on ask) enqueue nothing. Each attempt is
+//! bounded like any other job — a deploy or shutdown interrupts at most one
+//! step, and queued next-step rows survive it.
 //!
-//! The runner (`AgentRunner`) cannot hand its `AgentRun` back, so this module
-//! replays the runner's driving protocol itself (mirroring
-//! `rig-agent/src/agent/engine.rs`): `next_step()` → `CallModel` (prepare,
-//! advertise, `model.call`, `model_response`) → `CallTools` (execute via the
-//! built agent's toolset, `run.answer`) → `Done`. Every `Err` return from the
-//! job goes through [`Durable::retry_or_requeue`]: after persisted
-//! progress (now only the mid-batch case — an early tool answer persisted
-//! with progress, then a retryable error on a later call in the same
-//! batch) it hands the run to a fresh job row, otherwise it releases the
-//! lease and errors so cja's backoff retries the same row — except a
-//! deploy-shutdown notice, which returns [`cja::jobs::JobYield`] and is
-//! released uncharged and immediately claimable by a post-deploy worker.
+//! `AgentRunner` cannot hand its `AgentRun` back, so this module replays
+//! the runner's driving protocol (mirroring `rig-agent/src/agent/engine.rs`):
+//! `next_step()` → `CallModel` (prepare, advertise, `model.call`,
+//! `model_response`) → `CallTools` (execute via the built agent's toolset,
+//! `run.answer`) → `Done`. Every `Err` return from the job goes through
+//! [`Durable::retry_or_requeue`]. After persisted progress (now only
+//! the mid-batch case — an early tool answer persisted with progress, then a
+//! retryable error on a later call in the same batch), it hands the run to
+//! a fresh job row. Otherwise, it releases the lease and errors so cja's
+//! backoff retries the same row — except on a deploy-shutdown notice, which
+//! returns [`cja::jobs::JobYield`] and is released uncharged and
+//! immediately claimable by a post-deploy worker.
 //!
 //! No panics or unwraps anywhere on this path: a panic is caught by cja's
 //! worker and retried 20× into dead-letter on a permanent condition,
@@ -57,14 +57,13 @@ const WRITE_BOUND: Duration = Duration::from_secs(5);
 /// default 2s `shutdown_drain_timeout`.
 const RELEASE_BOUND: Duration = Duration::from_secs(1);
 
-/// The outcome of one step helper for the attempt driver.
+/// Outcome of a step helper for the attempt driver.
 enum StepOutcome {
     /// Persisted, keep going WITHIN this step (the pre-call checkpoint, a
-    /// non-final tool answer inside a batch). Never escapes a step
-    /// helper: every step path ends in a handoff, a terminal, or a
-    /// `Retry`.
+    /// non-final tool answer in a batch). Never escapes a step helper:
+    /// every step path ends in a handoff, a terminal, or a `Retry`.
     Continue,
-    /// The step completed and its end-persist committed the next-step job
+    /// The step completed, and its end-persist committed the next-step job
     /// row and released the lease — the attempt ends `Ok`. Returned only
     /// by [`Attempt::persist_step_end`]'s commit branch.
     HandedOff,
@@ -133,10 +132,10 @@ impl RunSnapshot {
     }
 }
 
-/// Map a next-step enqueue failure onto `sqlx::Error` so the step-end
-/// transaction keeps one error type: the enqueue helpers only produce
-/// [`super::RunError::Storage`] (any other variant is impossible here and
-/// is preserved as a protocol error — still an attempt `Retry`, never a
+/// Map a next-step enqueue failure to `sqlx::Error` so the step-end
+/// transaction keeps one error type. Enqueue helpers only produce
+/// [`super::RunError::Storage`]; any other variant is impossible here and
+/// is preserved as a protocol error (still an attempt `Retry`, never a
 /// silent loss).
 fn run_error_into_sqlx(error: super::RunError) -> sqlx::Error {
     match error {
@@ -401,16 +400,16 @@ impl Durable {
         })
     }
 
-    /// Advance one run ONE STEP as a cja job attempt: claim, run a
-    /// single step (`CallModel`, `CallTools`, or `Done`), and end — the
-    /// step's end-persist (`Attempt::persist_step_end`) has already
-    /// committed the next-step job and released the lease, or the state
-    /// was terminal/waiting and enqueues nothing. Never in the request
-    /// path; `shutdown` is the worker's shutdown token (deploys), a
-    /// different signal from user cancellation. Takes the app state so
-    /// step helpers can enqueue the next-step job row and wake the
-    /// worker, and a progress-separated retryable error can enqueue a
-    /// fresh job row ([`Self::retry_or_requeue`]).
+    /// Advance a run ONE STEP as a cja job attempt: claim, execute one
+    /// step (`CallModel`, `CallTools`, or `Done`), and return.
+    /// `Attempt::persist_step_end` has either committed the next-step
+    /// job and released the lease, or the state was terminal/waiting and
+    /// nothing was enqueued. Never called in the request path.
+    /// `shutdown` is the worker's shutdown token (for deploys), distinct
+    /// from user cancellation. Takes the app state so step helpers can
+    /// enqueue the next-step job row and wake the worker, and so a
+    /// progress-separated retryable error can enqueue a fresh job row
+    /// ([`Self::retry_or_requeue`]).
     pub(crate) async fn advance_run<S: super::HasDurable>(
         &self,
         state: &S,
@@ -558,23 +557,23 @@ impl Durable {
     }
 
     /// A retryable error ended this attempt. If the attempt persisted at
-    /// least one ADVANCING step since it claimed (now only the mid-batch
+    /// least one ADVANCING step since claiming (now only the mid-batch
     /// case: an early tool answer persisted with progress, then a
     /// retryable error on a later call in the same batch), hand the run
     /// to a FRESH job row instead of erroring: release + enqueue in one
     /// transaction, wake the worker, return `Ok`. cja deletes the errored
     /// row on `Ok`, and the fresh row starts at `error_count = 0` — so
     /// errors separated by successful steps never escalate cja's
-    /// `2^(n+1)`s backoff and never dead-letter it through the error path
-    /// (a shutdown [`cja::jobs::JobYield`] takes this path released and
+    /// `2^(n+1)`s backoff or dead-letter it through the error path (a
+    /// shutdown [`cja::jobs::JobYield`] takes this path released and
     /// uncharged). Crashes and lost job leases still charge the same row
     /// via cja's reclaim; a dead-lettered row orphans the run until
     /// [`super::recover_orphans`] re-enqueues it.
     /// Zero-progress attempts keep the plain `Err` path (release + cja
-    /// backoff): only consecutive no-progress failures may escalate. A
-    /// crash between this transaction's commit and cja's delete of the
-    /// old row leaves a duplicate — duplicates converge because every
-    /// next-step enqueue reuses an existing unlocked row for the run
+    /// backoff): only consecutive no-progress failures escalate. A crash
+    /// between this transaction's commit and cja's delete of the old row
+    /// leaves a duplicate — duplicates converge because every next-step
+    /// enqueue reuses an existing unlocked row for the run
     /// ([`super::enqueue_next_step_on_tx`]).
     async fn retry_or_requeue<S: super::HasDurable>(
         &self,
@@ -596,9 +595,9 @@ impl Durable {
     /// on the caller's `Ok`). The enqueue is dedup-aware
     /// ([`super::enqueue_next_step_on_tx`]): an unlocked row for the run
     /// (e.g. a lost-delete duplicate) is pulled forward instead of
-    /// inserting a second carrier. Bounded by the lease-write bound;
-    /// `false` on any failure or timeout so the caller falls back to the
-    /// plain release + `Err` path — recovery is then bounded by lease
+    /// inserting a second carrier. Subject to the lease-write bound;
+    /// returns `false` on failure or timeout so the caller falls back to
+    /// the plain release + `Err` path — recovery is then bounded by lease
     /// takeover, never an orphan.
     async fn requeue_with_fresh_job<S: super::HasDurable>(
         &self,
@@ -827,9 +826,9 @@ impl Attempt<'_> {
     /// DB write — simulating process death between persists, so the
     /// on-disk state is exactly the previous persist's. One-shot: re-armed
     /// only by the test. Without the reset, a crash before the model call
-    /// would loop forever (every resume repeats that same persist).
-    /// Shared by both persist kinds (`persist` and `persist_step_end`) so
-    /// the persist-count rhythm is identical to production.
+    /// would loop forever, as every resume repeats that persist. Shared by
+    /// `persist` and `persist_step_end` so the persist-count rhythm matches
+    /// production.
     #[cfg(feature = "testing")]
     fn inject_if_armed(&self) -> Option<StepOutcome> {
         let count = self.durable.persist_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -846,12 +845,12 @@ impl Attempt<'_> {
     }
 
     /// Persist the run after a state transition that does NOT end the
-    /// step (the pre-call checkpoint, a non-final tool answer inside a
-    /// batch, and `done_step`'s pre-persist), projecting any newly
-    /// committed messages, then check for user cancellation. When
-    /// `advanced` is set (this persist follows a committed model response
-    /// or tool answer — NOT the pre-call checkpoint) and the write lands,
-    /// the attempt is marked as having made progress.
+    /// step (the pre-call checkpoint, a non-final tool answer in a batch,
+    /// and `done_step`'s pre-persist), projecting newly committed
+    /// messages, then check for user cancellation. When `advanced` is set
+    /// (this persist follows a committed model response or tool answer —
+    /// NOT the pre-call checkpoint) and the write lands, mark the attempt
+    /// as having made progress.
     async fn persist(&self, run: &AgentRun, advanced: bool) -> StepOutcome {
         #[cfg(feature = "testing")]
         if let Some(injected) = self.inject_if_armed() {
@@ -956,10 +955,10 @@ impl Attempt<'_> {
     /// projection + next-step `AdvanceRunJob` enqueue (deduplicating
     /// against an existing unlocked row for the run) + lease release;
     /// commit; wake the worker only after commit. `Ok` lease-lost is a
-    /// silent stop, as everywhere. On `cancel_requested` the state is
-    /// committed WITHOUT an enqueue (lease kept) and the run finishes
-    /// `cancelled` via [`Durable::finish_run`] — a cancelled run must
-    /// never enqueue a next step.
+    /// silent stop, as everywhere. On `cancel_requested`, commit the state
+    /// WITHOUT an enqueue (lease kept) and finish the run `cancelled` via
+    /// [`Durable::finish_run`] — a cancelled run must never enqueue a next
+    /// step.
     async fn persist_step_end<S: super::HasDurable>(
         &self,
         state: &S,
@@ -1086,7 +1085,7 @@ impl Attempt<'_> {
     }
 
     /// One `CallModel` step: prepare + advertise + persist-before-call +
-    /// guarded model call + `model_response` + token budget + the step-end
+    /// guarded model call + `model_response` + token budget + step-end
     /// handoff persist.
     async fn call_model_step<S: super::HasDurable>(
         &self,
@@ -1236,8 +1235,8 @@ impl Attempt<'_> {
 
     /// One `CallTools` step: intercept `ask` (suspend), execute everything
     /// else through the built agent's toolset with the idempotency key in
-    /// its context, answer malformed calls with corrective feedback. Each
-    /// answered call persists (crash-resume identity); the LAST call's
+    /// its context, and answer malformed calls with corrective feedback.
+    /// Each answered call persists (crash-resume identity); the LAST call's
     /// persist is the step-end handoff — the batch's final state, the
     /// next-step job, and the lease release commit together.
     async fn call_tools_step<S: super::HasDurable>(
@@ -1337,10 +1336,10 @@ impl Attempt<'_> {
         StepOutcome::Retry(cja::color_eyre::eyre::eyre!("empty tool batch"))
     }
 
-    /// An `ask` call: parse its arguments; on success suspend the run
+    /// An `ask` call: parse its arguments; on success, suspend the run
     /// (waiting + relational ask identity + lease cleared, atomically) and
-    /// end the attempt Ok — a waiting run holds no worker and no job. An
-    /// ask whose arguments don't parse never suspends: answer it with a
+    /// end the attempt Ok — a waiting run holds no worker or job. An ask
+    /// whose arguments don't parse never suspends: answer it with a
     /// corrective failure and end the attempt via the step-end handoff
     /// (the corrective answer always ends the batch; remaining sibling
     /// calls re-emit on the next attempt).

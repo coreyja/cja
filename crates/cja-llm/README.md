@@ -143,12 +143,12 @@ assert_eq!(fake.requests().len(), 1);
 
 A durable agent run is a **cja background job, never in the request path** —
 specifically a **chain of `AdvanceRunJob` rows, one step each** (a model
-call, a tool batch, or an ask suspension per attempt). In production each
-step's handoff inserts a fresh row (`jobs.context = agent-run-step:<kind>`)
-and the previous row is deleted when its attempt returns `Ok`. Its whole
-conversation is persisted in Postgres (`agent_runs` /
-`agent_messages`), so a run survives deploys, crashes, and job retries,
-pauses for human input, and resumes exactly where it left off.
+call, a tool batch, or an ask suspension per attempt). In production, each
+step's handoff inserts a fresh row (`jobs.context = agent-run-step:<kind>`),
+and the previous row is deleted when its attempt returns `Ok`. The whole
+conversation is persisted in Postgres (`agent_runs` / `agent_messages`), so
+a run survives deploys, crashes, and job retries, pauses for human input,
+and resumes exactly where it left off.
 
 ### Enabling
 
@@ -263,7 +263,7 @@ not `waiting` returns a typed error.
 At most one worker advances a run at a time. Each attempt claims the run
 (`queued`, or `running` with a stale lease) with a fresh identity, runs
 exactly ONE step, and hands off: the step's final persist commits the
-step's state, the next-step `AdvanceRunJob`, and the lease release in one
+step state, the next-step `AdvanceRunJob`, and the lease release in one
 transaction. Attempts heartbeat every `lease_takeover / 3` (default 90s
 window, so 30s heartbeats) while a model call or tool runs.
 `lease_takeover` **must stay below cja's `reclaim_window`** (default
@@ -273,18 +273,17 @@ returning. **Next-step enqueues are idempotent**: if an unlocked
 `AdvanceRunJob` row for the run already exists (a lost cja delete, a
 crash between handoff commit and delete, an ambiguous commit timeout), it
 is pulled forward (`run_at = NOW()`, `error_count = 0`) instead of
-inserting, so duplicate rows converge to one carrier instead of
+inserting, so duplicate rows converge to one carrier rather than
 multiplying into parallel chains; duplicates that find a fresh foreign
 lease still back off. **Transient errors never use up the retry budget**:
 each step hands off to a row at `error_count = 0`, so only *consecutive*
 zero-progress failures on one row escalate (first retry at ~2s) — a long
 run that hits a transient blip per step never escalates the `2^(n+1)`s
-backoff and never dead-letters its job through the error path. The
-residual progress-separated requeue (an early tool answer persisted with
-progress, then a retryable error on a later call in the same batch) still
-hands the run to a fresh row the same way. Crashes and lost job leases
-still charge the executing row via cja's reclaim, so the row can
-dead-letter —
+backoff or dead-letters its job through the error path. The residual
+progress-separated requeue (an early tool answer persisted with progress,
+then a retryable error on a later call in the same batch) hands the run
+to a fresh row the same way. Crashes and lost job leases still charge the
+executing row via cja's reclaim, so the row can dead-letter —
 [`durable::recover_orphans`](#registration-drift-shutdown-wiring-and-ops)
 is the backstop that re-enqueues such orphans. A duplicate job that finds
 the row leased by a live owner errors (backoff) instead of completing —
@@ -305,29 +304,26 @@ a path must enqueue.
 
 ### Cancel vs shutdown
 
-- **User `cancel(run_id)`** marks a queued/waiting run (or a `running` run
-  under a dead lease — the orphaned-run escape hatch) `cancelled` directly;
-  a live `running` run is flagged and its owner marks it `cancelled` at the
-  next step boundary — including the suspension write, which checks
-  `cancel_requested` under the row lock and finishes `cancelled` instead of
-  parking the question: a cancel is never lost behind an unanswered ask.
-  The transcript is preserved in every case. Cancelling an
-  already-`cancelled` run is `Ok`; other terminal statuses are rejected.
+- **User `cancel(run_id)`** directly marks a queued/waiting run (or a `running`
+  run under a dead lease — the orphaned-run escape hatch) `cancelled`. A live
+  `running` run is flagged so its owner marks it `cancelled` at the next step
+  boundary. This includes the suspension write, which checks `cancel_requested`
+  under the row lock and finishes `cancelled` instead of parking the question:
+  a cancel is never lost behind an unanswered ask. Every case preserves the
+  transcript. Cancelling an already-`cancelled` run returns `Ok`; other
+  terminal statuses are rejected.
 - **Deploy shutdown never terminates a run.** A deploy interrupts at most
-  ONE step: the next-step job rows survive in the queue, and a
-  post-deploy worker resumes at the last persist. The worker's shutdown
-  token aborts the in-flight step and releases the run lease within cja's
-  `shutdown_drain_timeout` (default 2s; keep any custom drain ≥ the 1s
-  release bound). The run is then handed back the same way any retryable
-  error is: after persisted progress, via a fresh job row picked up
-  immediately; otherwise by yielding the attempt (`cja::jobs::JobYield`)
-  so cja releases the row uncharged — no failure is charged and no
-  backoff is applied; a first-attempt row is immediately claimable
-  again. In both cases the post-deploy worker
-  claims the unleased row and resumes at the last persist. If the handler
-  is dropped anyway or the process is `SIGKILL`ed,
-  recovery falls back to lease expiry (90s) / cja reclaim (~120s) — delayed,
-  never lost.
+  ONE step: next-step job rows survive in the queue, and a post-deploy worker
+  resumes at the last persist. The worker's shutdown token aborts the in-flight
+  step and releases the run lease within cja's `shutdown_drain_timeout`
+  (default 2s; keep any custom drain ≥ the 1s release bound). The run is handed
+  back like any retryable error: after persisted progress, via a fresh job row
+  picked up immediately; otherwise by yielding the attempt
+  (`cja::jobs::JobYield`) so cja releases the row uncharged and without
+  backoff, leaving a first-attempt row immediately claimable again. Either way,
+  the post-deploy worker claims the unleased row and resumes at the last
+  persist. If the handler is dropped or the process is `SIGKILL`ed, recovery
+  falls back to lease expiry (90s) / cja reclaim (~120s) — delayed, never lost.
 
 ### Limits and failure classification
 
@@ -352,12 +348,11 @@ job completes instead of retrying a poison payload into dead-letter.
 - **Retried by cja backoff** (lease released, job errors): connection
   failures, 429, 5xx. Each step hands off to a fresh row at
   `error_count = 0`, so transient errors never accumulate across a long
-  run — only consecutive zero-progress failures on one row escalate
-  toward dead-letter; the residual mid-batch progress case requeues on a
-  fresh row exactly like a handoff.
+  run. Only consecutive zero-progress failures on one row escalate toward
+  dead-letter; mid-batch progress requeues on a fresh row like a handoff.
 - **Failed immediately** (job completes, no retry storm): gateway identity
   rejection, budget exceeded (HTTP 402), admin-only route, schema failures,
-  timeouts (the attempt may have been billed; re-calling would double-bill
+  timeouts (the attempt may have been billed; retrying would double-bill
   and fork the transcript), unknown kind, corrupt run state, protocol
   errors.
 
@@ -370,18 +365,18 @@ pre-existing version constraint, newly load-bearing per step.
 
 ### The enqueue/wake contract
 
-`start`, `answer`, the worker's own step-handoff enqueues (context
+`start`, `answer`, the worker's step-handoff enqueues (context
 `agent-run-step:<kind>`, via the deduplicating helper), and the
 progress-separated requeue all enqueue `AdvanceRunJob` through cja's
-`Job::enqueue_on` **on the same transaction as the row write**, and call
+`Job::enqueue_on` **on the same transaction as the row write**, calling
 `state.job_enqueued()` only after commit — the same span/receipt/INSERT as
-every cja enqueue. If you ever enqueue `AdvanceRunJob` yourself, use
+every cja enqueue. If you enqueue `AdvanceRunJob` yourself, use
 `enqueue_on` on your own connection and wake after commit the same way.
 For the one sanctioned recovery case — a dead-lettered job row orphaning
-its run — `durable::recover_orphans` is the built-in sweep; register it
-as a cron (below) instead of hand-enqueueing. The failure mode of
-skipping the wake is silent: a `queued`/`running` run with no worker
-woken, latched until the periodic idle poll (or `cancel()`).
+its run — register the built-in `durable::recover_orphans` sweep as a cron
+(below) instead of hand-enqueueing. Skipping the wake fails silently: a
+`queued`/`running` run with no woken worker stays latched until the
+periodic idle poll (or `cancel()`).
 
 ### Registration drift, shutdown wiring, and ops
 
@@ -389,14 +384,14 @@ woken, latched until the periodic idle poll (or `cancel()`).
   `impl_job_registry!` compiles fine and fails only at runtime with
   `Unknown job type`. One-line app test:
   `assert!(Jobs::job_names().contains(&AdvanceRunJob::NAME));`
-- **Shutdown wiring**: cancel-vs-shutdown only works if the app wires
+- **Shutdown wiring**: cancel-vs-shutdown works only if the app wires
   `SIGTERM` → one shared `CancellationToken` → `job_worker` (see the
-  reference `main.rs` in `crates/home-server`). An unwired token means
-  `SIGTERM` kills the process mid-step — recovery still works (lease
-  expiry), just slower.
+  reference `main.rs` in `crates/home-server`). With an unwired token,
+  `SIGTERM` kills the process mid-step — recovery still works via lease
+  expiry, just slower.
 - **Orphan recovery**: register a cron calling `durable::recover_orphans`
   every few minutes — it re-enqueues `queued`/`running` runs with a dead
-  lease and no `AdvanceRunJob` row (dead-lettered, or vanished through a
+  lease and no `AdvanceRunJob` row (dead-lettered, or vanished via a
   payload that no longer deserializes after a deploy), leaving job-backed
   and `waiting` runs alone:
   ```rust
@@ -404,30 +399,30 @@ woken, latched until the periodic idle poll (or `cancel()`).
       Box::pin(async move { cja_llm::durable::recover_orphans(&state).await.map(|_| ()) })
   });
   ```
-  All enqueues go through the enqueue/wake contract above. Since cja#84 a
+  All enqueues go through the enqueue/wake contract above. Since cja#84, a
   failing tick is logged and the process survives, so propagate the `Err`.
   A new interval cron fires on the first tick after boot — benign here:
-  freshly-orphaned runs still hold stale leases until the takeover window
-  passes, and job-backed runs are skipped by the job check. A run whose
-  every attempt fails permanently-but-retryably cycles dead-letter →
-  re-enqueue: the `Err` path's backoff stretches each cycle over days,
-  but a process-fatal attempt (OOM, abort, or a panic that aborts) is
-  faster — cja's reclaim charges the row without backoff, so the job
-  re-runs about every 120s and dead-letters after 21 claims (~42
-  minutes), and the sweep then re-enqueues it at `error_count` 0. The
-  crash loop repeats until `cancel()`, the operator exit.
+  freshly orphaned runs hold stale leases until the takeover window
+  passes, and the job check skips job-backed runs. A run whose every
+  attempt fails permanently-but-retryably cycles dead-letter →
+  re-enqueue: `Err` backoff stretches each cycle over days, but a
+  process-fatal attempt (OOM, abort, or aborting panic) is faster — cja's
+  reclaim charges the row without backoff, so the job re-runs about every
+  120s and dead-letters after 21 claims (~42 minutes), then the sweep
+  re-enqueues it at `error_count` 0. The crash loop repeats until
+  `cancel()`, the operator exit.
 - **Ops sizing**: a run occupies one worker slot per step, not for its
   duration — no worker is pinned indefinitely, and a per-job-type runtime
   limit needs no special case. Worst-case resume delay after an
-  ungraceful death is cja's reclaim window (~120s), not the run lease;
-  after a graceful shutdown the run resumes immediately (a fresh job row
-  when the attempt had made progress, otherwise the uncharged yield
-  leaves the row claimable at its existing `run_at`).
+  ungraceful death is cja's reclaim window (~120s), not the run lease.
+  After a graceful shutdown, the run resumes immediately (via a fresh job
+  row if the attempt made progress; otherwise, the uncharged yield leaves
+  the row claimable at its existing `run_at`).
 - **Tool authority**: app tools run in-process with the app's full
   authority, driven by model output — file-style tools must validate paths
   (reject absolute and `..`); execution-style tools need a subprocess
   boundary.
-- **Migrations**: call `cja_llm::durable::run_migrations`, never copy the
+- **Migrations**: call `cja_llm::durable::run_migrations`; never copy the
   SQL. Runtime-checked SQL compiles fine against a missing table and fails
   only at runtime (`relation "agent_runs" does not exist`). For dev
   databases: drop and recreate; never `sqlx migrate revert` (revert walks

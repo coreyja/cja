@@ -7,17 +7,16 @@ use super::HasDurable;
 
 /// Advance one agent run — exactly ONE step per job attempt (a model
 /// call, a tool batch, or an ask suspension). The step's final persist
-/// enqueues the run's next-step job and releases the run lease in the
-/// SAME transaction, reusing an existing unlocked row for the run if one
-/// survived (duplicates converge instead of multiplying), so the run
-/// advances as a chain of short attempts and each attempt is bounded
-/// like any other job — a per-job-type runtime limit needs no special
-/// case here and no `None` exception once cja#93 / DEV-2423 lands it.
-/// Terminal and waiting states
-/// (done, failed, cancelled, waiting on ask) enqueue nothing.
-/// Payload is just the run id: kind, input, and model
-/// are read from the row. Registered in an app's `impl_job_registry!` as the
-/// plain struct — no type parameter.
+/// enqueues the next-step job and releases the run lease in the SAME
+/// transaction, reusing any surviving unlocked row for the run so
+/// duplicates converge instead of multiplying. The run advances as a
+/// chain of short attempts, each bounded like any other job — a
+/// per-job-type runtime limit needs no special case or `None` exception
+/// once cja#93 / DEV-2423 lands it. Terminal and waiting states (done,
+/// failed, cancelled, waiting on ask) enqueue nothing. Payload is just
+/// the run id: kind, input, and model are read from the row. Registered
+/// in an app's `impl_job_registry!` as the plain struct — no type
+/// parameter.
 ///
 /// A queued payload can survive a deploy: any field added later must land
 /// with `#[serde(default)]`, or old rows fail to deserialize and dead-letter
