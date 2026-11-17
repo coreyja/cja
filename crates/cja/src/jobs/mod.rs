@@ -91,10 +91,9 @@
 //! failure whose message names the limit; each retry gets a fresh budget.
 //! The timeout cancels **async** work only — work already inside
 //! `spawn_blocking` keeps running after the drop, so jobs that hand work to
-//! blocking threads must bound it themselves. Move the attempt's
-//! concurrency `slot` (see [`Job::run_with_cancellation`]) into the
-//! `spawn_blocking` closure and the attempt's concurrency budget stays
-//! held until that work ends.
+//! blocking threads must bound it themselves. Move the attempt's concurrency
+//! `slot` (see [`Job::run_with_cancellation`]) into the `spawn_blocking`
+//! closure to hold the concurrency budget until that work ends.
 //!
 //! # Idempotency
 //!
@@ -113,25 +112,24 @@
 //! type: a type declaring `Job::CONCURRENCY = PerProcess(n)` is excluded
 //! from claims while at its cap, and types sharing a
 //! `Concurrency::PerProcessShared` key are excluded while the shared
-//! budget is saturated — so a saturated scope never blocks other types.
+//! budget is saturated. A saturated scope never blocks other types.
 //!
 //! # Per-Process Concurrency
 //!
-//! A job type may declare `CONCURRENCY = Concurrency::PerProcess(n)` to cap
-//! its concurrent attempts, or `Concurrency::PerProcessShared { key, limit }`
-//! to share one named budget with several job types — every type declaring
-//! the same `key` (with the same `limit`; conflicting limits fail worker
-//! startup) counts against one in-process counter. The cap is per worker
-//! process (in-memory, shared by all `job_worker` tasks via
-//! `JobWorkerConfig::type_concurrency`, process-shared by default).
-//! Saturated scopes are skipped at claim (`name <> ALL(...)`), so a worker
-//! claims the next runnable job of another type. A raced claim is released
-//! uncharged via [`JobYield`], and the slot is released when the attempt
-//! finalizes (success, failure, [`Job::MAX_RUNTIME`] expiry, yield, lease
-//! loss, shutdown drain). A body can also move its `slot` into
-//! `spawn_blocking` to hold the budget until that blocking work ends. The
-//! cap bounds in-process resources only — for outside resources (APIs,
-//! quotas), the effective limit is cap × instances.
+//! A job type can declare `CONCURRENCY = Concurrency::PerProcess(n)` to cap
+//! concurrent attempts, or `Concurrency::PerProcessShared { key, limit }` to
+//! share a named budget across job types — every type with the same `key`
+//! (and `limit`; conflicting limits fail worker startup) counts against one
+//! in-process counter. The cap is per worker process (in-memory, shared by
+//! all `job_worker` tasks via `JobWorkerConfig::type_concurrency`,
+//! process-shared by default). Saturated scopes are skipped at claim
+//! (`name <> ALL(...)`), so a worker claims the next runnable job of another
+//! type. A raced claim is released uncharged via [`JobYield`], and a slot is
+//! released when the attempt finalizes (success, failure,
+//! [`Job::MAX_RUNTIME`] expiry, yield, lease loss, shutdown drain). A body
+//! can also move its `slot` into `spawn_blocking` to hold the budget until
+//! that blocking work ends. The cap bounds in-process resources only — for
+//! outside resources (APIs, quotas), the effective limit is cap × instances.
 //!
 //! # Cancellation Support
 //!
@@ -379,45 +377,43 @@ pub enum Concurrency {
     PerProcess(NonZeroUsize),
     /// At most `limit` attempts run concurrently per worker process across
     /// **every job type declaring the same `key`**: one shared in-process
-    /// counter per key, counted through the same
-    /// [`crate::jobs::worker::JobWorkerConfig::type_concurrency`] tracker
-    /// as [`Concurrency::PerProcess`]. Several job types that contend for
-    /// one resource — Arena's archive types sharing a single backup slot
-    /// on a 1-vCPU box — express a single budget by declaring the same
-    /// `key` and `limit` on each type.
+    /// counter per key, tracked through
+    /// [`crate::jobs::worker::JobWorkerConfig::type_concurrency`] like
+    /// [`Concurrency::PerProcess`]. Job types contending for one resource
+    /// — e.g., Arena's archive types sharing a backup slot on a 1-vCPU box
+    /// — share a budget by declaring the same `key` and `limit`.
     ///
     /// Every type sharing a key MUST declare the same `limit`: conflicting
     /// limits fail worker startup instead of being silently min'd or
-    /// max'd. The validation is per registry at worker build; two
-    /// registries in one process sharing the process-shared tracker with
-    /// conflicting limits is not detected (documented limitation). A
-    /// shared key and a type's [`Concurrency::PerProcess`] scope are
-    /// separate namespaces: a key spelled like a job type name is a
-    /// different budget from that type's per-type scope.
+    /// max'd. Validation runs per registry at worker build; conflicting
+    /// limits across two registries in one process sharing the
+    /// process-shared tracker are not detected (documented limitation).
+    /// Shared keys and [`Concurrency::PerProcess`] scopes use separate
+    /// namespaces: a key matching a job type name has a separate budget
+    /// from that type's per-type scope.
     ///
-    /// Enforced exactly like [`Concurrency::PerProcess`]: types whose key
-    /// is saturated are excluded from the worker's claim query (so a
-    /// worker claims the next runnable job of an unrelated type instead
-    /// of parking), a raced claim is released uncharged via
-    /// [`JobYield`], and the slot is held for the whole attempt. The cap
-    /// bounds **in-process** resources only — for outside resources
-    /// (APIs, quotas), the effective limit is `limit x instances`.
+    /// Enforced like [`Concurrency::PerProcess`]: types with a saturated
+    /// key are excluded from the claim query (so the worker claims an
+    /// unrelated runnable job instead of parking), raced claims release
+    /// uncharged via [`JobYield`], and the slot is held for the whole
+    /// attempt. The cap bounds **in-process** resources only — for
+    /// external resources (APIs, quotas), the effective limit is
+    /// `limit x instances`.
     ///
-    /// A body can keep the shared budget held across blocking work that
-    /// outlives its attempt — for example, so the next archive cannot
-    /// start while the CPU work of a `MAX_RUNTIME`-expired attempt still
-    /// runs: override [`Job::run_with_cancellation`] and move its `slot`
-    /// into the `spawn_blocking` closure (`let _held = slot;` at the top
-    /// of the closure). The budget stays held until the closure exits.
-    /// Blocking work that holds a slot must bound itself (its own
-    /// timeout): an unbounded closure saturates the key until the
-    /// process exits — fail-closed, never fail-open.
+    /// A body can hold the shared budget across blocking work that
+    /// outlives its attempt — e.g., preventing the next archive from
+    /// starting while CPU work from a `MAX_RUNTIME`-expired attempt
+    /// finishes: override [`Job::run_with_cancellation`] and move `slot`
+    /// into the `spawn_blocking` closure (`let _held = slot;` at the top).
+    /// The budget stays held until the closure exits. Slot-holding
+    /// blocking work must bound itself with its own timeout: an unbounded
+    /// closure saturates the key until process exit — fail-closed, never
+    /// fail-open.
     PerProcessShared {
-        /// The name of the shared budget: every job type declaring this
-        /// same `key` (and the same `limit`) shares one in-process
-        /// counter.
+        /// Shared budget name: job types declaring the same `key` (and
+        /// `limit`) share one in-process counter.
         key: &'static str,
-        /// The maximum concurrent attempts across every type declaring
+        /// The maximum concurrent attempts across all types declaring
         /// `key`.
         limit: NonZeroUsize,
     },
@@ -630,24 +626,24 @@ pub trait Job<AppState: AS>:
     /// drain.
     ///
     /// `Concurrency::PerProcessShared { key, limit }` instead caps the
-    /// **combined** attempts of every job type declaring the same `key`
-    /// (all of which must declare the same `limit`; conflicting limits
-    /// fail worker startup) — one named budget for several types
-    /// contending for a single resource. See that variant's docs for the
-    /// full story, including holding the budget across blocking work that
-    /// outlives the attempt by moving this attempt's `slot` (the
+    /// **combined** attempts of all job types declaring the same `key`
+    /// (they must declare the same `limit`; conflicts fail worker
+    /// startup) — one named budget for several types contending for a
+    /// single resource. See that variant's docs for the full story,
+    /// including holding the budget across blocking work that outlives
+    /// the attempt by moving this attempt's `slot` (the
     /// `run_with_cancellation` parameter) into the `spawn_blocking`
     /// closure.
     ///
     /// # Caveat
     ///
-    /// Per **process**: this bounds in-process resources only. The effective
-    /// limit on an outside resource (API, quota) is the cap times your
-    /// instance count. Work already inside `spawn_blocking` is not cancelled
-    /// when an attempt ends; the count tracks attempts, not OS threads, so
-    /// blocking work that outlives its attempt (see `MAX_RUNTIME`'s caveat)
-    /// is invisible to the counter — unless the body moves its `slot`
-    /// into the closure, which holds the budget until the closure exits.
+    /// Per **process**: bounds in-process resources only. The effective limit
+    /// on an outside resource (API, quota) is the cap times your instance
+    /// count. Work already in `spawn_blocking` is not cancelled when an
+    /// attempt ends; the count tracks attempts, not OS threads, so blocking
+    /// work that outlives its attempt (see `MAX_RUNTIME`'s caveat) is
+    /// invisible to the counter — unless the body moves its `slot` into the
+    /// closure, holding the budget until the closure exits.
     const CONCURRENCY: Concurrency = Concurrency::Unlimited;
 
     /// Execute the job logic.
@@ -666,15 +662,14 @@ pub trait Job<AppState: AS>:
     /// ignores the token and calls `run()`, so existing jobs continue to work
     /// without changes.
     ///
-    /// The `slot` parameter is the worker's handle on this attempt's
-    /// concurrency budget ([`Job::CONCURRENCY`]). The worker keeps its own
-    /// handle for the whole attempt, so the default implementation — and any
-    /// override that ignores `slot` — is safe: dropping this clone early
-    /// releases nothing. A body that hands work to `spawn_blocking` can move
-    /// `slot` into the closure (`let _held = slot;` at the top) so the
-    /// budget stays held until that blocking work ends — for a shared key,
-    /// this is how the next archive waits out the CPU work of an attempt
-    /// whose `MAX_RUNTIME` already expired.
+    /// `slot` is the worker's handle on this attempt's concurrency budget
+    /// ([`Job::CONCURRENCY`]). The worker keeps its own handle for the whole
+    /// attempt, so the default implementation — and any override that ignores
+    /// `slot` — is safe: dropping this clone early releases nothing. A body
+    /// that hands work to `spawn_blocking` can move `slot` into the closure
+    /// (`let _held = slot;` at the top) to hold the budget until that blocking
+    /// work ends — for a shared key, this is how the next archive waits out
+    /// the CPU work of an attempt whose `MAX_RUNTIME` expired.
     ///
     /// When the token fires, a job body has three options:
     ///

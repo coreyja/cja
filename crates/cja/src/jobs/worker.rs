@@ -135,10 +135,10 @@ impl Drop for WaitingGuard<'_> {
     }
 }
 
-/// One in-process concurrency budget that attempts are counted against —
-/// the map key of [`ConcurrencyTracker`]. The two variants are separate
-/// namespaces: a shared key spelled like a job type name is a different
-/// budget from that type's implicit per-type scope.
+/// One in-process concurrency budget that attempts count against — the map
+/// key of [`ConcurrencyTracker`]. The two variants are separate namespaces:
+/// a shared key spelled like a job type name is a distinct budget from that
+/// type's implicit per-type scope.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ConcurrencyScope {
     /// The implicit per-type budget of [`Concurrency::PerProcess`], keyed
@@ -201,11 +201,10 @@ impl ConcurrencyTracker {
         self.0.counts().get(scope).copied().unwrap_or(0)
     }
 
-    /// Reserve one of the `limit` slots for `scope`, if one is free.
-    /// `None` means the scope is saturated. The returned guard releases the
-    /// count when its LAST handle drops (clones share the same counted
-    /// unit), so a body can move one into `spawn_blocking` and hold the
-    /// budget until that work ends.
+    /// Reserve one of the `limit` slots for `scope`, or return `None` if the
+    /// scope is saturated. The guard releases the count when its LAST handle
+    /// drops (clones share the counted unit), so a body can move one into
+    /// `spawn_blocking` and hold the budget until that work ends.
     pub fn try_acquire(
         &self,
         scope: ConcurrencyScope,
@@ -236,31 +235,28 @@ impl Default for ConcurrencyTracker {
 }
 
 /// The RAII reservation returned by [`ConcurrencyTracker::try_acquire`].
-/// Dropping the last handle releases the slot: `Clone` yields another
-/// handle on the SAME counted unit, not a new reservation, and the count
-/// decrements only when every handle has dropped. That is the mechanism
-/// for holding a budget across blocking work that outlives the attempt:
-/// override `run_with_cancellation`, clone the slot, and move the clone
-/// into the `spawn_blocking` closure with `let _held = slot;` bound at
-/// the TOP of the closure (NOT `let _ = slot;`, which drops it
-/// immediately and releases the budget) — the worker keeps its own
-/// handle across body + finalization, so every existing release path
-/// (success, failure, `MAX_RUNTIME` expiry, yield, lease loss, shutdown
-/// drain) is unchanged, and the budget stays held until the closure
-/// exits.
+/// `Clone` yields another handle on the SAME counted unit, not a new
+/// reservation; dropping the last handle decrements the count and
+/// releases the slot. To hold a budget across blocking work that
+/// outlives the attempt, override `run_with_cancellation`, clone the
+/// slot, and move the clone into the `spawn_blocking` closure with
+/// `let _held = slot;` bound at the TOP of the closure (NOT
+/// `let _ = slot;`, which drops it immediately and releases the budget).
+/// The worker keeps its own handle across body + finalization, leaving
+/// every existing release path (success, failure, `MAX_RUNTIME` expiry,
+/// yield, lease loss, shutdown drain) unchanged while keeping the budget
+/// held until the closure exits.
 ///
-/// An extended hold is fail-closed: a blocking closure that never returns
-/// saturates its scope until the process exits (claims of every type on
-/// the key are skipped — never run over-budget), which is the safe
-/// direction but means blocking work that holds a slot must bound itself
-/// (its own timeout). The worker logs an info event when a body keeps
-/// handles past its attempt and another when the last handle finally
-/// releases, so a wedge is visible.
+/// Extended holds are fail-closed: a blocking closure that never returns
+/// saturates its scope until the process exits, skipping claims of every
+/// type on the key rather than running over-budget. Because of this,
+/// blocking work holding a slot must enforce its own timeout. To make a
+/// wedge visible, the worker logs an info event when a body keeps handles
+/// past its attempt and another when the last handle releases.
 ///
 /// `untracked()` guards hold nothing (inert for
-/// [`Concurrency::Unlimited`] types) and are the argument to pass when
-/// calling `run_with_cancellation` outside the worker (tests, direct
-/// dispatch).
+/// [`Concurrency::Unlimited`] types); pass one when calling
+/// `run_with_cancellation` outside the worker (tests, direct dispatch).
 #[must_use = "dropping the slot releases the concurrency permit immediately"]
 #[derive(Clone)]
 pub struct ConcurrencySlot(Option<Arc<ConcurrencySlotInner>>);
@@ -316,10 +312,10 @@ impl ConcurrencySlot {
         Self(None)
     }
 
-    /// Whether handles other than this one still hold the slot — the body
-    /// moved its clone into work that outlives the attempt. Marks the
-    /// inner so its final release is logged; returns the scope for the
-    /// caller's log line. `None` for untracked / fully-released slots.
+    /// Whether other handles still hold the slot — the body moved its
+    /// clone into work that outlives the attempt. Marks the inner so its
+    /// final release is logged; returns the scope for the caller's log
+    /// line. `None` for untracked / fully-released slots.
     pub(crate) fn note_held_past_attempt(&self) -> Option<&ConcurrencyScope> {
         let inner = self.0.as_ref()?;
         if Arc::strong_count(inner) > 1 {
@@ -354,10 +350,10 @@ pub struct JobWorkerConfig {
     /// [`crate::jobs::Concurrency::PerProcessShared`] budgets. Defaults to
     /// the process-shared tracker ([`ConcurrencyTracker::process_shared`],
     /// also `ConcurrencyTracker::default`): one tracker per process, so
-    /// every worker spawned with a defaulted config shares the same counts.
+    /// every worker spawned with a defaulted config shares counts.
     /// Production full literals must pass `process_shared()` (or
     /// `Default::default()`); tests embedding independent worker fleets in
-    /// one process should pass [`ConcurrencyTracker::isolated`] instead.
+    /// one process should pass [`ConcurrencyTracker::isolated`].
     pub type_concurrency: ConcurrencyTracker,
 }
 
@@ -536,8 +532,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
 
     /// Reject job types that declare the same shared concurrency key with
     /// conflicting limits (same key + same limit is legal). Per registry
-    /// only: two registries in one process sharing the process-shared
-    /// tracker with conflicting limits is not detected — a documented
+    /// only: conflicting limits across two registries in one process
+    /// sharing the process-shared tracker are not detected — a documented
     /// limitation of [`Concurrency::PerProcessShared`].
     fn validate_shared_limits(registry: &R) -> color_eyre::Result<()> {
         // key -> (first declaring type name, its limit)
@@ -907,7 +903,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
     }
 
     /// Job-type names whose per-process concurrency scope is saturated —
-    /// its own `PerProcess` cap or its `PerProcessShared` key's budget —
+    /// their own `PerProcess` cap or `PerProcessShared` key's budget —
     /// for the claim query's exclusion list. In-memory only: one registry
     /// scan per claim, no DB work.
     fn saturated_job_types(&self) -> Vec<String> {
@@ -1143,22 +1139,21 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 ///
 /// # Per-Process Concurrency
 ///
-/// A job type may declare [`Job::CONCURRENCY`](crate::jobs::Job::CONCURRENCY) =
-/// `Concurrency::PerProcess(n)` to cap its concurrent attempts per worker
-/// process, or `Concurrency::PerProcessShared { key, limit }` to share one
-/// named budget across several job types (every type on a key must declare
-/// the same `limit`; conflicting limits fail worker startup). Both are
-/// enforced at claim: types whose scope is saturated are excluded from the
-/// claim query, so a worker claims the next runnable job of another type
-/// instead of parking behind the cap. A claim that raced a same-process worker
-/// for the last slot is released uncharged via `JobYield`. The slot is
-/// released when the attempt finalizes (success, failure, `MAX_RUNTIME`
-/// expiry, yield, lease loss, shutdown drain) — or, if the body moved a
-/// clone of its slot into `spawn_blocking`, when that blocking work ends
-/// (the worker's own handle covers the standard paths; the closure's handle
-/// extends the hold). Counts live in memory per process, shared across
-/// worker tasks via `JobWorkerConfig::type_concurrency`
-/// — process-shared by default (`ConcurrencyTracker::process_shared()`, also
+/// A job type can declare [`Job::CONCURRENCY`](crate::jobs::Job::CONCURRENCY) =
+/// `Concurrency::PerProcess(n)` to cap concurrent attempts per worker
+/// process, or `Concurrency::PerProcessShared { key, limit }` to share a
+/// named budget across job types (every type on a key must declare the same
+/// `limit`; conflicts fail worker startup). Both are enforced at claim:
+/// saturated scopes are excluded from the claim query, so a worker claims
+/// the next runnable job of another type instead of parking behind the cap.
+/// A claim that raced a same-process worker for the last slot is released
+/// uncharged via `JobYield`. The slot is released when the attempt finalizes
+/// (success, failure, `MAX_RUNTIME` expiry, yield, lease loss, shutdown
+/// drain) — or, if the body moved a clone of its slot into `spawn_blocking`,
+/// when that blocking work ends (the worker's handle covers standard paths;
+/// the closure's handle extends the hold). Counts live in memory per process,
+/// shared across worker tasks via `JobWorkerConfig::type_concurrency` —
+/// process-shared by default (`ConcurrencyTracker::process_shared()`, also
 /// `Default`); pass `ConcurrencyTracker::isolated()` to isolate embedded test
 /// fleets. The cap bounds in-process resources only: with M processes, the
 /// effective limit on an outside resource (API, quota) is cap x M.
@@ -1741,8 +1736,8 @@ mod tests {
     /// A shared-key type on "archive": `hang` bodies park on the
     /// cancellation token (yielding on shutdown) so a test can hold the
     /// single shared slot indefinitely. The `id` matches the enqueue
-    /// context ("shared-<id>") so tests can observe exactly which row ran:
-    /// the body rewrites the context to "started-shared-<id>".
+    /// context ("shared-<id>") so tests can see which row ran: the body
+    /// rewrites the context to "started-shared-<id>".
     #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
     struct SharedArchiveJob {
         id: String,
@@ -1813,8 +1808,8 @@ mod tests {
         }
     }
 
-    /// A shared-key type on "archive" that finishes at once: rewrites its
-    /// context and leaves a probe marker, so tests can observe exactly
+    /// A shared-key type on "archive" that finishes immediately, rewriting
+    /// its context and leaving a probe marker so tests can observe exactly
     /// when the shared budget admitted it.
     #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
     struct SharedQuickJob;
@@ -1893,10 +1888,10 @@ mod tests {
         }
     }
 
-    /// Conflict fixtures: same shared key, different limits — only ever
-    /// registered in [`shared_conflict_jobs`]' own registry below, never
-    /// the main tests registry (a limit-2 declaration on "archive" would
-    /// fail every other test's worker build).
+    /// Conflict fixtures: same shared key, different limits — registered
+    /// only in [`shared_conflict_jobs`]' registry below, never the main
+    /// tests registry (a limit-2 declaration on "archive" would fail every
+    /// other test's worker build).
     #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
     struct ConflictAJob;
 
@@ -2382,10 +2377,10 @@ mod tests {
     }
 
     /// DEV-2431: types sharing a `PerProcessShared` key share ONE budget.
-    /// With the holder hung, a different type on the same key is excluded
-    /// from claims (never claimed, never charged) while an unrelated type
-    /// still flows. Under per-type scoping the free worker would claim the
-    /// quick row at once and the context assertion fails.
+    /// With the holder hung, another type on the same key is excluded from
+    /// claims (never claimed, never charged) while an unrelated type still
+    /// flows. Under per-type scoping, the free worker would claim the quick
+    /// row immediately and the context assertion would fail.
     #[sqlx::test]
     async fn test_shared_key_saturated_skips_to_other_types(db: sqlx::PgPool) {
         sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
@@ -2471,9 +2466,9 @@ mod tests {
 
     /// DEV-2431: a hung holder on a shared key must free the SHARED slot at
     /// `MAX_RUNTIME` expiry so a different type on the key can run. Two
-    /// workers (a single worker serializes attempts, which would make the
-    /// test vacuous); the quick row is enqueued only after the holder
-    /// provably started.
+    /// workers (a single worker serializes attempts, making the test
+    /// vacuous); the quick row is enqueued only after the holder provably
+    /// starts.
     #[sqlx::test]
     async fn test_shared_key_hung_holder_frees_slot_on_max_runtime_expiry(db: sqlx::PgPool) {
         sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
