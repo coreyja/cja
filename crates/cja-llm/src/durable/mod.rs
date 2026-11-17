@@ -865,7 +865,7 @@ async fn enqueue_on_tx<S: HasDurable>(
 
 /// Enqueue the run's NEXT-STEP [`AdvanceRunJob`] on an open transaction,
 /// deduplicating against an existing unlocked row for the same run.
-/// MUST run as a LATER statement of the caller's transaction than the
+/// MUST run as a LATER statement in the caller's transaction than the
 /// `agent_runs` row UPDATE (same READ COMMITTED discipline as
 /// [`db::has_advancing_job`]: inlined into the locking statement, the
 /// check reads a pre-wait snapshot). Without reuse, a duplicate row (a

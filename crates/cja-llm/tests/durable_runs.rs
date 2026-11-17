@@ -109,7 +109,7 @@ fn stalls_for(run: RunId) -> usize {
 }
 
 /// Record the run, then stall long enough for the test to cancel the
-/// attempt mid-tool — the `with_lease_guards` shutdown arm's fixture.
+/// attempt mid-tool — the fixture for the `with_lease_guards` shutdown arm.
 #[rig_tool(description = "Record the run, stall, then add")]
 async fn stall_add(
     #[rig(context)] context: &mut rig_core::tool::ToolContext,
@@ -297,9 +297,9 @@ async fn setup(kinds: &[&'static AgentKind]) -> Env {
 }
 
 /// Drive one job attempt directly (no worker): the unit of "one retry".
-/// One attempt advances exactly ONE step — a model call, a tool batch, or
-/// an ask suspension — and never locks or deletes a `jobs` row, so the
-/// `start()` row stays unlocked and every handoff reuses it (the dedup
+/// An attempt advances exactly ONE step — a model call, a tool batch, or
+/// an ask suspension — without locking or deleting a `jobs` row. The
+/// `start()` row stays unlocked, and every handoff reuses it (the dedup
 /// helper) instead of inserting.
 async fn drive(state: &TestState, run: RunId) -> cja::color_eyre::Result<()> {
     AdvanceRunJob { run_id: run.0 }
@@ -402,7 +402,7 @@ async fn jobs_for(db: &sqlx::PgPool, run: RunId) -> i64 {
     .expect("count jobs")
 }
 
-/// How many UNLOCKED `AdvanceRunJob` rows exist for the run — the dedup
+/// Number of UNLOCKED `AdvanceRunJob` rows for the run — the dedup
 /// invariant's observable (the executing row is locked by cja and
 /// excluded; steady state is at most one unlocked carrier).
 async fn unlocked_jobs_for(db: &sqlx::PgPool, run: RunId) -> i64 {
@@ -1868,14 +1868,13 @@ async fn mid_batch_shutdown_requeues_on_a_fresh_job_row() {
 /// only job row. With one step per attempt, every 503 here hits a
 /// ZERO-progress attempt (the pre-call checkpoint is not progress) on a
 /// row the previous step's handoff already made fresh (`error_count = 0`,
-/// pulled forward): only consecutive failures on one row may escalate, so
-/// no row ever carries `error_count > 1`. The handoff itself is exercised
-/// by `one_attempt_advances_exactly_one_step`; the progress-separated
-/// requeue path (an early tool answer persisted, then a retryable error
-/// later in the same batch) is covered by
-/// `mid_batch_shutdown_requeues_on_a_fresh_job_row`. Driving through a
-/// real worker makes `error_count` real; the test polls it after every
-/// attempt.
+/// pulled forward). Only consecutive failures on one row may escalate, so
+/// no row ever carries `error_count > 1`.
+/// `one_attempt_advances_exactly_one_step` exercises the handoff itself;
+/// `mid_batch_shutdown_requeues_on_a_fresh_job_row` covers the
+/// progress-separated requeue path (an early tool answer persisted, then a
+/// retryable error later in the same batch). Driving through a real worker
+/// makes `error_count` real; the test polls it after every attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn progress_separated_errors_requeue_on_a_fresh_job_row() {
     // Reference transcript for the identical-run assertion.

@@ -188,12 +188,12 @@ where
 
 /// Persist one step's state on an OPEN transaction: conditionally update
 /// the run state (proving lease ownership), then insert the newly
-/// committed transcript messages. Does NOT commit and does NOT roll
-/// back — the caller adds the step-end writes (next-job enqueue + lease
-/// release, or nothing) and commits, or drops the transaction to discard
-/// everything (dropping a `Transaction` rolls it back; there is no
-/// `rollback()` on a bare `&mut PgConnection`). `Ok(None)` = lease lost
-/// (caller discards the transaction, writes nothing).
+/// committed transcript messages. Does NOT commit or roll back — the
+/// caller adds the step-end writes (next-job enqueue + lease release, or
+/// nothing) and commits, or drops the transaction to discard everything
+/// (dropping a `Transaction` rolls it back; there is no `rollback()` on
+/// a bare `&mut PgConnection`). `Ok(None)` = lease lost (caller discards
+/// the transaction, writes nothing).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) async fn persist_step_on_tx(
     tx: &mut sqlx::PgConnection,
