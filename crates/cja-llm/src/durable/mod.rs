@@ -863,6 +863,62 @@ async fn enqueue_on_tx<S: HasDurable>(
     .map(|_| ())
 }
 
+/// Enqueue the run's NEXT-STEP [`AdvanceRunJob`] on an open transaction,
+/// deduplicating against an existing unlocked row for the same run.
+/// MUST run as a LATER statement of the caller's transaction than the
+/// `agent_runs` row UPDATE (same READ COMMITTED discipline as
+/// [`db::has_advancing_job`]: inlined into the locking statement, the
+/// check reads a pre-wait snapshot). Without reuse, a duplicate row (a
+/// lost cja delete, a crash between handoff commit and delete, an
+/// ambiguous commit timeout) claims the freed lease after a handoff and
+/// enqueues its own successor — permanently parallel chains per run.
+/// The executing worker's own row is excluded automatically: cja locks
+/// it (`locked_by`) for the attempt's duration. `error_count` resets on
+/// reuse: the row's errors were concurrency backoffs or predate the
+/// run's latest progress, so they must never escalate to dead-letter.
+async fn enqueue_next_step_on_tx<S: HasDurable>(
+    tx: &mut sqlx::PgConnection,
+    run_id: uuid::Uuid,
+    context: String,
+) -> Result<(), RunError> {
+    // (1) A separate statement AFTER the caller's row UPDATE — never
+    // inlined into it (see the doc above). The executing row is locked
+    // by cja and therefore never matches.
+    let existing: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT job_id FROM jobs
+         WHERE name = $1 AND payload->>'run_id' = $2 AND locked_by IS NULL
+         ORDER BY run_at, created_at
+         LIMIT 1",
+    )
+    .bind(job::AdvanceRunJob::NAME)
+    .bind(run_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(job_id) = existing {
+        // (2) Pull the carrier forward — never skip: the run just made
+        // progress, so the row is due NOW, not at its backed-off run_at.
+        // If zero rows match (claimed in the interim), fall through to
+        // the insert.
+        let reused = sqlx::query(
+            "UPDATE jobs SET run_at = NOW(), error_count = 0
+             WHERE job_id = $1 AND locked_by IS NULL",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if reused {
+            tracing::debug!(job.id = %job_id, "next-step job reused");
+            return Ok(());
+        }
+    }
+    // (3) No reusable carrier: the sanctioned insert (same span,
+    // receipt, and INSERT as every cja enqueue; the caller wakes after
+    // commit).
+    enqueue_on_tx::<S>(tx, run_id, context).await
+}
+
 fn decode_error(column: &str, value: &str) -> RunError {
     RunError::Storage(sqlx::Error::ColumnDecode {
         index: column.to_owned(),
