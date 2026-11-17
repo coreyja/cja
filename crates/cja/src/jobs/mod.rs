@@ -387,7 +387,7 @@ pub enum Concurrency {
     /// limits fail worker startup instead of being silently min'd or
     /// max'd. Validation runs per registry at worker build; conflicting
     /// limits across two registries in one process sharing the
-    /// process-shared tracker are not detected (documented limitation).
+    /// process-shared tracker are not detected.
     /// Shared keys and [`Concurrency::PerProcess`] scopes use separate
     /// namespaces: a key matching a job type name has a separate budget
     /// from that type's per-type scope.

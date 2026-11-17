@@ -238,10 +238,11 @@ impl Default for ConcurrencyTracker {
 /// `Clone` yields another handle on the SAME counted unit, not a new
 /// reservation; dropping the last handle decrements the count and
 /// releases the slot. To hold a budget across blocking work that
-/// outlives the attempt, override `run_with_cancellation`, clone the
-/// slot, and move the clone into the `spawn_blocking` closure with
-/// `let _held = slot;` bound at the TOP of the closure (NOT
-/// `let _ = slot;`, which drops it immediately and releases the budget).
+/// outlives the attempt, override `run_with_cancellation` and move its
+/// `slot` parameter (already the body's own handle) into the
+/// `spawn_blocking` closure with `let _held = slot;` bound at the TOP of
+/// the closure (NOT `let _ = slot;`, which drops it immediately and
+/// releases the budget).
 /// The worker keeps its own handle across body + finalization, leaving
 /// every existing release path (success, failure, `MAX_RUNTIME` expiry,
 /// yield, lease loss, shutdown drain) unchanged while keeping the budget
@@ -253,6 +254,9 @@ impl Default for ConcurrencyTracker {
 /// blocking work holding a slot must enforce its own timeout. To make a
 /// wedge visible, the worker logs an info event when a body keeps handles
 /// past its attempt and another when the last handle releases.
+/// Releasing an extended hold wakes no idle worker: rows excluded on that
+/// scope wait for the next claim (a periodic idle claim, an enqueue
+/// notification, or a busy worker finishing its job).
 ///
 /// `untracked()` guards hold nothing (inert for
 /// [`Concurrency::Unlimited`] types); pass one when calling
