@@ -43,7 +43,7 @@ pub trait JobRegistry<AppState: app_state::AppState> {
     ///
     /// `impl_job_registry!` implements this automatically from the
     /// registered types' consts. Hand-written `JobRegistry` impls MUST
-    /// implement it (it is required, like `run_job`) — delegate to the job
+    /// implement it (required, like `run_job`) — delegate to the job
     /// types' `CONCURRENCY` consts so caps apply.
     fn concurrency(&self, name: &str) -> Concurrency;
 }

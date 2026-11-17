@@ -137,8 +137,8 @@ impl Drop for WaitingGuard<'_> {
 
 /// Process-local running counts per job type, backing
 /// [`Concurrency::PerProcess`] caps. Clone one instance into every worker
-/// that should share the same counts — [`JobWorkerConfig::default`] wires
-/// the process-shared instance for you.
+/// that should share counts — [`JobWorkerConfig::default`] wires the
+/// process-shared instance for you.
 ///
 /// This bounds in-process resources only. Each worker process counts its
 /// own attempts; the effective fleet-wide limit is cap x processes.
@@ -149,9 +149,9 @@ pub struct ConcurrencyTracker(Arc<ConcurrencyTrackerInner>);
 struct ConcurrencyTrackerInner(Mutex<HashMap<String, usize>>);
 
 impl ConcurrencyTrackerInner {
-    /// Lock the counts, recovering from poisoning instead of panicking:
-    /// the critical sections only insert / decrement `usize`s, so a
-    /// poisoned mutex still holds a structurally valid map — and
+    /// Lock the counts, recovering from poisoning instead of panicking.
+    /// Critical sections only insert or decrement `usize`s, so a
+    /// poisoned mutex still holds a structurally valid map, and
     /// `unwrap()` inside `Drop` during an unwind would double-panic and
     /// abort the process.
     fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
@@ -162,12 +162,12 @@ impl ConcurrencyTrackerInner {
 }
 
 impl ConcurrencyTracker {
-    /// A tracker shared by no one else. For tests that embed several
-    /// independent worker fleets in one process. **Never construct one per
-    /// worker in production**: a tracker per worker turns a per-process
-    /// cap into a per-worker cap (the exact outage shape this feature
-    /// exists to prevent). Production code wants [`Self::process_shared`]
-    /// — or just `Default`, which is the same thing.
+    /// An unshared tracker. For tests that embed several independent
+    /// worker fleets in one process. **Never construct one per worker
+    /// in production**: that turns a per-process cap into a per-worker
+    /// cap (the exact outage shape this feature prevents). Production
+    /// code wants [`Self::process_shared`] — or just `Default`, which is
+    /// the same.
     pub fn isolated() -> Self {
         Self(Arc::new(ConcurrencyTrackerInner::default()))
     }
@@ -181,7 +181,7 @@ impl ConcurrencyTracker {
         Self(Arc::clone(&SHARED))
     }
 
-    /// How many attempts of `name` this process currently counts as running.
+    /// How many attempts of `name` this process counts as running.
     pub fn running(&self, name: &str) -> usize {
         self.0.counts().get(name).copied().unwrap_or(0)
     }
@@ -205,8 +205,8 @@ impl ConcurrencyTracker {
 
 impl Default for ConcurrencyTracker {
     /// The process-shared tracker ([`Self::process_shared`]) — deliberately
-    /// NOT an isolated one, so `Default::default()` keeps every worker in a
-    /// process on one counter. Tests that need isolation pass
+    /// NOT isolated, so `Default::default()` keeps every worker in a process
+    /// on one counter. Tests needing isolation pass
     /// [`ConcurrencyTracker::isolated`] explicitly.
     fn default() -> Self {
         Self::process_shared()
@@ -267,14 +267,13 @@ pub struct JobWorkerConfig {
     /// Optional shared admission for idle claims. `None` keeps independent polling.
     pub idle_poll_gate: Option<IdlePollGate>,
     /// Shared per-process running counts backing
-    /// [`crate::jobs::Concurrency::PerProcess`] caps. The default is the
+    /// [`crate::jobs::Concurrency::PerProcess`] caps. Defaults to the
     /// process-shared tracker ([`ConcurrencyTracker::process_shared`],
-    /// which is also `ConcurrencyTracker::default`): one tracker per
-    /// process, so every worker spawned with a defaulted config shares
-    /// the same counts. Production full literals must pass `process_shared()`
-    /// (or `Default::default()`); tests embedding independent worker
-    /// fleets in one process should pass
-    /// [`ConcurrencyTracker::isolated`] instead.
+    /// also `ConcurrencyTracker::default`): one tracker per process, so
+    /// every worker spawned with a defaulted config shares the same counts.
+    /// Production full literals must pass `process_shared()` (or
+    /// `Default::default()`); tests embedding independent worker fleets in
+    /// one process should pass [`ConcurrencyTracker::isolated`] instead.
     pub type_concurrency: ConcurrencyTracker,
 }
 
@@ -768,9 +767,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         Ok(true)
     }
 
-    /// Job-type names whose per-process concurrency cap is currently
-    /// reached, for the claim query's exclusion list. In-memory only: one
-    /// registry scan per claim, no DB work.
+    /// Job-type names whose per-process concurrency cap is reached, for the
+    /// claim query's exclusion list. In-memory only: one registry scan per
+    /// claim, no DB work.
     fn saturated_job_types(&self) -> Vec<String> {
         R::job_names()
             .iter()
@@ -1006,19 +1005,18 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// # Per-Process Concurrency
 ///
 /// A job type may declare [`Job::CONCURRENCY`](crate::jobs::Job::CONCURRENCY) =
-/// `Concurrency::PerProcess(n)` to cap how many of its attempts run
-/// concurrently per worker process. The cap is enforced at claim: saturated
-/// types are excluded from the claim query, so a worker claims the next
-/// runnable job of another type instead of parking behind the cap. A claim
-/// that raced a same-process worker for the last slot is released uncharged
-/// via `JobYield`. The slot is released when the attempt finalizes (success,
-/// failure, `MAX_RUNTIME` expiry, yield, lease loss, shutdown drain). Counts
-/// live in memory per process, shared by every worker task via
-/// `JobWorkerConfig::type_concurrency` — process-shared by default
-/// (`ConcurrencyTracker::process_shared()`, which is also `Default`); pass
-/// `ConcurrencyTracker::isolated()` to isolate embedded test fleets. The
-/// cap bounds in-process resources only: with M processes the effective
-/// limit on an outside resource (API, quota) is cap x M.
+/// `Concurrency::PerProcess(n)` to cap its concurrent attempts per worker
+/// process. The cap is enforced at claim: saturated types are excluded from
+/// the claim query, so a worker claims the next runnable job of another type
+/// instead of parking behind the cap. A claim that raced a same-process worker
+/// for the last slot is released uncharged via `JobYield`. The slot is
+/// released when the attempt finalizes (success, failure, `MAX_RUNTIME`
+/// expiry, yield, lease loss, shutdown drain). Counts live in memory per
+/// process, shared across worker tasks via `JobWorkerConfig::type_concurrency`
+/// — process-shared by default (`ConcurrencyTracker::process_shared()`, also
+/// `Default`); pass `ConcurrencyTracker::isolated()` to isolate embedded test
+/// fleets. The cap bounds in-process resources only: with M processes, the
+/// effective limit on an outside resource (API, quota) is cap x M.
 ///
 /// # Graceful Shutdown
 ///
@@ -1556,7 +1554,7 @@ mod tests {
     }
 
     /// A capped type whose hung rows await forever past a short
-    /// `MAX_RUNTIME`: the worker must drop the body at the limit, and that
+    /// `MAX_RUNTIME`. The worker must drop the body at the limit, and that
     /// drop must release the single per-process slot so a second row of
     /// the same type can run (the arena `BACKUP_SLOT` wedge shape). Quick
     /// rows insert a probe marker and finish.
@@ -1835,8 +1833,8 @@ mod tests {
     /// DEV-2424 regression: a claim that raced a same-process worker for
     /// the last slot (unsaturated at claim time, saturated by admission
     /// time) must be released uncharged without dispatching the body.
-    /// Deterministic by construction: claim with an empty tracker, then
-    /// hold the slot from the test, then `run_next_job`.
+    /// Deterministic by construction: claim with an empty tracker, hold
+    /// the slot from the test, then `run_next_job`.
     #[sqlx::test]
     async fn test_capped_claim_race_loser_releases_uncharged(db: sqlx::PgPool) {
         let state = test_state(db.clone());
@@ -1937,13 +1935,12 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
-    /// DEV-2424 regression: a hung capped attempt must free its
-    /// per-process slot when `MAX_RUNTIME` expires — the arena `BACKUP_SLOT`
-    /// wedge was exactly a hung capped attempt starving every other row of
-    /// its type. One worker, cap 1: the hung row takes the slot and is
-    /// dropped at its 1s limit; the second row of the SAME type (which a
-    /// leaked slot keeps excluded from claims) must then run and leave its
-    /// probe marker.
+    /// DEV-2424 regression: a hung capped attempt must free its per-process
+    /// slot when `MAX_RUNTIME` expires — the arena `BACKUP_SLOT` wedge was a
+    /// hung capped attempt starving every other row of its type. One worker,
+    /// cap 1: the hung row takes the slot and is dropped at its 1s limit;
+    /// the second row of the SAME type (which a leaked slot excludes from
+    /// claims) must then run and leave its probe marker.
     #[sqlx::test]
     async fn test_capped_hung_job_releases_slot_on_max_runtime_expiry(db: sqlx::PgPool) {
         sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
