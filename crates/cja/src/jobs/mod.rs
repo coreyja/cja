@@ -84,15 +84,14 @@
 //!
 //! Every job attempt runs under a per-job-type wall-clock limit:
 //! [`Job::MAX_RUNTIME`], defaulting to [`DEFAULT_MAX_RUNTIME`] (15 minutes).
-//! Set `None` to disable the limit for a type — rare, because a hung body
-//! then holds its worker and lease forever; cja-llm's whole-run
-//! `AdvanceRunJob` is the framework's one `None` case. On expiry the worker
-//! drops the body future, stops heartbeating, releases the lease, and
-//! records a retryable failure whose message names the limit; each retry
-//! gets a fresh budget. The timeout cancels **async** work only — work
-//! already inside `spawn_blocking` keeps running after the drop, so jobs
-//! that hand work to blocking threads must bound that work themselves. Set
-//! a per-type override for legitimately long jobs.
+//! A job type whose healthy attempts run longer overrides it with a larger
+//! `Duration` (e.g. `const MAX_RUNTIME: Duration =
+//! Duration::from_secs(2 * 60 * 60);`). On expiry the worker drops the body
+//! future, stops heartbeating, releases the lease, and records a retryable
+//! failure whose message names the limit; each retry gets a fresh budget.
+//! The timeout cancels **async** work only — work already inside
+//! `spawn_blocking` keeps running after the drop, so jobs that hand work to
+//! blocking threads must bound that work themselves.
 //!
 //! # Idempotency
 //!
@@ -477,12 +476,10 @@ pub trait Job<AppState: AS>:
 
     /// Maximum wall-clock time a single attempt of this job may run before
     /// the worker drops the body future. Defaults to
-    /// [`DEFAULT_MAX_RUNTIME`] (15 minutes); override per job type, or set
-    /// `None` for no limit (rare — a hung body then holds its worker and
-    /// lease forever, which is the outage this limit exists to prevent;
-    /// cja-llm's `AdvanceRunJob` is the framework's one `None` user, because
-    /// a whole multi-turn agent run is legitimately longer than any wall
-    /// clock).
+    /// [`DEFAULT_MAX_RUNTIME`] (15 minutes); a job type whose healthy
+    /// attempts legitimately run longer overrides it with a larger
+    /// `Duration`, e.g. `const MAX_RUNTIME: Duration =
+    /// Duration::from_secs(2 * 60 * 60);`.
     ///
     /// On expiry the worker drops the future, stops heartbeating, releases
     /// the lease, and charges the attempt as a normal retryable failure
@@ -495,7 +492,7 @@ pub trait Job<AppState: AS>:
     /// running after the job future is dropped. Jobs that hand work to
     /// blocking threads must bound that work themselves (e.g. their own
     /// timeout around the blocking call) if it must not outlive the attempt.
-    const MAX_RUNTIME: Option<Duration> = Some(DEFAULT_MAX_RUNTIME);
+    const MAX_RUNTIME: Duration = DEFAULT_MAX_RUNTIME;
 
     /// Execute the job logic.
     ///

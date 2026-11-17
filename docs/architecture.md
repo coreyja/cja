@@ -100,7 +100,7 @@ Defines a background job type. Key members:
 - `run(&self, app_state) -> Result<()>` — job logic
 - `run_with_cancellation(&self, app_state, token) -> Result<()>` — override for graceful shutdown support
 - `enqueue(self, app_state, context, priority) -> Result<()>` — inserts job into the `jobs` table
-- `MAX_RUNTIME: Option<Duration>` — per-attempt wall-clock limit the worker enforces (default 15 min; `None` = unbounded, e.g. cja-llm's `AdvanceRunJob`)
+- `MAX_RUNTIME: Duration` — per-attempt wall-clock limit the worker enforces (default 15 min; override per type with a larger `Duration`)
 
 ### Job enqueue evidence
 

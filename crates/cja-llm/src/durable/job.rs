@@ -1,7 +1,5 @@
 //! The generic advancement job.
 
-use std::time::Duration;
-
 use cja::jobs::{CancellationToken, Job};
 use uuid::Uuid;
 
@@ -44,20 +42,6 @@ impl AdvanceRunJob {
 #[async_trait::async_trait]
 impl<S: HasDurable> Job<S> for AdvanceRunJob {
     const NAME: &'static str = Self::NAME;
-
-    /// `None`: one attempt advances the WHOLE run (`Durable::advance_run`
-    /// loops every step), so a healthy multi-turn run can exceed any
-    /// wall-clock limit while making progress. A dropped attempt would also
-    /// skip `retry_or_requeue`/`release_lease`, leaving the run lease held
-    /// for the 90s takeover window while cja's fast retries burn charged
-    /// "leased by another worker" attempts — a finite cap dead-letters
-    /// healthy runs. Bounding lives inside the run instead: per-model-call
-    /// request/stream deadlines, the run-lease takeover, and
-    /// `recover_orphans`. Tool executions are app code and must bound
-    /// themselves (a hung tool still pins its worker — the long-term fix is
-    /// a per-step bound inside `advance_run` routed through
-    /// `retry_or_requeue`).
-    const MAX_RUNTIME: Option<Duration> = None;
 
     async fn run(&self, state: S) -> cja::color_eyre::Result<()> {
         self.run_with_cancellation(state, CancellationToken::new())
