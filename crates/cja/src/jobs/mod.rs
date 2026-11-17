@@ -72,12 +72,26 @@
 //! | 20 | ~12 days |
 //!
 //! With `max_retries = N`, a job can execute N+1 times. Returned errors,
-//! caught handler panics, and expired leases each count as a failed attempt.
+//! caught handler panics, expired leases, and bodies that exceed
+//! [`Job::MAX_RUNTIME`] each count as a failed attempt.
 //! A [`JobYield`] error releases the row uncharged; an unknown job name is
 //! released uncharged on an age-scaled delay (30s for the first hour of the
 //! row's life, hourly after that, dead-letter past 14 days); an
 //! undeserializable payload is dead-lettered on first dispatch. The final
 //! incremented count is stored in `dead_letter_jobs`.
+//!
+//! # Maximum Runtime
+//!
+//! Every job attempt runs under a per-job-type wall-clock limit:
+//! [`Job::MAX_RUNTIME`], defaulting to [`DEFAULT_MAX_RUNTIME`] (15 minutes).
+//! A job type whose healthy attempts run longer overrides it with a larger
+//! `Duration` (e.g. `const MAX_RUNTIME: Duration =
+//! Duration::from_secs(2 * 60 * 60);`). On expiry, the worker drops the body
+//! future, stops heartbeating, releases the lease, and records a retryable
+//! failure whose message names the limit; each retry gets a fresh budget.
+//! The timeout cancels **async** work only — work already inside
+//! `spawn_blocking` keeps running after the drop, so jobs that hand work to
+//! blocking threads must bound it themselves.
 //!
 //! # Idempotency
 //!
@@ -137,6 +151,8 @@
 //! | `last_error_message` | TEXT | Final error |
 //! | `created_at` | TIMESTAMPTZ | Original creation time |
 //! | `failed_at` | TIMESTAMPTZ | When moved to dead letter |
+
+use std::time::Duration;
 
 use crate::app_state::AppState as AS;
 use serde::{Serialize, de::DeserializeOwned};
@@ -228,6 +244,15 @@ pub use worker::{
     JobWorkerConfig,
 };
 
+/// Default maximum runtime per job attempt ([`Job::MAX_RUNTIME`]).
+///
+/// 15 minutes is ~30 default heartbeat intervals and 3× the 5-minute stopgap
+/// arena shipped for its wedged backups (BattlesnakeOfficial/arena#341): long
+/// enough that no healthy job notices, short enough that a hung body releases
+/// its worker slot and lease in bounded time. Renders as `900s` in
+/// [`crate::jobs::JobMaxRuntimeExceeded`]'s message (`Duration`'s `Debug`).
+pub const DEFAULT_MAX_RUNTIME: Duration = Duration::from_mins(15);
+
 #[derive(Debug, Error)]
 pub enum EnqueueError {
     #[error("SqlxError: {0}")]
@@ -282,6 +307,21 @@ pub struct UnknownJobType(pub String);
 #[error("job payload is not deserializable")]
 pub struct InvalidJobPayload(#[from] serde_json::Error);
 
+/// A single job attempt exceeded [`Job::MAX_RUNTIME`] and was dropped by the
+/// worker. Charged like any other failure: the attempt increments
+/// `error_count`, takes the normal exponential backoff, and eventually
+/// dead-letters. Dropping the future cancels async work only — work already
+/// inside `spawn_blocking` keeps running.
+///
+/// The message renders the limit via `Duration`'s `Debug` (`900s` at the
+/// 15-minute default, `2s` for a 2-second override).
+#[derive(Debug, Error)]
+#[error("job exceeded its max runtime of {limit:?}")]
+pub struct JobMaxRuntimeExceeded {
+    /// The `Job::MAX_RUNTIME` that expired.
+    pub limit: Duration,
+}
+
 /// A trait for defining background jobs that can be enqueued and processed asynchronously.
 ///
 /// Jobs must be serializable and provide a unique name identifier. The job system
@@ -304,6 +344,10 @@ pub struct InvalidJobPayload(#[from] serde_json::Error);
 /// - A missing heartbeat makes the job claimable after 120 seconds by default
 /// - Every expired lease counts as a failed attempt
 /// - This ensures jobs are eventually processed even after worker failures
+///
+/// A crashed worker is the lease-based case; a body that is alive but stuck
+/// (the process keeps heartbeating while the job never progresses) is bounded
+/// by [`Job::MAX_RUNTIME`] instead — see "Maximum Runtime".
 ///
 /// # Example
 ///
@@ -429,6 +473,25 @@ pub trait Job<AppState: AS>:
     /// The unique name identifier for this job type.
     /// This is used for routing jobs to their handlers.
     const NAME: &'static str;
+
+    /// Maximum wall-clock time a single attempt of this job may run before
+    /// the worker drops the body future. Defaults to
+    /// [`DEFAULT_MAX_RUNTIME`] (15 minutes). Job types whose healthy
+    /// attempts take longer can override it with a larger `Duration`, e.g.
+    /// `const MAX_RUNTIME: Duration = Duration::from_secs(2 * 60 * 60);`.
+    ///
+    /// On expiry, the worker drops the future, stops heartbeating, releases
+    /// the lease, and charges the attempt as a normal retryable failure
+    /// (the error message names the limit). Each retry gets a fresh budget.
+    ///
+    /// # Caveat
+    ///
+    /// The limit cancels **async** work only. Work running inside
+    /// `tokio::task::spawn_blocking` (or a detached `tokio::spawn`) continues
+    /// after the job future is dropped. Jobs that hand work to blocking
+    /// threads must bound it themselves (e.g. with their own timeout around
+    /// the blocking call) if it must not outlive the attempt.
+    const MAX_RUNTIME: Duration = DEFAULT_MAX_RUNTIME;
 
     /// Execute the job logic.
     ///

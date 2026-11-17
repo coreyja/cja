@@ -17,7 +17,7 @@ use tracing::Span;
 use crate::app_state::AppState as AS;
 
 use super::registry::JobRegistry;
-use super::{InvalidJobPayload, JobYield, UnknownJobType};
+use super::{InvalidJobPayload, JobMaxRuntimeExceeded, JobYield, UnknownJobType};
 
 /// Default maximum number of retry attempts before a job is moved to the dead letter queue.
 ///
@@ -339,18 +339,27 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             job.created_at = %job.created_at,
             job.context = job.context,
             job.error_count = job.error_count,
+            job.max_runtime = ?self.registry.max_runtime(&job.name),
             worker.id = %self.id,
         ),
         err,
     )]
     async fn run_job(&self, job: &JobFromDB) -> color_eyre::Result<()> {
-        let result = std::panic::AssertUnwindSafe(self.registry.run_job(
+        let limit = self.registry.max_runtime(&job.name);
+        let body = std::panic::AssertUnwindSafe(self.registry.run_job(
             job,
             self.state.clone(),
             self.cancellation_token.clone(),
         ))
-        .catch_unwind()
-        .await;
+        .catch_unwind();
+        let result = match tokio::time::timeout(limit, body).await {
+            Ok(caught) => caught,
+            // Wrap as a CAUGHT result (inner Err), never as the panic
+            // payload: the outer match's Err arm is reserved for real
+            // panics, and `panic_message` would render a non-string
+            // payload as "non-string payload", losing the limit.
+            Err(_expired) => Ok(Err(JobMaxRuntimeExceeded { limit }.into())),
+        };
         match result {
             Ok(result) => result,
             Err(payload) => Err(color_eyre::eyre::eyre!(
@@ -807,6 +816,17 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 ///   (first retry: 2s, second: 4s, third: 8s, fourth: 16s, etc.)
 /// - If `error_count` >= `max_retries`, the job is moved to the dead letter queue
 ///
+/// # Maximum Runtime
+///
+/// Every job attempt runs under [`Job::MAX_RUNTIME`](crate::jobs::Job::MAX_RUNTIME) — a per-job-type
+/// wall-clock limit defaulting to 15 minutes. Job types whose healthy attempts
+/// run longer override it with a larger `Duration`. On expiry, the worker
+/// drops the body future, stops heartbeating, releases the lease, and charges
+/// the attempt as a normal retryable failure whose error message names the
+/// limit. Each retry gets a fresh budget. The timeout cancels **async**
+/// work only — work already inside `spawn_blocking` keeps running after the
+/// drop, so jobs that hand work to blocking threads must bound it themselves.
+///
 /// # Graceful Shutdown
 ///
 /// When the `shutdown_token` is cancelled:
@@ -1254,6 +1274,52 @@ mod tests {
         }
     }
 
+    /// A job whose body awaits forever but carries a short `MAX_RUNTIME`: the
+    /// worker must drop it at the limit and charge the attempt.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct HungJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for HungJob {
+        const NAME: &'static str = "HungJob";
+        const MAX_RUNTIME: Duration = Duration::from_secs(2);
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// A job whose body runs longer than a neighbour type's short limit
+    /// (`HungJob`'s 2s) but under its own larger `MAX_RUNTIME`: the limit is
+    /// per type, so this body must complete normally.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct SlowJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for SlowJob {
+        const NAME: &'static str = "SlowJob";
+        const MAX_RUNTIME: Duration = Duration::from_secs(10);
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            let error_count: i32 =
+                sqlx::query_scalar("SELECT error_count FROM jobs WHERE name = $1")
+                    .bind(Self::NAME)
+                    .fetch_one(app_state.db())
+                    .await?;
+            sqlx::query("INSERT INTO job_probe (marker) VALUES ($1)")
+                .bind(format!("error_count={error_count}"))
+                .execute(app_state.db())
+                .await?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(())
+        }
+    }
+
     impl_job_registry!(
         TestAppState,
         TestJob,
@@ -1263,7 +1329,9 @@ mod tests {
         DrainCooperativeJob,
         DrainStubbornJob,
         YieldingJob,
-        ChargedOnShutdownJob
+        ChargedOnShutdownJob,
+        HungJob,
+        SlowJob
     );
 
     fn test_state(db: sqlx::PgPool) -> TestAppState {
@@ -1447,6 +1515,144 @@ mod tests {
             (count == 1).then_some(())
         })
         .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// DEV-2423 regression: a body that awaits forever must be dropped at its
+    /// `MAX_RUNTIME`, charged as a retryable failure with the limit in the
+    /// error message, and released (no lingering lock); the same worker must
+    /// then claim a second job. Without enforcement, heartbeats keep the lease
+    /// forever and this test times out in `wait_for`.
+    #[sqlx::test]
+    async fn test_max_runtime_drops_hung_job_and_worker_continues(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        HungJob
+            .enqueue(state.clone(), "hung".into(), None)
+            .await
+            .unwrap();
+        NormalProbeJob
+            .enqueue(state.clone(), "normal".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
+            },
+        ));
+        wait_until_started(&db, HungJob::NAME).await;
+        // 2s limit + finalization, well inside the 10s wait_for cap.
+        type Row = (
+            i32,
+            Option<String>,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            f64,
+        );
+        let row: Row = wait_for(|| async {
+            let row: Option<Row> = sqlx::query_as(
+                "SELECT error_count, locked_by, last_error_message, locked_at,
+                        EXTRACT(EPOCH FROM run_at - NOW())::double precision
+                 FROM jobs WHERE name = 'HungJob'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            row.filter(|(count, owner, message, locked_at, _)| {
+                *count == 1
+                    && owner.is_none()
+                    && locked_at.is_none()
+                    && message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("max runtime") && m.contains("2s"))
+            })
+        })
+        .await;
+        assert!(
+            row.4 > 0.0,
+            "a timed-out attempt must be retried later (run_at in the future), got {}s",
+            row.4
+        );
+        // The freed worker claims the second job.
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_probe")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// DEV-2423: the limit is per job TYPE. A body that outlives a
+    /// neighbour type's short limit (2s) but stays under its own larger
+    /// `MAX_RUNTIME` (10s) completes normally: the row is deleted after one
+    /// uncharged attempt (`error_count` 0 at body time, nothing in
+    /// `dead_letter_jobs`).
+    #[sqlx::test]
+    async fn test_max_runtime_body_past_neighbour_limit_completes(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        SlowJob
+            .enqueue(state.clone(), "slow".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
+            },
+        ));
+        // 3s body + finalization, well inside the 10s wait_for cap.
+        wait_for(|| async {
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE name = 'SlowJob'")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            (remaining == 0).then_some(())
+        })
+        .await;
+        let marker: String = sqlx::query_scalar("SELECT marker FROM job_probe")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(marker, "error_count=0");
+        let dead_lettered: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs WHERE name = 'SlowJob'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            dead_lettered, 0,
+            "a successful attempt must not dead-letter"
+        );
         token.cancel();
         handle.await.unwrap().unwrap();
     }
