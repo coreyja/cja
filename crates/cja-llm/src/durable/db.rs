@@ -186,12 +186,17 @@ where
     .await
 }
 
-/// Persist one step atomically: conditionally update the run state (proving
-/// lease ownership), then insert the newly committed transcript messages, in
-/// one transaction. `Ok(None)` = lease lost (write nothing, stop silently).
+/// Persist one step's state on an OPEN transaction: conditionally update
+/// the run state (proving lease ownership), then insert the newly
+/// committed transcript messages. Does NOT commit and does NOT roll
+/// back — the caller adds the step-end writes (next-job enqueue + lease
+/// release, or nothing) and commits, or drops the transaction to discard
+/// everything (dropping a `Transaction` rolls it back; there is no
+/// `rollback()` on a bare `&mut PgConnection`). `Ok(None)` = lease lost
+/// (caller discards the transaction, writes nothing).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(super) async fn persist_step(
-    db: &sqlx::PgPool,
+pub(super) async fn persist_step_on_tx(
+    tx: &mut sqlx::PgConnection,
     run_id: Uuid,
     me: &str,
     run_state_json: &serde_json::Value,
@@ -200,7 +205,6 @@ pub(super) async fn persist_step(
     output_tokens: i64,
     new_messages: &[(i64, String, serde_json::Value)],
 ) -> sqlx::Result<Option<bool>> {
-    let mut tx = db.begin().await?;
     let cancel_requested = sqlx::query_scalar::<_, bool>(
         "UPDATE agent_runs
          SET run_state = $3, turns = $4, input_tokens = $5, output_tokens = $6, locked_at = NOW()
@@ -217,11 +221,9 @@ pub(super) async fn persist_step(
     .fetch_optional(&mut *tx)
     .await?;
     let Some(cancel_requested) = cancel_requested else {
-        tx.rollback().await?;
         return Ok(None);
     };
-    insert_messages(&mut tx, run_id, new_messages).await?;
-    tx.commit().await?;
+    insert_messages(tx, run_id, new_messages).await?;
     Ok(Some(cancel_requested))
 }
 

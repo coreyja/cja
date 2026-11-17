@@ -379,6 +379,23 @@ The budget has to fit the platform's kill window: Cloud Run sends SIGKILL a fixe
 
 `NamedTask` and `wait_for_first_error` remain for apps that manage shutdown themselves. Note that a signal-handler task which simply returns ends `wait_for_first_error` without draining anything.
 
+## Durable agent runs (cja-llm)
+
+Durable agent runs are rig `AgentRun`s persisted in `agent_runs` /
+`agent_messages` and advanced by a **chain of `AdvanceRunJob` rows — one
+step (a model call, a tool batch, or an ask suspension) per job attempt**.
+The step's final persist commits the run state, the run's next-step job
+row (`jobs.context = agent-run-step:<kind>`), and the lease release in
+ONE transaction, reusing an existing unlocked row for the run when one
+survives (duplicate rows converge instead of multiplying into parallel
+chains). Terminal and waiting states (done, failed, cancelled, waiting
+on ask) enqueue nothing, so each attempt is bounded like any other job
+and a deploy interrupts at most one step. `durable::recover_orphans`
+(registered as a cron) re-enqueues runs whose job rows were dead-lettered.
+See `crates/cja-llm/README.md` for the full model: kinds, leases,
+ask/answer suspension, failure classification, and the enqueue/wake
+contract.
+
 ## Migration Locations
 
 Three copies of migrations exist in the repository, but only one is authoritative:

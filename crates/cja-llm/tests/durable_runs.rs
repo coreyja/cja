@@ -94,6 +94,47 @@ static KEYED: AgentKind = AgentKind {
     build: |llm, model| llm.agent(model).tool(Ask).tool(KeyedAdd),
 };
 
+/// Every run whose `stall_add` tool started executing, across attempts —
+/// the mid-batch shutdown fixture's progress probe. Process-global for
+/// the same reason as `SEEN_KEYS`; run ids are unique per test.
+static STALLS: Mutex<Vec<RunId>> = Mutex::new(Vec::new());
+
+fn stalls_for(run: RunId) -> usize {
+    STALLS
+        .lock()
+        .expect("stall log lock")
+        .iter()
+        .filter(|id| **id == run)
+        .count()
+}
+
+/// Record the run, then stall long enough for the test to cancel the
+/// attempt mid-tool — the `with_lease_guards` shutdown arm's fixture.
+#[rig_tool(description = "Record the run, stall, then add")]
+async fn stall_add(
+    #[rig(context)] context: &mut rig_core::tool::ToolContext,
+    a: i32,
+    b: i32,
+) -> Result<i32, rig_core::tool::ToolExecutionError> {
+    let key = context
+        .require::<ToolCallKey>()
+        .map_err(|e| rig_core::tool::ToolExecutionError::other(e.to_string()))?;
+    STALLS.lock().expect("stall log lock").push(key.run_id);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    Ok(a + b)
+}
+
+static STALLS_KIND: AgentKind = AgentKind {
+    name: "stalls",
+    model: models::DEFAULT,
+    limits: RunLimits {
+        max_turns: 20,
+        max_total_tokens: 200_000,
+    },
+    unhandled_invalid_tool_call: UnhandledInvalidToolCall::Fail,
+    build: |llm, model| llm.agent(model).tool(Ask).tool(KeyedAdd).tool(StallAdd),
+};
+
 static TWO_TURNS: AgentKind = AgentKind {
     name: "two_turns",
     model: models::DEFAULT,
@@ -256,10 +297,48 @@ async fn setup(kinds: &[&'static AgentKind]) -> Env {
 }
 
 /// Drive one job attempt directly (no worker): the unit of "one retry".
+/// One attempt advances exactly ONE step — a model call, a tool batch, or
+/// an ask suspension — and never locks or deletes a `jobs` row, so the
+/// `start()` row stays unlocked and every handoff reuses it (the dedup
+/// helper) instead of inserting.
 async fn drive(state: &TestState, run: RunId) -> cja::color_eyre::Result<()> {
     AdvanceRunJob { run_id: run.0 }
         .run_with_cancellation(state.clone(), CancellationToken::new())
         .await
+}
+
+/// Drive attempts directly until the run is terminal or waiting. One
+/// attempt = one step; the handoff releases the lease, so attempts chain
+/// without sleeps (the 25ms pacing absorbs stale-lease takeovers after
+/// Errs).
+async fn drive_to_end(state: &TestState, run: RunId) -> RunStatus {
+    for _ in 0..200 {
+        let _ = drive(state, run).await;
+        let status = status_of(&state.db, run).await;
+        if matches!(
+            status,
+            RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Waiting
+        ) {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("run did not reach a terminal/waiting status within 200 attempts");
+}
+
+/// Drive attempts directly until the run reaches `Waiting` (an ask
+/// suspension is its own step — the model call that produced it is a
+/// separate attempt).
+async fn drive_until_waiting(state: &TestState, run: RunId) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "run did not reach waiting");
+        let _ = drive(state, run).await;
+        if status_of(&state.db, run).await == RunStatus::Waiting {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn spawn_worker(
@@ -323,6 +402,20 @@ async fn jobs_for(db: &sqlx::PgPool, run: RunId) -> i64 {
     .expect("count jobs")
 }
 
+/// How many UNLOCKED `AdvanceRunJob` rows exist for the run — the dedup
+/// invariant's observable (the executing row is locked by cja and
+/// excluded; steady state is at most one unlocked carrier).
+async fn unlocked_jobs_for(db: &sqlx::PgPool, run: RunId) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM jobs WHERE name = 'AdvanceRunJob' \
+         AND payload->>'run_id' = $1 AND locked_by IS NULL",
+    )
+    .bind(run.0.to_string())
+    .fetch_one(db)
+    .await
+    .expect("count unlocked jobs")
+}
+
 async fn locked_by_of(db: &sqlx::PgPool, run: RunId) -> Option<String> {
     sqlx::query_scalar::<_, Option<String>>("SELECT locked_by FROM agent_runs WHERE id = $1")
         .bind(run.0)
@@ -376,7 +469,7 @@ async fn happy_path_round_trip() {
     let run = durable::start(&env.state, "counter", "add 2 and 3")
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("drive");
+    drive_to_end(&env.state, run).await;
 
     let view = view_of(&env.db, run).await;
     assert_eq!(view.status, RunStatus::Succeeded);
@@ -394,6 +487,154 @@ async fn happy_path_round_trip() {
     let roles: Vec<_> = rows.iter().map(|(_, role, _)| role.as_str()).collect();
     assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
     assert_eq!(env.fake.requests().len(), 2, "exactly two model requests");
+}
+
+// ---------------------------------------------------------------------------
+// 1b. One attempt advances exactly one step (the acceptance test)
+// ---------------------------------------------------------------------------
+
+/// The multi-turn run finishes through SEVERAL `AdvanceRunJob` executions,
+/// each advancing exactly one step, asserted behaviorally: request counts,
+/// statuses, lease state, and job-row identity/context — never pinned
+/// step constants. Also pins both branches of the deduplicating
+/// next-step enqueue: the reuse/pull-forward branch (a leftover unlocked
+/// row is pulled forward with `error_count = 0` instead of duplicating)
+/// and the insert branch (`jobs.context = agent-run-step:<kind>`).
+#[tokio::test]
+async fn one_attempt_advances_exactly_one_step() {
+    let env = setup(&[&COUNTER]).await;
+    script_happy(&env.fake);
+    let run = durable::start(&env.state, "counter", "add 2 and 3")
+        .await
+        .expect("start");
+    let start_job_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT job_id FROM jobs WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(run.0.to_string())
+    .fetch_one(&env.db)
+    .await
+    .expect("start job row");
+
+    // Leg A (one step per attempt + reuse/pull-forward): back the start
+    // row off — the lost-cja-delete duplicate shape. One drive performs
+    // exactly ONE model call (today's whole-run loop would have finished
+    // the run with two) and hands off by reusing this very row.
+    sqlx::query(
+        "UPDATE jobs SET run_at = NOW() + interval '30 seconds', error_count = 3 \
+         WHERE job_id = $1",
+    )
+    .bind(start_job_id)
+    .execute(&env.db)
+    .await
+    .expect("back the start row off");
+
+    drive(&env.state, run)
+        .await
+        .expect("drive 1: the t0 model step");
+    assert_eq!(env.fake.requests().len(), 1, "one attempt = one model call");
+    assert_eq!(status_of(&env.db, run).await, RunStatus::Running);
+    assert_eq!(
+        locked_by_of(&env.db, run).await,
+        None,
+        "the handoff released the lease"
+    );
+    let roles: Vec<String> = transcript_rows(&env.db, run)
+        .await
+        .iter()
+        .map(|(_, role, _)| role.clone())
+        .collect();
+    assert_eq!(
+        roles,
+        ["user"],
+        "the assistant message projects at the next next_step"
+    );
+    assert_eq!(jobs_for(&env.db, run).await, 1, "no duplicate row");
+    let (reused_id, due, error_count): (uuid::Uuid, bool, i32) = sqlx::query_as(
+        "SELECT job_id, run_at <= NOW(), error_count FROM jobs \
+         WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(run.0.to_string())
+    .fetch_one(&env.db)
+    .await
+    .expect("carrier row");
+    assert_eq!(
+        reused_id, start_job_id,
+        "the backed-off row was REUSED as the carrier, not duplicated"
+    );
+    assert!(due, "pulled forward: run_at is due now");
+    assert_eq!(error_count, 0, "error_count reset on reuse");
+
+    // Leg B (the insert path + its context string): delete the rows cja
+    // would have deleted after the previous attempt's Ok, so the next
+    // handoff must INSERT a fresh carrier.
+    delete_jobs_for(&env.db, run).await;
+    drive(&env.state, run)
+        .await
+        .expect("drive 2: the tool batch");
+    assert_eq!(
+        env.fake.requests().len(),
+        1,
+        "the tool batch made no model call"
+    );
+    let roles: Vec<String> = transcript_rows(&env.db, run)
+        .await
+        .iter()
+        .map(|(_, role, _)| role.clone())
+        .collect();
+    assert_eq!(
+        roles,
+        ["user", "assistant", "user"],
+        "assistant tool call + committed tool result"
+    );
+    assert_eq!(jobs_for(&env.db, run).await, 1);
+    let context: String = sqlx::query_scalar(
+        "SELECT context FROM jobs WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(run.0.to_string())
+    .fetch_one(&env.db)
+    .await
+    .expect("fresh carrier row");
+    assert_eq!(
+        context, "agent-run-step:counter",
+        "the step handoff's insert path, pinned by context"
+    );
+
+    // Leg C (finish): the t1 model call, then Done — the Done step
+    // enqueues nothing. The wake snapshot sits between legs B and C: the
+    // delta is exactly leg C's one handoff wake, and total wakes across
+    // the whole test stay observable above.
+    let wakes_before_leg_c = env.state.wakes.load(Ordering::SeqCst);
+    drive(&env.state, run)
+        .await
+        .expect("drive 3: the t1 model step");
+    drive(&env.state, run).await.expect("drive 4: Done");
+    let view = view_of(&env.db, run).await;
+    assert_eq!(view.status, RunStatus::Succeeded);
+    assert_eq!(view.output.as_deref(), Some("5"));
+    assert_eq!(view.turns, 2);
+    assert_eq!(
+        env.fake.requests().len(),
+        2,
+        "exactly the two scripted model calls"
+    );
+    assert_eq!(
+        transcript_rows(&env.db, run).await.len(),
+        4,
+        "the full reference transcript"
+    );
+    assert_eq!(
+        jobs_for(&env.db, run).await,
+        1,
+        "the leg-B row, reused by the t1 handoff (direct drives never delete)"
+    );
+    // 1 wake for start + 3 handoff wakes (leg-A reuse, leg-B insert,
+    // leg-C reuse): the Done step enqueues nothing.
+    assert_eq!(env.state.wakes.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        env.state.wakes.load(Ordering::SeqCst) - wakes_before_leg_c,
+        1,
+        "exactly one handoff wake in leg C, in the reuse branch too"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -435,13 +676,12 @@ async fn crash_at_every_step_resumes_identically() {
     let reference_run = durable::start(&reference_env.state, "counter", "add 2 and 3")
         .await
         .expect("start reference");
-    drive(&reference_env.state, reference_run)
-        .await
-        .expect("reference drive");
+    drive_to_end(&reference_env.state, reference_run).await;
     let reference = transcript_rows(&reference_env.db, reference_run).await;
     let reference_requests = reference_env.fake.requests().len();
     let k = reference_env.state.durable.persist_count();
-    // The reference flow's persist rhythm, in order:
+    // The reference flow's persist rhythm, in order (one attempt per step
+    // now; persists 2/3/5 are the step-end handoff persists):
     //   1 pre-call t0, 2 post-response t0, 3 post-tool-result,
     //   4 pre-call t1, 5 post-response t1, 6 done-path.
     // `script_crash` below maps crash positions onto re-issued model calls
@@ -505,9 +745,7 @@ async fn two_workers_one_run_no_duplicate_transcript() {
     let reference_run = durable::start(&reference_env.state, "counter", "add 2 and 3")
         .await
         .expect("start reference");
-    drive(&reference_env.state, reference_run)
-        .await
-        .expect("reference drive");
+    drive_to_end(&reference_env.state, reference_run).await;
     let reference = transcript_rows(&reference_env.db, reference_run).await;
 
     let env = setup_with(&[&COUNTER], Duration::from_secs(1)).await;
@@ -527,6 +765,10 @@ async fn two_workers_one_run_no_duplicate_transcript() {
 
     // The one sanctioned raw-SQL jobs INSERT in the repo: a test fixture
     // simulating an ops mistake (a duplicate job row for the same run).
+    // With the deduplicating next-step enqueue, the duplicate now
+    // CONVERGES instead of churning: each handoff reuses an unlocked row
+    // for the run, so the duplicate becomes the next carrier and the
+    // steady-state invariant (at most one UNLOCKED row) holds throughout.
     sqlx::query(
         "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
          VALUES ($1, $2, $3, 0, NOW(), NOW(), 'duplicate-fixture')",
@@ -541,6 +783,30 @@ async fn two_workers_one_run_no_duplicate_transcript() {
     let (worker_a, token_a) = spawn_worker(&env.state, Duration::from_millis(10)).await;
     let (worker_b, token_b) = spawn_worker(&env.state, Duration::from_millis(10)).await;
 
+    // While the run progresses, poll the dedup invariant: at most one
+    // UNLOCKED AdvanceRunJob row for the run at any time (the executing
+    // row is locked by cja and excluded). The watch starts at the FIRST
+    // claim — the fixture itself is two unlocked rows before any worker
+    // claims one, and the claim is where convergence begins. An assert
+    // inside the watcher surfaces through the join below.
+    wait_until(|| async { (unlocked_jobs_for(&env.db, run).await <= 1).then_some(()) }).await;
+    let watch_db = env.db.clone();
+    let watch_run = run;
+    let watch = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            let unlocked = unlocked_jobs_for(&watch_db, watch_run).await;
+            assert!(
+                unlocked <= 1,
+                "at most one unlocked AdvanceRunJob row per run: {unlocked}"
+            );
+            if status_of(&watch_db, watch_run).await == RunStatus::Succeeded {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
     let done = tokio::time::timeout(Duration::from_secs(30), async {
         wait_until(|| async {
             let status = status_of(&env.db, run).await;
@@ -550,6 +816,27 @@ async fn two_workers_one_run_no_duplicate_transcript() {
     })
     .await;
     assert!(done.is_ok(), "run did not succeed under two workers");
+    tokio::time::timeout(Duration::from_secs(30), watch)
+        .await
+        .expect("watcher exited")
+        .expect("dedup invariant held for the whole run");
+
+    // The duplicate converges to nothing: it is reused and deleted by a
+    // handoff, or it errors (backing off 2s/4s/8s on a foreign lease) and
+    // no-ops Ok on the terminal run, which cja deletes. Bounded at 30s —
+    // a duplicate that errored twice backs off 8s.
+    let converge_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = jobs_for(&env.db, run).await;
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < converge_deadline,
+            "duplicate job row did not converge ({remaining} rows remain)"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     token_a.cancel();
     token_b.cancel();
@@ -597,9 +884,7 @@ async fn tool_output_nul_is_sanitized_and_crash_resume_identical() {
     let reference_run = durable::start(&reference_env.state, "nul_tool", "give me a nul")
         .await
         .expect("start reference");
-    drive(&reference_env.state, reference_run)
-        .await
-        .expect("reference drive");
+    drive_to_end(&reference_env.state, reference_run).await;
     assert_eq!(
         status_of(&reference_env.db, reference_run).await,
         RunStatus::Succeeded
@@ -789,8 +1074,7 @@ async fn ask_suspends_and_answer_resumes_as_tool_result() {
         .await
         .expect("answer");
     assert_eq!(status_of(&env.db, run).await, RunStatus::Running);
-    drive(&env.state, run).await.expect("drive to completion");
-    assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
+    assert_eq!(drive_to_end(&env.state, run).await, RunStatus::Succeeded);
 
     // The message after the ask assistant message is a `user` message whose
     // content is the tool result for that call id.
@@ -847,7 +1131,7 @@ async fn answer_requires_waiting() {
         &serde_json::json!({"question": "q"}),
     );
     env.fake.chat_completion(models::DEFAULT, "done");
-    drive(&env.state, suspended).await.expect("suspend");
+    drive_until_waiting(&env.state, suspended).await;
     assert_eq!(status_of(&env.db, suspended).await, RunStatus::Waiting);
 
     let state_a = env.state.clone();
@@ -861,9 +1145,7 @@ async fn answer_requires_waiting() {
     assert!(matches!(loser, Err(RunError::NotWaiting(..))));
     // Drive the winner to completion so its scripted reply is consumed and
     // the queue is clean for the next part.
-    drive(&env.state, suspended)
-        .await
-        .expect("winner completes");
+    drive_to_end(&env.state, suspended).await;
 
     // Cancel a waiting run, then answer: NotWaiting.
     let cancelled = durable::start(&env.state, "counter", "z")
@@ -875,7 +1157,7 @@ async fn answer_requires_waiting() {
         "ask",
         &serde_json::json!({"question": "q"}),
     );
-    drive(&env.state, cancelled).await.expect("suspend");
+    drive_until_waiting(&env.state, cancelled).await;
     durable::cancel(&env.state, cancelled)
         .await
         .expect("cancel waiting");
@@ -923,7 +1205,7 @@ async fn cancel_paths() {
         "ask",
         &serde_json::json!({"question": "q?"}),
     );
-    drive(&env.state, waiting).await.expect("suspend");
+    drive_until_waiting(&env.state, waiting).await;
     durable::cancel(&env.state, waiting)
         .await
         .expect("cancel waiting");
@@ -1010,7 +1292,7 @@ async fn cancel_paths() {
         .await
         .expect("start done");
     env.fake.chat_completion(models::DEFAULT, "done");
-    drive(&env.state, done).await.expect("finish");
+    drive_to_end(&env.state, done).await;
     assert!(matches!(
         durable::cancel(&env.state, done).await,
         Err(RunError::InvalidTransition { .. })
@@ -1132,7 +1414,10 @@ async fn turn_budget_fails_the_run() {
     let run = durable::start(&env.state, "two_turns", "x")
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("job completes Ok");
+    // The turn budget is enforced by `next_step()` at attempt start, so
+    // the run fails on a later attempt's claim — still exactly two model
+    // requests.
+    assert_eq!(drive_to_end(&env.state, run).await, RunStatus::Failed);
 
     let view = view_of(&env.db, run).await;
     assert_eq!(view.status, RunStatus::Failed);
@@ -1333,8 +1618,7 @@ async fn retryable_error_releases_lease_and_retry_completes() {
         &serde_json::json!({"a": 2, "b": 3}),
     );
     env.fake.chat_completion(models::DEFAULT, "5");
-    drive(&env.state, run).await.expect("retry succeeds");
-    assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
+    assert_eq!(drive_to_end(&env.state, run).await, RunStatus::Succeeded);
 }
 
 #[tokio::test]
@@ -1377,7 +1661,7 @@ async fn shutdown_mid_model_call_aborts_promptly_and_releases_lease() {
     assert_eq!(locked_by_of(&env.db, run).await, None, "lease released");
 
     // A fresh attempt with a fresh token completes the run.
-    drive(&env.state, run).await.expect("resume after shutdown");
+    drive_to_end(&env.state, run).await;
     assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
 }
 
@@ -1467,19 +1751,131 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
     }
 }
 
+/// The retained progress-separated requeue path: an early tool answer in a
+/// batch persisted WITH progress, then a shutdown mid-tool on a LATER
+/// call in the same batch. `retry_or_requeue` must hand the run to a
+/// fresh job row (`agent-run:<kind>` context — distinct from the step
+/// handoff's `agent-run-step:<kind>`) instead of erroring, so the
+/// shutdown cost is one released row, not a charged failure. On resume,
+/// `call_1`'s persisted answer is NOT re-executed; the unanswered `call_2`
+/// re-executes (the at-least-once boundary).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_batch_shutdown_requeues_on_a_fresh_job_row() {
+    let env = setup(&[&STALLS_KIND]).await;
+    // One reply with TWO calls — a fast keyed_add then a stalling
+    // stall_add — then the final completion.
+    let c1 = serde_json::json!({"a": 1, "b": 2});
+    let c2 = serde_json::json!({"a": 3, "b": 4});
+    env.fake.tool_calls(
+        models::DEFAULT,
+        &[("call_1", "keyed_add", &c1), ("call_2", "stall_add", &c2)],
+    );
+    env.fake.chat_completion(models::DEFAULT, "done");
+
+    let run = durable::start(&env.state, "stalls", "two calls")
+        .await
+        .expect("start");
+    drive(&env.state, run)
+        .await
+        .expect("t0 model step (handoff)");
+    // Delete the row cja would have deleted after the previous attempt's
+    // Ok — without this the dedup would reuse the never-deleted start row
+    // and the requeue below would insert nothing (masking the fresh-row
+    // behavior under test).
+    delete_jobs_for(&env.db, run).await;
+
+    let token = CancellationToken::new();
+    let state = env.state.clone();
+    let task = {
+        let token = token.clone();
+        tokio::spawn(async move {
+            AdvanceRunJob { run_id: run.0 }
+                .run_with_cancellation(state, token)
+                .await
+        })
+    };
+    // call_1 has executed AND its answer persisted (that persist is the
+    // progress); call_2 is stalling inside the tool future.
+    wait_until(|| async { (stalls_for(run) >= 1).then_some(()) }).await;
+    token.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("attempt returned")
+        .expect("join");
+    assert!(
+        result.is_ok(),
+        "the mid-step shutdown was consumed by retry_or_requeue's requeue: {result:?}"
+    );
+
+    assert_eq!(jobs_for(&env.db, run).await, 1, "exactly the fresh row");
+    let context: String = sqlx::query_scalar(
+        "SELECT context FROM jobs \
+         WHERE name = 'AdvanceRunJob' AND payload->>'run_id' = $1",
+    )
+    .bind(run.0.to_string())
+    .fetch_one(&env.db)
+    .await
+    .expect("fresh row");
+    assert_eq!(
+        context, "agent-run:stalls",
+        "the progress requeue's context, distinct from agent-run-step:%"
+    );
+    assert_eq!(
+        locked_by_of(&env.db, run).await,
+        None,
+        "the run lease was released"
+    );
+
+    // Mid-batch progress state: rig commits the batch's user message only
+    // when every call is answered, so call_1's answer lives in run_state
+    // alone — exactly the shape the resume must pick up.
+    let roles: Vec<String> = transcript_rows(&env.db, run)
+        .await
+        .iter()
+        .map(|(_, role, _)| role.clone())
+        .collect();
+    assert_eq!(roles, ["user", "assistant"]);
+    let run_state_text: String =
+        sqlx::query_scalar("SELECT run_state::text FROM agent_runs WHERE id = $1")
+            .bind(run.0)
+            .fetch_one(&env.db)
+            .await
+            .expect("run_state");
+    assert!(
+        run_state_text.contains("call_1"),
+        "call_1's persisted answer lives in run_state"
+    );
+
+    // Resume: the run completes; call_1 is NOT re-executed, call_2 IS.
+    assert_eq!(drive_to_end(&env.state, run).await, RunStatus::Succeeded);
+    assert_eq!(
+        keys_for(run).len(),
+        1,
+        "call_1's answer was persisted — no re-execution"
+    );
+    assert_eq!(
+        stalls_for(run),
+        2,
+        "call_2 re-executed across the resume (the at-least-once boundary)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9b. Retry-budget accounting (operator review round 3, item 1)
 // ---------------------------------------------------------------------------
 
 /// Errors separated by persisted progress must never add up on the run's
-/// only job row: an attempt that has advanced the run and then hit a
-/// retryable error hands the run to a FRESH `AdvanceRunJob` (release +
-/// enqueue in one transaction, `Ok` return), so cja deletes the errored
-/// row and the fresh row starts at `error_count = 0`. Driving through a
+/// only job row. With one step per attempt, every 503 here hits a
+/// ZERO-progress attempt (the pre-call checkpoint is not progress) on a
+/// row the previous step's handoff already made fresh (`error_count = 0`,
+/// pulled forward): only consecutive failures on one row may escalate, so
+/// no row ever carries `error_count > 1`. The handoff itself is exercised
+/// by `one_attempt_advances_exactly_one_step`; the progress-separated
+/// requeue path (an early tool answer persisted, then a retryable error
+/// later in the same batch) is covered by
+/// `mid_batch_shutdown_requeues_on_a_fresh_job_row`. Driving through a
 /// real worker makes `error_count` real; the test polls it after every
-/// attempt. On the pre-fix design every error charged the same row, so its
-/// `error_count` reached 2 here (2^(n+1)s backoff; 20 would dead-letter
-/// the run's only job).
+/// attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn progress_separated_errors_requeue_on_a_fresh_job_row() {
     // Reference transcript for the identical-run assertion.
@@ -1488,17 +1884,14 @@ async fn progress_separated_errors_requeue_on_a_fresh_job_row() {
     let reference_run = durable::start(&reference_env.state, "counter", "add 2 and 3")
         .await
         .expect("start reference");
-    drive(&reference_env.state, reference_run)
-        .await
-        .expect("reference drive");
+    drive_to_end(&reference_env.state, reference_run).await;
     let reference = transcript_rows(&reference_env.db, reference_run).await;
 
     // Each model call succeeds only after one retryable failure: 503,
-    // tool-call reply, 503, final completion. The first 503 hits an
-    // attempt with NO completed step (only the pre-call checkpoint), so it
-    // keeps the plain Err path (error_count 1 on the original row); the
-    // second 503 hits an attempt that has committed the tool turn, so it
-    // must requeue on a fresh row instead of charging error_count 2.
+    // tool-call reply, 503, final completion. Each 503 hits an attempt
+    // with NO completed step (only the pre-call checkpoint — not
+    // progress), so it keeps the plain Err path on a row the previous
+    // handoff already made fresh.
     let env = setup(&[&COUNTER]).await;
     env.fake.status(503, r#"{"error":"upstream down"}"#);
     env.fake.tool_call(
@@ -1531,6 +1924,11 @@ async fn progress_separated_errors_requeue_on_a_fresh_job_row() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // Wait for the row to be GONE before cancelling the worker: the
+    // shutdown_drain_timeout is ZERO, so a cancel landing between the
+    // terminal commit and the handler's row DELETE would leave the row
+    // behind (the known DEV-2304 flake shape) and fail the final count.
+    wait_until(|| async { (jobs_for(&env.db, run).await == 0).then_some(()) }).await;
     token.cancel();
     tokio::time::timeout(Duration::from_secs(10), async {
         let _ = worker.await;
@@ -1630,7 +2028,7 @@ async fn read_api_and_parsing_round_trips() {
     let run = durable::start(&env.state, "counter", "read me")
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("drive");
+    drive_to_end(&env.state, run).await;
 
     let view = durable::get_run(&env.db, run).await.expect("view");
     assert!(view.created_at <= chrono::Utc::now());
@@ -1733,7 +2131,7 @@ async fn stored_errors_are_content_free() {
     let run = durable::start(&env.state, "two_turns", PROMPT_SENTINEL)
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("job Ok");
+    drive_to_end(&env.state, run).await;
     let view = view_of(&env.db, run).await;
     assert_eq!(view.status, RunStatus::Failed);
     assert!(
@@ -1848,7 +2246,7 @@ async fn tool_call_key_idempotency() {
     let run = durable::start(&env.state, "keyed", "add 2 and 3")
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("drive");
+    drive_to_end(&env.state, run).await;
     let keys = keys_for(run);
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].run_id, run);
@@ -1869,7 +2267,9 @@ async fn tool_call_key_idempotency() {
         attempts += 1;
         assert!(attempts <= 20, "crash variant did not complete");
         tokio::time::sleep(Duration::from_millis(2)).await;
-        if drive(&env2.state, run2).await.is_ok() {
+        if drive(&env2.state, run2).await.is_ok()
+            && status_of(&env2.db, run2).await == RunStatus::Succeeded
+        {
             break;
         }
     }
@@ -1920,7 +2320,7 @@ async fn reused_call_id_across_turns_gets_distinct_keys() {
     let run = durable::start(&env.state, "keyed", "reuse the id")
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("drive");
+    drive_to_end(&env.state, run).await;
     assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
     assert_eq!(env.fake.requests().len(), 3, "exactly three model requests");
 
@@ -1987,7 +2387,7 @@ async fn invalid_tool_call_policy() {
     let run = durable::start(&env.state, "counter", "x")
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("job Ok");
+    drive_to_end(&env.state, run).await;
     let view = view_of(&env.db, run).await;
     assert_eq!(view.status, RunStatus::Failed);
     assert_eq!(view.fail_reason, Some(FailReason::Protocol));
@@ -2008,7 +2408,7 @@ async fn invalid_tool_call_policy() {
     let run2 = durable::start(&env2.state, "ignore_bad_tools", "x")
         .await
         .expect("start");
-    drive(&env2.state, run2).await.expect("drive to completion");
+    drive_to_end(&env2.state, run2).await;
     assert_eq!(status_of(&env2.db, run2).await, RunStatus::Succeeded);
 }
 
@@ -2124,7 +2524,7 @@ async fn ask_with_invalid_args_fails_and_continues() {
     let run = durable::start(&env.state, "counter", "bad ask")
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("drive");
+    drive_to_end(&env.state, run).await;
 
     assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
     let rows = transcript_rows(&env.db, run).await;
@@ -2286,7 +2686,7 @@ async fn enqueue_wakes_once_after_commit() {
     )
     .await
     .expect("start suspended run");
-    drive(&env.state, suspended).await.expect("suspend");
+    drive_until_waiting(&env.state, suspended).await;
     assert_eq!(status_of(&env.db, suspended).await, RunStatus::Waiting);
 
     env.state.wakes.store(0, Ordering::SeqCst);
@@ -2446,7 +2846,7 @@ async fn spans_carry_metadata_never_content() {
     let run = durable::start(&env.state, "traced", SPAN_PROMPT_SENTINEL)
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("drive");
+    drive_to_end(&env.state, run).await;
     assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
 
     let text = writer.text();
@@ -2499,7 +2899,7 @@ async fn answer_projects_tool_result_into_transcript() {
     let run = durable::start(&env.state, "counter", "go")
         .await
         .expect("start");
-    drive(&env.state, run).await.expect("drive to suspension");
+    drive_until_waiting(&env.state, run).await;
     assert_eq!(status_of(&env.db, run).await, RunStatus::Waiting);
     let before = transcript_rows(&env.db, run).await;
     assert_eq!(before.len(), 2, "user prompt + assistant ask call");
@@ -2594,9 +2994,7 @@ async fn heartbeat_timeout_does_not_complete_the_job() {
     let reference_run = durable::start(&reference_env.state, "counter", "x")
         .await
         .expect("start reference");
-    drive(&reference_env.state, reference_run)
-        .await
-        .expect("reference drive");
+    drive_to_end(&reference_env.state, reference_run).await;
     let reference = transcript_rows(&reference_env.db, reference_run).await;
 
     // 3s takeover -> 1s heartbeat period. The delayed reply keeps the
@@ -2655,9 +3053,7 @@ async fn heartbeat_timeout_does_not_complete_the_job() {
     // With the lock released, a later attempt re-claims (cleared lease or
     // stale-lease takeover — both are past the 3s window) and drives the
     // run to `succeeded` with the reference transcript.
-    drive(&env.state, run)
-        .await
-        .expect("retry re-claims and completes");
+    drive_to_end(&env.state, run).await;
     assert_eq!(status_of(&env.db, run).await, RunStatus::Succeeded);
     assert_eq!(
         transcript_rows(&env.db, run).await,
@@ -2754,9 +3150,11 @@ async fn dead_letter_jobs_for(db: &sqlx::PgPool, run: RunId) {
 #[tokio::test]
 async fn recover_orphans_reenqueues_a_dead_lettered_run_and_completes() {
     let env = setup(&[&COUNTER]).await;
-    // Attempt 1: the tool-call reply commits the tool turn (progress),
-    // then a retryable 503 hits the second model call — the attempt ends
-    // via `retry_or_requeue` (release + fresh job row, `Ok`).
+    // Two direct drives advance two steps (the t0 model call, then the
+    // tool batch — each handoff REUSES the never-deleted start() row), so
+    // the transcript reaches the committed tool turn; a retryable 503 then
+    // hits the t1 model call on a ZERO-progress attempt (its `Err` is the
+    // plain release + cja-backoff path, dropped here).
     env.fake.tool_call(
         models::DEFAULT,
         "call_1",
@@ -2767,9 +3165,9 @@ async fn recover_orphans_reenqueues_a_dead_lettered_run_and_completes() {
     let run = durable::start(&env.state, "counter", "add 2 and 3")
         .await
         .expect("start");
-    drive(&env.state, run)
-        .await
-        .expect("requeue attempt ends Ok");
+    drive(&env.state, run).await.expect("t0 model step");
+    drive(&env.state, run).await.expect("tool batch step");
+    let _ = drive(&env.state, run).await; // t1: the 503 (retryable Err)
 
     // Partial progress persisted: running, and the transcript carries the
     // committed tool turn — prompt, assistant tool call, tool result.
@@ -2779,8 +3177,8 @@ async fn recover_orphans_reenqueues_a_dead_lettered_run_and_completes() {
     assert_eq!(roles, ["user", "assistant", "user"]);
     assert_eq!(
         jobs_for(&env.db, run).await,
-        2,
-        "the start() row and the requeue row both exist"
+        1,
+        "the reused start() row (direct drives never insert or delete)"
     );
 
     // cja dead-letters the run's only job rows (20 zero-progress failures
@@ -2795,7 +3193,7 @@ async fn recover_orphans_reenqueues_a_dead_lettered_run_and_completes() {
     // The recovered run completes from its persisted progress: the tool
     // result is NOT re-executed, the 503 consumed no turn.
     env.fake.chat_completion(models::DEFAULT, "5");
-    drive(&env.state, run).await.expect("drive to completion");
+    drive_to_end(&env.state, run).await;
     let view = view_of(&env.db, run).await;
     assert_eq!(view.status, RunStatus::Succeeded);
     assert_eq!(view.output.as_deref(), Some("5"));
@@ -2973,9 +3371,10 @@ async fn recover_orphans_leaves_job_backed_and_waiting_runs_alone() {
     .expect("dead-locked job row");
 
     // C: waiting — no job row on purpose. The DELETE is load-bearing:
-    // `drive()` runs the job directly and never deletes the `start()` row,
-    // and with that row present a wrongly-inclusive status filter would be
-    // masked by the job check returning true.
+    // `drive()` runs the job directly and never deletes the `start()` row
+    // (its handoffs reuse it), and with that row present a
+    // wrongly-inclusive status filter would be masked by the job check
+    // returning true.
     let leg_c = durable::start(&env.state, "counter", "c")
         .await
         .expect("start c");
@@ -2985,7 +3384,7 @@ async fn recover_orphans_leaves_job_backed_and_waiting_runs_alone() {
         "ask",
         &serde_json::json!({"question": "q?"}),
     );
-    drive(&env.state, leg_c).await.expect("suspend c");
+    drive_until_waiting(&env.state, leg_c).await;
     assert_eq!(status_of(&env.db, leg_c).await, RunStatus::Waiting);
     delete_jobs_for(&env.db, leg_c).await;
 
