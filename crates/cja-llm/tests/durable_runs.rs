@@ -364,6 +364,7 @@ async fn spawn_worker(
             reclaim_window: Duration::from_secs(1),
             shutdown_drain_timeout: Duration::ZERO,
             idle_poll_gate: None,
+            type_concurrency: cja::jobs::ConcurrencyTracker::isolated(),
         },
     ));
     (handle, token)
@@ -1359,6 +1360,7 @@ async fn cancel_during_in_flight_ask_reply_cancels_the_run() {
             reclaim_window: Duration::from_secs(10),
             shutdown_drain_timeout: Duration::from_secs(2),
             idle_poll_gate: None,
+            type_concurrency: cja::jobs::ConcurrencyTracker::isolated(),
         },
     ));
     wait_until(|| async { (env.fake.requests().len() == 1).then_some(()) }).await;
@@ -1694,6 +1696,7 @@ async fn shutdown_through_real_worker_releases_lease_and_job_survives() {
             reclaim_window: Duration::from_millis(150),
             shutdown_drain_timeout: Duration::from_secs(2),
             idle_poll_gate: None,
+            type_concurrency: cja::jobs::ConcurrencyTracker::isolated(),
         },
     ));
 
