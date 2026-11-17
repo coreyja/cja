@@ -2037,7 +2037,7 @@ async fn read_api_and_parsing_round_trips() {
     drive_to_end(&env.state, run).await;
 
     let view = durable::get_run(&env.db, run).await.expect("view");
-    assert!(view.created_at <= chrono::Utc::now());
+    assert!(view.created_at <= jiff::Timestamp::now());
     assert!(view.started_at.is_some());
     assert!(view.finished_at.is_some());
 
@@ -3326,10 +3326,10 @@ async fn set_running(db: &sqlx::PgPool, run: RunId, lease: Option<(&str, &str)>)
         Some((by, age)) => (format!("'{by}'"), format!("NOW() - interval '{age}'")),
         None => ("NULL".to_owned(), "NULL".to_owned()),
     };
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE agent_runs SET status = 'running', locked_by = {locked_by}, \
          locked_at = {locked_at} WHERE id = $1"
-    ))
+    )))
     .bind(run.0)
     .execute(db)
     .await

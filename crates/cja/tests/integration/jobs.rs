@@ -317,7 +317,7 @@ async fn test_failing_job_enqueue() {
     assert_eq!(row.get::<i32, _>("error_count"), 0);
     assert!(row.get::<Option<String>, _>("last_error_message").is_none());
     assert!(
-        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+        row.get::<Option<jiff_sqlx::Timestamp>, _>("last_failed_at")
             .is_none()
     );
 }
@@ -348,7 +348,7 @@ async fn test_error_tracking_fields_present() {
     assert_eq!(row.get::<i32, _>("error_count"), 0);
     assert!(row.get::<Option<String>, _>("last_error_message").is_none());
     assert!(
-        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+        row.get::<Option<jiff_sqlx::Timestamp>, _>("last_failed_at")
             .is_none()
     );
 }
@@ -410,13 +410,13 @@ async fn test_job_error_count_increment() {
         Some(error_message.to_string())
     );
     assert!(
-        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_failed_at")
+        row.get::<Option<jiff_sqlx::Timestamp>, _>("last_failed_at")
             .is_some()
     );
 
     // Verify run_at was pushed forward (should be at least 2 seconds in future)
-    let run_at = row.get::<chrono::DateTime<chrono::Utc>, _>("run_at");
-    assert!(run_at > chrono::Utc::now());
+    let run_at = row.get::<jiff_sqlx::Timestamp, _>("run_at").to_jiff();
+    assert!(run_at > jiff::Timestamp::now());
 }
 
 #[tokio::test]
@@ -443,7 +443,7 @@ async fn test_exponential_backoff_calculation() {
     .await
     .unwrap();
 
-    let before_update = chrono::Utc::now();
+    let before_update = jiff::Timestamp::now();
 
     // Simulate failure - should set run_at to NOW() + 2^6 seconds = 64 seconds
     sqlx::query(
@@ -473,13 +473,13 @@ async fn test_exponential_backoff_calculation() {
 
     // run_at should be approximately 64 seconds (2^6) in the future
     // Allow some tolerance for test execution time
-    let run_at = row.get::<chrono::DateTime<chrono::Utc>, _>("run_at");
+    let run_at = row.get::<jiff_sqlx::Timestamp, _>("run_at").to_jiff();
     let actual_delay = run_at - before_update;
 
     // Should be between 63 and 66 seconds to account for timing
     assert!(
-        actual_delay >= chrono::Duration::seconds(63)
-            && actual_delay <= chrono::Duration::seconds(66),
+        actual_delay >= jiff::SignedDuration::from_secs(63)
+            && actual_delay <= jiff::SignedDuration::from_secs(66),
         "Expected delay ~64 seconds, got {actual_delay:?}"
     );
 }
@@ -568,7 +568,7 @@ async fn test_max_retries_exceeded_moves_to_dead_letter_queue() {
     );
     assert!(
         dlq_row
-            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("failed_at")
+            .get::<Option<jiff_sqlx::Timestamp>, _>("failed_at")
             .is_some()
     );
 

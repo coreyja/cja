@@ -112,9 +112,11 @@ pub struct CJASession {
     /// DB trigger on every UPDATE; the `Session` extractor refreshes it at
     /// most once per [`ACTIVITY_REFRESH_MIN_INTERVAL`] while the session is
     /// in use, so it doubles as the idle clock for [`prune`].
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub updated_at: jiff::Timestamp,
     /// Timestamp when the session was first created
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub created_at: jiff::Timestamp,
 }
 
 // #[async_trait::async_trait]
@@ -323,11 +325,11 @@ pub trait AppSession: Sized {
         &self.inner().session_id
     }
 
-    fn created_at(&self) -> &chrono::DateTime<chrono::Utc> {
+    fn created_at(&self) -> &jiff::Timestamp {
         &self.inner().created_at
     }
 
-    fn updated_at(&self) -> &chrono::DateTime<chrono::Utc> {
+    fn updated_at(&self) -> &jiff::Timestamp {
         &self.inner().updated_at
     }
 }
@@ -452,7 +454,7 @@ impl<A: AppState + Send + Sync, S: AppSession + Send + Sync> FromRequestParts<A>
 /// so [`prune`] measures real activity. Best-effort: a failure is logged,
 /// never fatal for the request (pinned by `failed_activity_refresh_...`).
 async fn touch_if_stale(pool: &sqlx::PgPool, session: &CJASession) {
-    if session.updated_at + ACTIVITY_REFRESH_MIN_INTERVAL > chrono::Utc::now() {
+    if session.updated_at + ACTIVITY_REFRESH_MIN_INTERVAL > jiff::Timestamp::now() {
         return;
     }
     let refreshed = sqlx::query(

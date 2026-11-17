@@ -60,13 +60,15 @@ async fn state_snapshot(
     .await
     .unwrap()
     .into_iter()
-    .map(|r| serde_json::json!({
-        "username": r.try_get::<String, _>("username").unwrap(),
-        "user_id": r.try_get::<Uuid, _>("user_id").unwrap(),
-        "credential_id_pk": r.try_get::<Uuid, _>("credential_id_pk").unwrap(),
-        "credential_json": r.try_get::<serde_json::Value, _>("credential_json").unwrap(),
-        "last_used_at": r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_used_at").unwrap(),
-    }))
+    .map(|r| {
+        serde_json::json!({
+            "username": r.try_get::<String, _>("username").unwrap(),
+            "user_id": r.try_get::<Uuid, _>("user_id").unwrap(),
+            "credential_id_pk": r.try_get::<Uuid, _>("credential_id_pk").unwrap(),
+            "credential_json": r.try_get::<serde_json::Value, _>("credential_json").unwrap(),
+            "last_used_at": r.try_get::<Option<jiff_sqlx::Timestamp>, _>("last_used_at").unwrap().map(jiff_sqlx::Timestamp::to_jiff),
+        })
+    })
     .collect::<Vec<_>>();
     Json(serde_json::json!({
         "session_id": session.session_id(),

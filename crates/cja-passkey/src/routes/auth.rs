@@ -340,7 +340,7 @@ async fn persist_authenticated_credential(
                 executor,
                 row.credential_id_pk,
                 credential_json,
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )
             .await
             .map_err(|err| {

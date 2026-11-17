@@ -152,7 +152,7 @@ async fn run_application() -> cja::Result<()> {
         let worker = cja::cron::Worker::new_with_timezone(
             app_state.clone(),
             cron_registry,
-            heartbeat::TIMEZONE,
+            heartbeat::TIMEZONE.clone(),
             std::time::Duration::from_secs(30),
         );
         let token = supervisor.shutdown_token();

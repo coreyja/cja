@@ -1,14 +1,15 @@
+use jiff_sqlx::ToSqlx as _;
 use sqlx::Row;
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct PasskeyCredential {
     pub credential_id_pk: uuid::Uuid,
     pub user_id: uuid::Uuid,
     pub credential_json: serde_json::Value,
     pub credential_id: Vec<u8>,
     pub name: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: jiff::Timestamp,
+    pub last_used_at: Option<jiff::Timestamp>,
 }
 
 fn row_to_credential(row: &sqlx::postgres::PgRow) -> sqlx::Result<PasskeyCredential> {
@@ -18,8 +19,12 @@ fn row_to_credential(row: &sqlx::postgres::PgRow) -> sqlx::Result<PasskeyCredent
         credential_json: row.try_get("credential_json")?,
         credential_id: row.try_get("credential_id")?,
         name: row.try_get("name")?,
-        created_at: row.try_get("created_at")?,
-        last_used_at: row.try_get("last_used_at")?,
+        created_at: row
+            .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+            .to_jiff(),
+        last_used_at: row
+            .try_get::<Option<jiff_sqlx::Timestamp>, _>("last_used_at")?
+            .map(jiff_sqlx::Timestamp::to_jiff),
     })
 }
 
@@ -83,7 +88,7 @@ pub async fn update_after_auth(
     executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     credential_id_pk: uuid::Uuid,
     credential_json: serde_json::Value,
-    last_used_at: chrono::DateTime<chrono::Utc>,
+    last_used_at: jiff::Timestamp,
 ) -> cja::Result<()> {
     sqlx::query(
         "UPDATE passkey_credentials \
@@ -91,7 +96,7 @@ pub async fn update_after_auth(
          WHERE credential_id_pk = $3",
     )
     .bind(credential_json)
-    .bind(last_used_at)
+    .bind(last_used_at.to_sqlx())
     .bind(credential_id_pk)
     .execute(executor)
     .await?;

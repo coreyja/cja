@@ -592,10 +592,10 @@ pub(super) async fn lock_active_run(
     // covers the later job check and enqueue, whose lock waits are not
     // expected (cja's job inserts do not conflict on a unique key) and
     // would surface as an `Err` the next tick retries anyway.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET LOCAL lock_timeout = '{}s'",
         LOCK_BOUND.as_secs()
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     let statuses: Vec<String> = [RunStatus::Queued, RunStatus::Running]
@@ -688,12 +688,12 @@ mod tests {
         let terminal = matches!(status, "succeeded" | "failed" | "cancelled");
         let fail_reason = if status == "failed" { "'x'" } else { "NULL" };
         let finished_at = if terminal { "NOW()" } else { "NULL" };
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state, \
              pending_call_id, pending_question, fail_reason, finished_at) \
              VALUES ($1, 'k', $2, 'in', 'm', 'a', '{{}}'::jsonb, \
              {pending_call}, {pending_question}, {fail_reason}, {finished_at})"
-        ))
+        )))
         .bind(id)
         .bind(status)
         .execute(db)
@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(pending_call, None, "pending columns cleared");
         assert_eq!(pending_question, None, "pending columns cleared");
         assert_eq!(locked_by, None, "lease cleared");
-        let (error, finished_at): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        let (error, finished_at): (Option<String>, Option<jiff_sqlx::Timestamp>) =
             sqlx::query_as("SELECT error, finished_at FROM agent_runs WHERE id = $1")
                 .bind(id)
                 .fetch_one(&db)
@@ -1038,14 +1038,14 @@ mod tests {
         lease: bool,
     ) -> sqlx::Result<Uuid> {
         let id = Uuid::new_v4();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state, \
              fail_reason, finished_at, locked_by, locked_at) \
              VALUES ($1, 'k', $2, 'in', 'm', 'a', '{{}}'::jsonb, $3, {}, {}, {})",
             if finished_at { "NOW()" } else { "NULL" },
             if lease { "'x'" } else { "NULL" },
             if lease { "NOW()" } else { "NULL" },
-        ))
+        )))
         .bind(id)
         .bind(status)
         .bind(fail_reason)

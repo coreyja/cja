@@ -5,7 +5,8 @@ pub struct User {
     pub user_id: uuid::Uuid,
     pub username: String,
     pub display_name: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub created_at: jiff::Timestamp,
 }
 
 fn row_to_user(row: &sqlx::postgres::PgRow) -> sqlx::Result<User> {
@@ -13,7 +14,9 @@ fn row_to_user(row: &sqlx::postgres::PgRow) -> sqlx::Result<User> {
         user_id: row.try_get("user_id")?,
         username: row.try_get("username")?,
         display_name: row.try_get("display_name")?,
-        created_at: row.try_get("created_at")?,
+        created_at: row
+            .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+            .to_jiff(),
     })
 }
 

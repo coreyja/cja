@@ -32,7 +32,7 @@ async fn status(State(app_state): State<AppState>) -> Result<impl IntoResponse, 
     let status = crate::heartbeat::status(
         &app_state.db,
         &app_state.heartbeat_schedule,
-        cja::chrono::Utc::now(),
+        cja::jiff::Timestamp::now(),
     )
     .await
     .map_err(|error| {

@@ -11,9 +11,9 @@ pub fn status_page(status: &crate::heartbeat::Status) -> Markup {
 fn status_content(status: &crate::heartbeat::Status) -> Markup {
     use crate::heartbeat::{TIMEZONE, ago};
 
-    let local = |at: &cja::chrono::DateTime<cja::chrono::Utc>| {
-        at.with_timezone(&TIMEZONE)
-            .format("%b %-d, %-I:%M:%S %p %Z")
+    let local = |at: &cja::jiff::Timestamp| {
+        at.to_zoned_datetime(TIMEZONE.clone())
+            .strftime("%b %-d, %-I:%M:%S %p %Z")
             .to_string()
     };
 
@@ -24,7 +24,7 @@ fn status_content(status: &crate::heartbeat::Status) -> Markup {
                     h2 { "Status" }
                     p {
                         "This site runs on cja. A cron fires every five minutes ("
-                        (TIMEZONE.name())
+                        (TIMEZONE.iana_name().unwrap_or("UTC"))
                         "), enqueues a job, and the job records a heartbeat."
                     }
                 }
@@ -40,7 +40,7 @@ fn status_content(status: &crate::heartbeat::Status) -> Markup {
                     }
                     div class="status-stat" {
                         h4 { "Next fire" }
-                        p { (status.next_fire_at.format("%-I:%M %p %Z")) }
+                        p { (status.next_fire_at.strftime("%-I:%M %p %Z")) }
                     }
                 }
                 h3 { "Recent heartbeats" }
@@ -54,7 +54,7 @@ fn status_content(status: &crate::heartbeat::Status) -> Markup {
                                 span class="status-detail" { (ago(status.now, beat.started_at)) }
                                 @match beat.finished_at {
                                     Some(finished) => span class="status-detail" {
-                                        "took " ((finished - beat.started_at).num_milliseconds()) "ms"
+                                        "took " (finished.duration_since(beat.started_at).as_millis()) "ms"
                                     },
                                     None => span class="status-detail" { "unfinished" },
                                 }
@@ -66,7 +66,7 @@ fn status_content(status: &crate::heartbeat::Status) -> Markup {
                 ul class="status-list" {
                     @for day in &status.days {
                         li {
-                            span { (day.local_date.format("%a %b %-d")) }
+                            span { (day.local_date.strftime("%a %b %-d")) }
                             span class="status-detail" { (day.beats) }
                         }
                     }
@@ -392,13 +392,13 @@ fn server_icon() -> Markup {
 mod tests {
     #[test]
     fn status_page_renders_empty_state() {
-        let now = cja::chrono::Utc::now();
+        let now = cja::jiff::Timestamp::now();
         let status = crate::heartbeat::Status {
             now,
             recent: vec![],
             days: vec![],
             last_fired_at: None,
-            next_fire_at: now.with_timezone(&crate::heartbeat::TIMEZONE),
+            next_fire_at: now.to_zoned_datetime(crate::heartbeat::TIMEZONE.clone()),
         };
         let html = super::status_page(&status).into_string();
         assert!(html.contains("Never"));
