@@ -47,7 +47,9 @@ jobs:
         run: cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres
 
       - name: Migrate DB
-        run: cd crates/cja && cargo sqlx database create && cargo sqlx migrate run
+        run: |
+          (cd crates/cja && cargo sqlx database create && cargo sqlx migrate run)
+          (cd crates/cja.app && cargo sqlx migrate run --ignore-missing)
 
       - name: Check sqlx prepare
         run: ./scripts/sqlx.sh --check

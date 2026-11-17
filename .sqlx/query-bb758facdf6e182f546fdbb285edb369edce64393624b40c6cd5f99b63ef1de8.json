@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT local_date, count(*) AS \"beats!\"\n           FROM heartbeats\n           GROUP BY local_date\n           ORDER BY local_date DESC\n           LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "local_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 1,
+        "name": "beats!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "bb758facdf6e182f546fdbb285edb369edce64393624b40c6cd5f99b63ef1de8"
+}
