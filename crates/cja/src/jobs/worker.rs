@@ -5080,12 +5080,23 @@ mod idle_gate_tests {
     async fn pool_failure_releases_permits_before_backoff(db: sqlx::PgPool) {
         use sqlx::postgres::PgPoolOptions;
         setup(&db).await;
-        // Lazy: an eager connect must finish inside the 100ms acquire
-        // timeout, which a loaded CI runner can miss before the test starts.
+        // The 100ms acquire timeout is for waiting on a busy pool, not for
+        // opening connections: a loaded CI runner can take longer than that
+        // to connect. Open both connections up front, then start the workers.
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .acquire_timeout(Duration::from_millis(100))
             .connect_lazy_with((*db.connect_options()).clone());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut opened = Vec::new();
+            while opened.len() < 2 {
+                if let Ok(conn) = pool.acquire().await {
+                    opened.push(conn);
+                }
+            }
+        })
+        .await
+        .expect("pool opens both connections");
         let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
         let state = make_state(pool.clone(), gate.clone());
         let workers = Workers::start(&state, 100, Duration::from_millis(200), true);
