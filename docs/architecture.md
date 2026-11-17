@@ -126,7 +126,7 @@ cja::impl_job_registry!(AppState, NoopJob, CancellableDemoJob);
 // Generates a `Jobs` struct implementing JobRegistry
 ```
 
-The macro also generates the required `max_runtime(name)` from each registered type's `MAX_RUNTIME` const, which the worker consults to bound each attempt.
+The macro also uses each registered type's `MAX_RUNTIME` const to generate the required `max_runtime(name)`, which the worker consults to bound each attempt.
 
 ### `AppSession` (`server/session.rs`)
 
@@ -161,7 +161,7 @@ enqueue() → INSERT INTO jobs (with priority, payload, context)
     → SELECT ... FOR UPDATE SKIP LOCKED (claims one row and charges an expired lease)
       → Deserialize payload → JobRegistry::run_job() → Job::run()
         → Heartbeat `locked_at` while the handler runs
-        → Body runs under Job::MAX_RUNTIME (default 15m): on expiry the future is dropped, charged like a returned error
+        → Body runs under Job::MAX_RUNTIME (default 15m): on expiry, the future is dropped and charged like a returned error
         → On success: DELETE FROM jobs
         → On returned error or caught panic (error_count < max_retries):
             UPDATE jobs SET error_count += 1,
@@ -174,7 +174,7 @@ enqueue() → INSERT INTO jobs (with priority, payload, context)
             INSERT INTO dead_letter_jobs with final count + DELETE FROM jobs
 ```
 
-The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not; a `JobYield` error and an unknown job name release uncharged (unknown names: 30s, hourly past 1h of row age, dead-letter past 14 days). When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent. Attempts exceeding `Job::MAX_RUNTIME` are dropped — cancelling async work only; work inside `spawn_blocking` keeps running after the drop — and charged as retryable failures whose error names the limit.
+The `FOR UPDATE SKIP LOCKED` clause makes claim and expired-lease accounting atomic across workers. Priority ordering is `ORDER BY priority DESC, run_at ASC, created_at ASC`. Owners are plain UUID strings. `locked_at` is the last successful heartbeat, and every owned lock older than the reclaim window can be charged and reclaimed. `JobWorkerConfig` defaults to a 30-second heartbeat, 120-second reclaim window, and the Supervisor-aligned 2-second body drain. Its reclaim window must be at least three heartbeat intervals. Missing heartbeats count as failed attempts, while completion and graceful drain do not; a `JobYield` error and an unknown job name release uncharged (unknown names: 30s, hourly past 1h of row age, dead-letter past 14 days). When the heartbeat loses ownership or the watchdog expires, the worker drops the body without finalizing the row. Graceful drain releases only its own locks. Infrastructure panics outside the caught handler future still trigger supervisor shutdown and platform restart; an abandoned row is charged on expiry. Jobs must be idempotent. Attempts exceeding `Job::MAX_RUNTIME` are dropped and charged as retryable failures whose error names the limit. Dropping cancels async work only; work inside `spawn_blocking` keeps running.
 
 `JobWorkerConfig.idle_poll_gate` optionally shares a process-local `IdlePollGate` among workers. Its permits limit periodic idle claims; a worker keeps a permit across empty sleeps and releases it before running a job or its heartbeat. A successful autocommit `Job::enqueue` calls `AppState::job_enqueued`, which an app may override to wake one parked worker for one extra claim. Direct SQL, other processes, transactional enqueue, due retries, and expired leases do not provide this local wake; the periodic claimers discover them. Notifications may coalesce or be lost, so SQL remains authoritative with the same priority order.
 

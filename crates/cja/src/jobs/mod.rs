@@ -86,12 +86,12 @@
 //! [`Job::MAX_RUNTIME`], defaulting to [`DEFAULT_MAX_RUNTIME`] (15 minutes).
 //! A job type whose healthy attempts run longer overrides it with a larger
 //! `Duration` (e.g. `const MAX_RUNTIME: Duration =
-//! Duration::from_secs(2 * 60 * 60);`). On expiry the worker drops the body
+//! Duration::from_secs(2 * 60 * 60);`). On expiry, the worker drops the body
 //! future, stops heartbeating, releases the lease, and records a retryable
 //! failure whose message names the limit; each retry gets a fresh budget.
 //! The timeout cancels **async** work only — work already inside
 //! `spawn_blocking` keeps running after the drop, so jobs that hand work to
-//! blocking threads must bound that work themselves.
+//! blocking threads must bound it themselves.
 //!
 //! # Idempotency
 //!
@@ -244,12 +244,12 @@ pub use worker::{
     JobWorkerConfig,
 };
 
-/// Default per-attempt maximum runtime for a job ([`Job::MAX_RUNTIME`]).
+/// Default maximum runtime per job attempt ([`Job::MAX_RUNTIME`]).
 ///
 /// 15 minutes is ~30 default heartbeat intervals and 3× the 5-minute stopgap
 /// arena shipped for its wedged backups (BattlesnakeOfficial/arena#341): long
-/// enough that no healthy job notices it, short enough that a hung body
-/// releases its worker slot and lease in bounded time. Renders as `900s` in
+/// enough that no healthy job notices, short enough that a hung body releases
+/// its worker slot and lease in bounded time. Renders as `900s` in
 /// [`crate::jobs::JobMaxRuntimeExceeded`]'s message (`Duration`'s `Debug`).
 pub const DEFAULT_MAX_RUNTIME: Duration = Duration::from_mins(15);
 
@@ -307,11 +307,11 @@ pub struct UnknownJobType(pub String);
 #[error("job payload is not deserializable")]
 pub struct InvalidJobPayload(#[from] serde_json::Error);
 
-/// A single attempt of a job exceeded [`Job::MAX_RUNTIME`] and was dropped by
-/// the worker. Charged like any other failure: the attempt increments
+/// A single job attempt exceeded [`Job::MAX_RUNTIME`] and was dropped by the
+/// worker. Charged like any other failure: the attempt increments
 /// `error_count`, takes the normal exponential backoff, and eventually
 /// dead-letters. Dropping the future cancels async work only — work already
-/// inside `spawn_blocking` keeps running after the drop.
+/// inside `spawn_blocking` keeps running.
 ///
 /// The message renders the limit via `Duration`'s `Debug` (`900s` at the
 /// 15-minute default, `2s` for a 2-second override).
@@ -476,22 +476,21 @@ pub trait Job<AppState: AS>:
 
     /// Maximum wall-clock time a single attempt of this job may run before
     /// the worker drops the body future. Defaults to
-    /// [`DEFAULT_MAX_RUNTIME`] (15 minutes); a job type whose healthy
-    /// attempts legitimately run longer overrides it with a larger
-    /// `Duration`, e.g. `const MAX_RUNTIME: Duration =
-    /// Duration::from_secs(2 * 60 * 60);`.
+    /// [`DEFAULT_MAX_RUNTIME`] (15 minutes). Job types whose healthy
+    /// attempts take longer can override it with a larger `Duration`, e.g.
+    /// `const MAX_RUNTIME: Duration = Duration::from_secs(2 * 60 * 60);`.
     ///
-    /// On expiry the worker drops the future, stops heartbeating, releases
+    /// On expiry, the worker drops the future, stops heartbeating, releases
     /// the lease, and charges the attempt as a normal retryable failure
-    /// (error message names the limit). Each retry gets a fresh budget.
+    /// (the error message names the limit). Each retry gets a fresh budget.
     ///
     /// # Caveat
     ///
-    /// The limit cancels **async** work only. Work already running inside
-    /// `tokio::task::spawn_blocking` (or a detached `tokio::spawn`) keeps
-    /// running after the job future is dropped. Jobs that hand work to
-    /// blocking threads must bound that work themselves (e.g. their own
-    /// timeout around the blocking call) if it must not outlive the attempt.
+    /// The limit cancels **async** work only. Work running inside
+    /// `tokio::task::spawn_blocking` (or a detached `tokio::spawn`) continues
+    /// after the job future is dropped. Jobs that hand work to blocking
+    /// threads must bound it themselves (e.g. with their own timeout around
+    /// the blocking call) if it must not outlive the attempt.
     const MAX_RUNTIME: Duration = DEFAULT_MAX_RUNTIME;
 
     /// Execute the job logic.

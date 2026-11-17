@@ -27,12 +27,12 @@ pub trait JobRegistry<AppState: app_state::AppState> {
     where
         Self: Sized;
 
-    /// The per-attempt maximum runtime for the named job type, from its
+    /// Per-attempt maximum runtime for the named job type, from its
     /// [`crate::jobs::Job::MAX_RUNTIME`] const.
     ///
     /// `impl_job_registry!` implements this automatically from the
     /// registered types' consts. Hand-written `JobRegistry` impls MUST
-    /// implement it (it is required, like `run_job`) — delegate to the job
+    /// implement it (required, like `run_job`) — delegate to the job
     /// types' `MAX_RUNTIME` consts so limits apply.
     fn max_runtime(&self, name: &str) -> Duration;
 }

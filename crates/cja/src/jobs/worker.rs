@@ -819,14 +819,13 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// # Maximum Runtime
 ///
 /// Every job attempt runs under [`Job::MAX_RUNTIME`](crate::jobs::Job::MAX_RUNTIME) — a per-job-type
-/// wall-clock limit, defaulting to 15 minutes; a type whose healthy attempts
-/// run longer overrides it with a larger `Duration`. On expiry the worker
+/// wall-clock limit defaulting to 15 minutes. Job types whose healthy attempts
+/// run longer override it with a larger `Duration`. On expiry, the worker
 /// drops the body future, stops heartbeating, releases the lease, and charges
 /// the attempt as a normal retryable failure whose error message names the
 /// limit. Each retry gets a fresh budget. The timeout cancels **async**
 /// work only — work already inside `spawn_blocking` keeps running after the
-/// drop, so jobs that hand work to blocking threads must bound that work
-/// themselves.
+/// drop, so jobs that hand work to blocking threads must bound it themselves.
 ///
 /// # Graceful Shutdown
 ///
@@ -1522,9 +1521,9 @@ mod tests {
 
     /// DEV-2423 regression: a body that awaits forever must be dropped at its
     /// `MAX_RUNTIME`, charged as a retryable failure with the limit in the
-    /// error message, released (no lingering lock), and the same worker must
-    /// go on to claim a second job. Without enforcement the heartbeats keep
-    /// the lease forever and this test times out in `wait_for`.
+    /// error message, and released (no lingering lock); the same worker must
+    /// then claim a second job. Without enforcement, heartbeats keep the lease
+    /// forever and this test times out in `wait_for`.
     #[sqlx::test]
     async fn test_max_runtime_drops_hung_job_and_worker_continues(db: sqlx::PgPool) {
         sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
@@ -1600,10 +1599,10 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
-    /// DEV-2423: the limit is per job TYPE — a body that outlives a
+    /// DEV-2423: the limit is per job TYPE. A body that outlives a
     /// neighbour type's short limit (2s) but stays under its own larger
-    /// `MAX_RUNTIME` (10s) completes normally: the row is deleted after a
-    /// single uncharged attempt (`error_count` 0 at body time, nothing in
+    /// `MAX_RUNTIME` (10s) completes normally: the row is deleted after one
+    /// uncharged attempt (`error_count` 0 at body time, nothing in
     /// `dead_letter_jobs`).
     #[sqlx::test]
     async fn test_max_runtime_body_past_neighbour_limit_completes(db: sqlx::PgPool) {
