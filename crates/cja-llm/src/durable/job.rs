@@ -1,6 +1,6 @@
 //! The generic advancement job.
 
-use cja::jobs::{CancellationToken, Job};
+use cja::jobs::{CancellationToken, ConcurrencySlot, Job};
 use uuid::Uuid;
 
 use super::HasDurable;
@@ -43,8 +43,12 @@ impl<S: HasDurable> Job<S> for AdvanceRunJob {
     const NAME: &'static str = Self::NAME;
 
     async fn run(&self, state: S) -> cja::color_eyre::Result<()> {
-        self.run_with_cancellation(state, CancellationToken::new())
-            .await
+        self.run_with_cancellation(
+            state,
+            CancellationToken::new(),
+            ConcurrencySlot::untracked(),
+        )
+        .await
     }
 
     /// `token` is the worker's shutdown token (`run_job` forwards it): what
@@ -55,6 +59,7 @@ impl<S: HasDurable> Job<S> for AdvanceRunJob {
         &self,
         state: S,
         cancellation_token: CancellationToken,
+        _slot: cja::jobs::ConcurrencySlot,
     ) -> cja::color_eyre::Result<()> {
         state
             .durable()

@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::app_state::{self};
 
 use super::Concurrency;
-use super::worker::JobFromDB;
+use super::worker::{ConcurrencySlot, JobFromDB};
 
 /// A trait for job registries that can dispatch jobs based on their name.
 ///
@@ -17,6 +17,7 @@ pub trait JobRegistry<AppState: app_state::AppState> {
         job: &JobFromDB,
         app_state: AppState,
         cancellation_token: tokio_util::sync::CancellationToken,
+        slot: ConcurrencySlot,
     ) -> color_eyre::Result<()>;
 
     /// The names of every job type registered with this registry.
@@ -122,6 +123,7 @@ macro_rules! impl_job_registry {
                 job: &$crate::jobs::worker::JobFromDB,
                 app_state: $state,
                 cancellation_token: $crate::jobs::CancellationToken,
+                slot: $crate::jobs::worker::ConcurrencySlot,
             ) -> $crate::Result<()> {
                 use $crate::jobs::Job as _;
 
@@ -129,7 +131,7 @@ macro_rules! impl_job_registry {
 
                 match job.name.as_str() {
                     $(
-                        <$job_type>::NAME => <$job_type>::run_from_value(payload, app_state, cancellation_token).await,
+                        <$job_type>::NAME => <$job_type>::run_from_value(payload, app_state, cancellation_token, slot).await,
                     )*
                     _ => Err($crate::jobs::UnknownJobType(job.name.clone()).into()),
                 }
