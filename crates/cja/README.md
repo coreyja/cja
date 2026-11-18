@@ -360,7 +360,8 @@ the database clock fires on the next tick and no longer pauses the cron.
 Worker::new(app_state, registry).run(shutdown_token).await;
 
 // Custom timezone and poll interval
-Worker::new_with_timezone(app_state, registry, chrono_tz::US::Eastern, Duration::from_secs(10))
+let eastern = cja::jiff::tz::TimeZone::get("America/New_York")?;
+Worker::new_with_timezone(app_state, registry, eastern, Duration::from_secs(10))
     .run(shutdown_token)
     .await;
 
@@ -512,6 +513,6 @@ use cja::sqlx;
 use cja::uuid;
 use cja::color_eyre;
 use cja::maud;
-use cja::chrono;
-use cja::chrono_tz;
+use cja::jiff;
+use cja::jiff_sqlx;
 ```

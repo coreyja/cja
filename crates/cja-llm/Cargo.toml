@@ -12,7 +12,7 @@ default = []
 tailnet = ["dep:cja-tailnet"]
 # Durable agent runs: rig AgentRun persisted in Postgres, advanced by cja
 # jobs. Ships the agent_runs/agent_messages migrations.
-durable = ["dep:cja", "cja/jobs", "dep:sqlx", "dep:uuid", "dep:chrono", "dep:async-trait"]
+durable = ["dep:cja", "cja/jobs", "dep:sqlx", "dep:uuid", "dep:jiff", "dep:jiff-sqlx", "dep:async-trait"]
 # Fake gateway for app tests: scripted OpenAI chat-completions over real HTTP.
 # (serde_json is a non-optional dependency — no `dep:serde_json` here; cargo
 # rejects `dep:` on non-optional dependencies.)
@@ -26,7 +26,8 @@ cja-tailnet = { path = "../cja-tailnet", optional = true }
 cja = { path = "../cja", default-features = false, optional = true }
 sqlx = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
-chrono = { workspace = true, optional = true }
+jiff = { workspace = true, optional = true }
+jiff-sqlx = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bytes = "1"
 http = "1"

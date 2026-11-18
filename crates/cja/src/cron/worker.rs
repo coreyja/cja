@@ -3,8 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
+use jiff::tz::TimeZone;
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState as AS;
@@ -32,29 +31,34 @@ pub struct Worker<AppState: AS> {
     id: uuid::Uuid,
     state: AppState,
     registry: CronRegistry<AppState>,
-    pub(crate) started_at: DateTime<Utc>,
-    timezone: Tz,
+    pub(crate) started_at: jiff::Timestamp,
+    timezone: TimeZone,
     sleep_duration: Duration,
 }
 
 impl<AppState: AS> Worker<AppState> {
     /// Create a new Worker with UTC as the default timezone
     pub fn new(state: AppState, registry: CronRegistry<AppState>) -> Self {
-        Self::new_with_timezone(state, registry, chrono_tz::UTC, Duration::from_mins(1))
+        Self::new_with_timezone(
+            state,
+            registry,
+            jiff::tz::TimeZone::UTC,
+            Duration::from_mins(1),
+        )
     }
 
     /// Create a new Worker with a specific timezone
     pub fn new_with_timezone(
         state: AppState,
         registry: CronRegistry<AppState>,
-        timezone: Tz,
+        timezone: TimeZone,
         sleep_duration: Duration,
     ) -> Self {
         Self {
             id: uuid::Uuid::new_v4(),
             state,
             registry,
-            started_at: Utc::now(),
+            started_at: jiff::Timestamp::now(),
             timezone,
             sleep_duration,
         }
@@ -118,26 +122,31 @@ impl<AppState: AS> Worker<AppState> {
 
     async fn last_enqueue_map(
         &self,
-    ) -> Result<(HashMap<String, DateTime<Utc>>, DateTime<Utc>), sqlx::Error> {
+    ) -> Result<(HashMap<String, jiff::Timestamp>, jiff::Timestamp), sqlx::Error> {
         // Tick time first, then the row snapshot. A row committed after this
         // read can carry a stamp later than `db_now`; the pre-filter passes
         // such a stamp through as due and the claim re-check — with a fresh
         // clock_timestamp() — decides.
-        let db_now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+        let db_now = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>("SELECT clock_timestamp()")
             .fetch_one(self.state.db())
-            .await?;
+            .await?
+            .to_jiff();
         // Runtime query (not `query!`): with `DATABASE_URL` set and
         // `SQLX_OFFLINE` unset, the macro live-checks the query against that
         // database at compile time. That is exactly the state the
         // scaffolded-app run instructions create, on a database that has no
         // `crons` table until boot-time migrations run — so a macro here
         // would break compiling a freshly scaffolded app.
-        let last_runs =
-            sqlx::query_as::<_, (String, DateTime<Utc>)>("SELECT name, last_run_at FROM crons")
-                .fetch_all(self.state.db())
-                .await?;
+        let last_runs = sqlx::query_as::<_, (String, jiff_sqlx::Timestamp)>(
+            "SELECT name, last_run_at FROM crons",
+        )
+        .fetch_all(self.state.db())
+        .await?;
 
-        let last_run_map: HashMap<String, DateTime<Utc>> = last_runs.into_iter().collect();
+        let last_run_map: HashMap<String, jiff::Timestamp> = last_runs
+            .into_iter()
+            .map(|(name, at)| (name, at.to_jiff()))
+            .collect();
 
         Ok((last_run_map, db_now))
     }
@@ -182,15 +191,15 @@ impl<AppState: AS> Worker<AppState> {
         };
         for job in self.registry.jobs.values() {
             let now = db_now
-                + chrono::Duration::from_std(tick_started.elapsed())
-                    .unwrap_or_else(|_| chrono::Duration::zero());
+                + jiff::SignedDuration::try_from(tick_started.elapsed())
+                    .unwrap_or(jiff::SignedDuration::ZERO);
             if let Err(error) = job
                 .tick(
                     self.state.clone(),
                     &last_enqueue_map,
                     now,
                     self.started_at,
-                    self.timezone,
+                    &self.timezone,
                 )
                 .await
             {

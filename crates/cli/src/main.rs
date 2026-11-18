@@ -519,6 +519,8 @@ fn create_project(
     fs::write(project_path.join("build.rs"), build_rs_content)
         .context("Failed to write build.rs")?;
 
+    fs::write(project_path.join("sqlx.toml"), SQLX_TOML).context("Failed to write sqlx.toml")?;
+
     println!("Created new CJA project '{project_name}'");
     println!("\nTo run it:");
     println!("  cd {project_name}");
@@ -658,6 +660,11 @@ fn init_project(
         fs::write(build_rs_path, build_rs_content).context("Failed to write build.rs")?;
     }
 
+    let sqlx_toml_path = Path::new("sqlx.toml");
+    if !sqlx_toml_path.exists() {
+        fs::write(sqlx_toml_path, SQLX_TOML).context("Failed to write sqlx.toml")?;
+    }
+
     println!("Successfully initialized CJA in your project!");
     println!("Binary created at: {}", bin_file_path.display());
     println!("\nTo run your CJA application:");
@@ -697,14 +704,15 @@ fn add_dependencies(github_repo: Option<&String>, branch: &str) -> Result<()> {
         ("tokio", Some("1"), vec!["full"]),
         (
             "sqlx",
-            Some("0.8"),
+            Some("0.9"),
             vec![
-                "runtime-tokio-rustls",
+                "runtime-tokio",
+                "tls-rustls",
                 "postgres",
                 "uuid",
                 "json",
-                "chrono",
                 "migrate",
+                "sqlx-toml",
             ],
         ),
         ("serde", Some("1.0"), vec!["derive"]),
@@ -863,7 +871,7 @@ edition = "2024"
 {cja_dep}
 axum = "0.8"
 tokio = {{ version = "1", features = ["full"] }}
-sqlx = {{ version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono", "migrate"] }}
+sqlx = {{ version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "json", "migrate", "sqlx-toml"] }}
 serde = {{ version = "1.0", features = ["derive"] }}
 tracing = "0.1"
 uuid = {{ version = "1", features = ["v4", "serde"] }}
@@ -875,6 +883,16 @@ vergen = {{ version = "8", features = ["build", "git", "gitcl"] }}
 "#
     )
 }
+
+/// `sqlx.toml` for generated apps: `query!`/`query_as!` decode Postgres
+/// date/time columns as cja's jiff-sqlx wrappers, which convert into jiff types
+/// with `.into()`.
+const SQLX_TOML: &str = r#"[macros.type-overrides]
+'TIMESTAMPTZ' = "cja::jiff_sqlx::Timestamp"
+'TIMESTAMP' = "cja::jiff_sqlx::DateTime"
+'DATE' = "cja::jiff_sqlx::Date"
+'TIME' = "cja::jiff_sqlx::Time"
+"#;
 
 /// Generates the `build.rs` content for a new CJA project.
 ///
@@ -1451,7 +1469,7 @@ mod tests {
             toml.contains(r#"cja = { git = "https://github.com/coreyja/cja", branch = "main" }"#)
         );
         assert!(toml.contains(
-            r#"sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono", "migrate"] }"#
+            r#"sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "json", "migrate", "sqlx-toml"] }"#
         ));
 
         // --branch without --github overrides the default repo's branch

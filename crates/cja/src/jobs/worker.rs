@@ -9,6 +9,7 @@ use std::{
 };
 
 use futures::FutureExt;
+use jiff_sqlx::ToSqlx as _;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
@@ -444,7 +445,7 @@ pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 pub(super) struct RunJobSuccess(JobFromDB);
 
 enum RunJobOutcome {
-    Completed(RunJobResult),
+    Completed(Box<RunJobResult>),
     LeaseLost(uuid::Uuid),
     /// The row was released without charging a failure: cooperative yield or
     /// unknown job type.
@@ -470,18 +471,18 @@ impl LeaseTracker {
     }
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 pub struct JobFromDB {
     pub job_id: uuid::Uuid,
     pub name: String,
     pub payload: serde_json::Value,
     pub priority: i32,
-    pub run_at: chrono::DateTime<chrono::Utc>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub run_at: jiff::Timestamp,
+    pub created_at: jiff::Timestamp,
     pub context: String,
     pub error_count: i32,
     pub last_error_message: Option<String>,
-    pub last_failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_failed_at: Option<jiff::Timestamp>,
 }
 
 #[derive(Debug, Error)]
@@ -796,7 +797,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     }
                     tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
                         "Job permanently failed - unknown job type past its age limit, moved to dead letter queue");
-                    return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
+                    return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
+                        job, error,
+                    )))));
                 }
                 tracing::warn!(job_id = %job.job_id, name = %job.name,
                     "Unknown job type for this binary; released uncharged with an age-scaled delay");
@@ -812,7 +815,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 }
                 tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
                     "Job permanently failed - payload is not deserializable, moved to dead letter queue without retries");
-                return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
+                return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
+                    job, error,
+                )))));
             }
             if job.error_count >= self.max_retries {
                 let count = job
@@ -844,7 +849,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 tracing::warn!(job_id = %job.job_id, retry = job.error_count + 1, error = %error_message,
                     "Job failed, retry scheduled");
             }
-            return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
+            return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
+                job, error,
+            )))));
         }
 
         let result = sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
@@ -856,7 +863,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             tracing::warn!(job_id = %job.job_id, "Job completion lost ownership");
             return Ok(RunJobOutcome::LeaseLost(job.job_id));
         }
-        Ok(RunJobOutcome::Completed(Ok(RunJobSuccess(job))))
+        Ok(RunJobOutcome::Completed(Box::new(Ok(RunJobSuccess(job)))))
     }
 
     async fn dead_letter_owned(
@@ -889,7 +896,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         .bind(job.priority)
         .bind(count)
         .bind(message)
-        .bind(job.created_at)
+        .bind(job.created_at.to_sqlx())
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
@@ -965,12 +972,16 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 name: row.try_get("name")?,
                 payload: row.try_get("payload")?,
                 priority: row.try_get("priority")?,
-                run_at: row.try_get("run_at")?,
-                created_at: row.try_get("created_at")?,
+                run_at: row.try_get::<jiff_sqlx::Timestamp, _>("run_at")?.to_jiff(),
+                created_at: row
+                    .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+                    .to_jiff(),
                 context: row.try_get("context")?,
                 error_count: row.try_get("error_count")?,
                 last_error_message: row.try_get("last_error_message")?,
-                last_failed_at: row.try_get("last_failed_at")?,
+                last_failed_at: row
+                    .try_get::<Option<jiff_sqlx::Timestamp>, _>("last_failed_at")?
+                    .map(jiff_sqlx::Timestamp::to_jiff),
             },
             claim_sent_at,
             previous_locked_by: row.try_get("previous_locked_by")?,
@@ -1389,12 +1400,15 @@ async fn run_claimed_job<AppState: AS, R: JobRegistry<AppState>>(
     // kill the worker, which would take down apps that join on
     // all worker tasks.
     Some(match run_result {
-        Ok(RunJobOutcome::Completed(Ok(RunJobSuccess(job)))) => {
-            tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
-            Ok(())
-        }
-        Ok(RunJobOutcome::Completed(Err(job_error))) => {
-            tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+        Ok(RunJobOutcome::Completed(result)) => {
+            match *result {
+                Ok(RunJobSuccess(job)) => {
+                    tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
+                }
+                Err(job_error) => {
+                    tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+                }
+            }
             Ok(())
         }
         Ok(RunJobOutcome::LeaseLost(job_id)) => {
@@ -2223,7 +2237,7 @@ mod tests {
         let (error_count, locked_by, locked_at, context): (
             i32,
             Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
+            Option<jiff_sqlx::Timestamp>,
             String,
         ) = sqlx::query_as(
             "SELECT error_count, locked_by, locked_at, context FROM jobs WHERE name = 'CappedJob'",
@@ -2614,7 +2628,7 @@ mod tests {
         let (error_count, locked_by, locked_at, context): (
             i32,
             Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
+            Option<jiff_sqlx::Timestamp>,
             String,
         ) = sqlx::query_as(
             "SELECT error_count, locked_by, locked_at, context \
@@ -2903,7 +2917,7 @@ mod tests {
             i32,
             Option<String>,
             Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
+            Option<jiff_sqlx::Timestamp>,
             f64,
         );
         let row: Row = wait_for(|| async {
@@ -3361,7 +3375,7 @@ mod tests {
             .unwrap()
             .expect("worker must not error");
 
-        let locks: (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        let locks: (Option<String>, Option<jiff_sqlx::Timestamp>) =
             sqlx::query_as("SELECT locked_by, locked_at FROM jobs WHERE name = $1")
                 .bind(YieldingJob::NAME)
                 .fetch_one(&db)
@@ -3369,7 +3383,7 @@ mod tests {
                 .unwrap();
         assert!(locks.0.is_none(), "yield must unlock the row");
         assert!(locks.1.is_none(), "yield must clear locked_at");
-        let charges: (i32, Option<String>, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        let charges: (i32, Option<String>, jiff_sqlx::Timestamp) = sqlx::query_as(
             "SELECT error_count, last_error_message, run_at FROM jobs WHERE name = $1",
         )
         .bind(YieldingJob::NAME)
@@ -3382,7 +3396,7 @@ mod tests {
             "yield must not record an error message"
         );
         assert!(
-            charges.2 <= chrono::Utc::now(),
+            charges.2.to_jiff() <= jiff::Timestamp::now(),
             "yield leaves run_at immediately claimable, not backed off"
         );
         let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
@@ -3745,7 +3759,7 @@ mod tests {
 
         let outcome = worker.run_next_job(claimed).await.unwrap();
         assert!(
-            matches!(&outcome, RunJobOutcome::Completed(Err(_))),
+            matches!(&outcome, RunJobOutcome::Completed(result) if result.is_err()),
             "an unknown row past its age limit must dead-letter"
         );
 
@@ -4153,7 +4167,7 @@ mod tests {
             .unwrap(),
         );
         let claimed = worker.fetch_next_job().await.unwrap().unwrap();
-        let initial: chrono::DateTime<chrono::Utc> =
+        let initial: jiff_sqlx::Timestamp =
             sqlx::query_scalar("SELECT locked_at FROM jobs WHERE job_id = $1")
                 .bind(claimed.job.job_id)
                 .fetch_one(&db)
@@ -4167,7 +4181,7 @@ mod tests {
         });
         wait_until_started(&db, LongJob::NAME).await;
         let advanced = wait_for(|| async {
-            let current: chrono::DateTime<chrono::Utc> =
+            let current: jiff_sqlx::Timestamp =
                 sqlx::query_scalar("SELECT locked_at FROM jobs WHERE name = 'LongJob'")
                     .fetch_one(&db)
                     .await
@@ -4190,7 +4204,7 @@ mod tests {
             assert!(competitor.fetch_next_job().await.unwrap().is_none());
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let row: (i32, chrono::DateTime<chrono::Utc>) =
+        let row: (i32, jiff_sqlx::Timestamp) =
             sqlx::query_as("SELECT error_count, locked_at FROM jobs WHERE name = 'LongJob'")
                 .fetch_one(&db)
                 .await
@@ -5066,12 +5080,23 @@ mod idle_gate_tests {
     async fn pool_failure_releases_permits_before_backoff(db: sqlx::PgPool) {
         use sqlx::postgres::PgPoolOptions;
         setup(&db).await;
+        // The 100ms acquire timeout is for waiting on a busy pool, not for
+        // opening connections: a loaded CI runner can take longer than that
+        // to connect. Open both connections up front, then start the workers.
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .acquire_timeout(Duration::from_millis(100))
-            .connect_with((*db.connect_options()).clone())
-            .await
-            .unwrap();
+            .connect_lazy_with((*db.connect_options()).clone());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut opened = Vec::new();
+            while opened.len() < 2 {
+                if let Ok(conn) = pool.acquire().await {
+                    opened.push(conn);
+                }
+            }
+        })
+        .await
+        .expect("pool opens both connections");
         let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
         let state = make_state(pool.clone(), gate.clone());
         let workers = Workers::start(&state, 100, Duration::from_millis(200), true);

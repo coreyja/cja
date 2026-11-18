@@ -66,8 +66,8 @@ impl AppSession for TestSession {
         Ok(row.map(|row| Self {
             inner: CJASession {
                 session_id: row.get("session_id"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
+                created_at: row.get::<jiff_sqlx::Timestamp, _>("created_at").to_jiff(),
+                updated_at: row.get::<jiff_sqlx::Timestamp, _>("updated_at").to_jiff(),
             },
             user_id: None,
         }))
@@ -83,8 +83,8 @@ impl AppSession for TestSession {
         Ok(Self {
             inner: CJASession {
                 session_id: row.get("session_id"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
+                created_at: row.get::<jiff_sqlx::Timestamp, _>("created_at").to_jiff(),
+                updated_at: row.get::<jiff_sqlx::Timestamp, _>("updated_at").to_jiff(),
             },
             user_id: None,
         })
@@ -266,8 +266,8 @@ impl AppSession for ErroringSession {
         Ok(Self {
             inner: CJASession {
                 session_id: row.get("session_id"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
+                created_at: row.get::<jiff_sqlx::Timestamp, _>("created_at").to_jiff(),
+                updated_at: row.get::<jiff_sqlx::Timestamp, _>("updated_at").to_jiff(),
             },
         })
     }
@@ -382,9 +382,9 @@ async fn backdate_session(pool: &PgPool, session_id: Uuid, interval: &str) {
         .execute(pool)
         .await
         .unwrap();
-    let result = sqlx::query(&format!(
+    let result = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE sessions SET updated_at = now() - interval '{interval}' WHERE session_id = $1"
-    ))
+    )))
     .bind(session_id)
     .execute(pool)
     .await
@@ -467,14 +467,16 @@ async fn stale_session_updated_at_is_refreshed_after_request() {
         .unwrap();
     assert_eq!(response.status(), 200);
 
-    let updated_at: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT updated_at FROM sessions WHERE session_id = $1")
-            .bind(session.inner.session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let updated_at: jiff::Timestamp = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
+        "SELECT updated_at FROM sessions WHERE session_id = $1",
+    )
+    .bind(session.inner.session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .to_jiff();
     assert!(
-        updated_at > chrono::Utc::now() - chrono::Duration::minutes(1),
+        updated_at > jiff::Timestamp::now() - jiff::SignedDuration::from_mins(1),
         "stale session must have been refreshed, got {updated_at}"
     );
 }
@@ -487,12 +489,14 @@ async fn fresh_session_updated_at_is_not_touched_by_request() {
 
     let session = TestSession::create(&pool).await.unwrap();
     backdate_session(&pool, session.inner.session_id, "10 minutes").await;
-    let before: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT updated_at FROM sessions WHERE session_id = $1")
-            .bind(session.inner.session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let before: jiff::Timestamp = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
+        "SELECT updated_at FROM sessions WHERE session_id = $1",
+    )
+    .bind(session.inner.session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .to_jiff();
 
     let state = CookieProbeState {
         db: pool.clone(),
@@ -514,12 +518,14 @@ async fn fresh_session_updated_at_is_not_touched_by_request() {
         .unwrap();
     assert_eq!(response.status(), 200);
 
-    let after: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT updated_at FROM sessions WHERE session_id = $1")
-            .bind(session.inner.session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let after: jiff::Timestamp = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
+        "SELECT updated_at FROM sessions WHERE session_id = $1",
+    )
+    .bind(session.inner.session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .to_jiff();
     assert_eq!(
         before, after,
         "no UPDATE may run for a session refreshed within the interval"

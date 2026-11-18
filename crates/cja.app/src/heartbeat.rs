@@ -9,9 +9,13 @@
 //! (nullable and not), `date`, time zone conversion, cron schedules, and the
 //! framework's own `crons` table.
 
-use cja::chrono::{DateTime, NaiveDate, TimeDelta, Utc};
-use cja::chrono_tz::Tz;
+use std::sync::LazyLock;
+
 use cja::cron::{CronRegistry, Schedule};
+use cja::jiff::civil::Date;
+use cja::jiff::tz::TimeZone;
+use cja::jiff::{SignedDuration, Timestamp, ZonedDateTime};
+use cja::jiff_sqlx::ToSqlx as _;
 use cja::jobs::Job;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -19,7 +23,8 @@ use sqlx::PgPool;
 use crate::AppState;
 
 /// Time zone the cron schedule is evaluated in and the status page renders in.
-pub const TIMEZONE: Tz = cja::chrono_tz::America::New_York;
+pub static TIMEZONE: LazyLock<TimeZone> =
+    LazyLock::new(|| TimeZone::get("America/New_York").expect("cja bundles the tz database"));
 
 /// Every five minutes, on the minute (sec min hour day month weekday).
 pub const SCHEDULE: &str = "0 */5 * * * *";
@@ -35,7 +40,7 @@ impl Job<AppState> for HeartbeatJob {
     const NAME: &'static str = "HeartbeatJob";
 
     async fn run(&self, app_state: AppState) -> cja::Result<()> {
-        record(&app_state.db, Utc::now()).await?;
+        record(&app_state.db, Timestamp::now()).await?;
         Ok(())
     }
 }
@@ -60,26 +65,29 @@ pub fn schedule(registry: &CronRegistry<AppState>) -> Schedule {
 }
 
 /// Calendar day of `at` in [`TIMEZONE`].
-pub fn local_date(at: DateTime<Utc>) -> NaiveDate {
-    at.with_timezone(&TIMEZONE).date_naive()
+pub fn local_date(at: Timestamp) -> Date {
+    TIMEZONE.to_datetime(at).date()
 }
 
 /// Records one heartbeat started at `started_at`, prunes expired rows, and
 /// marks the new row finished. A retried job records a second row, which is
 /// harmless for a liveness signal.
-pub async fn record(db: &PgPool, started_at: DateTime<Utc>) -> cja::Result<uuid::Uuid> {
+pub async fn record(db: &PgPool, started_at: Timestamp) -> cja::Result<uuid::Uuid> {
     let id = sqlx::query_scalar!(
         "INSERT INTO heartbeats (started_at, local_date) VALUES ($1, $2) RETURNING id",
-        started_at,
-        local_date(started_at),
+        started_at.to_sqlx(),
+        local_date(started_at).to_sqlx(),
     )
     .fetch_one(db)
     .await?;
 
-    let cutoff = started_at - TimeDelta::days(RETENTION_DAYS);
-    sqlx::query!("DELETE FROM heartbeats WHERE started_at < $1", cutoff)
-        .execute(db)
-        .await?;
+    let cutoff = started_at - SignedDuration::from_hours(24 * RETENTION_DAYS);
+    sqlx::query!(
+        "DELETE FROM heartbeats WHERE started_at < $1",
+        cutoff.to_sqlx()
+    )
+    .execute(db)
+    .await?;
 
     sqlx::query!(
         "UPDATE heartbeats SET finished_at = clock_timestamp() WHERE id = $1",
@@ -93,37 +101,44 @@ pub async fn record(db: &PgPool, started_at: DateTime<Utc>) -> cja::Result<uuid:
 
 #[derive(Debug, Clone)]
 pub struct Heartbeat {
-    pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
+    pub started_at: Timestamp,
+    pub finished_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DayCount {
-    pub local_date: NaiveDate,
+    pub local_date: Date,
     pub beats: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct Status {
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
     pub recent: Vec<Heartbeat>,
     pub days: Vec<DayCount>,
     /// The cron's last claim, from cja's `crons` table. `None` before the
     /// first fire.
-    pub last_fired_at: Option<DateTime<Utc>>,
-    pub next_fire_at: DateTime<Tz>,
+    pub last_fired_at: Option<Timestamp>,
+    pub next_fire_at: ZonedDateTime,
 }
 
-pub async fn status(db: &PgPool, schedule: &Schedule, now: DateTime<Utc>) -> cja::Result<Status> {
-    let recent = sqlx::query_as!(
-        Heartbeat,
+pub async fn status(db: &PgPool, schedule: &Schedule, now: Timestamp) -> cja::Result<Status> {
+    // Nullable columns decode as `Option<jiff_sqlx::Timestamp>`, which has no
+    // `Into<Option<jiff::Timestamp>>`, so `query_as!` can't fill `Heartbeat`.
+    let recent = sqlx::query!(
         "SELECT started_at, finished_at
          FROM heartbeats
          ORDER BY started_at DESC
          LIMIT 12"
     )
     .fetch_all(db)
-    .await?;
+    .await?
+    .into_iter()
+    .map(|row| Heartbeat {
+        started_at: row.started_at.into(),
+        finished_at: row.finished_at.map(Into::into),
+    })
+    .collect();
 
     let days = sqlx::query_as!(
         DayCount,
@@ -142,9 +157,10 @@ pub async fn status(db: &PgPool, schedule: &Schedule, now: DateTime<Utc>) -> cja
         HeartbeatJob::NAME
     )
     .fetch_optional(db)
-    .await?;
+    .await?
+    .map(Timestamp::from);
 
-    let next_fire_at = schedule.next_run(last_fired_at.as_ref(), now, TIMEZONE);
+    let next_fire_at = schedule.next_run(last_fired_at.as_ref(), now, &TIMEZONE);
 
     Ok(Status {
         now,
@@ -157,45 +173,36 @@ pub async fn status(db: &PgPool, schedule: &Schedule, now: DateTime<Utc>) -> cja
 
 /// Coarse "how long ago" for the status page: `now` for under a minute,
 /// then minutes, hours, days. Times in the future (clock skew) read `now`.
-pub fn ago(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
-    let elapsed = now - then;
-    if elapsed < TimeDelta::minutes(1) {
+pub fn ago(now: Timestamp, then: Timestamp) -> String {
+    let elapsed = now.duration_since(then);
+    if elapsed < SignedDuration::from_mins(1) {
         "just now".to_string()
-    } else if elapsed < TimeDelta::hours(1) {
-        format!("{}m ago", elapsed.num_minutes())
-    } else if elapsed < TimeDelta::days(1) {
-        format!("{}h ago", elapsed.num_hours())
+    } else if elapsed < SignedDuration::from_hours(1) {
+        format!("{}m ago", elapsed.as_mins())
+    } else if elapsed < SignedDuration::from_hours(24) {
+        format!("{}h ago", elapsed.as_hours())
     } else {
-        format!("{}d ago", elapsed.num_days())
+        format!("{}d ago", elapsed.as_hours() / 24)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cja::chrono::TimeZone as _;
+    use cja::jiff::civil::date;
 
-    fn utc(rfc3339: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(rfc3339).unwrap().to_utc()
+    fn utc(rfc3339: &str) -> Timestamp {
+        rfc3339.parse().unwrap()
     }
 
     #[test]
     fn local_date_uses_eastern_calendar_day() {
         // 03:30Z on the 18th is 22:30 EST on the 17th.
-        assert_eq!(
-            local_date(utc("2026-11-18T03:30:00Z")),
-            NaiveDate::from_ymd_opt(2026, 11, 17).unwrap()
-        );
+        assert_eq!(local_date(utc("2026-11-18T03:30:00Z")), date(2026, 11, 17));
         // 05:30Z is 00:30 EST, already the 18th.
-        assert_eq!(
-            local_date(utc("2026-11-18T05:30:00Z")),
-            NaiveDate::from_ymd_opt(2026, 11, 18).unwrap()
-        );
+        assert_eq!(local_date(utc("2026-11-18T05:30:00Z")), date(2026, 11, 18));
         // Summer: 03:30Z on Jul 5 is 23:30 EDT on Jul 4.
-        assert_eq!(
-            local_date(utc("2026-07-05T03:30:00Z")),
-            NaiveDate::from_ymd_opt(2026, 7, 4).unwrap()
-        );
+        assert_eq!(local_date(utc("2026-07-05T03:30:00Z")), date(2026, 7, 4));
     }
 
     #[test]
@@ -213,10 +220,13 @@ mod tests {
         let registry = cron_registry().unwrap();
         let schedule = schedule(&registry);
         let last = utc("2026-11-17T17:00:00Z");
-        let next = schedule.next_run(Some(&last), utc("2026-11-17T17:02:00Z"), TIMEZONE);
+        let next = schedule.next_run(Some(&last), utc("2026-11-17T17:02:00Z"), &TIMEZONE);
         assert_eq!(
             next,
-            TIMEZONE.with_ymd_and_hms(2026, 11, 17, 12, 5, 0).unwrap()
+            date(2026, 11, 17)
+                .at(12, 5, 0, 0)
+                .to_zoned_datetime(TIMEZONE.clone())
+                .unwrap()
         );
     }
 }
@@ -224,10 +234,11 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use cja::jiff::civil::date;
     use cja::testing::test_db::create_test_database;
 
-    fn utc(rfc3339: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(rfc3339).unwrap().to_utc()
+    fn utc(rfc3339: &str) -> Timestamp {
+        rfc3339.parse().unwrap()
     }
 
     #[tokio::test]
@@ -256,11 +267,11 @@ mod db_tests {
             status.days,
             vec![
                 DayCount {
-                    local_date: NaiveDate::from_ymd_opt(2026, 11, 18).unwrap(),
+                    local_date: date(2026, 11, 18),
                     beats: 1,
                 },
                 DayCount {
-                    local_date: NaiveDate::from_ymd_opt(2026, 11, 17).unwrap(),
+                    local_date: date(2026, 11, 17),
                     beats: 1,
                 },
             ]

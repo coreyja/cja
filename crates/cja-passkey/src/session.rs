@@ -46,8 +46,12 @@ impl AppSession for PasskeySession {
         };
         let inner = CJASession {
             session_id: row.try_get("session_id")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
+            created_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+                .to_jiff(),
+            updated_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>("updated_at")?
+                .to_jiff(),
         };
         let user_id: Option<uuid::Uuid> = row.try_get("user_id")?;
         let challenge_state: Option<serde_json::Value> = row.try_get("challenge_state")?;
@@ -67,8 +71,12 @@ impl AppSession for PasskeySession {
         .await?;
         let inner = CJASession {
             session_id: row.try_get("session_id")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
+            created_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+                .to_jiff(),
+            updated_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>("updated_at")?
+                .to_jiff(),
         };
         let user_id: Option<uuid::Uuid> = row.try_get("user_id")?;
         let challenge_state: Option<serde_json::Value> = row.try_get("challenge_state")?;
@@ -172,8 +180,12 @@ impl PasskeySession {
         .await?;
         Ok(CJASession {
             session_id: row.try_get("session_id")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
+            created_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+                .to_jiff(),
+            updated_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>("updated_at")?
+                .to_jiff(),
         })
     }
 }

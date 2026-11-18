@@ -435,9 +435,9 @@ pub struct RunView {
     pub fail_reason: Option<FailReason>,
     pub error: Option<String>,
     pub pending_ask: Option<PendingAsk>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: jiff::Timestamp,
+    pub started_at: Option<jiff::Timestamp>,
+    pub finished_at: Option<jiff::Timestamp>,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for RunView {
@@ -488,9 +488,15 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for RunView {
             fail_reason,
             error: row.try_get("error")?,
             pending_ask,
-            created_at: row.try_get("created_at")?,
-            started_at: row.try_get("started_at")?,
-            finished_at: row.try_get("finished_at")?,
+            created_at: row
+                .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+                .to_jiff(),
+            started_at: row
+                .try_get::<Option<jiff_sqlx::Timestamp>, _>("started_at")?
+                .map(jiff_sqlx::Timestamp::to_jiff),
+            finished_at: row
+                .try_get::<Option<jiff_sqlx::Timestamp>, _>("finished_at")?
+                .map(jiff_sqlx::Timestamp::to_jiff),
         })
     }
 }
@@ -505,7 +511,8 @@ pub struct RunMessage {
     /// The rig `Message` body.
     pub message: serde_json::Value,
     /// When the row was written.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[sqlx(try_from = "jiff_sqlx::Timestamp")]
+    pub created_at: jiff::Timestamp,
 }
 
 /// Start a run of `kind`: build the fresh rig run from the kind's spec,

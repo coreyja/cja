@@ -41,7 +41,7 @@ fn named_database(prefix: &str, epoch: u64) -> String {
 }
 
 async fn create_database(admin: &cja::sqlx::PgPool, name: &str) {
-    cja::sqlx::query(&format!(r#"CREATE DATABASE "{name}""#))
+    cja::sqlx::query(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
         .execute(admin)
         .await
         .unwrap();
@@ -54,9 +54,11 @@ async fn drop_database(admin: &cja::sqlx::PgPool, name: &str) {
     .bind(name)
     .execute(admin)
     .await;
-    let _ = cja::sqlx::query(&format!(r#"DROP DATABASE IF EXISTS "{name}""#))
-        .execute(admin)
-        .await;
+    let _ = cja::sqlx::query(sqlx::AssertSqlSafe(format!(
+        r#"DROP DATABASE IF EXISTS "{name}""#
+    )))
+    .execute(admin)
+    .await;
 }
 
 async fn database_exists(admin: &cja::sqlx::PgPool, name: &str) -> bool {

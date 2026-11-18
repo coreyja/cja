@@ -179,6 +179,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::app_state::AppState as AS;
+use jiff_sqlx::ToSqlx as _;
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tracing::{Instrument, instrument};
@@ -187,7 +188,7 @@ pub(crate) fn enqueue_span<AppState: AS, J: Job<AppState>>(
     job: &J,
     context: &str,
     priority: Option<i32>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     job_id: uuid::Uuid,
 ) -> tracing::Span {
     tracing::info_span!(
@@ -209,7 +210,7 @@ pub(crate) async fn enqueue_on_connection<AppState: AS, J: Job<AppState>>(
     job: J,
     context: &str,
     priority: Option<i32>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     job_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, EnqueueError> {
     sqlx::query(
@@ -220,8 +221,8 @@ pub(crate) async fn enqueue_on_connection<AppState: AS, J: Job<AppState>>(
     .bind(J::NAME)
     .bind(serde_json::to_value(job)?)
     .bind(priority.unwrap_or(0))
-    .bind(created_at)
-    .bind(created_at)
+    .bind(created_at.to_sqlx())
+    .bind(created_at.to_sqlx())
     .bind(context)
     .execute(conn)
     .await?;
@@ -245,7 +246,7 @@ async fn enqueue_core<AppState: AS, J: Job<AppState>>(
     job: J,
     context: &str,
     priority: Option<i32>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     job_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, EnqueueError> {
     let result =
@@ -783,7 +784,7 @@ pub trait Job<AppState: AS>:
         priority: Option<i32>,
     ) -> Result<uuid::Uuid, EnqueueError> {
         let job_id = uuid::Uuid::new_v4();
-        let created_at = chrono::Utc::now();
+        let created_at = jiff::Timestamp::now();
         // Eyes captures fields at span creation; same constructor as `enqueue`
         // so an enqueue stays linkable to its worker attempts.
         let span = enqueue_span::<AppState, Self>(&self, &context, priority, created_at, job_id);
@@ -838,7 +839,7 @@ pub trait Job<AppState: AS>:
         priority: Option<i32>,
     ) -> Result<(), EnqueueError> {
         let job_id = uuid::Uuid::new_v4();
-        let created_at = chrono::Utc::now();
+        let created_at = jiff::Timestamp::now();
         // Same span (same field list) as `enqueue_on`: a pool-acquire
         // failure is an enqueue failure and is recorded inside the span
         // through `enqueue_failure`, exactly like an insert failure — the
