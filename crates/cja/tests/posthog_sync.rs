@@ -10,7 +10,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use cja::observability::{
-    AggregateFunction, AlertBuilder, Comparison, Declarations, Item, TelemetryMetricBuilder,
+    AggregateFunction, AlertBuilder, Comparison, Declarations, Item, Link, RatioMetricBuilder,
+    TelemetryMetricBuilder,
     posthog::{self, SyncConfig, SyncError, SyncReport},
 };
 use serde_json::{Value, json};
@@ -331,30 +332,90 @@ async fn surfaces_rejected_write_and_missing_tag() {
     );
 }
 #[tokio::test]
-async fn telemetry_and_health_are_skipped() {
+async fn eyes_only_declarations_are_skipped_with_named_warnings() {
     let m = Mock::start().await;
     let mut d = example::declarations().unwrap();
-    d.dashboards[0].sections[0]
-        .items
-        .push(Item::health_summary());
+    d.dashboards[0].sections[0].items.extend([
+        Item::health_summary(),
+        Item::links(vec![Link::new("Runbook", "/runbook").unwrap()]),
+        Item::stat("jobs"),
+        Item::stat("share"),
+    ]);
+    let telemetry = |id: &str| {
+        TelemetryMetricBuilder::new(id, AggregateFunction::Count, None)
+            .unwrap()
+            .build()
+            .unwrap()
+    };
+    let alert = |id: &str, metric: &str| {
+        AlertBuilder::new(id, metric)
+            .window_seconds(60)
+            .evaluation_interval_seconds(60)
+            .critical(Comparison::Above, 1.)
+            .build()
+            .unwrap()
+    };
     let d = d
+        .metric(telemetry("jobs"))
+        .metric(telemetry("all_jobs"))
         .metric(
-            TelemetryMetricBuilder::new("jobs", AggregateFunction::Count, None)
-                .unwrap()
+            RatioMetricBuilder::new("share", "jobs", "all_jobs")
+                .as_percentage()
                 .build()
                 .unwrap(),
         )
-        .alert(
-            AlertBuilder::new("failed", "jobs")
-                .window_seconds(60)
-                .evaluation_interval_seconds(60)
-                .critical(Comparison::Above, 1.)
-                .build()
-                .unwrap(),
-        );
+        .alert(alert("failed", "jobs"))
+        .alert(alert("low-share", "share"));
     let r = m.sync("demo", &d).await.unwrap();
-    assert_eq!(r.skipped.len(), 3);
-    assert_eq!(r.created.len(), 5);
+    assert_eq!(
+        r.skipped,
+        [
+            "cja:demo:insight:jobs: telemetry metric (Eyes-only)",
+            "cja:demo:insight:all_jobs: telemetry metric (Eyes-only)",
+            "cja:demo:insight:share: ratio metric (Eyes-only)",
+            "cja:demo:dashboard:activity: health summary item (Eyes-only)",
+            "cja:demo:dashboard:activity: links item (Eyes-only)",
+            "cja:demo:dashboard:activity: tile for telemetry metric jobs (Eyes-only)",
+            "cja:demo:dashboard:activity: tile for ratio metric share (Eyes-only)",
+            "cja:demo:alert:failed: telemetry metric jobs (Eyes-only)",
+            "cja:demo:alert:low-share: ratio metric share (Eyes-only)",
+        ]
+    );
+    assert_eq!(
+        r.created,
+        [
+            "cja:demo:dashboard:activity",
+            "cja:demo:insight:pages",
+            "cja:demo:insight:sessions",
+            "cja:demo:insight:daily",
+            "cja:demo:alert:quiet",
+        ]
+    );
+    let writes = m
+        .log()
+        .into_iter()
+        .filter(|(method, _, _)| method != Method::GET)
+        .collect::<Vec<_>>();
+    // Only the example's own alert is created: none for the telemetry or
+    // ratio alert, and no insight or tile for an Eyes-only metric.
+    let posts = |path: &str| {
+        writes
+            .iter()
+            .filter(|(method, p, _)| method == Method::POST && p == path)
+            .map(|(_, _, body)| body.clone())
+            .collect::<Vec<_>>()
+    };
+    let alerts = posts("alerts/");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0]["name"], "quiet [cja:demo:alert:quiet]");
+    assert_eq!(posts("insights/").len(), 3);
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|(_, path, _)| path.ends_with("/add_insight/"))
+            .count(),
+        3
+    );
 }
 
 #[tokio::test]

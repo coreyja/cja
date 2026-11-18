@@ -9,4 +9,4 @@
 pub mod declarations;
 pub mod posthog;
 pub use declarations::*;
-pub use eyes_subscriber::{AggregateFunction, MetricValueType};
+pub use eyes_subscriber::{AggregateFunction, MetricResultShape, MetricValueType};

@@ -38,6 +38,7 @@ use crate::{app_state::AppState, jobs::registry::JobRegistry};
 pub use eyes_subscriber::{
     AppManifest, CronEntry, ExpectedProcessRole, ManifestError, MonitorTargetError,
     ProcessHeartbeat, ProcessHeartbeatConfig, ProcessHeartbeatHandle, ProcessIdentity,
+    RetentionPolicy,
 };
 
 /// A locally invalid HTTP monitor declaration.

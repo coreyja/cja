@@ -59,17 +59,30 @@ pub struct Link {
     pub href: String,
 }
 
-/// Dashboard-id grammar (the named-metric id grammar): non-empty, trimmed,
-/// ASCII, at most 128 bytes, chars in `[A-Za-z0-9._:-]`.
+/// Metric- and alert-id grammar: non-empty, at most 128 bytes, chars in
+/// `[a-z0-9._:_-]`.
+///
+/// Every declaration id becomes part of a `PostHog` identity: a tag for
+/// metrics and dashboards, a name suffix for alerts. `PostHog` lowercases
+/// tags on write, so an uppercase id would never be echoed back and would
+/// leak one orphan per deploy. Lowercase is therefore part of the grammar.
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
-        && id.trim() == id
-        && id.is_ascii()
         && id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._:-_".contains(&b))
 }
+
+/// Dashboard-id grammar: [`valid_id`] without `_`, which the Eyes dashboard
+/// grammar does not accept.
+fn valid_dashboard_id(id: &str) -> bool {
+    valid_id(id) && !id.contains('_')
+}
+
+const ID_RULE: &str = "must be non-empty, at most 128 bytes, lowercase chars [a-z0-9._:_-]";
+const DASHBOARD_ID_RULE: &str =
+    "must be non-empty, at most 128 bytes, lowercase chars [a-z0-9._:-]";
 
 /// Link href grammar: root-relative path (starts with `/` but not `//` —
 /// protocol-relative URLs resolve as scheme-relative external URLs) or an
@@ -90,15 +103,13 @@ fn valid_href(href: &str) -> bool {
 
 impl Dashboard {
     /// Start a declaration. **Fallible**: validates the id grammar
-    /// (non-empty, `[A-Za-z0-9._:-]`, ASCII, at most 128 bytes, trimmed)
+    /// (non-empty, lowercase `[a-z0-9._:-]`, at most 128 bytes)
     /// and the title (non-empty after trim, at most 256 chars) — a bad
     /// declaration fails at boot in the app.
     pub fn new(id: impl Into<String>, title: impl Into<String>) -> Result<Self, String> {
         let id = id.into();
-        if !valid_id(&id) {
-            return Err(format!(
-                "invalid dashboard id {id:?}: must be non-empty, trimmed, ASCII, at most 128 bytes, chars [A-Za-z0-9._:-]"
-            ));
+        if !valid_dashboard_id(&id) {
+            return Err(format!("invalid dashboard id {id:?}: {DASHBOARD_ID_RULE}"));
         }
         let title = title.into();
         if title.trim().is_empty() || title.chars().count() > 256 {
@@ -574,6 +585,101 @@ pub struct Metric {
 pub enum MetricQuery {
     Telemetry(TelemetryMetric),
     ProductEvent(ProductEventMetric),
+    Ratio(RatioMetric),
+}
+/// One declared metric divided by another, both in the same [`Declarations`].
+///
+/// Eyes-only: the `PostHog` sync skips ratio metrics, their dashboard tiles
+/// and alerts on them with a warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatioMetric {
+    pub numerator: String,
+    pub denominator: String,
+    pub numerator_window_seconds: Option<u64>,
+    pub denominator_window_seconds: Option<u64>,
+    pub as_percentage: bool,
+    pub preferred_bucket_seconds: Option<u64>,
+}
+/// Build a ratio metric over two other declared metrics.
+///
+/// Mirrors the Eyes ratio builder, except that `build` takes no result
+/// shapes or value types: [`Declarations::validate`] reads them from the
+/// two declared operands.
+#[derive(Debug)]
+#[must_use]
+pub struct RatioMetricBuilder {
+    id: String,
+    display_name: Option<String>,
+    description: Option<String>,
+    unit: Option<String>,
+    spec: RatioMetric,
+}
+impl RatioMetricBuilder {
+    pub fn new(
+        id: impl Into<String>,
+        numerator: impl Into<String>,
+        denominator: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            display_name: None,
+            description: None,
+            unit: None,
+            spec: RatioMetric {
+                numerator: numerator.into(),
+                denominator: denominator.into(),
+                numerator_window_seconds: None,
+                denominator_window_seconds: None,
+                as_percentage: false,
+                preferred_bucket_seconds: None,
+            },
+        }
+    }
+    /// Trailing window of the numerator. Scalar and table ratios only.
+    pub fn numerator_window_seconds(mut self, seconds: u64) -> Self {
+        self.spec.numerator_window_seconds = Some(seconds);
+        self
+    }
+    /// Trailing window of the denominator. Scalar and table ratios only.
+    pub fn denominator_window_seconds(mut self, seconds: u64) -> Self {
+        self.spec.denominator_window_seconds = Some(seconds);
+        self
+    }
+    /// Multiply the value by 100 for display and thresholds. Forbids a unit.
+    pub fn as_percentage(mut self) -> Self {
+        self.spec.as_percentage = true;
+        self
+    }
+    pub fn display_name(mut self, v: impl Into<String>) -> Self {
+        self.display_name = Some(v.into());
+        self
+    }
+    pub fn description(mut self, v: impl Into<String>) -> Self {
+        self.description = Some(v.into());
+        self
+    }
+    pub fn unit(mut self, v: impl Into<String>) -> Self {
+        self.unit = Some(v.into());
+        self
+    }
+    pub fn preferred_bucket_seconds(mut self, v: u64) -> Self {
+        self.spec.preferred_bucket_seconds = Some(v);
+        self
+    }
+    /// Check the id grammar. The operands are checked by
+    /// [`Declarations::validate`], which can see them.
+    pub fn build(self) -> Result<Metric, String> {
+        if !valid_id(&self.id) {
+            return Err(format!("invalid metric id {:?}: {ID_RULE}", self.id));
+        }
+        Ok(Metric {
+            id: self.id,
+            display_name: self.display_name,
+            description: self.description,
+            unit: self.unit,
+            query: MetricQuery::Ratio(self.spec),
+        })
+    }
 }
 /// An Eyes telemetry query validated by the telemetry builder.
 #[derive(Debug, Clone, PartialEq)]
@@ -744,7 +850,15 @@ pub struct ProductEventMetric {
     pub aggregate: ProductAggregate,
     pub property_filters: Vec<PropertyFilter>,
     pub breakdown_property: Option<String>,
-    pub bucket_seconds: Option<u64>,
+    pub bucket: Option<Bucket>,
+}
+/// Width of one time bucket of a product metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bucket {
+    /// Epoch-aligned buckets this many seconds wide.
+    Seconds(u64),
+    /// Monday-aligned buckets this many weeks wide (1 to 4).
+    Weeks(u32),
 }
 /// Aggregation over matching product events.
 #[derive(Debug, Clone, PartialEq)]
@@ -782,7 +896,7 @@ impl ProductMetricBuilder {
                 aggregate,
                 property_filters: vec![],
                 breakdown_property: None,
-                bucket_seconds: None,
+                bucket: None,
             },
         }
     }
@@ -926,8 +1040,15 @@ impl ProductMetricBuilder {
         self.spec.breakdown_property = Some(property.into());
         self
     }
+    /// Epoch-aligned buckets. Replaces any earlier bucket choice.
     pub fn bucket_seconds(mut self, seconds: u64) -> Self {
-        self.spec.bucket_seconds = Some(seconds);
+        self.spec.bucket = Some(Bucket::Seconds(seconds));
+        self
+    }
+    /// Monday-aligned calendar weeks, 1 to 4 wide. Replaces any earlier
+    /// bucket choice. `PostHog` charts these at its `week` interval.
+    pub fn bucket_weeks(mut self, weeks: u32) -> Self {
+        self.spec.bucket = Some(Bucket::Weeks(weeks));
         self
     }
     pub fn build(self) -> Result<Metric, String> {
@@ -966,12 +1087,69 @@ impl ProductAggregate {
     }
 }
 
+impl RatioMetric {
+    /// Exactly what the Eyes ratio builder produces for the same inputs,
+    /// with the shapes and value types read from the declared operands.
+    fn eyes(
+        &self,
+        metric: &Metric,
+        singular: &std::collections::HashMap<&str, eyes::NamedMetric>,
+    ) -> Result<eyes::NamedMetric, String> {
+        let side = |label: &str, id: &str| {
+            singular.get(id).ok_or_else(|| {
+                format!(
+                    "ratio metric {}: {label} {id:?} is not a declared telemetry or product metric",
+                    metric.id
+                )
+            })
+        };
+        let numerator = side("numerator", &self.numerator)?;
+        let denominator = side("denominator", &self.denominator)?;
+        let mut b = eyes::RatioMetricBuilder::new(&metric.id, &self.numerator, &self.denominator);
+        if let Some(v) = self.numerator_window_seconds {
+            b = b.numerator_window_seconds(v);
+        }
+        if let Some(v) = self.denominator_window_seconds {
+            b = b.denominator_window_seconds(v);
+        }
+        if self.as_percentage {
+            b = b.as_percentage();
+        }
+        if let Some(v) = &metric.display_name {
+            b = b.display_name(v);
+        }
+        if let Some(v) = &metric.description {
+            b = b.description(v);
+        }
+        if let Some(v) = &metric.unit {
+            b = b.unit(v);
+        }
+        if let Some(v) = self.preferred_bucket_seconds {
+            b = b.preferred_bucket_seconds(v);
+        }
+        b.build(
+            numerator.result_shape,
+            numerator.value_type,
+            denominator.result_shape,
+            denominator.value_type,
+        )
+    }
+}
+
 impl Metric {
+    /// Convert a telemetry or product metric. A ratio needs its operands,
+    /// so it converts through [`Declarations::eyes_metrics`] instead.
     fn eyes(&self) -> Result<eyes::NamedMetric, String> {
         if !valid_id(&self.id) {
-            return Err(format!("invalid metric id {:?}", self.id));
+            return Err(format!("invalid metric id {:?}: {ID_RULE}", self.id));
         }
         let mut m = match &self.query {
+            MetricQuery::Ratio(_) => {
+                return Err(format!(
+                    "ratio metric {} converts only as part of its declarations",
+                    self.id
+                ));
+            }
             MetricQuery::Telemetry(m) => m.0.clone(),
             MetricQuery::ProductEvent(p) => {
                 let (function, _, property) = p.aggregate.parts();
@@ -999,9 +1177,11 @@ impl Metric {
                 if let Some(p) = &p.breakdown_property {
                     b = b.group_by(&format!("fields.{}", name(p)?))?;
                 }
-                if let Some(n) = p.bucket_seconds {
-                    b = b.time_bucket(n);
-                }
+                b = match p.bucket {
+                    Some(Bucket::Seconds(n)) => b.time_bucket(n),
+                    Some(Bucket::Weeks(n)) => b.time_bucket_weeks(n),
+                    None => b,
+                };
                 b.build_eyes()?
             }
         };
@@ -1144,27 +1324,56 @@ impl Declarations {
         self.alerts.push(a);
         self
     }
+    /// Convert every metric for the Eyes manifest, in declaration order.
+    /// Rejects duplicate ids and ratios whose operands are missing, are
+    /// ratios themselves, or pair incompatible shapes.
+    fn eyes_metrics(&self) -> Result<Vec<eyes::NamedMetric>, String> {
+        use std::collections::{HashMap, HashSet};
+        let mut ids = HashSet::new();
+        let mut singular = HashMap::new();
+        for m in &self.metrics {
+            if !ids.insert(m.id.as_str()) {
+                return Err(format!("duplicate metric {}", m.id));
+            }
+            if !matches!(m.query, MetricQuery::Ratio(_)) {
+                singular.insert(m.id.as_str(), m.eyes()?);
+            }
+        }
+        self.metrics
+            .iter()
+            .map(|m| match &m.query {
+                MetricQuery::Ratio(ratio) => {
+                    if !valid_id(&m.id) {
+                        return Err(format!("invalid metric id {:?}: {ID_RULE}", m.id));
+                    }
+                    ratio.eyes(m, &singular)
+                }
+                _ => Ok(singular[m.id.as_str()].clone()),
+            })
+            .collect()
+    }
     /// Check declaration identities, references, result shapes and manifest limits.
     pub fn validate(&self) -> Result<(), String> {
         use std::collections::{HashMap, HashSet};
         if self.metrics.len() > 100 || self.dashboards.len() > 20 {
             return Err("manifest exceeds 100 metrics or 20 dashboards".into());
         }
-        let mut shapes = HashMap::new();
-        for m in &self.metrics {
-            if shapes
-                .insert(m.id.as_str(), m.eyes()?.result_shape)
-                .is_some()
-            {
-                return Err(format!("duplicate metric {}", m.id));
-            }
-        }
+        let converted = self.eyes_metrics()?;
+        let shapes = converted
+            .iter()
+            .map(|m| (m.id.as_str(), m.result_shape))
+            .collect::<HashMap<_, _>>();
         let mut ids = HashSet::new();
         for a in &self.alerts {
-            if !valid_id(&a.id) || !ids.insert(&a.id) || !shapes.contains_key(a.metric_id.as_str())
-            {
+            if !valid_id(&a.id) {
+                return Err(format!("invalid alert id {:?}: {ID_RULE}", a.id));
+            }
+            if !ids.insert(&a.id) {
+                return Err(format!("duplicate alert {}", a.id));
+            }
+            if !shapes.contains_key(a.metric_id.as_str()) {
                 return Err(format!(
-                    "invalid or duplicate alert {} or missing metric {}",
+                    "alert {}: metric {} is not declared",
                     a.id, a.metric_id
                 ));
             }
@@ -1172,6 +1381,12 @@ impl Declarations {
         }
         ids.clear();
         for d in &self.dashboards {
+            if !valid_dashboard_id(&d.id) {
+                return Err(format!(
+                    "invalid dashboard id {:?}: {DASHBOARD_ID_RULE}",
+                    d.id
+                ));
+            }
             if !ids.insert(&d.id) || d.sections.len() > 20 {
                 return Err(format!("duplicate or oversized dashboard {}", d.id));
             }
@@ -1201,12 +1416,7 @@ impl Declarations {
     ) -> Result<eyes::AppManifest, String> {
         self.validate()?;
         Ok(manifest
-            .metrics(
-                self.metrics
-                    .iter()
-                    .map(Metric::eyes)
-                    .collect::<Result<_, _>>()?,
-            )
+            .metrics(self.eyes_metrics()?)
             .metric_thresholds(
                 self.alerts
                     .iter()
@@ -1378,5 +1588,247 @@ mod product_tests {
                 ok
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use serde_json::to_value;
+
+    const DAY: u64 = 86_400;
+    const FOUR_WEEKS: u64 = 2_419_200;
+
+    fn eyes_users(id: &str) -> eyes::NamedMetric {
+        eyes::NamedMetricBuilder::new(id, AggregateFunction::CountDistinct, Some("fields.user_id"))
+            .unwrap()
+            .display_name("Users")
+            .filter_eq("target", "cja::server::trace")
+            .unwrap()
+            .filter_eq("message", "finished processing request")
+            .unwrap()
+            .unit("users")
+            .build()
+            .unwrap()
+    }
+    fn users(id: &str) -> Metric {
+        TelemetryMetricBuilder::new(id, AggregateFunction::CountDistinct, Some("fields.user_id"))
+            .unwrap()
+            .display_name("Users")
+            .filter_eq("target", "cja::server::trace")
+            .unwrap()
+            .filter_eq("message", "finished processing request")
+            .unwrap()
+            .unit("users")
+            .build()
+            .unwrap()
+    }
+    fn stickiness() -> RatioMetricBuilder {
+        RatioMetricBuilder::new(
+            "product.users.active.stickiness.daily",
+            "product.users.active",
+            "product.users.active.month",
+        )
+        .numerator_window_seconds(DAY)
+        .denominator_window_seconds(FOUR_WEEKS)
+        .as_percentage()
+        .display_name("Users: last 1 day as % of last 28 days")
+        .description("Distinct users in the last day as a percentage of the last 28 days.")
+    }
+    /// Two telemetry metrics, a ratio over them and a stat tile on the
+    /// ratio, as arena's `arena-product` dashboard declares them.
+    fn arena_shaped() -> Declarations {
+        Declarations::new()
+            .metric(users("product.users.active"))
+            .metric(users("product.users.active.month"))
+            .metric(stickiness().build().unwrap())
+            .dashboard(
+                Dashboard::new("arena-product", "Arena product")
+                    .unwrap()
+                    .section(
+                        Section::new().title("Engagement").item(
+                            Item::stat("product.users.active.stickiness.daily")
+                                .label("DAU / MAU")
+                                .window_seconds(DAY),
+                        ),
+                    ),
+            )
+    }
+
+    #[test]
+    fn ratio_metric_converts_to_exactly_the_eyes_ratio_builder_output() {
+        let declarations = arena_shaped();
+        declarations.validate().unwrap();
+        let manifest = declarations
+            .attach_to_eyes_manifest(eyes::AppManifest::default())
+            .unwrap();
+        let metrics = manifest.metrics.unwrap();
+        let expected = eyes::RatioMetricBuilder::new(
+            "product.users.active.stickiness.daily",
+            "product.users.active",
+            "product.users.active.month",
+        )
+        .numerator_window_seconds(DAY)
+        .denominator_window_seconds(FOUR_WEEKS)
+        .as_percentage()
+        .display_name("Users: last 1 day as % of last 28 days")
+        .description("Distinct users in the last day as a percentage of the last 28 days.")
+        .build(
+            eyes::MetricResultShape::Scalar,
+            MetricValueType::Int,
+            eyes::MetricResultShape::Scalar,
+            MetricValueType::Int,
+        )
+        .unwrap();
+        assert_eq!(
+            to_value(&metrics).unwrap(),
+            to_value([
+                eyes_users("product.users.active"),
+                eyes_users("product.users.active.month"),
+                expected,
+            ])
+            .unwrap()
+        );
+        assert_eq!(
+            to_value(&manifest.dashboards.unwrap()[0].sections[0].items[0]).unwrap(),
+            to_value(
+                eyes::DashboardItem::stat("product.users.active.stickiness.daily")
+                    .label("DAU / MAU")
+                    .window_seconds(DAY)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn ratio_operands_must_be_declared_singular_metrics() {
+        let with = |ratio: RatioMetricBuilder| {
+            let mut declarations = arena_shaped();
+            declarations.metrics[2] = ratio.build().unwrap();
+            declarations.validate()
+        };
+        let id = "product.users.active.stickiness.daily";
+        let error = with(RatioMetricBuilder::new(
+            id,
+            "missing",
+            "product.users.active.month",
+        ))
+        .unwrap_err();
+        assert!(error.contains("numerator \"missing\""), "{error}");
+        let error = with(RatioMetricBuilder::new(
+            id,
+            "product.users.active",
+            "missing",
+        ))
+        .unwrap_err();
+        assert!(error.contains("denominator \"missing\""), "{error}");
+        // A ratio cannot be the side of a ratio, itself included.
+        let error = with(RatioMetricBuilder::new(id, "product.users.active", id)).unwrap_err();
+        assert!(error.contains("denominator"), "{error}");
+        // The Eyes builder's own rules still apply.
+        assert!(with(stickiness().unit("users")).is_err());
+        assert!(
+            with(RatioMetricBuilder::new(
+                id,
+                "product.users.active",
+                "product.users.active"
+            ))
+            .is_err()
+        );
+        // A time-series tile needs a time-series ratio.
+        let mut declarations = arena_shaped();
+        declarations.dashboards[0].sections[0].items[0] = Item::time_series(id);
+        assert!(declarations.validate().is_err());
+    }
+
+    #[test]
+    fn ids_must_be_lowercase() {
+        let mut declarations = arena_shaped();
+        declarations.metrics[0].id = "product.Users.active".into();
+        let error = declarations.validate().unwrap_err();
+        assert!(error.contains("invalid metric id"), "{error}");
+
+        let mut declarations = arena_shaped();
+        declarations.metrics[2].id = "Stickiness".into();
+        declarations.dashboards[0].sections.clear();
+        let error = declarations.validate().unwrap_err();
+        assert!(error.contains("invalid metric id"), "{error}");
+
+        let mut declarations = arena_shaped();
+        declarations.dashboards[0].id = "Arena-product".into();
+        let error = declarations.validate().unwrap_err();
+        assert!(error.contains("invalid dashboard id"), "{error}");
+        assert!(Dashboard::new("Arena", "Arena").is_err());
+
+        let alert = |id: &str| {
+            AlertBuilder::new(id, "product.users.active")
+                .window_seconds(300)
+                .evaluation_interval_seconds(60)
+                .critical(Comparison::Below, 1.)
+                .build()
+                .unwrap()
+        };
+        arena_shaped().alert(alert("quiet")).validate().unwrap();
+        let error = arena_shaped().alert(alert("Quiet")).validate().unwrap_err();
+        assert!(error.contains("invalid alert id"), "{error}");
+        for bad in ["a]", "a b", ""] {
+            assert!(arena_shaped().alert(alert(bad)).validate().is_err());
+        }
+        assert!(RatioMetricBuilder::new("Ratio", "a", "b").build().is_err());
+        assert!(ProductMetricBuilder::count("Signups", "e").build().is_err());
+    }
+
+    #[test]
+    fn arena_metric_ids_with_underscores_stay_valid() {
+        let mut declarations = arena_shaped();
+        declarations.metrics[0].id = "game.queue_wait.p95".into();
+        if let MetricQuery::Ratio(ratio) = &mut declarations.metrics[2].query {
+            ratio.numerator = "game.queue_wait.p95".into();
+        }
+        let manifest = declarations
+            .alert(
+                AlertBuilder::new("game-queue_delay", "game.queue_wait.p95")
+                    .window_seconds(300)
+                    .evaluation_interval_seconds(60)
+                    .critical(Comparison::Above, 1.)
+                    .build()
+                    .unwrap(),
+            )
+            .attach_to_eyes_manifest(eyes::AppManifest::default())
+            .unwrap();
+        assert_eq!(manifest.metrics.unwrap()[0].id, "game.queue_wait.p95");
+    }
+
+    #[test]
+    fn weekly_product_bucket_converts_to_monday_aligned_eyes_weeks() {
+        let weekly = ProductMetricBuilder::count("signups.weekly", "user_created")
+            .bucket_weeks(1)
+            .build()
+            .unwrap();
+        let eyes_builder = || {
+            eyes::NamedMetricBuilder::new("signups.weekly", AggregateFunction::Count, None)
+                .unwrap()
+                .filter_eq("fields.event_type", "user_created")
+                .unwrap()
+        };
+        let monday = to_value(eyes_builder().time_bucket_weeks(1).build().unwrap()).unwrap();
+        let epoch = to_value(eyes_builder().time_bucket(604_800).build().unwrap()).unwrap();
+        assert_ne!(monday, epoch);
+        assert_eq!(to_value(weekly.eyes().unwrap()).unwrap(), monday);
+        let seconds = ProductMetricBuilder::count("signups.weekly", "user_created")
+            .bucket_seconds(604_800)
+            .build()
+            .unwrap();
+        assert_eq!(to_value(seconds.eyes().unwrap()).unwrap(), epoch);
+        assert_eq!(
+            weekly.eyes().unwrap().result_shape,
+            eyes::MetricResultShape::TimeSeries
+        );
+        assert!(
+            ProductMetricBuilder::count("m", "e")
+                .bucket_weeks(0)
+                .build()
+                .is_err()
+        );
     }
 }

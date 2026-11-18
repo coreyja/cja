@@ -1,6 +1,7 @@
 //! Reconcile one application's declarations against the `PostHog` project API.
 use super::{
-    Alert, Comparison, Declarations, FilterOperator, FilterValue, MetricQuery, ProductEventMetric,
+    Alert, Bucket, Comparison, Dashboard, Declarations, FilterOperator, FilterValue, Item,
+    MetricQuery, ProductEventMetric,
 };
 use reqwest::{Client, Method};
 use serde_json::{Value, json};
@@ -276,7 +277,13 @@ fn query(p: &ProductEventMetric, app: &str) -> Value {
     if let Some(prop) = property {
         series["math_property"] = json!(prop);
     }
-    let bucket = ["hour", "day", "week", "month"][p.bucket_seconds.map_or(1, interval)];
+    // PostHog has no multi-week interval, so every week-aligned bucket charts
+    // at `week`: its alignment matters more than its exact width.
+    let bucket = ["hour", "day", "week", "month"][match p.bucket {
+        None => 1,
+        Some(Bucket::Seconds(n)) => interval(n),
+        Some(Bucket::Weeks(_)) => 2,
+    }];
     let mut source = json!({
         "kind": "TrendsQuery",
         "series": [series],
@@ -452,7 +459,11 @@ async fn alerts(
     for a in &decl.alerts {
         let tag = format!("cja:{app}:alert:{}", a.id);
         let Some(n) = ids.get(a.metric_id.as_str()) else {
-            r.skipped.push(format!("{tag}: telemetry metric"));
+            r.skipped.push(format!(
+                "{tag}: {} metric {} (Eyes-only)",
+                eyes_only(decl, &a.metric_id),
+                a.metric_id
+            ));
             continue;
         };
         let cadence =
@@ -518,6 +529,42 @@ async fn alerts(
     }
     Ok(())
 }
+/// Why a declared metric has no `PostHog` insight: its kind, for warnings.
+fn eyes_only(decl: &Declarations, metric_id: &str) -> &'static str {
+    match decl.metrics.iter().find(|m| m.id == metric_id) {
+        Some(m) if matches!(m.query, MetricQuery::Ratio(_)) => "ratio",
+        _ => "telemetry",
+    }
+}
+/// Insights a dashboard should tile, in declaration order. Items with no
+/// `PostHog` equivalent are reported as skipped.
+fn wanted_tiles(
+    decl: &Declarations,
+    dash: &Dashboard,
+    key: &str,
+    ids: &BTreeMap<&str, i64>,
+    r: &mut SyncReport,
+) -> Vec<i64> {
+    let mut wanted = vec![];
+    for item in dash.sections.iter().flat_map(|s| &s.items) {
+        match (item, item.reference()) {
+            (_, Some((mid, _))) => match ids.get(mid) {
+                Some(insight_id) => wanted.push(*insight_id),
+                None => r.skipped.push(format!(
+                    "{key}: tile for {} metric {mid} (Eyes-only)",
+                    eyes_only(decl, mid)
+                )),
+            },
+            (Item::Links { .. }, None) => {
+                r.skipped.push(format!("{key}: links item (Eyes-only)"));
+            }
+            (_, None) => r
+                .skipped
+                .push(format!("{key}: health summary item (Eyes-only)")),
+        }
+    }
+    wanted
+}
 fn alert_path(row: &Value) -> Result<String, SyncError> {
     let id = row["id"]
         .as_str()
@@ -555,7 +602,10 @@ pub async fn sync(
     for metric in &declarations.metrics {
         let key = tag("insight", &metric.id);
         let MetricQuery::ProductEvent(product) = &metric.query else {
-            report.skipped.push(format!("{key}: telemetry metric"));
+            report.skipped.push(format!(
+                "{key}: {} metric (Eyes-only)",
+                eyes_only(declarations, &metric.id)
+            ));
             continue;
         };
         let insight_id = upsert(
@@ -576,16 +626,7 @@ pub async fn sync(
         .collect::<Result<_, _>>()?;
     for dash in &declarations.dashboards {
         let key = tag("dashboard", &dash.id);
-        let mut wanted = vec![];
-        for item in dash.sections.iter().flat_map(|s| &s.items) {
-            if let Some((mid, _)) = item.reference() {
-                if let Some(insight_id) = ids.get(mid) {
-                    wanted.push(*insight_id);
-                }
-            } else {
-                report.skipped.push(format!("{key}: unsupported {item:?}"));
-            }
-        }
+        let wanted = wanted_tiles(declarations, dash, &key, &ids, &mut report);
         tiles(
             &api,
             &key,
@@ -771,6 +812,16 @@ mod mapping_tests {
         };
         let q = query(&spec, "demo");
         assert_eq!(q["source"]["interval"], "day");
+        for weeks in [1, 2] {
+            let weekly = ProductMetricBuilder::count("weekly", "opened")
+                .bucket_weeks(weeks)
+                .build()
+                .unwrap();
+            let MetricQuery::ProductEvent(spec) = weekly.query else {
+                panic!("expected product metric")
+            };
+            assert_eq!(query(&spec, "demo")["source"]["interval"], "week");
+        }
         assert_eq!(q["source"]["series"][0]["math"], "total");
         assert!(q["source"].get("breakdownFilter").is_none());
         assert!(q["source"]["series"][0].get("math_property").is_none());
