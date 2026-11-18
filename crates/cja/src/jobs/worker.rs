@@ -2628,7 +2628,7 @@ mod tests {
         let (error_count, locked_by, locked_at, context): (
             i32,
             Option<String>,
-            Option<chrono::DateTime<chrono::Utc>>,
+            Option<jiff_sqlx::Timestamp>,
             String,
         ) = sqlx::query_as(
             "SELECT error_count, locked_by, locked_at, context \
