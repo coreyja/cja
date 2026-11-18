@@ -58,7 +58,6 @@ pub struct TestClient {
 #[allow(dead_code)]
 impl TestClient {
     pub fn new(port: u16) -> Self {
-        cja::setup::install_crypto_provider();
         let cookie_jar = Arc::new(Jar::default());
         let client = reqwest::Client::builder()
             .cookie_provider(cookie_jar.clone())

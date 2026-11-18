@@ -1,9 +1,10 @@
-use std::{collections::HashMap, fmt, time::Duration};
+use std::{collections::HashMap, fmt, io::Read as _, sync::Arc, time::Duration};
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::{OpenTelemetryTracingBridge, TracingSpanAttributes};
+use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response, ResponseBodyTooLarge};
 use opentelemetry_otlp::{
     LogExporter, Protocol, SpanExporter, WithExportConfig as _, WithHttpConfig as _,
 };
@@ -12,6 +13,7 @@ use opentelemetry_sdk::{
     logs::{self, BatchLogProcessor, SdkLogger, SdkLoggerProvider},
     trace::{self, BatchSpanProcessor, Sampler, SdkTracer, SdkTracerProvider},
 };
+use rustls_platform_verifier::BuilderVerifierExt as _;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
 /// Per-request bound on one OTLP export (client and exporter).
@@ -56,7 +58,7 @@ impl PostHogEnv {
             });
         };
         let host = read("POSTHOG_HOST").unwrap_or_else(|| "https://us.i.posthog.com".into());
-        let url = reqwest::Url::parse(host.trim()).map_err(|_| eyre!("invalid POSTHOG_HOST"))?;
+        let url = url::Url::parse(host.trim()).map_err(|_| eyre!("invalid POSTHOG_HOST"))?;
         ensure!(
             matches!(url.scheme(), "http" | "https")
                 && url.host().is_some()
@@ -169,6 +171,57 @@ pub struct PostHogSink {
     filter: Targets,
 }
 
+/// Largest response body read back from `PostHog`, as in `opentelemetry-http`.
+const MAX_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The exporters' HTTP client: reqwest 0.12's blocking client over rustls
+/// with ring and the platform verifier (system roots).
+///
+/// It carries its own ring `ClientConfig`, so building it installs no
+/// process-wide crypto provider and leaves the app's TLS setup alone. Why
+/// reqwest 0.12 and not the workspace's 0.13: see `reqwest_012` in
+/// `crates/cja/Cargo.toml`.
+#[derive(Debug, Clone)]
+struct OtlpHttpClient(reqwest_012::blocking::Client);
+
+impl OtlpHttpClient {
+    fn new() -> Result<Self> {
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .wrap_err("selecting TLS protocol versions")?
+        .with_platform_verifier()
+        .wrap_err("loading the platform certificate verifier")?
+        .with_no_client_auth();
+        let client = reqwest_012::blocking::Client::builder()
+            .use_preconfigured_tls(tls)
+            .timeout(TIMEOUT)
+            .build()
+            .wrap_err("building the HTTP client")?;
+        Ok(Self(client))
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpClient for OtlpHttpClient {
+    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+        let mut response = self.0.execute(request.try_into()?)?;
+        let status = response.status();
+        let headers = std::mem::take(response.headers_mut());
+        let mut body = Vec::new();
+        response
+            .take(MAX_RESPONSE_BODY_BYTES + 1)
+            .read_to_end(&mut body)?;
+        if body.len() as u64 > MAX_RESPONSE_BODY_BYTES {
+            return Err(Box::new(ResponseBodyTooLarge::new()));
+        }
+        let mut http_response = Response::builder().status(status).body(Bytes::from(body))?;
+        *http_response.headers_mut() = headers;
+        Ok(http_response)
+    }
+}
+
 impl PostHogSink {
     pub fn build(
         config: &PostHogConfig,
@@ -177,15 +230,11 @@ impl PostHogSink {
         process: Option<&eyes_subscriber::ProcessIdentity>,
         max_queue_size: usize,
     ) -> Result<Self> {
-        // The exporter's reqwest client needs a process-default provider.
-        super::install_crypto_provider();
         let (logs, spans) = build_on_sync_thread(|| {
             // The async client can panic on the batch worker. Construct and drop blocking clients outside Tokio.
             // https://posthog.com/docs/logs/installation/rust
-            let client = reqwest::blocking::Client::builder()
-                .timeout(TIMEOUT)
-                .build()
-                .wrap_err("building PostHog exporter or HTTP client")?;
+            let client =
+                OtlpHttpClient::new().wrap_err("building PostHog exporter or HTTP client")?;
             let headers = HashMap::from([(
                 "Authorization".to_owned(),
                 format!("Bearer {}", config.token),

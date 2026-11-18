@@ -165,19 +165,6 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<TelemetryShutdownHa
     TracingConfig::new(crate_name).init()
 }
 
-/// Installs ring as the process-wide rustls crypto provider, unless one is
-/// already installed (an installed provider wins).
-///
-/// cja links rustls with ring only: no aws-lc-rs anywhere in its dependency
-/// graph. Its reqwest uses `rustls-no-provider`, so any reqwest 0.13 client
-/// in the app panics at build time if no process-default provider is
-/// installed. [`setup_tracing`] calls this first. Call it yourself if you
-/// build a reqwest client before tracing is set up.
-pub fn install_crypto_provider() {
-    // Err only means a provider is already installed; keep it.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 /// Tracing setup with an optional boot-stable Eyes process identity.
 /// Use the same identity in the boot manifest and heartbeat configuration.
 pub struct TracingConfig<'a> {
@@ -222,8 +209,6 @@ fn initialize_tracing(
     process: Option<&eyes_subscriber::ProcessIdentity>,
     version: Option<&str>,
 ) -> color_eyre::Result<TelemetryShutdownHandle> {
-    install_crypto_provider();
-
     let rust_log = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| format!("info,{crate_name}=trace,tower_http=debug,serenity=error"));
 
@@ -439,18 +424,6 @@ mod tests {
     use tracing::Level;
 
     use super::*;
-
-    /// cja links ring only and reqwest uses `rustls-no-provider`: without a
-    /// process-default provider, building any reqwest client panics.
-    #[test]
-    fn install_crypto_provider_lets_reqwest_build() {
-        install_crypto_provider();
-
-        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
-        reqwest::blocking::Client::builder()
-            .build()
-            .expect("reqwest builds once a provider is installed");
-    }
 
     /// Builds the production composition: the `RUST_LOG`-driven `EnvFilter`
     /// with the static `Targets` cap stacked on top of it, exactly as

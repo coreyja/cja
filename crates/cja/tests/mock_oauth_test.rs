@@ -21,7 +21,6 @@ async fn start_test_server() -> (u16, tokio::task::JoinHandle<()>) {
 }
 
 fn create_client() -> reqwest::Client {
-    cja::setup::install_crypto_provider();
     reqwest::Client::builder()
         .redirect(Policy::none())
         .build()

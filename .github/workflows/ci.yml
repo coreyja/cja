@@ -85,10 +85,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # reqwest's `rustls` feature links aws-lc-rs next to ring. With two
-      # providers linked, rustls' `ClientConfig::builder()` panics in every app
-      # built on cja, and every build compiles aws-lc-sys. cja-tailnet opts
-      # into aws-lc-rs on its own; cja itself must not.
+      # reqwest 0.13's `rustls` feature links aws-lc-rs next to ring. With two
+      # providers linked and none installed, rustls' `ClientConfig::builder()`
+      # panics (eyes-subscriber's websocket transport calls it), and every app
+      # build compiles aws-lc-sys. cja-tailnet opts into aws-lc-rs on its own;
+      # cja itself must not.
       - name: Assert no aws-lc-rs in cja's dependency graph
         run: |
           for features in "" "--all-features" "--no-default-features"; do

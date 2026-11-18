@@ -14,6 +14,9 @@ async fn exports() {
         8192,
     )
     .unwrap();
+    // The exporter's client carries its own ring config. Building it must not
+    // install a process-wide rustls provider over the app's own choice.
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
     let (env, cap) = filter_stack("trace").unwrap();
     let sub = tracing_subscriber::registry()
         .with(
