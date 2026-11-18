@@ -182,9 +182,9 @@ const MAX_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
 /// reqwest 0.12 and not the workspace's 0.13: see `reqwest_012` in
 /// `crates/cja/Cargo.toml`.
 #[derive(Debug, Clone)]
-struct OtlpHttpClient(reqwest_012::blocking::Client);
+struct PostHogHttpClient(reqwest_012::blocking::Client);
 
-impl OtlpHttpClient {
+impl PostHogHttpClient {
     fn new() -> Result<Self> {
         let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -204,7 +204,7 @@ impl OtlpHttpClient {
 }
 
 #[async_trait::async_trait]
-impl HttpClient for OtlpHttpClient {
+impl HttpClient for PostHogHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
         let mut response = self.0.execute(request.try_into()?)?;
         let status = response.status();
@@ -234,7 +234,7 @@ impl PostHogSink {
             // The async client can panic on the batch worker. Construct and drop blocking clients outside Tokio.
             // https://posthog.com/docs/logs/installation/rust
             let client =
-                OtlpHttpClient::new().wrap_err("building PostHog exporter or HTTP client")?;
+                PostHogHttpClient::new().wrap_err("building PostHog exporter or HTTP client")?;
             let headers = HashMap::from([(
                 "Authorization".to_owned(),
                 format!("Bearer {}", config.token),

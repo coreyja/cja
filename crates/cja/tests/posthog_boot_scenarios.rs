@@ -28,16 +28,16 @@ fn eyes_targets(eyes: &Captures) -> Vec<String> {
         .collect()
 }
 
-// A1: `reqwest::blocking::Client::build()` fails, so the exporters cannot be
+// A1: the exporters' HTTP client cannot be built, so the exporters cannot be
 // constructed. Boot must still succeed with the sink skipped and Eyes intact.
 //
-// How the failure is forced: reqwest 0.13's rustls backend builds its
+// How the failure is forced: `PostHogHttpClient::new` builds its rustls
 // verifier with `rustls-platform-verifier`, which on Linux loads the roots
 // through `rustls-native-certs` and returns an error when the resulting root
 // store is empty (rustls-platform-verifier 0.7.1
 // `src/verification/others.rs`). `rustls-native-certs` honors
 // `SSL_CERT_FILE` / `SSL_CERT_DIR`, so pointing them at an empty file and an
-// empty directory yields zero roots and a deterministic `build()` error.
+// empty directory yields zero roots and a deterministic construction error.
 #[test]
 fn exporter_setup_failure_skips_posthog_and_keeps_eyes() {
     const MARKER: &str = "setup-failure-eyes-marker";

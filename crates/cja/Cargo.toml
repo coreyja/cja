@@ -14,7 +14,7 @@ testing = ["serde_urlencoded"]
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "logs", "internal-logs"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "logs", "internal-logs"] }
 # PostHog requires rustls for HTTPS: https://posthog.com/docs/logs/installation/rust
-# No reqwest feature here: the exporter's HTTP client is `OtlpHttpClient` in
+# No reqwest feature here: the exporter's HTTP client is `PostHogHttpClient` in
 # src/setup/posthog.rs, over `reqwest_012` below.
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "trace", "logs"] }
 opentelemetry-http = { version = "0.33.1", default-features = false }
@@ -28,7 +28,7 @@ tracing-opentelemetry = { version = "0.34", default-features = false }
 # 0.12 already ships in every cja graph (eyes-subscriber) on ring. The client
 # carries its own ring config, so nothing is installed process-wide. CI's
 # "ring only" job fails if aws-lc-rs enters cja's dependency graph.
-reqwest_012 = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "rustls-tls-manual-roots"] }
+reqwest_012 = { package = "reqwest", version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls-manual-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = "0.7"
 url = "2"
