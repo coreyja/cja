@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use crate::app_state::{self};
 
-use super::worker::JobFromDB;
+use super::Concurrency;
+use super::worker::{ConcurrencySlot, JobFromDB};
 
 /// A trait for job registries that can dispatch jobs based on their name.
 ///
@@ -14,6 +17,7 @@ pub trait JobRegistry<AppState: app_state::AppState> {
         job: &JobFromDB,
         app_state: AppState,
         cancellation_token: tokio_util::sync::CancellationToken,
+        slot: ConcurrencySlot,
     ) -> color_eyre::Result<()>;
 
     /// The names of every job type registered with this registry.
@@ -24,6 +28,25 @@ pub trait JobRegistry<AppState: app_state::AppState> {
     fn job_names() -> &'static [&'static str]
     where
         Self: Sized;
+
+    /// Per-attempt maximum runtime for the named job type, from its
+    /// [`crate::jobs::Job::MAX_RUNTIME`] const.
+    ///
+    /// `impl_job_registry!` implements this automatically from the
+    /// registered types' consts. Hand-written `JobRegistry` impls MUST
+    /// implement it (required, like `run_job`) — delegate to the job
+    /// types' `MAX_RUNTIME` consts so limits apply.
+    fn max_runtime(&self, name: &str) -> Duration;
+
+    /// The declared concurrency limit for the named job type, from its
+    /// [`crate::jobs::Job::CONCURRENCY`] const. `Concurrency::Unlimited`
+    /// (also the fallback for unknown names) means no per-process cap.
+    ///
+    /// `impl_job_registry!` implements this automatically from the
+    /// registered types' consts. Hand-written `JobRegistry` impls MUST
+    /// implement it (required, like `run_job`) — delegate to the job
+    /// types' `CONCURRENCY` consts so caps apply.
+    fn concurrency(&self, name: &str) -> Concurrency;
 }
 
 /// A macro for implementing a job registry that handles job dispatch.
@@ -100,6 +123,7 @@ macro_rules! impl_job_registry {
                 job: &$crate::jobs::worker::JobFromDB,
                 app_state: $state,
                 cancellation_token: $crate::jobs::CancellationToken,
+                slot: $crate::jobs::worker::ConcurrencySlot,
             ) -> $crate::Result<()> {
                 use $crate::jobs::Job as _;
 
@@ -107,7 +131,7 @@ macro_rules! impl_job_registry {
 
                 match job.name.as_str() {
                     $(
-                        <$job_type>::NAME => <$job_type>::run_from_value(payload, app_state, cancellation_token).await,
+                        <$job_type>::NAME => <$job_type>::run_from_value(payload, app_state, cancellation_token, slot).await,
                     )*
                     _ => Err($crate::jobs::UnknownJobType(job.name.clone()).into()),
                 }
@@ -117,6 +141,24 @@ macro_rules! impl_job_registry {
                 use $crate::jobs::Job as _;
 
                 &[$(<$job_type>::NAME),*]
+            }
+
+            fn max_runtime(&self, name: &str) -> std::time::Duration {
+                use $crate::jobs::Job as _;
+
+                match name {
+                    $(<$job_type>::NAME => <$job_type as $crate::jobs::Job<$state>>::MAX_RUNTIME,)*
+                    _ => $crate::jobs::DEFAULT_MAX_RUNTIME,
+                }
+            }
+
+            fn concurrency(&self, name: &str) -> $crate::jobs::Concurrency {
+                use $crate::jobs::Job as _;
+
+                match name {
+                    $(<$job_type>::NAME => <$job_type as $crate::jobs::Job<$state>>::CONCURRENCY,)*
+                    _ => $crate::jobs::Concurrency::Unlimited,
+                }
             }
         }
     };

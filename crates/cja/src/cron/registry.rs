@@ -1,7 +1,13 @@
 use std::{collections::HashMap, error::Error, future::Future, pin::Pin, time::Duration};
 
-use chrono::{TimeZone, Timelike, Utc};
-use chrono_tz::Tz;
+use croner::Cron;
+use croner::errors::CronError;
+use croner::parser::{CronParser, Seconds, Year};
+use croner::time::{CivilDate, CivilDateTime, CivilTime, CronDateTime, Resolution, Weekday};
+use jiff::civil::DateTime;
+use jiff::tz::{AmbiguousOffset, TimeZone};
+use jiff::{SignedDuration, Timestamp, ZonedDateTime};
+use jiff_sqlx::ToSqlx as _;
 
 use crate::app_state::AppState as AS;
 #[cfg(feature = "jobs")]
@@ -60,37 +66,47 @@ pub struct IntervalSchedule(pub Duration);
 impl IntervalSchedule {
     fn should_run(
         &self,
-        last_run: Option<&chrono::DateTime<Utc>>,
-        now: chrono::DateTime<Utc>,
-        _worker_started_at: chrono::DateTime<Utc>,
-        _timezone: Tz,
+        last_run: Option<&Timestamp>,
+        now: Timestamp,
+        _worker_started_at: Timestamp,
+        _timezone: &TimeZone,
     ) -> bool {
-        if let Some(last_run) = last_run {
-            let elapsed = now - last_run;
-            // If elapsed is negative, return false (don't run)
-            if elapsed < chrono::Duration::zero() {
-                return false;
-            }
-            // Safe to convert since we checked it's non-negative
-            let elapsed = elapsed.to_std().unwrap_or(Duration::ZERO);
-            elapsed > self.0
-        } else {
-            true
-        }
+        let Some(last_run) = last_run else {
+            return true;
+        };
+        let elapsed = now.duration_since(*last_run);
+        // A last run in the future is not due.
+        !elapsed.is_negative() && elapsed.unsigned_abs() > self.0
     }
 
     pub fn next_run(
         &self,
-        last_run: Option<&chrono::DateTime<Utc>>,
-        now: chrono::DateTime<Utc>,
-        timezone: Tz,
-    ) -> chrono::DateTime<Tz> {
-        let last_run = last_run.unwrap_or(&now);
-        let last_run_tz = last_run.with_timezone(&timezone);
-        let duration: chrono::Duration = chrono::Duration::from_std(self.0).unwrap();
-        let next_run = last_run_tz.checked_add_signed(duration).unwrap();
-        next_run.with_timezone(&timezone)
+        last_run: Option<&Timestamp>,
+        now: Timestamp,
+        timezone: &TimeZone,
+    ) -> ZonedDateTime {
+        let last_run = last_run.copied().unwrap_or(now);
+        let interval =
+            SignedDuration::try_from(self.0).expect("cron interval fits in a SignedDuration");
+        (last_run + interval).to_zoned_datetime(timezone.clone())
     }
+}
+
+/// Parses a cron expression in cja's format: seconds, minutes, hours, day of
+/// month, month, day of week, and an optional year.
+///
+/// The fields keep the meaning they had under the `cron` crate. Day of week
+/// counts from 1 = Sunday through 7 = Saturday (names like `MON` work too),
+/// and a day must match both the day-of-month and day-of-week fields.
+pub fn parse_cron(expr: &str) -> Result<Cron, CronError> {
+    CronParser::builder()
+        .seconds(Seconds::Required)
+        .year(Year::Optional)
+        .dom_and_dow(true)
+        .alternative_weekdays(true)
+        .sloppy_ranges(true)
+        .build()
+        .parse(expr)
 }
 
 /// A cron expression, evaluated against local wall-clock time.
@@ -107,73 +123,145 @@ impl IntervalSchedule {
 ///   so `0 */15 * * * * *` goes 75 minutes between fires that night. Register
 ///   an interval for elapsed-time cadence.
 #[derive(Clone, Debug)]
-pub struct CronSchedule(pub Box<cron::Schedule>);
+pub struct CronSchedule(pub Box<Cron>);
 
-/// The wall-clock time of `at` in `timezone`, carried in a `DateTime<Utc>`.
-///
-/// UTC has no daylight saving, so the cron expression can be evaluated here
-/// without `cron`'s handling of repeated times: from inside the second copy
-/// of a repeated hour, `Schedule::after` returns the first copy, which is
-/// earlier than its argument.
-fn wall_clock(at: &chrono::DateTime<Utc>, timezone: Tz) -> chrono::DateTime<Utc> {
-    at.with_timezone(&timezone).naive_local().and_utc()
+/// A civil (wall-clock) datetime, which croner evaluates without any time
+/// zone. Evaluating the expression on wall-clock time sidesteps repeated and
+/// skipped hours; `CronSchedule` maps the result back to an instant itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WallClock(DateTime);
+
+impl WallClock {
+    fn of(at: Timestamp, timezone: &TimeZone) -> Self {
+        Self(timezone.to_datetime(at))
+    }
+}
+
+impl CronDateTime for WallClock {
+    fn to_civil(&self) -> CivilDateTime {
+        let at = self.0;
+        // jiff keeps every part in range.
+        CivilDateTime::new(
+            CivilDate::from_parts_unchecked(
+                i32::from(at.year()),
+                u32::try_from(at.month()).expect("month is positive"),
+                u32::try_from(at.day()).expect("day is positive"),
+            ),
+            CivilTime::from_parts_unchecked(
+                u32::try_from(at.hour()).expect("hour is nonnegative"),
+                u32::try_from(at.minute()).expect("minute is nonnegative"),
+                u32::try_from(at.second()).expect("second is nonnegative"),
+            ),
+        )
+    }
+
+    fn civil_weekday(&self) -> Weekday {
+        Weekday::from_days_from_sunday(
+            u32::try_from(self.0.weekday().to_sunday_zero_offset())
+                .expect("weekday offset is nonnegative"),
+        )
+    }
+
+    fn resolve_civil(&self, civil: CivilDateTime) -> Result<Resolution<Self>, CronError> {
+        let part = |value: u32| i8::try_from(value).map_err(|_| CronError::InvalidDate);
+        let year = i16::try_from(civil.year()).map_err(|_| CronError::InvalidDate)?;
+        DateTime::new(
+            year,
+            part(civil.month())?,
+            part(civil.day())?,
+            part(civil.hour())?,
+            part(civil.minute())?,
+            part(civil.second())?,
+            0,
+        )
+        .map(|at| Resolution::Single(Self(at)))
+        .map_err(|_| CronError::InvalidDate)
+    }
+
+    fn checked_add_seconds(&self, seconds: i64) -> Option<Self> {
+        self.0
+            .checked_add(SignedDuration::from_secs(seconds))
+            .ok()
+            .map(Self)
+    }
+
+    fn cmp_instant(&self, other: &Self) -> std::cmp::Ordering {
+        self.cmp(other)
+    }
 }
 
 impl CronSchedule {
+    /// The first scheduled wall-clock time strictly after `after`.
+    fn next_wall_clock(&self, after: WallClock) -> DateTime {
+        self.0
+            .find_next_occurrence(&after, false)
+            .expect("cron expression has a next occurrence")
+            .0
+    }
+
     fn should_run(
         &self,
-        last_run: Option<&chrono::DateTime<Utc>>,
-        now: chrono::DateTime<Utc>,
-        worker_started_at: chrono::DateTime<Utc>,
-        timezone: Tz,
+        last_run: Option<&Timestamp>,
+        now: Timestamp,
+        worker_started_at: Timestamp,
+        timezone: &TimeZone,
     ) -> bool {
         // Use last run time if available, otherwise use worker start time
-        let last_run = last_run.unwrap_or(&worker_started_at);
-        self.0
-            .after(&wall_clock(last_run, timezone))
-            .next()
-            .is_some_and(|next_run| wall_clock(&now, timezone) >= next_run)
+        let last_run = last_run.copied().unwrap_or(worker_started_at);
+        let next_run = self.next_wall_clock(WallClock::of(last_run, timezone));
+        WallClock::of(now, timezone).0 >= next_run
     }
 
     pub fn next_run(
         &self,
-        last_run: Option<&chrono::DateTime<Utc>>,
-        now: chrono::DateTime<Utc>,
-        timezone: Tz,
-    ) -> chrono::DateTime<Tz> {
-        let last_run = last_run.unwrap_or(&now);
-        let next_run = self
-            .0
-            .after(&wall_clock(last_run, timezone))
-            .next()
-            .unwrap()
-            .naive_utc();
-        match timezone.from_local_datetime(&next_run) {
-            chrono::LocalResult::Single(at) => at,
-            chrono::LocalResult::Ambiguous(earlier, later) => {
-                if earlier > *last_run {
+        last_run: Option<&Timestamp>,
+        now: Timestamp,
+        timezone: &TimeZone,
+    ) -> ZonedDateTime {
+        let last_run = last_run.copied().unwrap_or(now);
+        let next_run = self.next_wall_clock(WallClock::of(last_run, timezone));
+        let at = match timezone.to_ambiguous_timestamp(next_run).offset() {
+            AmbiguousOffset::Unambiguous { offset } => offset_instant(offset, next_run),
+            AmbiguousOffset::Fold { before, after } => {
+                let earlier = offset_instant(before, next_run);
+                if earlier > last_run {
                     earlier
                 } else {
-                    later
+                    offset_instant(after, next_run)
                 }
             }
             // Skipped by the clock, so reached when the clock jumps past it:
             // the first whole minute that exists after it.
-            chrono::LocalResult::None => {
+            AmbiguousOffset::Gap { .. } => {
                 let minute = next_run
-                    .with_second(0)
-                    .and_then(|at| at.with_nanosecond(0))
-                    .unwrap();
+                    .with()
+                    .second(0)
+                    .subsec_nanosecond(0)
+                    .build()
+                    .expect("truncating to the minute stays in range");
                 (1..=24 * 60)
                     .find_map(|offset| {
-                        timezone
-                            .from_local_datetime(&(minute + chrono::Duration::minutes(offset)))
-                            .earliest()
+                        let candidate =
+                            minute.checked_add(SignedDuration::from_mins(offset)).ok()?;
+                        match timezone.to_ambiguous_timestamp(candidate).offset() {
+                            AmbiguousOffset::Gap { .. } => None,
+                            AmbiguousOffset::Unambiguous { offset }
+                            | AmbiguousOffset::Fold { before: offset, .. } => {
+                                Some(offset_instant(offset, candidate))
+                            }
+                        }
                     })
-                    .unwrap()
+                    .expect("a time zone gap ends within a day")
             }
-        }
+        };
+        at.to_zoned_datetime(timezone.clone())
     }
+}
+
+fn offset_instant(offset: jiff::tz::Offset, at: DateTime) -> Timestamp {
+    offset
+        .to_timestamp(at)
+        .expect("a cron fire time is a representable instant")
 }
 
 #[derive(Clone, Debug)]
@@ -185,10 +273,10 @@ pub enum Schedule {
 impl Schedule {
     pub fn should_run(
         &self,
-        last_run: Option<&chrono::DateTime<Utc>>,
-        now: chrono::DateTime<Utc>,
-        worker_started_at: chrono::DateTime<Utc>,
-        timezone: Tz,
+        last_run: Option<&jiff::Timestamp>,
+        now: jiff::Timestamp,
+        worker_started_at: jiff::Timestamp,
+        timezone: &jiff::tz::TimeZone,
     ) -> bool {
         match self {
             Schedule::Interval(interval) => {
@@ -200,10 +288,10 @@ impl Schedule {
 
     pub fn next_run(
         &self,
-        last_run: Option<&chrono::DateTime<Utc>>,
-        now: chrono::DateTime<Utc>,
-        timezone: Tz,
-    ) -> chrono::DateTime<Tz> {
+        last_run: Option<&jiff::Timestamp>,
+        now: jiff::Timestamp,
+        timezone: &jiff::tz::TimeZone,
+    ) -> ZonedDateTime {
         match self {
             Schedule::Interval(interval) => interval.next_run(last_run, now, timezone),
             Schedule::Cron(cron) => cron.next_run(last_run, now, timezone),
@@ -231,7 +319,7 @@ struct ClaimPause {
 
 #[cfg(all(test, feature = "jobs"))]
 struct CallbackPause {
-    committed: tokio::sync::mpsc::Sender<chrono::DateTime<Utc>>,
+    committed: tokio::sync::mpsc::Sender<jiff::Timestamp>,
     release: tokio::sync::Notify,
 }
 
@@ -248,10 +336,10 @@ trait CronEnqueueJob<AppState: AS>: Send + Sync {
         &self,
         conn: &mut sqlx::PgConnection,
         context: &str,
-        at: chrono::DateTime<Utc>,
+        at: jiff::Timestamp,
         id: uuid::Uuid,
     ) -> Result<uuid::Uuid, EnqueueError>;
-    fn span(&self, context: &str, at: chrono::DateTime<Utc>, id: uuid::Uuid) -> tracing::Span;
+    fn span(&self, context: &str, at: jiff::Timestamp, id: uuid::Uuid) -> tracing::Span;
     fn name(&self) -> &'static str;
     async fn enqueue_direct(&self, app_state: AppState, context: String) -> Result<(), String>;
 }
@@ -263,12 +351,12 @@ impl<AppState: AS, J: Job<AppState>> CronEnqueueJob<AppState> for J {
         &self,
         conn: &mut sqlx::PgConnection,
         context: &str,
-        at: chrono::DateTime<Utc>,
+        at: jiff::Timestamp,
         id: uuid::Uuid,
     ) -> Result<uuid::Uuid, EnqueueError> {
         enqueue_on_connection::<AppState, J>(conn, self.clone(), context, None, at, id).await
     }
-    fn span(&self, context: &str, at: chrono::DateTime<Utc>, id: uuid::Uuid) -> tracing::Span {
+    fn span(&self, context: &str, at: jiff::Timestamp, id: uuid::Uuid) -> tracing::Span {
         enqueue_span::<AppState, J>(self, context, None, at, id)
     }
     fn name(&self) -> &'static str {
@@ -309,9 +397,9 @@ pub(super) fn recoverable(error: &sqlx::Error) -> bool {
 struct Claim<'c> {
     tx: sqlx::Transaction<'c, sqlx::Postgres>,
     /// Database time of the claim; becomes the row's new `last_run_at`.
-    at: chrono::DateTime<Utc>,
+    at: jiff::Timestamp,
     /// The row's `last_run_at` before this claim; `None` on a cron's first fire.
-    last_run: Option<chrono::DateTime<Utc>>,
+    last_run: Option<jiff::Timestamp>,
 }
 
 #[cfg(feature = "jobs")]
@@ -331,10 +419,10 @@ impl<AppState: AS> CronJob<AppState> {
     /// a pure schedule predicate.
     fn is_due(
         &self,
-        last_run: Option<&chrono::DateTime<Utc>>,
-        now: chrono::DateTime<Utc>,
-        worker_started_at: chrono::DateTime<Utc>,
-        timezone: Tz,
+        last_run: Option<&jiff::Timestamp>,
+        now: jiff::Timestamp,
+        worker_started_at: jiff::Timestamp,
+        timezone: &jiff::tz::TimeZone,
     ) -> bool {
         last_run.is_some_and(|at| *at > now)
             || self
@@ -367,10 +455,10 @@ impl<AppState: AS> CronJob<AppState> {
     pub(crate) async fn tick(
         &self,
         app_state: AppState,
-        last_enqueue_map: &HashMap<String, chrono::DateTime<Utc>>,
-        now: chrono::DateTime<Utc>,
-        worker_started_at: chrono::DateTime<Utc>,
-        timezone: Tz,
+        last_enqueue_map: &HashMap<String, jiff::Timestamp>,
+        now: jiff::Timestamp,
+        worker_started_at: jiff::Timestamp,
+        timezone: &jiff::tz::TimeZone,
     ) -> Result<(), TickError> {
         let last_enqueue = last_enqueue_map.get(self.name);
         let context = format!("Cron@{}", app_state.version());
@@ -406,7 +494,7 @@ impl<AppState: AS> CronJob<AppState> {
     /// `cja::cron::registry`. cja#53 dropped this event once and blinded every
     /// cron monitor in apps that picked it up.
     #[cfg(feature = "jobs")]
-    fn fire_receipt(&self, last_run: Option<chrono::DateTime<Utc>>) {
+    fn fire_receipt(&self, last_run: Option<jiff::Timestamp>) {
         tracing::info!(task_name = self.name, last_run = ?last_run, "Enqueuing Task");
     }
 
@@ -442,8 +530,8 @@ impl<AppState: AS> CronJob<AppState> {
     async fn claim_due(
         &self,
         app_state: &AppState,
-        worker_started_at: chrono::DateTime<Utc>,
-        timezone: Tz,
+        worker_started_at: jiff::Timestamp,
+        timezone: &jiff::tz::TimeZone,
     ) -> Result<Option<Claim<'_>>, TickError> {
         let mut tx = match app_state.db().begin().await {
             Ok(tx) => tx,
@@ -456,7 +544,10 @@ impl<AppState: AS> CronJob<AppState> {
             ("idle_in_transaction_session_timeout", "15s"),
         ] {
             let sql = format!("SET LOCAL {setting} = '{value}'");
-            if let Err(err) = sqlx::query(&sql).execute(&mut *tx).await {
+            if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *tx)
+                .await
+            {
                 if skip_recoverable(self.name, "timeout setup", &err) {
                     return Ok(None);
                 }
@@ -480,14 +571,14 @@ impl<AppState: AS> CronJob<AppState> {
             tracing::debug!(cron.name = self.name, "Cron paused; skipping claim");
             return Ok(None);
         }
-        let existing = sqlx::query_as::<_, (chrono::DateTime<Utc>,)>(
+        let existing = sqlx::query_as::<_, (jiff_sqlx::Timestamp,)>(
             "SELECT last_run_at FROM crons WHERE name = $1 FOR UPDATE NOWAIT",
         )
         .bind(self.name)
         .fetch_optional(&mut *tx)
         .await;
         let last_run = match existing {
-            Ok(Some((at,))) => Some(at),
+            Ok(Some((at,))) => Some(at.to_jiff()),
             Ok(None) => {
                 let inserted = sqlx::query(
                     "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
@@ -500,14 +591,14 @@ impl<AppState: AS> CronJob<AppState> {
                 .await;
                 match inserted {
                     Ok(Some(_)) => None,
-                    Ok(None) => match sqlx::query_as::<_, (chrono::DateTime<Utc>,)>(
+                    Ok(None) => match sqlx::query_as::<_, (jiff_sqlx::Timestamp,)>(
                         "SELECT last_run_at FROM crons WHERE name = $1 FOR UPDATE NOWAIT",
                     )
                     .bind(self.name)
                     .fetch_one(&mut *tx)
                     .await
                     {
-                        Ok((at,)) => Some(at),
+                        Ok((at,)) => Some(at.to_jiff()),
                         Err(err) if skip_recoverable(self.name, "reselect", &err) => {
                             return Ok(None);
                         }
@@ -523,11 +614,11 @@ impl<AppState: AS> CronJob<AppState> {
             Err(err) => return Err(TickError::SqlxError(err)),
         };
         let claim_time =
-            match sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+            match sqlx::query_scalar::<_, jiff_sqlx::Timestamp>("SELECT clock_timestamp()")
                 .fetch_one(&mut *tx)
                 .await
             {
-                Ok(at) => at,
+                Ok(at) => at.to_jiff(),
                 Err(err) if skip_recoverable(self.name, "database time", &err) => return Ok(None),
                 Err(err) => return Err(TickError::SqlxError(err)),
             };
@@ -554,8 +645,8 @@ impl<AppState: AS> CronJob<AppState> {
         &self,
         app_state: &AppState,
         context: &str,
-        worker_started_at: chrono::DateTime<Utc>,
-        timezone: Tz,
+        worker_started_at: jiff::Timestamp,
+        timezone: &jiff::tz::TimeZone,
     ) -> Result<(), TickError> {
         let Some(Claim {
             tx,
@@ -609,11 +700,11 @@ impl<AppState: AS> CronJob<AppState> {
     async fn commit_claim(
         &self,
         mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
-        claim_time: chrono::DateTime<Utc>,
+        claim_time: jiff::Timestamp,
     ) -> Result<bool, TickError> {
         if let Err(err) =
             sqlx::query("UPDATE crons SET last_run_at = $1, updated_at = $1 WHERE name = $2")
-                .bind(claim_time)
+                .bind(claim_time.to_sqlx())
                 .bind(self.name)
                 .execute(&mut *tx)
                 .await
@@ -636,8 +727,8 @@ impl<AppState: AS> CronJob<AppState> {
     async fn fire(
         &self,
         mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
-        claim_time: chrono::DateTime<Utc>,
-        last_run: Option<chrono::DateTime<Utc>>,
+        claim_time: jiff::Timestamp,
+        last_run: Option<jiff::Timestamp>,
         job: &dyn CronEnqueueJob<AppState>,
         context: &str,
     ) -> Result<(), TickError> {
@@ -747,8 +838,8 @@ impl<AppState: AS> CronRegistry<AppState> {
         + Send
         + Sync
         + 'static,
-    ) -> Result<(), cron::error::Error> {
-        let cron_schedule = cron_expr.parse::<cron::Schedule>()?;
+    ) -> Result<(), CronError> {
+        let cron_schedule = parse_cron(cron_expr)?;
         let cron_job = CronJob {
             name,
             description,
@@ -806,8 +897,8 @@ impl<AppState: AS> CronRegistry<AppState> {
         job: J,
         description: Option<&'static str>,
         cron_expr: &str,
-    ) -> Result<(), cron::error::Error> {
-        let schedule = cron_expr.parse::<cron::Schedule>()?;
+    ) -> Result<(), CronError> {
+        let schedule = parse_cron(cron_expr)?;
         self.insert_unique(CronJob {
             name: J::NAME,
             description,
@@ -1050,11 +1141,7 @@ mod test {
     }
 
     /// The exact event shape Eyes classifies as `cron.fire`.
-    fn assert_fire_receipt(
-        receipt: &CapturedEvent,
-        name: &str,
-        last_run: Option<chrono::DateTime<Utc>>,
-    ) {
+    fn assert_fire_receipt(receipt: &CapturedEvent, name: &str, last_run: Option<jiff::Timestamp>) {
         assert_eq!(receipt.target, "cja::cron::registry", "{receipt:?}");
         assert_eq!(receipt.level, tracing::Level::INFO, "{receipt:?}");
         let field = |key: &str| receipt.fields.get(key).map(String::as_str);
@@ -1066,8 +1153,8 @@ mod test {
 
     /// Moves cron `name` back by `by` so it is due, returning the
     /// `last_run_at` its next fire must report.
-    async fn backdate(db: &sqlx::PgPool, name: &str, by: &str) -> chrono::DateTime<Utc> {
-        sqlx::query_scalar(
+    async fn backdate(db: &sqlx::PgPool, name: &str, by: &str) -> jiff::Timestamp {
+        sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "UPDATE crons SET last_run_at = clock_timestamp() - $2::text::interval
              WHERE name = $1 RETURNING last_run_at",
         )
@@ -1076,20 +1163,22 @@ mod test {
         .fetch_one(db)
         .await
         .unwrap()
+        .to_jiff()
     }
 
-    async fn db_now(db: &sqlx::PgPool) -> chrono::DateTime<Utc> {
-        sqlx::query_scalar("SELECT clock_timestamp()")
+    async fn db_now(db: &sqlx::PgPool) -> jiff::Timestamp {
+        sqlx::query_scalar::<_, jiff_sqlx::Timestamp>("SELECT clock_timestamp()")
             .fetch_one(db)
             .await
             .unwrap()
+            .to_jiff()
     }
 
     /// Insert a crons row stamped into the past (creating it), returning the
     /// stamp. `backdate` only updates existing rows; tests that assert "no
     /// fire" must start from a row that exists with zero prior fires.
-    async fn seed(db: &sqlx::PgPool, name: &str, by: &str) -> chrono::DateTime<Utc> {
-        sqlx::query_scalar(
+    async fn seed(db: &sqlx::PgPool, name: &str, by: &str) -> jiff::Timestamp {
+        sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
              VALUES ($1, $2, clock_timestamp() - $3::text::interval, clock_timestamp(), clock_timestamp())
              RETURNING last_run_at",
@@ -1100,18 +1189,19 @@ mod test {
         .fetch_one(db)
         .await
         .unwrap()
+            .to_jiff()
     }
 
     /// Pause cron `name` until `until`, a SQL expression evaluated by the
     /// database (e.g. `"clock_timestamp() + interval '1 hour'"`), so expiry
     /// transitions are driven by data — mirroring the documented operator SQL.
     async fn pause(db: &sqlx::PgPool, name: &str, until: &str) {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO cron_pauses (name, paused_until)
              VALUES ($1, {until})
              ON CONFLICT (name) DO UPDATE
              SET paused_until = EXCLUDED.paused_until, paused_at = clock_timestamp()"
-        ))
+        )))
         .bind(name)
         .execute(db)
         .await
@@ -1322,12 +1412,13 @@ mod test {
         for expected in 1..=4 {
             // Start each pair just after a database-clock slot boundary. A pair
             // straddling a boundary is entitled to two enqueues.
-            let db_now = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+            let db_now = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>("SELECT clock_timestamp()")
                 .fetch_one(&db)
                 .await
-                .unwrap();
+                .unwrap()
+                .to_jiff();
             tokio::time::sleep(Duration::from_millis(
-                1100 - u64::from(db_now.timestamp_subsec_millis()),
+                1100 - u64::from(db_now.subsec_millisecond().unsigned_abs()),
             ))
             .await;
             if expected > 1 {
@@ -1436,12 +1527,13 @@ mod test {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let stored = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stored = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "SELECT last_run_at FROM crons WHERE name = 'callback'",
         )
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap()
+        .to_jiff();
         assert_eq!(stored, claim_time);
         sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '31 seconds' WHERE name = 'callback'")
             .execute(&db).await.unwrap();
@@ -1472,7 +1564,7 @@ mod test {
         registry.register_job(TestJob, None, Duration::from_secs(864));
         let cron = registry.get(TestJob::NAME).unwrap();
         let claim = cron
-            .claim_due(&state, Utc::now(), chrono_tz::UTC)
+            .claim_due(&state, jiff::Timestamp::now(), &jiff::tz::TimeZone::UTC)
             .await
             .unwrap()
             .unwrap();
@@ -1499,7 +1591,7 @@ mod test {
         registry.register_job(TestJob, None, Duration::from_secs(864));
         let cron = registry.get(TestJob::NAME).unwrap();
         let claim = cron
-            .claim_due(&state, Utc::now(), chrono_tz::UTC)
+            .claim_due(&state, jiff::Timestamp::now(), &jiff::tz::TimeZone::UTC)
             .await
             .unwrap()
             .unwrap();
@@ -1539,22 +1631,25 @@ mod test {
         );
         sqlx::query("UPDATE crons SET last_run_at = clock_timestamp() - interval '866 seconds' WHERE name = $1")
             .bind(TestJob::NAME).execute(&db).await.unwrap();
-        let before = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+        let before = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>("SELECT clock_timestamp()")
             .fetch_one(&db)
             .await
-            .unwrap();
+            .unwrap()
+            .to_jiff();
         assert_eq!(worker.tick().await, TickOutcome::default());
-        let after = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT clock_timestamp()")
+        let after = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>("SELECT clock_timestamp()")
             .fetch_one(&db)
             .await
-            .unwrap();
-        let stamp = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+            .unwrap()
+            .to_jiff();
+        let stamp = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "SELECT last_run_at FROM crons WHERE name = $1",
         )
         .bind(TestJob::NAME)
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap()
+        .to_jiff();
         assert!(stamp >= before && stamp <= after);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
@@ -1731,7 +1826,7 @@ mod test {
         registry.register_job(TestJob, None, Duration::from_mins(1));
         let cron = registry.get(TestJob::NAME).unwrap();
         let Claim { mut tx, .. } = cron
-            .claim_due(&state, Utc::now(), chrono_tz::UTC)
+            .claim_due(&state, jiff::Timestamp::now(), &jiff::tz::TimeZone::UTC)
             .await
             .unwrap()
             .unwrap();
@@ -2169,8 +2264,8 @@ mod test {
         let worker = crate::cron::Worker::new(state, receipt_registry());
         let mut previous = HashMap::new();
         for name in [TestJob::NAME, RECEIPT_CALLBACK] {
-            let at = sqlx::query_scalar::<_, chrono::DateTime<Utc>>("INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at) VALUES ($1, $2, clock_timestamp() - interval '2 minutes', clock_timestamp(), clock_timestamp()) RETURNING last_run_at")
-                .bind(uuid::Uuid::new_v4()).bind(name).fetch_one(&db).await.unwrap();
+            let at = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>("INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at) VALUES ($1, $2, clock_timestamp() - interval '2 minutes', clock_timestamp(), clock_timestamp()) RETURNING last_run_at")
+                .bind(uuid::Uuid::new_v4()).bind(name).fetch_one(&db).await.unwrap().to_jiff();
             previous.insert(name, at);
         }
         // Both crons are due, but another scheduler holds their rows.
@@ -2364,10 +2459,10 @@ mod test {
         .await
         .unwrap();
 
-        let now = Utc::now();
-        let last_run_at = last_run.last_run_at;
-        let diff = now.signed_duration_since(last_run_at);
-        assert!(diff.num_milliseconds() < 1000);
+        let now = jiff::Timestamp::now();
+        let last_run_at = last_run.last_run_at.to_jiff();
+        let diff = now.duration_since(last_run_at);
+        assert!(diff.as_millis() < 1000);
     }
 
     #[sqlx::test]
@@ -2380,7 +2475,7 @@ mod test {
         registry.register_job(TestJob, None, Duration::from_mins(1));
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
-        let previously = Utc::now();
+        let previously = jiff::Timestamp::now();
         sqlx::query!(
             "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
             VALUES ($1, $2, $3, $3, $3)
@@ -2389,7 +2484,7 @@ mod test {
             last_run_at = $3",
             uuid::Uuid::new_v4(),
             TestJob::NAME,
-            previously
+            jiff_sqlx::Timestamp::from(previously)
         )
         .execute(&app_state.db)
         .await
@@ -2405,8 +2500,8 @@ mod test {
         .await
         .unwrap();
 
-        let diff = last_run.last_run_at.signed_duration_since(previously);
-        assert!(diff.num_milliseconds() < 50);
+        let diff = last_run.last_run_at.to_jiff().duration_since(previously);
+        assert!(diff.as_millis() < 50);
     }
 
     #[sqlx::test]
@@ -2419,13 +2514,13 @@ mod test {
         registry.register_job(TestJob, None, Duration::from_secs(1));
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
-        let two_seconds_ago = Utc::now() - chrono::Duration::seconds(2);
+        let two_seconds_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2);
         sqlx::query!(
             "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
             VALUES ($1, $2, $3, $3, $3)",
             uuid::Uuid::new_v4(),
             TestJob::NAME,
-            two_seconds_ago
+            jiff_sqlx::Timestamp::from(two_seconds_ago)
         )
         .execute(&app_state.db)
         .await
@@ -2441,9 +2536,9 @@ mod test {
         .await
         .unwrap();
 
-        assert!(last_run.last_run_at > two_seconds_ago);
-        let diff = Utc::now().signed_duration_since(last_run.last_run_at);
-        assert!(diff.num_milliseconds() < 1000);
+        assert!(last_run.last_run_at.to_jiff() > two_seconds_ago);
+        let diff = jiff::Timestamp::now().duration_since(last_run.last_run_at.to_jiff());
+        assert!(diff.as_millis() < 1000);
     }
 
     #[sqlx::test]
@@ -2457,7 +2552,7 @@ mod test {
 
         let cron_job = registry.jobs.get(FailingJob::NAME).unwrap();
         let last_enqueue_map = HashMap::new();
-        let worker_started_at = Utc::now();
+        let worker_started_at = jiff::Timestamp::now();
 
         let result = cron_job
             .tick(
@@ -2465,7 +2560,7 @@ mod test {
                 &last_enqueue_map,
                 db_now(&db).await,
                 worker_started_at,
-                chrono_tz::UTC,
+                &jiff::tz::TimeZone::UTC,
             )
             .await;
         assert!(result.is_ok());
@@ -2478,9 +2573,9 @@ mod test {
         .await
         .unwrap();
 
-        let now = Utc::now();
-        let diff = now.signed_duration_since(cron_record.last_run_at);
-        assert!(diff.num_milliseconds() < 1000);
+        let now = jiff::Timestamp::now();
+        let diff = now.duration_since(cron_record.last_run_at.to_jiff());
+        assert!(diff.as_millis() < 1000);
 
         let job_count = sqlx::query!(
             "SELECT COUNT(*) as count FROM jobs WHERE name = $1",
@@ -2512,7 +2607,7 @@ mod test {
 
         let cron_job = registry.jobs.get("custom_failing").unwrap();
         let last_enqueue_map = HashMap::new();
-        let worker_started_at = Utc::now();
+        let worker_started_at = jiff::Timestamp::now();
 
         let result = cron_job
             .tick(
@@ -2520,7 +2615,7 @@ mod test {
                 &last_enqueue_map,
                 db_now(&db).await,
                 worker_started_at,
-                chrono_tz::UTC,
+                &jiff::tz::TimeZone::UTC,
             )
             .await;
         assert!(result.is_err());
@@ -2573,12 +2668,12 @@ mod test {
         .await
         .unwrap();
 
-        let now = Utc::now();
-        let diff1 = now.signed_duration_since(test_job_record.last_run_at);
-        let diff2 = now.signed_duration_since(second_job_record.last_run_at);
+        let now = jiff::Timestamp::now();
+        let diff1 = now.duration_since(test_job_record.last_run_at.to_jiff());
+        let diff2 = now.duration_since(second_job_record.last_run_at.to_jiff());
 
-        assert!(diff1.num_milliseconds() < 1000);
-        assert!(diff2.num_milliseconds() < 1000);
+        assert!(diff1.as_millis() < 1000);
+        assert!(diff2.as_millis() < 1000);
     }
 
     #[sqlx::test]
@@ -2593,15 +2688,15 @@ mod test {
 
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
-        let recent_time = Utc::now() - chrono::Duration::seconds(3);
-        let old_time = Utc::now() - chrono::Duration::seconds(10);
+        let recent_time = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3);
+        let old_time = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(10);
 
         sqlx::query!(
             "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
                 VALUES ($1, $2, $3, $3, $3)",
             uuid::Uuid::new_v4(),
             TestJob::NAME,
-            recent_time
+            jiff_sqlx::Timestamp::from(recent_time)
         )
         .execute(&app_state.db)
         .await
@@ -2612,7 +2707,7 @@ mod test {
                 VALUES ($1, $2, $3, $3, $3)",
             uuid::Uuid::new_v4(),
             SecondTestJob::NAME,
-            old_time
+            jiff_sqlx::Timestamp::from(old_time)
         )
         .execute(&app_state.db)
         .await
@@ -2638,9 +2733,10 @@ mod test {
 
         let recent_diff = test_job_record
             .last_run_at
-            .signed_duration_since(recent_time);
-        assert!(recent_diff.num_milliseconds() < 100);
-        assert!(second_job_record.last_run_at > old_time);
+            .to_jiff()
+            .duration_since(recent_time);
+        assert!(recent_diff.as_millis() < 100);
+        assert!(second_job_record.last_run_at.to_jiff() > old_time);
     }
 
     #[sqlx::test]
@@ -2653,7 +2749,7 @@ mod test {
         registry.register_job(TestJob, None, Duration::from_mins(1));
         let worker = crate::cron::Worker::new(state, registry);
 
-        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stamped = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
              VALUES ($1, $2, clock_timestamp() + interval '1 day', clock_timestamp(), clock_timestamp())
              RETURNING last_run_at",
@@ -2662,7 +2758,7 @@ mod test {
         .bind(TestJob::NAME)
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap().to_jiff();
 
         let capture = EventCapture::default();
         let before = db_now(&db).await;
@@ -2680,13 +2776,14 @@ mod test {
         .await
         .unwrap();
         assert_eq!(job_count.count.unwrap(), 1);
-        let stamp = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stamp = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "SELECT last_run_at FROM crons WHERE name = $1",
         )
         .bind(TestJob::NAME)
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap()
+        .to_jiff();
         assert!(stamp >= before && stamp <= after);
         let receipts = capture.fire_receipts(TestJob::NAME);
         assert_eq!(receipts.len(), 1, "{receipts:?}");
@@ -2733,7 +2830,7 @@ mod test {
             .unwrap();
         let worker = crate::cron::Worker::new(state, registry);
 
-        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stamped = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
              VALUES ($1, $2, clock_timestamp() + interval '1 day', clock_timestamp(), clock_timestamp())
              RETURNING last_run_at",
@@ -2742,7 +2839,7 @@ mod test {
         .bind(TestJob::NAME)
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap().to_jiff();
 
         let capture = EventCapture::default();
         let before = db_now(&db).await;
@@ -2760,13 +2857,14 @@ mod test {
         .await
         .unwrap();
         assert_eq!(job_count.count.unwrap(), 1);
-        let stamp = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stamp = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "SELECT last_run_at FROM crons WHERE name = $1",
         )
         .bind(TestJob::NAME)
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap()
+        .to_jiff();
         assert!(stamp >= before && stamp <= after);
         let receipts = capture.fire_receipts(TestJob::NAME);
         assert_eq!(receipts.len(), 1, "{receipts:?}");
@@ -2816,7 +2914,7 @@ mod test {
         );
         let worker = crate::cron::Worker::new(state, registry);
 
-        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stamped = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
              VALUES ($1, $2, clock_timestamp() + interval '1 day', clock_timestamp(), clock_timestamp())
              RETURNING last_run_at",
@@ -2825,7 +2923,7 @@ mod test {
         .bind("failing_callback")
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap().to_jiff();
 
         // The callback errors, but the claim commits first: the row is
         // restamped and the tick counts one failure.
@@ -2846,13 +2944,14 @@ mod test {
         let receipts = capture.fire_receipts("failing_callback");
         assert_eq!(receipts.len(), 1, "{receipts:?}");
         assert_fire_receipt(&receipts[0], "failing_callback", Some(stamped));
-        let stamp = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stamp = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "SELECT last_run_at FROM crons WHERE name = $1",
         )
         .bind("failing_callback")
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap()
+        .to_jiff();
         assert!(stamp >= before && stamp <= after);
 
         // The restamped row is now in the past and the interval has not
@@ -3059,7 +3158,7 @@ mod test {
         let mut registry = CronRegistry::new();
         registry.register_job(TestJob, None, Duration::from_secs(60));
         let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
-        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stamped = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
              VALUES ($1, $2, clock_timestamp() - interval '61 seconds', clock_timestamp(), clock_timestamp())
              RETURNING last_run_at",
@@ -3068,21 +3167,21 @@ mod test {
         .bind(TestJob::NAME)
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap().to_jiff();
         let mut last_enqueue_map = HashMap::new();
         last_enqueue_map.insert(TestJob::NAME.to_string(), stamped);
 
         // The passed `now` says 51s elapsed: not due. An implementation that
-        // ignores `now` and reads `Utc::now()` sees 61s elapsed and fires.
+        // ignores `now` and reads `jiff::Timestamp::now()` sees 61s elapsed and fires.
         // App and DB clocks share a host in CI, so only a passed-in `now`
         // that differs from the real clock can discriminate here.
         cron_job
             .tick(
                 state.clone(),
                 &last_enqueue_map,
-                db_now(&db).await - chrono::Duration::seconds(10),
-                Utc::now(),
-                chrono_tz::UTC,
+                db_now(&db).await - jiff::SignedDuration::from_secs(10),
+                jiff::Timestamp::now(),
+                &jiff::tz::TimeZone::UTC,
             )
             .await
             .unwrap();
@@ -3101,8 +3200,8 @@ mod test {
                 state.clone(),
                 &last_enqueue_map,
                 db_now(&db).await,
-                Utc::now(),
-                chrono_tz::UTC,
+                jiff::Timestamp::now(),
+                &jiff::tz::TimeZone::UTC,
             )
             .await
             .unwrap();
@@ -3181,14 +3280,14 @@ mod test {
         // First run should wait for the next scheduled time based on worker start
         let last_enqueue_map = HashMap::new();
         // Use a time in the past to ensure the cron will trigger
-        let worker_started_at = Utc::now() - chrono::Duration::minutes(2);
+        let worker_started_at = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(2);
         let result = cron_job
             .tick(
                 app_state.clone(),
                 &last_enqueue_map,
                 db_now(&db).await,
                 worker_started_at,
-                chrono_tz::UTC,
+                &jiff::tz::TimeZone::UTC,
             )
             .await;
         assert!(result.is_ok());
@@ -3205,9 +3304,9 @@ mod test {
         // The job should have run since we used a worker start time 2 minutes ago
         assert!(cron_record.is_some());
         if let Some(record) = cron_record {
-            let now = Utc::now();
-            let diff = now.signed_duration_since(record.last_run_at);
-            assert!(diff.num_milliseconds() < 1000);
+            let now = jiff::Timestamp::now();
+            let diff = now.duration_since(record.last_run_at.to_jiff());
+            assert!(diff.as_millis() < 1000);
         }
     }
 
@@ -3227,20 +3326,20 @@ mod test {
         let cron_job = registry.jobs.get(TestJob::NAME).unwrap();
 
         // Set last run to 29 minutes ago (shouldn't trigger if we're not at minute 30)
-        let last_run = Utc::now() - chrono::Duration::minutes(29);
+        let last_run = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(29);
         let mut last_enqueue_map = HashMap::new();
         last_enqueue_map.insert(TestJob::NAME.to_string(), last_run);
 
         // This might or might not run depending on current minute
         // We'll just verify it doesn't error
-        let worker_started_at = Utc::now();
+        let worker_started_at = jiff::Timestamp::now();
         let result = cron_job
             .tick(
                 app_state.clone(),
                 &last_enqueue_map,
                 db_now(&db).await,
                 worker_started_at,
-                chrono_tz::UTC,
+                &jiff::tz::TimeZone::UTC,
             )
             .await;
         assert!(result.is_ok());
@@ -3364,7 +3463,7 @@ mod test {
 
         // Create worker with start time in past to ensure both jobs run
         let mut worker = crate::cron::Worker::new(app_state.clone(), registry);
-        worker.started_at = Utc::now() - chrono::Duration::seconds(2);
+        worker.started_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2);
 
         // Both jobs should run on first tick
         assert_eq!(worker.tick().await, TickOutcome::default());
@@ -3435,13 +3534,13 @@ mod test {
         let worker = crate::cron::Worker::new(app_state.clone(), registry);
 
         // Simulate a fire 2 minutes ago — the interval has NOT yet elapsed
-        let two_minutes_ago = Utc::now() - chrono::Duration::minutes(2);
+        let two_minutes_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(2);
         sqlx::query!(
             "INSERT INTO Crons (cron_id, name, last_run_at, created_at, updated_at)
             VALUES ($1, $2, $3, $3, $3)",
             uuid::Uuid::new_v4(),
             TestJob::NAME,
-            two_minutes_ago
+            jiff_sqlx::Timestamp::from(two_minutes_ago)
         )
         .execute(&app_state.db)
         .await
@@ -3461,8 +3560,9 @@ mod test {
 
             let drift = last_run
                 .last_run_at
-                .signed_duration_since(two_minutes_ago)
-                .num_milliseconds()
+                .to_jiff()
+                .duration_since(two_minutes_ago)
+                .as_millis()
                 .abs();
             assert!(
                 drift < 50,
@@ -3481,10 +3581,10 @@ mod test {
         assert_eq!(job_count.count.unwrap(), 0);
 
         // Now simulate the interval having elapsed: last fire 6 minutes ago
-        let six_minutes_ago = Utc::now() - chrono::Duration::minutes(6);
+        let six_minutes_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(6);
         sqlx::query!(
             "UPDATE Crons SET last_run_at = $1 WHERE name = $2",
-            six_minutes_ago,
+            jiff_sqlx::Timestamp::from(six_minutes_ago),
             TestJob::NAME
         )
         .execute(&app_state.db)
@@ -3501,11 +3601,11 @@ mod test {
         .await
         .unwrap();
         assert!(
-            last_run.last_run_at > six_minutes_ago,
+            last_run.last_run_at.to_jiff() > six_minutes_ago,
             "cron should fire once the interval has elapsed"
         );
-        let diff = Utc::now().signed_duration_since(last_run.last_run_at);
-        assert!(diff.num_milliseconds() < 1000);
+        let diff = jiff::Timestamp::now().duration_since(last_run.last_run_at.to_jiff());
+        assert!(diff.as_millis() < 1000);
 
         let job_count = sqlx::query!(
             "SELECT COUNT(*) as count FROM jobs WHERE name = $1",
@@ -3525,14 +3625,15 @@ mod test {
             .unwrap()
     }
 
-    async fn last_run_at(db: &sqlx::PgPool, name: &str) -> chrono::DateTime<Utc> {
-        sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+    async fn last_run_at(db: &sqlx::PgPool, name: &str) -> jiff::Timestamp {
+        sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "SELECT last_run_at FROM crons WHERE name = $1",
         )
         .bind(name)
         .fetch_one(db)
         .await
         .unwrap()
+        .to_jiff()
     }
 
     #[sqlx::test]
@@ -3947,7 +4048,7 @@ mod test {
             registry,
         );
 
-        let stamped = sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        let stamped = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
             "INSERT INTO crons (cron_id, name, last_run_at, created_at, updated_at)
              VALUES ($1, $2, clock_timestamp() + interval '1 day', clock_timestamp(), clock_timestamp())
              RETURNING last_run_at",
@@ -3956,7 +4057,7 @@ mod test {
         .bind(TestJob::NAME)
         .fetch_one(&db)
         .await
-        .unwrap();
+        .unwrap().to_jiff();
         pause(&db, TestJob::NAME, "clock_timestamp() + interval '1 hour'").await;
 
         let capture = EventCapture::default();
@@ -3996,7 +4097,7 @@ mod test {
         // the claim session resolves `clock_timestamp()` to the shadow 30s
         // ahead: the pause must read as expired there and the cron must
         // fire. A host-clock comparison (decoding `paused_until` into Rust
-        // and comparing `Utc::now()`) would see 15s remaining and hold the
+        // and comparing `jiff::Timestamp::now()`) would see 15s remaining and hold the
         // pause — this test fails it. Note it over-pins: it shadows
         // `clock_timestamp()` specifically, so a `now()` implementation
         // would also fail; accepted, since the file's clock discipline is
@@ -4182,42 +4283,110 @@ mod test {
 }
 
 #[cfg(test)]
+mod cron_syntax_test {
+    //! cja kept the `cron` crate's expression syntax when it moved to croner.
+    //! A differential run of 20,000 random expressions against `cron` 0.17
+    //! agreed on every parse result and the next three fire times; these pin
+    //! the settings that agreement depends on.
+
+    use jiff::Timestamp;
+    use jiff::civil::{Weekday, date};
+    use jiff::tz::TimeZone;
+
+    use super::{CronSchedule, parse_cron};
+
+    fn next(expr: &str, after: &str) -> jiff::civil::DateTime {
+        let schedule = CronSchedule(Box::new(parse_cron(expr).unwrap()));
+        let after: Timestamp = after.parse().unwrap();
+        schedule
+            .next_run(Some(&after), after, &TimeZone::UTC)
+            .datetime()
+    }
+
+    #[test]
+    fn seconds_are_required_and_the_year_is_optional() {
+        assert!(parse_cron("0 9 * * *").is_err());
+        assert!(parse_cron("0 0 9 * * *").is_ok());
+        assert!(parse_cron("0 0 9 * * * *").is_ok());
+        assert!(parse_cron("0 0 9 * * * 2027").is_ok());
+    }
+
+    #[test]
+    fn day_of_week_counts_from_one_for_sunday() {
+        // 2026-11-17 is a Tuesday.
+        let at = next("0 0 12 * * 1", "2026-11-17T00:00:00Z");
+        assert_eq!(at.date(), date(2026, 11, 22));
+        assert_eq!(at.weekday(), Weekday::Sunday);
+        assert_eq!(
+            next("0 0 12 * * 7", "2026-11-17T00:00:00Z").weekday(),
+            Weekday::Saturday
+        );
+        assert_eq!(
+            next("0 0 12 * * MON", "2026-11-17T00:00:00Z").weekday(),
+            Weekday::Monday
+        );
+    }
+
+    #[test]
+    fn a_day_must_match_both_day_fields() {
+        // The 13th that falls on a Friday, not every 13th and every Friday.
+        let at = next("0 0 0 13 * FRI", "2026-11-17T00:00:00Z");
+        assert_eq!(at.date(), date(2027, 8, 13));
+        assert_eq!(at.weekday(), Weekday::Friday);
+    }
+
+    #[test]
+    fn a_number_before_a_step_starts_the_step() {
+        // `5/20` is 5, 25, 45, as in the `cron` crate.
+        assert_eq!(
+            next("0 5/20 * * * *", "2026-11-17T10:30:00Z").time(),
+            jiff::civil::time(10, 45, 0, 0)
+        );
+    }
+}
+
+#[cfg(test)]
 mod dst_test {
     //! Cron expressions across daylight-saving transitions, against the pure
     //! `CronSchedule` logic the worker runs on every tick.
 
-    use std::str::FromStr;
-
-    use chrono::{DateTime, Duration, NaiveDateTime, Offset, TimeZone, Timelike, Utc};
-    use chrono_tz::Tz;
+    use jiff::civil::DateTime;
+    use jiff::tz::TimeZone;
+    use jiff::{SignedDuration as Duration, Timestamp};
     use proptest::prelude::*;
 
-    use super::CronSchedule;
+    use super::{CronSchedule, WallClock, parse_cron};
 
-    const NEW_YORK: Tz = chrono_tz::America::New_York;
-
-    fn schedule(expr: &str) -> CronSchedule {
-        CronSchedule(Box::new(cron::Schedule::from_str(expr).unwrap()))
+    fn tz(name: &str) -> TimeZone {
+        TimeZone::get(name).unwrap()
     }
 
-    fn utc(at: &str) -> DateTime<Utc> {
+    fn new_york() -> TimeZone {
+        tz("America/New_York")
+    }
+
+    fn schedule(expr: &str) -> CronSchedule {
+        CronSchedule(Box::new(parse_cron(expr).unwrap()))
+    }
+
+    fn utc(at: &str) -> jiff::Timestamp {
         at.parse().unwrap()
     }
 
     /// Local wall-clock time of `at`, computed independently of the code under test.
-    fn wall(at: DateTime<Utc>, timezone: Tz) -> NaiveDateTime {
-        at.with_timezone(&timezone).naive_local()
+    fn wall(at: Timestamp, timezone: &TimeZone) -> DateTime {
+        timezone.to_datetime(at)
     }
 
     /// Ticks a worker every `tick` from `from` until `until`, starting from a
     /// stored `last_run`, and returns the instants it fired.
     fn fires(
         schedule: &CronSchedule,
-        timezone: Tz,
-        last_run: DateTime<Utc>,
-        (from, until): (DateTime<Utc>, DateTime<Utc>),
+        timezone: &TimeZone,
+        last_run: Timestamp,
+        (from, until): (jiff::Timestamp, jiff::Timestamp),
         tick: Duration,
-    ) -> Vec<DateTime<Utc>> {
+    ) -> Vec<jiff::Timestamp> {
         let mut last_run = last_run;
         let mut fired = vec![];
         let mut now = from;
@@ -4238,10 +4407,10 @@ mod dst_test {
     fn repeated_time_fires_once_when_the_worker_runs_all_night() {
         let fired = fires(
             &schedule("0 30 1 * * * *"),
-            NEW_YORK,
+            &new_york(),
             utc("2026-10-31T05:30:07Z"),
             (utc("2026-11-01T04:00:03Z"), utc("2026-11-01T09:00:00Z")),
-            Duration::seconds(60),
+            Duration::from_secs(60),
         );
         assert_eq!(fired, vec![utc("2026-11-01T05:30:03Z")]);
     }
@@ -4254,10 +4423,10 @@ mod dst_test {
         for tick in [10, 60] {
             let fired = fires(
                 &schedule("0 30 1 * * * *"),
-                NEW_YORK,
+                &new_york(),
                 utc("2026-10-31T05:30:07Z"),
                 (utc("2026-11-01T06:10:03Z"), utc("2026-11-01T09:00:00Z")),
-                Duration::seconds(tick),
+                Duration::from_secs(tick),
             );
             assert_eq!(fired, vec![utc("2026-11-01T06:30:03Z")], "{tick}s tick");
         }
@@ -4269,10 +4438,10 @@ mod dst_test {
         // argument, and the every-minute job then fired on every 10 s tick.
         let fired = fires(
             &schedule("0 * * * * * *"),
-            NEW_YORK,
+            &new_york(),
             utc("2026-11-01T05:59:59.400Z"),
             (utc("2026-11-01T06:00:09.400Z"), utc("2026-11-01T07:00:00Z")),
-            Duration::seconds(10),
+            Duration::from_secs(10),
         );
         assert!(fired.is_empty(), "{fired:?}");
     }
@@ -4281,10 +4450,10 @@ mod dst_test {
     fn skipped_time_fires_when_the_clock_jumps_past_it() {
         let fired = fires(
             &schedule("0 30 2 * * * *"),
-            NEW_YORK,
+            &new_york(),
             utc("2027-03-13T07:30:05Z"),
             (utc("2027-03-14T05:00:05Z"), utc("2027-03-14T12:00:00Z")),
-            Duration::seconds(60),
+            Duration::from_secs(60),
         );
         assert_eq!(fired, vec![utc("2027-03-14T07:00:05Z")]);
     }
@@ -4293,10 +4462,10 @@ mod dst_test {
     fn utc_schedules_are_unchanged() {
         let fired = fires(
             &schedule("0 */20 * * * * *"),
-            chrono_tz::UTC,
+            &TimeZone::UTC,
             utc("2026-11-01T05:40:00.250Z"),
             (utc("2026-11-01T05:40:30Z"), utc("2026-11-01T07:00:00Z")),
-            Duration::seconds(30),
+            Duration::from_secs(30),
         );
         let expected: Vec<_> = ["06:00:00", "06:20:00", "06:40:00"]
             .iter()
@@ -4310,27 +4479,37 @@ mod dst_test {
         let now = utc("2026-10-01T00:00:00Z");
         // Skipped 02:30 is reached when the clock jumps to 03:00 EDT.
         assert_eq!(
-            schedule("0 30 2 * * * *").next_run(Some(&utc("2027-03-13T07:30:05Z")), now, NEW_YORK),
+            schedule("0 30 2 * * * *")
+                .next_run(Some(&utc("2027-03-13T07:30:05Z")), now, &new_york())
+                .timestamp(),
             utc("2027-03-14T07:00:00Z")
         );
         // Repeated 01:50 after a fire before the hour: the first copy.
         assert_eq!(
-            schedule("0 50 1 * * * *").next_run(Some(&utc("2026-10-31T05:50:00Z")), now, NEW_YORK),
+            schedule("0 50 1 * * * *")
+                .next_run(Some(&utc("2026-10-31T05:50:00Z")), now, &new_york())
+                .timestamp(),
             utc("2026-11-01T05:50:00Z")
         );
         // Repeated 01:50 after a fire at 01:20 EST: the second copy.
         assert_eq!(
-            schedule("0 50 1 * * * *").next_run(Some(&utc("2026-11-01T06:20:00Z")), now, NEW_YORK),
+            schedule("0 50 1 * * * *")
+                .next_run(Some(&utc("2026-11-01T06:20:00Z")), now, &new_york())
+                .timestamp(),
             utc("2026-11-01T06:50:00Z")
         );
     }
 
     /// Instants at which `timezone` changes its UTC offset during `year`.
-    fn transitions(timezone: Tz, year: i32) -> Vec<DateTime<Utc>> {
-        let offset = |at: DateTime<Utc>| timezone.offset_from_utc_datetime(&at.naive_utc()).fix();
-        let start = Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
+    fn transitions(timezone: &TimeZone, year: i16) -> Vec<Timestamp> {
+        let offset = |at: Timestamp| timezone.to_offset(at);
+        let start = jiff::civil::date(year, 1, 1)
+            .at(0, 0, 0, 0)
+            .to_zoned_datetime(TimeZone::UTC)
+            .unwrap()
+            .timestamp();
         (0..366 * 24)
-            .map(|hour| start + Duration::hours(hour))
+            .map(|hour| start + Duration::from_hours(hour))
             .collect::<Vec<_>>()
             .windows(2)
             .filter(|pair| offset(pair[0]) != offset(pair[1]))
@@ -4338,19 +4517,24 @@ mod dst_test {
             .collect()
     }
 
-    fn transition() -> impl Strategy<Value = (Tz, DateTime<Utc>)> {
+    fn transition() -> impl Strategy<Value = (TimeZone, Timestamp)> {
         // Lord Howe shifts 30 minutes; Santiago changes at midnight.
         let zones = [
-            chrono_tz::America::New_York,
-            chrono_tz::Europe::London,
-            chrono_tz::Australia::Sydney,
-            chrono_tz::Australia::Lord_Howe,
-            chrono_tz::America::Santiago,
+            "America/New_York",
+            "Europe/London",
+            "Australia/Sydney",
+            "Australia/Lord_Howe",
+            "America/Santiago",
         ];
         let all: Vec<_> = zones
             .into_iter()
-            .flat_map(|tz| [2026, 2027].map(|year| (tz, year)))
-            .flat_map(|(tz, year)| transitions(tz, year).into_iter().map(move |at| (tz, at)))
+            .map(tz)
+            .flat_map(|zone| [2026, 2027].map(|year| (zone.clone(), year)))
+            .flat_map(|(zone, year)| {
+                transitions(&zone, year)
+                    .into_iter()
+                    .map(move |at| (zone.clone(), at))
+            })
             .collect();
         proptest::sample::select(all)
     }
@@ -4381,25 +4565,29 @@ mod dst_test {
             outage in proptest::option::of((0i64..=5 * 60, 1i64..=3 * 60)),
         ) {
             let expr = format!("0 {minute} {hour} * * * *");
+            let timezone = &timezone;
             let schedule = schedule(&expr);
-            let from = transition - Duration::hours(3) + Duration::milliseconds(phase_ms);
-            let until = transition + Duration::hours(3);
+            let from = transition - Duration::from_hours(3) + Duration::from_millis(phase_ms);
+            let until = transition + Duration::from_hours(3);
             let down = outage.map(|(start, length)| {
-                (from + Duration::minutes(start), from + Duration::minutes(start + length))
+                (from + Duration::from_mins(start), from + Duration::from_mins(start + length))
             });
-            let mut last_run = from - Duration::minutes(lead_minutes);
+            let mut last_run = from - Duration::from_mins(lead_minutes);
 
-            // Every scheduled wall-clock minute in range, found with `includes`
-            // rather than the `after` iterator the code under test uses.
-            let first = (wall(last_run, timezone) - Duration::hours(2))
-                .with_second(0)
-                .and_then(|at| at.with_nanosecond(0))
+            // Every scheduled wall-clock minute in range, found by matching
+            // each minute rather than the next-occurrence search the code
+            // under test uses.
+            let first = (wall(last_run, timezone) - Duration::from_hours(2))
+                .with()
+                .second(0)
+                .subsec_nanosecond(0)
+                .build()
                 .unwrap();
-            let slots: Vec<NaiveDateTime> = (0..36 * 60)
-                .map(|minute| first + Duration::minutes(minute))
-                .filter(|at| schedule.0.includes(at.and_utc()))
+            let slots: Vec<DateTime> = (0..36 * 60)
+                .map(|minute| first + Duration::from_mins(minute))
+                .filter(|at| schedule.0.is_time_matching(&WallClock(*at)).unwrap())
                 .collect();
-            let slot_in = |after: NaiveDateTime, upto: NaiveDateTime| {
+            let slot_in = |after: DateTime, upto: DateTime| {
                 let i = slots.partition_point(|slot| *slot <= after);
                 slots.get(i).is_some_and(|slot| *slot <= upto)
             };
@@ -4413,13 +4601,13 @@ mod dst_test {
                         fired,
                         expected,
                         "{} in {}: tick {} ({}), last fire {} ({})",
-                        expr, timezone, now, wall(now, timezone), last_run, wall(last_run, timezone)
+                        expr, timezone.iana_name().unwrap_or("?"), now, wall(now, timezone), last_run, wall(last_run, timezone)
                     );
                     if fired {
                         last_run = now;
                     }
                 }
-                now += Duration::seconds(tick_secs);
+                now += Duration::from_secs(tick_secs);
             }
         }
     }

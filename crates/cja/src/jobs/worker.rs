@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
@@ -9,6 +9,7 @@ use std::{
 };
 
 use futures::FutureExt;
+use jiff_sqlx::ToSqlx as _;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
@@ -17,7 +18,7 @@ use tracing::Span;
 use crate::app_state::AppState as AS;
 
 use super::registry::JobRegistry;
-use super::{InvalidJobPayload, JobYield, UnknownJobType};
+use super::{Concurrency, InvalidJobPayload, JobMaxRuntimeExceeded, JobYield, UnknownJobType};
 
 /// Default maximum number of retry attempts before a job is moved to the dead letter queue.
 ///
@@ -135,6 +136,204 @@ impl Drop for WaitingGuard<'_> {
     }
 }
 
+/// One in-process concurrency budget that attempts count against — the map
+/// key of [`ConcurrencyTracker`]. The two variants are separate namespaces:
+/// a shared key spelled like a job type name is a distinct budget from that
+/// type's implicit per-type scope.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ConcurrencyScope {
+    /// The implicit per-type budget of [`Concurrency::PerProcess`], keyed
+    /// by the job type's name.
+    Type(String),
+    /// The named budget of [`Concurrency::PerProcessShared`], shared by
+    /// every job type declaring the same key.
+    Shared(String),
+}
+
+/// Process-local running counts per [`ConcurrencyScope`], backing
+/// [`Concurrency::PerProcess`] caps and
+/// [`Concurrency::PerProcessShared`] budgets. Clone one instance into
+/// every worker that should share counts — [`JobWorkerConfig::default`]
+/// wires the process-shared instance for you.
+///
+/// This bounds in-process resources only. Each worker process counts its
+/// own attempts; the effective fleet-wide limit is cap x processes.
+#[derive(Clone, Debug)]
+pub struct ConcurrencyTracker(Arc<ConcurrencyTrackerInner>);
+
+#[derive(Debug, Default)]
+struct ConcurrencyTrackerInner(Mutex<HashMap<ConcurrencyScope, usize>>);
+
+impl ConcurrencyTrackerInner {
+    /// Lock the counts, recovering from poisoning instead of panicking.
+    /// Critical sections only insert or decrement `usize`s, so a
+    /// poisoned mutex still holds a structurally valid map, and
+    /// `unwrap()` inside `Drop` during an unwind would double-panic and
+    /// abort the process.
+    fn counts(&self) -> std::sync::MutexGuard<'_, HashMap<ConcurrencyScope, usize>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl ConcurrencyTracker {
+    /// An unshared tracker. For tests that embed several independent
+    /// worker fleets in one process. **Never construct one per worker
+    /// in production**: that turns a per-process cap into a per-worker
+    /// cap (the exact outage shape this feature prevents). Production
+    /// code wants [`Self::process_shared`] — or just `Default`, which is
+    /// the same.
+    pub fn isolated() -> Self {
+        Self(Arc::new(ConcurrencyTrackerInner::default()))
+    }
+
+    /// The tracker `JobWorkerConfig::default()` uses: one instance per
+    /// process, so every worker task spawned with a defaulted config shares
+    /// the same counts.
+    pub fn process_shared() -> Self {
+        static SHARED: std::sync::LazyLock<Arc<ConcurrencyTrackerInner>> =
+            std::sync::LazyLock::new(|| Arc::new(ConcurrencyTrackerInner::default()));
+        Self(Arc::clone(&SHARED))
+    }
+
+    /// How many attempts this process counts as running against `scope`.
+    pub fn running(&self, scope: &ConcurrencyScope) -> usize {
+        self.0.counts().get(scope).copied().unwrap_or(0)
+    }
+
+    /// Reserve one of the `limit` slots for `scope`, or return `None` if the
+    /// scope is saturated. The guard releases the count when its LAST handle
+    /// drops (clones share the counted unit), so a body can move one into
+    /// `spawn_blocking` and hold the budget until that work ends.
+    pub fn try_acquire(
+        &self,
+        scope: ConcurrencyScope,
+        limit: NonZeroUsize,
+    ) -> Option<ConcurrencySlot> {
+        let mut counts = self.0.counts();
+        let running = counts.get(&scope).copied().unwrap_or(0);
+        if running >= limit.get() {
+            return None;
+        }
+        counts.insert(scope.clone(), running + 1);
+        Some(ConcurrencySlot(Some(Arc::new(ConcurrencySlotInner {
+            tracker: Arc::clone(&self.0),
+            scope,
+            held_past_attempt: std::sync::atomic::AtomicBool::new(false),
+        }))))
+    }
+}
+
+impl Default for ConcurrencyTracker {
+    /// The process-shared tracker ([`Self::process_shared`]) — deliberately
+    /// NOT isolated, so `Default::default()` keeps every worker in a process
+    /// on one counter. Tests needing isolation pass
+    /// [`ConcurrencyTracker::isolated`] explicitly.
+    fn default() -> Self {
+        Self::process_shared()
+    }
+}
+
+/// The RAII reservation returned by [`ConcurrencyTracker::try_acquire`].
+/// `Clone` yields another handle on the SAME counted unit, not a new
+/// reservation; dropping the last handle decrements the count and
+/// releases the slot. To hold a budget across blocking work that
+/// outlives the attempt, override `run_with_cancellation` and move its
+/// `slot` parameter (already the body's own handle) into the
+/// `spawn_blocking` closure with `let _held = slot;` bound at the TOP of
+/// the closure (NOT `let _ = slot;`, which drops it immediately and
+/// releases the budget).
+/// The worker keeps its own handle across body + finalization, leaving
+/// every existing release path (success, failure, `MAX_RUNTIME` expiry,
+/// yield, lease loss, shutdown drain) unchanged while keeping the budget
+/// held until the closure exits.
+///
+/// Extended holds are fail-closed: a blocking closure that never returns
+/// saturates its scope until the process exits, skipping claims of every
+/// type on the key rather than running over-budget. Because of this,
+/// blocking work holding a slot must enforce its own timeout. To make a
+/// wedge visible, the worker logs an info event when a body keeps handles
+/// past its attempt and another when the last handle releases.
+/// Releasing an extended hold wakes no idle worker: rows excluded on that
+/// scope wait for the next claim (a periodic idle claim, an enqueue
+/// notification, or a busy worker finishing its job).
+///
+/// `untracked()` guards hold nothing (inert for
+/// [`Concurrency::Unlimited`] types); pass one when calling
+/// `run_with_cancellation` outside the worker (tests, direct dispatch).
+#[must_use = "dropping the slot releases the concurrency permit immediately"]
+#[derive(Clone)]
+pub struct ConcurrencySlot(Option<Arc<ConcurrencySlotInner>>);
+
+struct ConcurrencySlotInner {
+    tracker: Arc<ConcurrencyTrackerInner>,
+    scope: ConcurrencyScope,
+    // Set when the worker noticed handles surviving past the attempt's
+    // body; makes the final release loggable as an extended hold.
+    held_past_attempt: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for ConcurrencySlotInner {
+    fn drop(&mut self) {
+        if self
+            .held_past_attempt
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::info!(scope = ?self.scope,
+                "extended concurrency hold released; budget available again");
+        }
+        let mut counts = self.tracker.counts();
+        if let Some(count) = counts.get_mut(&self.scope) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.scope);
+            }
+        } else {
+            tracing::warn!(scope = ?self.scope,
+                "concurrency slot released without a running count");
+        }
+    }
+}
+
+// Manual Debug on purpose: prints the scope only. A derived Debug would
+// dump the tracker's whole count map (under its mutex) into any log or
+// assert that formats a slot.
+impl std::fmt::Debug for ConcurrencySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(inner) => write!(f, "ConcurrencySlot({:?})", inner.scope),
+            None => write!(f, "ConcurrencySlot::untracked()"),
+        }
+    }
+}
+
+impl ConcurrencySlot {
+    /// A slot that holds nothing: inert for [`Concurrency::Unlimited`]
+    /// types, and the argument to pass when calling
+    /// `run_with_cancellation` outside the worker (tests, direct
+    /// dispatch).
+    pub fn untracked() -> Self {
+        Self(None)
+    }
+
+    /// Whether other handles still hold the slot — the body moved its
+    /// clone into work that outlives the attempt. Marks the inner so its
+    /// final release is logged; returns the scope for the caller's log
+    /// line. `None` for untracked / fully-released slots.
+    pub(crate) fn note_held_past_attempt(&self) -> Option<&ConcurrencyScope> {
+        let inner = self.0.as_ref()?;
+        if Arc::strong_count(inner) > 1 {
+            inner
+                .held_past_attempt
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(&inner.scope)
+        } else {
+            None
+        }
+    }
+}
+
 /// Settings for the sole job worker. The reclaim window must be at least three
 /// heartbeat intervals; a larger window allows more transient DB failures.
 #[derive(Clone, Debug)]
@@ -151,6 +350,16 @@ pub struct JobWorkerConfig {
     pub shutdown_drain_timeout: Duration,
     /// Optional shared admission for idle claims. `None` keeps independent polling.
     pub idle_poll_gate: Option<IdlePollGate>,
+    /// Shared per-process running counts backing
+    /// [`crate::jobs::Concurrency::PerProcess`] caps and
+    /// [`crate::jobs::Concurrency::PerProcessShared`] budgets. Defaults to
+    /// the process-shared tracker ([`ConcurrencyTracker::process_shared`],
+    /// also `ConcurrencyTracker::default`): one tracker per process, so
+    /// every worker spawned with a defaulted config shares counts.
+    /// Production full literals must pass `process_shared()` (or
+    /// `Default::default()`); tests embedding independent worker fleets in
+    /// one process should pass [`ConcurrencyTracker::isolated`].
+    pub type_concurrency: ConcurrencyTracker,
 }
 
 impl Default for JobWorkerConfig {
@@ -160,6 +369,7 @@ impl Default for JobWorkerConfig {
             reclaim_window: DEFAULT_RECLAIM_WINDOW,
             shutdown_drain_timeout: crate::tasks::ShutdownBudget::from_env().job_drain,
             idle_poll_gate: None,
+            type_concurrency: ConcurrencyTracker::process_shared(),
         }
     }
 }
@@ -235,7 +445,7 @@ pub(super) type RunJobResult = Result<RunJobSuccess, JobError>;
 pub(super) struct RunJobSuccess(JobFromDB);
 
 enum RunJobOutcome {
-    Completed(RunJobResult),
+    Completed(Box<RunJobResult>),
     LeaseLost(uuid::Uuid),
     /// The row was released without charging a failure: cooperative yield or
     /// unknown job type.
@@ -261,18 +471,18 @@ impl LeaseTracker {
     }
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 pub struct JobFromDB {
     pub job_id: uuid::Uuid,
     pub name: String,
     pub payload: serde_json::Value,
     pub priority: i32,
-    pub run_at: chrono::DateTime<chrono::Utc>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub run_at: jiff::Timestamp,
+    pub created_at: jiff::Timestamp,
     pub context: String,
     pub error_count: i32,
     pub last_error_message: Option<String>,
-    pub last_failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_failed_at: Option<jiff::Timestamp>,
 }
 
 #[derive(Debug, Error)]
@@ -307,6 +517,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         config: JobWorkerConfig,
     ) -> color_eyre::Result<Self> {
         let reclaim_window_micros = config.validate()?;
+        Self::validate_shared_limits(&registry)?;
         let id = uuid::Uuid::new_v4();
         Ok(Self {
             id,
@@ -324,13 +535,43 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         })
     }
 
+    /// Reject job types that declare the same shared concurrency key with
+    /// conflicting limits (same key + same limit is legal). Per registry
+    /// only: conflicting limits across two registries in one process
+    /// sharing the process-shared tracker are not detected — a documented
+    /// limitation of [`Concurrency::PerProcessShared`].
+    fn validate_shared_limits(registry: &R) -> color_eyre::Result<()> {
+        // key -> (first declaring type name, its limit)
+        let mut declared: std::collections::HashMap<&'static str, (&'static str, NonZeroUsize)> =
+            std::collections::HashMap::new();
+        for &name in R::job_names() {
+            let Concurrency::PerProcessShared { key, limit } = registry.concurrency(name) else {
+                continue;
+            };
+            match declared.get(key) {
+                Some(&(_, seen)) if seen == limit => {}
+                Some(&(first, seen)) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "job types {first} and {name} both declare shared concurrency \
+                         key '{key}' with conflicting limits ({seen} vs {limit}); \
+                         declare the same limit on every type sharing a key"
+                    ));
+                }
+                None => {
+                    declared.insert(key, (name, limit));
+                }
+            }
+        }
+        Ok(())
+    }
+
     // Eyes contract: these fields must exist when the span is created. Eyes
     // treats a run as cron-triggered when `job.context` starts with `Cron@`
     // (its `cron_job_failed` monitors) and reads the timing fields for queue
     // delay. Don't drop or rename them without coordinating Eyes.
     #[tracing::instrument(
         name = "worker.run_job",
-        skip(self, job),
+        skip(self, job, slot),
         fields(
             job.id = %job.job_id,
             job.name = job.name,
@@ -339,18 +580,28 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             job.created_at = %job.created_at,
             job.context = job.context,
             job.error_count = job.error_count,
+            job.max_runtime = ?self.registry.max_runtime(&job.name),
             worker.id = %self.id,
         ),
         err,
     )]
-    async fn run_job(&self, job: &JobFromDB) -> color_eyre::Result<()> {
-        let result = std::panic::AssertUnwindSafe(self.registry.run_job(
+    async fn run_job(&self, job: &JobFromDB, slot: ConcurrencySlot) -> color_eyre::Result<()> {
+        let limit = self.registry.max_runtime(&job.name);
+        let body = std::panic::AssertUnwindSafe(self.registry.run_job(
             job,
             self.state.clone(),
             self.cancellation_token.clone(),
+            slot,
         ))
-        .catch_unwind()
-        .await;
+        .catch_unwind();
+        let result = match tokio::time::timeout(limit, body).await {
+            Ok(caught) => caught,
+            // Wrap as a CAUGHT result (inner Err), never as the panic
+            // payload: the outer match's Err arm is reserved for real
+            // panics, and `panic_message` would render a non-string
+            // payload as "non-string payload", losing the limit.
+            Err(_expired) => Ok(Err(JobMaxRuntimeExceeded { limit }.into())),
+        };
         match result {
             Ok(result) => result,
             Err(payload) => Err(color_eyre::eyre::eyre!(
@@ -374,63 +625,118 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             return Ok(RunJobOutcome::LeaseLost(job.job_id));
         }
 
-        let job_result = {
-            let mut body = std::pin::pin!(self.run_job(&job));
-            let mut next_tick = claimed.claim_sent_at + self.config.heartbeat_interval;
-            type HeartbeatResult = Result<
-                Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
-                tokio::time::error::Elapsed,
-            >;
-            let mut heartbeat: Option<Pin<Box<dyn Future<Output = HeartbeatResult> + Send + '_>>> =
-                None;
-            let mut heartbeat_sent_at = claimed.claim_sent_at;
-            loop {
-                let deadline = tracker.deadline();
-                tokio::select! {
-                    biased;
-                    result = &mut body => break result,
-                    () = tokio::time::sleep_until(deadline) => {
-                        tracing::warn!(job_id = %job.job_id, "Job lease watchdog expired");
-                        self.abandoned_jobs.lock().unwrap().insert(job.job_id);
-                        return Ok(RunJobOutcome::LeaseLost(job.job_id));
-                    }
-                    result = async { heartbeat.as_mut().expect("guarded heartbeat").await }, if heartbeat.is_some() => {
-                        heartbeat = None;
-                        match result {
-                            Ok(Ok(result)) if result.rows_affected() == 1 => {
-                                tracker.last_refresh_sent = heartbeat_sent_at;
+        // Per-process concurrency admission (DEV-2424). The claim already
+        // excluded saturated types; try_acquire closes the local race where
+        // another worker in this process took the last slot between our
+        // claim and here. A refusal is a JobYield: the row releases
+        // uncharged (existing branch below) and this worker moves on —
+        // never waiting on a slot while holding a claim. Scopes generalize
+        // per-type caps and shared keys alike (DEV-2431): admission stays
+        // at claim time — never move the acquire into the body (a slot
+        // wait inside the body counts toward the attempt's MAX_RUNTIME
+        // clock).
+        let concurrency = self.registry.concurrency(&job.name);
+        let admitted = match concurrency.scope_and_limit(&job.name) {
+            None => Ok(ConcurrencySlot::untracked()),
+            Some((scope, limit)) => self
+                .config
+                .type_concurrency
+                .try_acquire(scope, limit)
+                .ok_or_else(|| {
+                    let what = match concurrency {
+                        Concurrency::PerProcessShared { key, .. } => {
+                            format!("shared concurrency key '{key}'")
+                        }
+                        _ => job.name.clone(),
+                    };
+                    JobYield::new(format!(
+                        "{what} is at its per-process concurrency limit of {limit}"
+                    ))
+                }),
+        };
+        // `admitted` is matched BY VALUE with a `ref` Ok arm deliberately:
+        // `admitted` keeps owning the slot until `run_next_job` returns, so
+        // the guard is held across the body AND the finalization cascade
+        // below, released by Drop on every exit — success, failure,
+        // MAX_RUNTIME expiry (which drops only the body future inside
+        // run_job), yield, post-admission lease loss, and shutdown drain
+        // (which drops this whole future). Do NOT "simplify" `Ok(ref slot)`
+        // to `Ok(slot)`: a by-value binding's scope ends with this arm's
+        // block, dropping the guard BEFORE finalization. A CLONE is
+        // threaded into the body; the worker keeps this handle, and the
+        // body may move its clone into `spawn_blocking` to hold the budget
+        // past the attempt.
+        let job_result = match admitted {
+            Ok(ref slot) => {
+                let mut body = std::pin::pin!(self.run_job(&job, slot.clone()));
+                let mut next_tick = claimed.claim_sent_at + self.config.heartbeat_interval;
+                type HeartbeatResult = Result<
+                    Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+                    tokio::time::error::Elapsed,
+                >;
+                let mut heartbeat: Option<
+                    Pin<Box<dyn Future<Output = HeartbeatResult> + Send + '_>>,
+                > = None;
+                let mut heartbeat_sent_at = claimed.claim_sent_at;
+                let result = loop {
+                    let deadline = tracker.deadline();
+                    tokio::select! {
+                        biased;
+                        result = &mut body => break result,
+                        () = tokio::time::sleep_until(deadline) => {
+                            tracing::warn!(job_id = %job.job_id, "Job lease watchdog expired");
+                            self.abandoned_jobs.lock().unwrap().insert(job.job_id);
+                            return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                        }
+                        result = async { heartbeat.as_mut().expect("guarded heartbeat").await }, if heartbeat.is_some() => {
+                            heartbeat = None;
+                            match result {
+                                Ok(Ok(result)) if result.rows_affected() == 1 => {
+                                    tracker.last_refresh_sent = heartbeat_sent_at;
+                                }
+                                Ok(Ok(_)) => {
+                                    tracing::warn!(job_id = %job.job_id, owner = %self.owner_token, "Job lease ownership lost");
+                                    return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                                }
+                                Ok(Err(error)) => tracing::warn!(job_id = %job.job_id, %error, "Job heartbeat failed"),
+                                Err(_) => tracing::warn!(job_id = %job.job_id, "Job heartbeat timed out"),
                             }
-                            Ok(Ok(_)) => {
-                                tracing::warn!(job_id = %job.job_id, owner = %self.owner_token, "Job lease ownership lost");
-                                return Ok(RunJobOutcome::LeaseLost(job.job_id));
+                        }
+                        () = tokio::time::sleep_until(next_tick), if heartbeat.is_none() => {
+                            let sent_at = tokio::time::Instant::now();
+                            next_tick = sent_at + self.config.heartbeat_interval;
+                            #[cfg(test)]
+                            if self.fail_heartbeats.try_update(
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                                |n| n.checked_sub(1),
+                            ).is_ok() {
+                                tracing::warn!(job_id = %job.job_id, "Synthetic heartbeat failure");
+                                continue;
                             }
-                            Ok(Err(error)) => tracing::warn!(job_id = %job.job_id, %error, "Job heartbeat failed"),
-                            Err(_) => tracing::warn!(job_id = %job.job_id, "Job heartbeat timed out"),
+                            let update = sqlx::query(
+                                "UPDATE jobs SET locked_at = NOW() WHERE job_id = $1 AND locked_by = $2"
+                            )
+                            .bind(job.job_id)
+                            .bind(&self.owner_token)
+                            .execute(self.state.db());
+                            heartbeat_sent_at = sent_at;
+                            heartbeat = Some(Box::pin(tokio::time::timeout(self.config.heartbeat_interval / 3, update)));
                         }
                     }
-                    () = tokio::time::sleep_until(next_tick), if heartbeat.is_none() => {
-                        let sent_at = tokio::time::Instant::now();
-                        next_tick = sent_at + self.config.heartbeat_interval;
-                        #[cfg(test)]
-                        if self.fail_heartbeats.try_update(
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                            |n| n.checked_sub(1),
-                        ).is_ok() {
-                            tracing::warn!(job_id = %job.job_id, "Synthetic heartbeat failure");
-                            continue;
-                        }
-                        let update = sqlx::query(
-                            "UPDATE jobs SET locked_at = NOW() WHERE job_id = $1 AND locked_by = $2"
-                        )
-                        .bind(job.job_id)
-                        .bind(&self.owner_token)
-                        .execute(self.state.db());
-                        heartbeat_sent_at = sent_at;
-                        heartbeat = Some(Box::pin(tokio::time::timeout(self.config.heartbeat_interval / 3, update)));
-                    }
+                };
+                // The body has ended; if its handles haven't, the budget is
+                // held by work that outlives the attempt (spawn_blocking
+                // etc.) — say so. The early returns above (watchdog,
+                // lease loss) drop the whole future and skip this check.
+                if let Some(scope) = slot.note_held_past_attempt() {
+                    tracing::info!(scope = ?scope,
+                        "concurrency slot held past the attempt by the job body; \
+                         the budget stays held until that work ends");
                 }
+                result
             }
+            Err(yielded) => Err(yielded.into()),
         };
         // The body and all heartbeat futures have ended before finalization.
         if let Err(error) = job_result {
@@ -491,7 +797,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     }
                     tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
                         "Job permanently failed - unknown job type past its age limit, moved to dead letter queue");
-                    return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
+                    return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
+                        job, error,
+                    )))));
                 }
                 tracing::warn!(job_id = %job.job_id, name = %job.name,
                     "Unknown job type for this binary; released uncharged with an age-scaled delay");
@@ -507,7 +815,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 }
                 tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
                     "Job permanently failed - payload is not deserializable, moved to dead letter queue without retries");
-                return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
+                return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
+                    job, error,
+                )))));
             }
             if job.error_count >= self.max_retries {
                 let count = job
@@ -539,7 +849,9 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 tracing::warn!(job_id = %job.job_id, retry = job.error_count + 1, error = %error_message,
                     "Job failed, retry scheduled");
             }
-            return Ok(RunJobOutcome::Completed(Err(JobError(job, error))));
+            return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
+                job, error,
+            )))));
         }
 
         let result = sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
@@ -551,7 +863,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
             tracing::warn!(job_id = %job.job_id, "Job completion lost ownership");
             return Ok(RunJobOutcome::LeaseLost(job.job_id));
         }
-        Ok(RunJobOutcome::Completed(Ok(RunJobSuccess(job))))
+        Ok(RunJobOutcome::Completed(Box::new(Ok(RunJobSuccess(job)))))
     }
 
     async fn dead_letter_owned(
@@ -584,7 +896,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         .bind(job.priority)
         .bind(count)
         .bind(message)
-        .bind(job.created_at)
+        .bind(job.created_at.to_sqlx())
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query("DELETE FROM jobs WHERE job_id = $1 AND locked_by = $2")
@@ -601,18 +913,35 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         Ok(true)
     }
 
+    /// Job-type names whose per-process concurrency scope is saturated —
+    /// their own `PerProcess` cap or `PerProcessShared` key's budget —
+    /// for the claim query's exclusion list. In-memory only: one registry
+    /// scan per claim, no DB work.
+    fn saturated_job_types(&self) -> Vec<String> {
+        R::job_names()
+            .iter()
+            .filter_map(|name| {
+                let (scope, limit) = self.registry.concurrency(name).scope_and_limit(name)?;
+                (self.config.type_concurrency.running(&scope) >= limit.get())
+                    .then(|| (*name).to_owned())
+            })
+            .collect()
+    }
+
     #[tracing::instrument(name = "worker.fetch_next_job", level = "trace", skip(self),
         fields(worker.id = %self.id, job.id = tracing::field::Empty,
             job.name = tracing::field::Empty, reclaim_window_secs = self.config.reclaim_window.as_secs()), err)]
     async fn fetch_next_job(&self) -> color_eyre::Result<Option<ClaimedJob>> {
         use sqlx::Row;
         let claim_sent_at = tokio::time::Instant::now();
+        let saturated = self.saturated_job_types();
         let row = sqlx::query(
             "WITH candidate AS MATERIALIZED (
                 SELECT job_id, locked_by AS previous_locked_by,
                        error_count AS previous_error_count
                 FROM jobs
                 WHERE run_at <= NOW()
+                  AND name <> ALL($3::text[])
                   AND (locked_by IS NULL OR locked_at < NOW() - $2::bigint * interval '1 microsecond')
                   AND (locked_by IS NULL OR error_count < 2147483647)
                 ORDER BY priority DESC, run_at ASC, created_at ASC
@@ -633,6 +962,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
         )
         .bind(&self.owner_token)
         .bind(self.reclaim_window_micros)
+        .bind(&saturated)
         .fetch_optional(self.state.db())
         .await?;
         let Some(row) = row else { return Ok(None) };
@@ -642,12 +972,16 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 name: row.try_get("name")?,
                 payload: row.try_get("payload")?,
                 priority: row.try_get("priority")?,
-                run_at: row.try_get("run_at")?,
-                created_at: row.try_get("created_at")?,
+                run_at: row.try_get::<jiff_sqlx::Timestamp, _>("run_at")?.to_jiff(),
+                created_at: row
+                    .try_get::<jiff_sqlx::Timestamp, _>("created_at")?
+                    .to_jiff(),
                 context: row.try_get("context")?,
                 error_count: row.try_get("error_count")?,
                 last_error_message: row.try_get("last_error_message")?,
-                last_failed_at: row.try_get("last_failed_at")?,
+                last_failed_at: row
+                    .try_get::<Option<jiff_sqlx::Timestamp>, _>("last_failed_at")?
+                    .map(jiff_sqlx::Timestamp::to_jiff),
             },
             claim_sent_at,
             previous_locked_by: row.try_get("previous_locked_by")?,
@@ -806,6 +1140,38 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 /// - The job is requeued with exponential backoff: delay = `2^(error_count + 1)` seconds
 ///   (first retry: 2s, second: 4s, third: 8s, fourth: 16s, etc.)
 /// - If `error_count` >= `max_retries`, the job is moved to the dead letter queue
+///
+/// # Maximum Runtime
+///
+/// Every job attempt runs under [`Job::MAX_RUNTIME`](crate::jobs::Job::MAX_RUNTIME) — a per-job-type
+/// wall-clock limit defaulting to 15 minutes. Job types whose healthy attempts
+/// run longer override it with a larger `Duration`. On expiry, the worker
+/// drops the body future, stops heartbeating, releases the lease, and charges
+/// the attempt as a normal retryable failure whose error message names the
+/// limit. Each retry gets a fresh budget. The timeout cancels **async**
+/// work only — work already inside `spawn_blocking` keeps running after the
+/// drop, so jobs that hand work to blocking threads must bound it themselves.
+///
+/// # Per-Process Concurrency
+///
+/// A job type can declare [`Job::CONCURRENCY`](crate::jobs::Job::CONCURRENCY) =
+/// `Concurrency::PerProcess(n)` to cap concurrent attempts per worker
+/// process, or `Concurrency::PerProcessShared { key, limit }` to share a
+/// named budget across job types (every type on a key must declare the same
+/// `limit`; conflicts fail worker startup). Both are enforced at claim:
+/// saturated scopes are excluded from the claim query, so a worker claims
+/// the next runnable job of another type instead of parking behind the cap.
+/// A claim that raced a same-process worker for the last slot is released
+/// uncharged via `JobYield`. The slot is released when the attempt finalizes
+/// (success, failure, `MAX_RUNTIME` expiry, yield, lease loss, shutdown
+/// drain) — or, if the body moved a clone of its slot into `spawn_blocking`,
+/// when that blocking work ends (the worker's handle covers standard paths;
+/// the closure's handle extends the hold). Counts live in memory per process,
+/// shared across worker tasks via `JobWorkerConfig::type_concurrency` —
+/// process-shared by default (`ConcurrencyTracker::process_shared()`, also
+/// `Default`); pass `ConcurrencyTracker::isolated()` to isolate embedded test
+/// fleets. The cap bounds in-process resources only: with M processes, the
+/// effective limit on an outside resource (API, quota) is cap x M.
 ///
 /// # Graceful Shutdown
 ///
@@ -1034,12 +1400,15 @@ async fn run_claimed_job<AppState: AS, R: JobRegistry<AppState>>(
     // kill the worker, which would take down apps that join on
     // all worker tasks.
     Some(match run_result {
-        Ok(RunJobOutcome::Completed(Ok(RunJobSuccess(job)))) => {
-            tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
-            Ok(())
-        }
-        Ok(RunJobOutcome::Completed(Err(job_error))) => {
-            tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+        Ok(RunJobOutcome::Completed(result)) => {
+            match *result {
+                Ok(RunJobSuccess(job)) => {
+                    tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
+                }
+                Err(job_error) => {
+                    tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+                }
+            }
             Ok(())
         }
         Ok(RunJobOutcome::LeaseLost(job_id)) => {
@@ -1164,6 +1533,7 @@ mod tests {
             &self,
             app_state: TestAppState,
             cancellation_token: CancellationToken,
+            _slot: ConcurrencySlot,
         ) -> color_eyre::Result<()> {
             // Announce that the job body is running. A locked row only proves
             // the claim committed, not that the worker has the job yet.
@@ -1217,6 +1587,7 @@ mod tests {
             &self,
             app_state: TestAppState,
             cancellation_token: CancellationToken,
+            _slot: ConcurrencySlot,
         ) -> color_eyre::Result<()> {
             sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
                 .bind(Self::NAME)
@@ -1244,6 +1615,7 @@ mod tests {
             &self,
             app_state: TestAppState,
             cancellation_token: CancellationToken,
+            _slot: ConcurrencySlot,
         ) -> color_eyre::Result<()> {
             sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
                 .bind(Self::NAME)
@@ -1252,6 +1624,327 @@ mod tests {
             cancellation_token.cancelled().await;
             Err(color_eyre::eyre::eyre!("simulated failure during shutdown"))
         }
+    }
+
+    /// A job whose body awaits forever but carries a short `MAX_RUNTIME`: the
+    /// worker must drop it at the limit and charge the attempt.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct HungJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for HungJob {
+        const NAME: &'static str = "HungJob";
+        const MAX_RUNTIME: Duration = Duration::from_secs(2);
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            sqlx::query("UPDATE jobs SET context = 'started' WHERE name = $1")
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// A job whose body runs longer than a neighbour type's short limit
+    /// (`HungJob`'s 2s) but under its own larger `MAX_RUNTIME`: the limit is
+    /// per type, so this body must complete normally.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct SlowJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for SlowJob {
+        const NAME: &'static str = "SlowJob";
+        const MAX_RUNTIME: Duration = Duration::from_secs(10);
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            let error_count: i32 =
+                sqlx::query_scalar("SELECT error_count FROM jobs WHERE name = $1")
+                    .bind(Self::NAME)
+                    .fetch_one(app_state.db())
+                    .await?;
+            sqlx::query("INSERT INTO job_probe (marker) VALUES ($1)")
+                .bind(format!("error_count={error_count}"))
+                .execute(app_state.db())
+                .await?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(())
+        }
+    }
+
+    /// A job type capped at one concurrent attempt per process. `hang`
+    /// bodies park on the cancellation token (yielding on shutdown) so a
+    /// test can hold the single slot indefinitely; quick bodies finish at
+    /// once. The `id` matches the enqueue context ("capped-<id>") so tests
+    /// can observe exactly which row ran: the body rewrites the context to
+    /// "started-<id>".
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct CappedJob {
+        id: String,
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for CappedJob {
+        const NAME: &'static str = "CappedJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcess(NonZeroUsize::new(1).unwrap());
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            app_state: TestAppState,
+            cancellation_token: CancellationToken,
+            _slot: ConcurrencySlot,
+        ) -> color_eyre::Result<()> {
+            sqlx::query(
+                "UPDATE jobs SET context = 'started-' || $1
+                 WHERE name = $2 AND context = 'capped-' || $1",
+            )
+            .bind(&self.id)
+            .bind(Self::NAME)
+            .execute(app_state.db())
+            .await?;
+            if self.hang {
+                cancellation_token.cancelled().await;
+                return Err(JobYield::new("test shutdown").into());
+            }
+            Ok(())
+        }
+    }
+
+    /// A capped type whose hung rows await forever past a short
+    /// `MAX_RUNTIME`. The worker must drop the body at the limit, and that
+    /// drop must release the single per-process slot so a second row of
+    /// the same type can run (the arena `BACKUP_SLOT` wedge shape). Quick
+    /// rows insert a probe marker and finish.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct CappedHungJob {
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for CappedHungJob {
+        const NAME: &'static str = "CappedHungJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcess(NonZeroUsize::new(1).unwrap());
+        const MAX_RUNTIME: Duration = Duration::from_secs(1);
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            if self.hang {
+                sqlx::query(
+                    "UPDATE jobs SET context = 'started-hung'
+                     WHERE name = $1 AND context = 'capped-hung'",
+                )
+                .bind(Self::NAME)
+                .execute(app_state.db())
+                .await?;
+                std::future::pending::<()>().await;
+                Ok(())
+            } else {
+                sqlx::query("INSERT INTO job_probe (marker) VALUES ('capped-expiry-released')")
+                    .execute(app_state.db())
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// A shared-key type on "archive": `hang` bodies park on the
+    /// cancellation token (yielding on shutdown) so a test can hold the
+    /// single shared slot indefinitely. The `id` matches the enqueue
+    /// context ("shared-<id>") so tests can see which row ran: the body
+    /// rewrites the context to "started-shared-<id>".
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct SharedArchiveJob {
+        id: String,
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for SharedArchiveJob {
+        const NAME: &'static str = "SharedArchiveJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcessShared {
+            key: "archive",
+            limit: NonZeroUsize::new(1).unwrap(),
+        };
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            app_state: TestAppState,
+            cancellation_token: CancellationToken,
+            _slot: ConcurrencySlot,
+        ) -> color_eyre::Result<()> {
+            sqlx::query(
+                "UPDATE jobs SET context = 'started-shared-' || $1
+                 WHERE name = $2 AND context = 'shared-' || $1",
+            )
+            .bind(&self.id)
+            .bind(Self::NAME)
+            .execute(app_state.db())
+            .await?;
+            if self.hang {
+                cancellation_token.cancelled().await;
+                return Err(JobYield::new("test shutdown").into());
+            }
+            Ok(())
+        }
+    }
+
+    /// A shared-key type on "archive" whose body awaits forever past a
+    /// 2s `MAX_RUNTIME` (2s, not `CappedHungJob`'s 1s: cross-type
+    /// absence-window tests need margin). The worker must drop the body
+    /// at the limit, and that drop must free the SHARED slot so a row of
+    /// a DIFFERENT type on the same key can run.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct SharedHungJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for SharedHungJob {
+        const NAME: &'static str = "SharedHungJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcessShared {
+            key: "archive",
+            limit: NonZeroUsize::new(1).unwrap(),
+        };
+        const MAX_RUNTIME: Duration = Duration::from_secs(2);
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            sqlx::query(
+                "UPDATE jobs SET context = 'started-shared-hung'
+                 WHERE name = $1 AND context = 'shared-hung'",
+            )
+            .bind(Self::NAME)
+            .execute(app_state.db())
+            .await?;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// A shared-key type on "archive" that finishes immediately, rewriting
+    /// its context and leaving a probe marker so tests can observe exactly
+    /// when the shared budget admitted it.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct SharedQuickJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for SharedQuickJob {
+        const NAME: &'static str = "SharedQuickJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcessShared {
+            key: "archive",
+            limit: NonZeroUsize::new(1).unwrap(),
+        };
+
+        async fn run(&self, app_state: TestAppState) -> color_eyre::Result<()> {
+            sqlx::query(
+                "UPDATE jobs SET context = 'started-quick'
+                 WHERE name = $1 AND context = 'shared-quick'",
+            )
+            .bind(Self::NAME)
+            .execute(app_state.db())
+            .await?;
+            sqlx::query("INSERT INTO job_probe (marker) VALUES ('shared-quick-ran')")
+                .execute(app_state.db())
+                .await?;
+            Ok(())
+        }
+    }
+
+    /// A shared-key type on "archive" that detaches `spawn_blocking` work
+    /// holding its slot: the attempt returns at once, but the shared
+    /// budget stays held until the blocking closure (3s) ends — the
+    /// permit-lifetime semantics arena hand-rolls today. The detached
+    /// `JoinHandle` is the mechanism, not a bug: awaiting it would
+    /// re-couple the hold to the attempt. sqlx is async, so the closure
+    /// captures the runtime handle before `spawn_blocking` and drives its
+    /// marker inserts with `block_on`.
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct BlockingHoldJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for BlockingHoldJob {
+        const NAME: &'static str = "BlockingHoldJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcessShared {
+            key: "archive",
+            limit: NonZeroUsize::new(1).unwrap(),
+        };
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_cancellation(
+            &self,
+            state: TestAppState,
+            _cancellation_token: CancellationToken,
+            slot: ConcurrencySlot,
+        ) -> color_eyre::Result<()> {
+            let handle = tokio::runtime::Handle::current();
+            let pool = state.db().clone();
+            tokio::task::spawn_blocking(move || {
+                let _held = slot; // keep-alive: holds the shared budget for the closure
+                handle
+                    .block_on(
+                        sqlx::query("INSERT INTO job_probe (marker) VALUES ('blocking-started')")
+                            .execute(&pool),
+                    )
+                    .unwrap();
+                std::thread::sleep(Duration::from_secs(3));
+                handle
+                    .block_on(
+                        sqlx::query("INSERT INTO job_probe (marker) VALUES ('blocking-finished')")
+                            .execute(&pool),
+                    )
+                    .unwrap();
+            });
+            Ok(())
+        }
+    }
+
+    /// Conflict fixtures: same shared key, different limits — registered
+    /// only in [`shared_conflict_jobs`]' registry below, never the main
+    /// tests registry (a limit-2 declaration on "archive" would fail every
+    /// other test's worker build).
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct ConflictAJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for ConflictAJob {
+        const NAME: &'static str = "ConflictAJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcessShared {
+            key: "archive",
+            limit: NonZeroUsize::new(1).unwrap(),
+        };
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct ConflictBJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for ConflictBJob {
+        const NAME: &'static str = "ConflictBJob";
+        const CONCURRENCY: Concurrency = Concurrency::PerProcessShared {
+            key: "archive",
+            limit: NonZeroUsize::new(2).unwrap(),
+        };
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    mod shared_conflict_jobs {
+        use super::{ConflictAJob, ConflictBJob, TestAppState};
+        crate::impl_job_registry!(TestAppState, ConflictAJob, ConflictBJob);
     }
 
     impl_job_registry!(
@@ -1263,7 +1956,15 @@ mod tests {
         DrainCooperativeJob,
         DrainStubbornJob,
         YieldingJob,
-        ChargedOnShutdownJob
+        ChargedOnShutdownJob,
+        HungJob,
+        SlowJob,
+        CappedJob,
+        CappedHungJob,
+        SharedArchiveJob,
+        SharedHungJob,
+        SharedQuickJob,
+        BlockingHoldJob
     );
 
     fn test_state(db: sqlx::PgPool) -> TestAppState {
@@ -1400,6 +2101,729 @@ mod tests {
         panic!("job {name} never started running");
     }
 
+    /// DEV-2424 regression: with cap 1 and one `CappedJob` attempt running
+    /// (hung), a second `CappedJob` row is not claimed even at higher
+    /// priority, while a lower-priority job of another type is.
+    #[sqlx::test]
+    async fn test_capped_type_saturated_skips_to_other_types(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        let tracker = ConcurrencyTracker::isolated();
+        let config = JobWorkerConfig {
+            heartbeat_interval: Duration::from_millis(300),
+            reclaim_window: Duration::from_millis(1200),
+            // Nonzero drain: the hung body yields on cancel, and the drain
+            // window lets that release complete before the worker exits
+            // (mirrors test_shutdown_yield_releases_uncharged).
+            shutdown_drain_timeout: Duration::from_secs(5),
+            idle_poll_gate: None,
+            type_concurrency: tracker.clone(),
+        };
+        // Phase 1: only capped-a exists. Whichever worker wins the claim
+        // hangs inside the body holding the single slot; the loser idles.
+        CappedJob {
+            id: "a".into(),
+            hang: true,
+        }
+        .enqueue(state.clone(), "capped-a".into(), Some(10))
+        .await
+        .unwrap();
+        let token = CancellationToken::new();
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                tokio::spawn(job_worker(
+                    state.clone(),
+                    Jobs,
+                    Duration::from_millis(20),
+                    20,
+                    token.clone(),
+                    config.clone(),
+                ))
+            })
+            .collect();
+        // started-a is written inside the body, after admission: once seen,
+        // the slot is provably held for as long as this test runs.
+        wait_for(|| async {
+            let started: Option<String> = sqlx::query_scalar(
+                "SELECT context FROM jobs WHERE name = 'CappedJob' AND context = 'started-a'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            started.is_some().then_some(())
+        })
+        .await;
+        // Phase 2: capped-b outranks the probe. The free worker must skip
+        // capped-b (type saturated) and claim the probe instead.
+        CappedJob {
+            id: "b".into(),
+            hang: true,
+        }
+        .enqueue(state.clone(), "capped-b".into(), Some(10))
+        .await
+        .unwrap();
+        NormalProbeJob
+            .enqueue(state.clone(), "normal".into(), None)
+            .await
+            .unwrap();
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_probe")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        let (error_count, locked_by, context): (i32, Option<String>, String) = sqlx::query_as(
+            "SELECT error_count, locked_by, context FROM jobs WHERE context = 'capped-b'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(error_count, 0, "capped-b must never be charged");
+        assert!(locked_by.is_none(), "capped-b must never be claimed");
+        assert_eq!(context, "capped-b", "capped-b must never be dispatched");
+        token.cancel();
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    }
+
+    /// DEV-2424 regression: a claim that raced a same-process worker for
+    /// the last slot (unsaturated at claim time, saturated by admission
+    /// time) must be released uncharged without dispatching the body.
+    /// Deterministic by construction: claim with an empty tracker, hold
+    /// the slot from the test, then `run_next_job`.
+    #[sqlx::test]
+    async fn test_capped_claim_race_loser_releases_uncharged(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        let tracker = ConcurrencyTracker::isolated();
+        let worker = Worker::new(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
+                type_concurrency: tracker.clone(),
+            },
+        )
+        .unwrap();
+        CappedJob {
+            id: "a".into(),
+            hang: false,
+        }
+        .enqueue(test_state(db.clone()), "capped-a".into(), None)
+        .await
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().expect("claim");
+        // The racing winner takes the last slot between our claim and our
+        // admission.
+        let _winner = tracker
+            .try_acquire(
+                ConcurrencyScope::Type(CappedJob::NAME.to_owned()),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .expect("slot free");
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(matches!(outcome, RunJobOutcome::Released(_)));
+        let (error_count, locked_by, locked_at, context): (
+            i32,
+            Option<String>,
+            Option<jiff_sqlx::Timestamp>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT error_count, locked_by, locked_at, context FROM jobs WHERE name = 'CappedJob'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(error_count, 0, "a refused claim is never charged");
+        assert!(locked_by.is_none() && locked_at.is_none(), "row released");
+        assert_eq!(context, "capped-a", "body never dispatched");
+    }
+
+    /// DEV-2424: the slot must release when an attempt completes, or a
+    /// cap-1 type deadlocks behind its own success. Two quick `CappedJob`s
+    /// run sequentially under one worker.
+    #[sqlx::test]
+    async fn test_capped_slot_releases_on_completion(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        CappedJob {
+            id: "a".into(),
+            hang: false,
+        }
+        .enqueue(state.clone(), "capped-a".into(), None)
+        .await
+        .unwrap();
+        CappedJob {
+            id: "b".into(),
+            hang: false,
+        }
+        .enqueue(state.clone(), "capped-b".into(), None)
+        .await
+        .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
+            },
+        ));
+        // Both rows gone == both bodies ran AND both finalizations deleted
+        // their rows, so the cancel below cannot race a finalization.
+        wait_for(|| async {
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE name = 'CappedJob'")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            (remaining == 0).then_some(())
+        })
+        .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// DEV-2424 regression: a hung capped attempt must free its per-process
+    /// slot when `MAX_RUNTIME` expires — the arena `BACKUP_SLOT` wedge was a
+    /// hung capped attempt starving every other row of its type. One worker,
+    /// cap 1: the hung row takes the slot and is dropped at its 1s limit;
+    /// the second row of the SAME type (which a leaked slot excludes from
+    /// claims) must then run and leave its probe marker.
+    #[sqlx::test]
+    async fn test_capped_hung_job_releases_slot_on_max_runtime_expiry(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        // Same priority: the hung row (enqueued first) claims first by
+        // created_at, so the ordering is deterministic.
+        CappedHungJob { hang: true }
+            .enqueue(state.clone(), "capped-hung".into(), None)
+            .await
+            .unwrap();
+        CappedHungJob { hang: false }
+            .enqueue(state.clone(), "capped-quick".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                // Nonzero drain: on cancel the worker may be mid re-hang on
+                // the backed-off hung row; its 1s MAX_RUNTIME resolves
+                // inside the drain window (mirrors the saturated test).
+                shutdown_drain_timeout: Duration::from_secs(5),
+                idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
+            },
+        ));
+        // The quick row only becomes claimable once the expired attempt
+        // released the single slot: with a leaked slot the claim exclusion
+        // keeps every CappedHungJob row queued and this wait times out at
+        // its 10s cap.
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_probe WHERE marker = 'capped-expiry-released'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        // The hung attempt was charged through the MAX_RUNTIME expiry path
+        // (not a plain failure): the message names the runtime limit.
+        // error_count >= 1 rather than == 1: a slow machine can reclaim the
+        // backed-off row (4s delay) and charge it again before this poll —
+        // the message check still ties the charge to the expiry arm.
+        wait_for(|| async {
+            let row: Option<(i32, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT error_count, locked_by, last_error_message
+                 FROM jobs WHERE name = 'CappedHungJob' AND context = 'started-hung'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            let (count, owner, message) = row?;
+            (count >= 1
+                && owner.is_none()
+                && message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("max runtime")))
+            .then_some(())
+        })
+        .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// The standard two-worker test config: fast heartbeat/reclaim, an
+    /// isolated tracker (embedded fleets must not share counts with other
+    /// tests' workers), and a caller-chosen drain.
+    fn test_config(tracker: ConcurrencyTracker, drain: Duration) -> JobWorkerConfig {
+        JobWorkerConfig {
+            heartbeat_interval: Duration::from_millis(300),
+            reclaim_window: Duration::from_millis(1200),
+            shutdown_drain_timeout: drain,
+            idle_poll_gate: None,
+            type_concurrency: tracker,
+        }
+    }
+
+    /// DEV-2431: types sharing a `PerProcessShared` key share ONE budget.
+    /// With the holder hung, another type on the same key is excluded from
+    /// claims (never claimed, never charged) while an unrelated type still
+    /// flows. Under per-type scoping, the free worker would claim the quick
+    /// row immediately and the context assertion would fail.
+    #[sqlx::test]
+    async fn test_shared_key_saturated_skips_to_other_types(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        let tracker = ConcurrencyTracker::isolated();
+        let config = test_config(tracker, Duration::from_secs(5));
+        // Phase 1: only the holder exists. Whichever worker wins the claim
+        // hangs inside the body holding the single shared slot; the loser
+        // idles.
+        SharedArchiveJob {
+            id: "a".into(),
+            hang: true,
+        }
+        .enqueue(state.clone(), "shared-a".into(), Some(10))
+        .await
+        .unwrap();
+        let token = CancellationToken::new();
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                tokio::spawn(job_worker(
+                    state.clone(),
+                    Jobs,
+                    Duration::from_millis(20),
+                    20,
+                    token.clone(),
+                    config.clone(),
+                ))
+            })
+            .collect();
+        // started-shared-a is written inside the body, after admission:
+        // once seen, the shared slot is provably held for as long as this
+        // test runs.
+        wait_for(|| async {
+            let started: Option<String> = sqlx::query_scalar(
+                "SELECT context FROM jobs WHERE name = 'SharedArchiveJob' \
+                 AND context = 'started-shared-a'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            started.is_some().then_some(())
+        })
+        .await;
+        // Phase 2: a DIFFERENT type on the same key outranks the probe, but
+        // the shared budget is held — the free worker must skip it and
+        // claim the probe instead.
+        SharedQuickJob
+            .enqueue(state.clone(), "shared-quick".into(), Some(10))
+            .await
+            .unwrap();
+        NormalProbeJob
+            .enqueue(state.clone(), "normal".into(), None)
+            .await
+            .unwrap();
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_probe")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        let (error_count, locked_by, context): (i32, Option<String>, String) = sqlx::query_as(
+            "SELECT error_count, locked_by, context FROM jobs WHERE context = 'shared-quick'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(error_count, 0, "the quick row must never be charged");
+        assert!(locked_by.is_none(), "the quick row must never be claimed");
+        assert_eq!(
+            context, "shared-quick",
+            "the quick row must never be dispatched"
+        );
+        token.cancel();
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    }
+
+    /// DEV-2431: a hung holder on a shared key must free the SHARED slot at
+    /// `MAX_RUNTIME` expiry so a different type on the key can run. Two
+    /// workers (a single worker serializes attempts, making the test
+    /// vacuous); the quick row is enqueued only after the holder provably
+    /// starts.
+    #[sqlx::test]
+    async fn test_shared_key_hung_holder_frees_slot_on_max_runtime_expiry(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        let config = test_config(
+            ConcurrencyTracker::isolated(),
+            // Nonzero drain: on cancel a worker may be mid re-hang on the
+            // backed-off hung row; its 2s MAX_RUNTIME resolves inside the
+            // drain window (mirrors the capped test).
+            Duration::from_secs(5),
+        );
+        SharedHungJob
+            .enqueue(state.clone(), "shared-hung".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                tokio::spawn(job_worker(
+                    state.clone(),
+                    Jobs,
+                    Duration::from_millis(20),
+                    20,
+                    token.clone(),
+                    config.clone(),
+                ))
+            })
+            .collect();
+        // If the quick row were claimable before the holder started, the
+        // test would prove nothing — wait for the holder's marker first.
+        wait_for(|| async {
+            let started: Option<String> = sqlx::query_scalar(
+                "SELECT context FROM jobs WHERE name = 'SharedHungJob' \
+                 AND context = 'started-shared-hung'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            started.is_some().then_some(())
+        })
+        .await;
+        SharedQuickJob
+            .enqueue(state.clone(), "shared-quick".into(), None)
+            .await
+            .unwrap();
+        // Absence window: the 2s MAX_RUNTIME means the quick marker cannot
+        // legitimately appear inside 1s of its enqueue (~1s of margin even
+        // if a loaded runner observed the start a few hundred ms late);
+        // under per-type scoping the free worker claims the quick row
+        // within ~100ms and this assert fires.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_probe WHERE marker = 'shared-quick-ran'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 0,
+                "the shared budget must stay held through the window"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // The expiry frees the shared slot; the quick row now runs.
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_probe WHERE marker = 'shared-quick-ran'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        // The hung attempt was charged through the MAX_RUNTIME expiry path:
+        // the message names the runtime limit. error_count >= 1 rather than
+        // == 1: a slow machine can reclaim the backed-off row and charge it
+        // again before this poll.
+        wait_for(|| async {
+            let row: Option<(i32, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT error_count, locked_by, last_error_message
+                 FROM jobs WHERE name = 'SharedHungJob' AND context = 'started-shared-hung'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            let (count, owner, message) = row?;
+            (count >= 1
+                && owner.is_none()
+                && message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("max runtime")))
+            .then_some(())
+        })
+        .await;
+        token.cancel();
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    }
+
+    /// DEV-2431: a claim that raced a same-process worker for the last slot
+    /// of a SHARED key (unsaturated at claim time, saturated by admission
+    /// time) must be released uncharged without dispatching the body.
+    /// Deterministic by construction: claim with an empty tracker, hold the
+    /// shared scope from the test, then `run_next_job`.
+    #[sqlx::test]
+    async fn test_shared_key_claim_race_loser_releases_uncharged(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        let tracker = ConcurrencyTracker::isolated();
+        let worker = Worker::new(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            test_config(tracker.clone(), Duration::ZERO),
+        )
+        .unwrap();
+        SharedQuickJob
+            .enqueue(test_state(db.clone()), "shared-quick".into(), None)
+            .await
+            .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().expect("claim");
+        // The racing winner takes the last shared slot between our claim
+        // and our admission.
+        let _winner = tracker
+            .try_acquire(
+                ConcurrencyScope::Shared("archive".to_owned()),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .expect("shared slot free");
+        let outcome = worker.run_next_job(claimed).await.unwrap();
+        assert!(matches!(outcome, RunJobOutcome::Released(_)));
+        let (error_count, locked_by, locked_at, context): (
+            i32,
+            Option<String>,
+            Option<jiff_sqlx::Timestamp>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT error_count, locked_by, locked_at, context \
+             FROM jobs WHERE name = 'SharedQuickJob'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(error_count, 0, "a refused claim is never charged");
+        assert!(locked_by.is_none() && locked_at.is_none(), "row released");
+        assert_eq!(context, "shared-quick", "body never dispatched");
+    }
+
+    /// DEV-2431: job types declaring the same shared key with conflicting
+    /// limits fail worker build. `Worker` does not derive `Debug`, so
+    /// `unwrap_err` does not compile — use let-else. Same key + same limit
+    /// is legal: the main tests registry (four types on "archive", all
+    /// limit 1) must still build.
+    #[sqlx::test]
+    async fn test_shared_key_conflicting_limits_fail_worker_build(db: sqlx::PgPool) {
+        let state = test_state(db.clone());
+        let Err(error) = Worker::new(
+            state.clone(),
+            shared_conflict_jobs::Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        ) else {
+            panic!("conflicting shared-key limits must fail worker build");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("conflicting limits"), "{message}");
+        assert!(
+            message.contains("ConflictAJob") && message.contains("ConflictBJob"),
+            "{message}"
+        );
+        assert!(message.contains('1') && message.contains('2'), "{message}");
+        Worker::new(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+    }
+
+    /// DEV-2431: a body that moves its slot into `spawn_blocking` holds the
+    /// shared budget until that blocking work ENDS, past its own attempt
+    /// (row already deleted). The detached `JoinHandle` is the mechanism,
+    /// not a bug — awaiting it would re-couple the hold to the attempt.
+    #[sqlx::test]
+    async fn test_slot_extension_holds_shared_slot_for_blocking_work(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        let config = test_config(ConcurrencyTracker::isolated(), Duration::ZERO);
+        BlockingHoldJob
+            .enqueue(state.clone(), "blocking".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            config,
+        ));
+        // By the time this marker is visible the attempt may still be
+        // finalizing, but the closure is provably holding its clone — the
+        // only remaining handle once the worker's own drops.
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_probe WHERE marker = 'blocking-started'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        SharedQuickJob
+            .enqueue(test_state(db.clone()), "shared-quick".into(), None)
+            .await
+            .unwrap();
+        // 1.5s is half the closure's 3s sleep — margin both ways on a
+        // loaded runner — while a claim-poll cycle is tens of ms.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            let (locked_by, context): (Option<String>, String) =
+                sqlx::query_as("SELECT locked_by, context FROM jobs WHERE name = 'SharedQuickJob'")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            let markers: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_probe WHERE marker = 'shared-quick-ran'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert!(
+                locked_by.is_none() && context == "shared-quick" && markers == 0,
+                "the extended hold must keep the shared budget saturated"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // The closure ends, the hold releases, and the quick row claims and
+        // runs — proving the hold outlives the attempt AND releases when
+        // the blocking work ends.
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_probe WHERE marker = 'blocking-finished'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_probe WHERE marker = 'shared-quick-ran'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn test_concurrency_tracker_counts_and_releases() {
+        let tracker = ConcurrencyTracker::isolated();
+        let cap = NonZeroUsize::new(1).unwrap();
+        // The two scope kinds are separate namespaces: a shared key spelled
+        // like a job type name is a different budget from that type's
+        // implicit per-type scope.
+        let type_scope = ConcurrencyScope::Type("X".to_owned());
+        let shared_scope = ConcurrencyScope::Shared("X".to_owned());
+        assert_eq!(tracker.running(&type_scope), 0);
+        let first = tracker
+            .try_acquire(type_scope.clone(), cap)
+            .expect("first slot");
+        assert_eq!(tracker.running(&type_scope), 1);
+        assert!(
+            tracker.try_acquire(type_scope.clone(), cap).is_none(),
+            "saturated"
+        );
+        let shared = tracker
+            .try_acquire(shared_scope.clone(), cap)
+            .expect("a shared scope spelled like a type name is a different budget");
+        assert_eq!(tracker.running(&type_scope), 1);
+        assert_eq!(tracker.running(&shared_scope), 1);
+        drop(shared);
+        assert_eq!(tracker.running(&shared_scope), 0, "guard releases on drop");
+        drop(first);
+        assert_eq!(tracker.running(&type_scope), 0, "guard releases on drop");
+        // Bind, don't inline in assert!: a temporary guard drops at the end
+        // of the assert statement, releasing the slot early.
+        let second = tracker
+            .try_acquire(type_scope.clone(), cap)
+            .expect("reusable");
+        // A clone is another handle on the SAME counted unit: the count
+        // releases only when the last handle drops.
+        let clone = second.clone();
+        drop(second);
+        assert_eq!(
+            tracker.running(&type_scope),
+            1,
+            "a surviving clone keeps the slot held"
+        );
+        assert!(
+            tracker.try_acquire(type_scope.clone(), cap).is_none(),
+            "still saturated while a clone holds the slot"
+        );
+        // An untracked guard is inert — nothing counted, nothing released.
+        drop(ConcurrencySlot::untracked());
+        assert_eq!(
+            tracker.running(&type_scope),
+            1,
+            "untracked guard must not touch counts; clone still held"
+        );
+        drop(clone);
+        assert_eq!(tracker.running(&type_scope), 0);
+    }
+
     #[sqlx::test]
     async fn test_panicking_job_is_charged_and_worker_continues(db: sqlx::PgPool) {
         sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
@@ -1423,6 +2847,7 @@ mod tests {
                 reclaim_window: Duration::from_millis(1200),
                 shutdown_drain_timeout: Duration::ZERO,
                 idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
             },
         ));
         wait_for(|| async {
@@ -1447,6 +2872,146 @@ mod tests {
             (count == 1).then_some(())
         })
         .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// DEV-2423 regression: a body that awaits forever must be dropped at its
+    /// `MAX_RUNTIME`, charged as a retryable failure with the limit in the
+    /// error message, and released (no lingering lock); the same worker must
+    /// then claim a second job. Without enforcement, heartbeats keep the lease
+    /// forever and this test times out in `wait_for`.
+    #[sqlx::test]
+    async fn test_max_runtime_drops_hung_job_and_worker_continues(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        HungJob
+            .enqueue(state.clone(), "hung".into(), None)
+            .await
+            .unwrap();
+        NormalProbeJob
+            .enqueue(state.clone(), "normal".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
+            },
+        ));
+        wait_until_started(&db, HungJob::NAME).await;
+        // 2s limit + finalization, well inside the 10s wait_for cap.
+        type Row = (
+            i32,
+            Option<String>,
+            Option<String>,
+            Option<jiff_sqlx::Timestamp>,
+            f64,
+        );
+        let row: Row = wait_for(|| async {
+            let row: Option<Row> = sqlx::query_as(
+                "SELECT error_count, locked_by, last_error_message, locked_at,
+                        EXTRACT(EPOCH FROM run_at - NOW())::double precision
+                 FROM jobs WHERE name = 'HungJob'",
+            )
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+            row.filter(|(count, owner, message, locked_at, _)| {
+                *count == 1
+                    && owner.is_none()
+                    && locked_at.is_none()
+                    && message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("max runtime") && m.contains("2s"))
+            })
+        })
+        .await;
+        assert!(
+            row.4 > 0.0,
+            "a timed-out attempt must be retried later (run_at in the future), got {}s",
+            row.4
+        );
+        // The freed worker claims the second job.
+        wait_for(|| async {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_probe")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            (count == 1).then_some(())
+        })
+        .await;
+        token.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// DEV-2423: the limit is per job TYPE. A body that outlives a
+    /// neighbour type's short limit (2s) but stays under its own larger
+    /// `MAX_RUNTIME` (10s) completes normally: the row is deleted after one
+    /// uncharged attempt (`error_count` 0 at body time, nothing in
+    /// `dead_letter_jobs`).
+    #[sqlx::test]
+    async fn test_max_runtime_body_past_neighbour_limit_completes(db: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE job_probe (marker text NOT NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(db.clone());
+        SlowJob
+            .enqueue(state.clone(), "slow".into(), None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(job_worker(
+            state,
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            token.clone(),
+            JobWorkerConfig {
+                heartbeat_interval: Duration::from_millis(300),
+                reclaim_window: Duration::from_millis(1200),
+                shutdown_drain_timeout: Duration::ZERO,
+                idle_poll_gate: None,
+                type_concurrency: ConcurrencyTracker::isolated(),
+            },
+        ));
+        // 3s body + finalization, well inside the 10s wait_for cap.
+        wait_for(|| async {
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE name = 'SlowJob'")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            (remaining == 0).then_some(())
+        })
+        .await;
+        let marker: String = sqlx::query_scalar("SELECT marker FROM job_probe")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(marker, "error_count=0");
+        let dead_lettered: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs WHERE name = 'SlowJob'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            dead_lettered, 0,
+            "a successful attempt must not dead-letter"
+        );
         token.cancel();
         handle.await.unwrap().unwrap();
     }
@@ -1476,6 +3041,7 @@ mod tests {
                     reclaim_window: Duration::from_millis(1200),
                     shutdown_drain_timeout: Duration::ZERO,
                     idle_poll_gate: None,
+                    type_concurrency: ConcurrencyTracker::isolated(),
                 },
             ));
             let count: i32 = wait_for(|| async {
@@ -1809,7 +3375,7 @@ mod tests {
             .unwrap()
             .expect("worker must not error");
 
-        let locks: (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        let locks: (Option<String>, Option<jiff_sqlx::Timestamp>) =
             sqlx::query_as("SELECT locked_by, locked_at FROM jobs WHERE name = $1")
                 .bind(YieldingJob::NAME)
                 .fetch_one(&db)
@@ -1817,7 +3383,7 @@ mod tests {
                 .unwrap();
         assert!(locks.0.is_none(), "yield must unlock the row");
         assert!(locks.1.is_none(), "yield must clear locked_at");
-        let charges: (i32, Option<String>, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        let charges: (i32, Option<String>, jiff_sqlx::Timestamp) = sqlx::query_as(
             "SELECT error_count, last_error_message, run_at FROM jobs WHERE name = $1",
         )
         .bind(YieldingJob::NAME)
@@ -1830,7 +3396,7 @@ mod tests {
             "yield must not record an error message"
         );
         assert!(
-            charges.2 <= chrono::Utc::now(),
+            charges.2.to_jiff() <= jiff::Timestamp::now(),
             "yield leaves run_at immediately claimable, not backed off"
         );
         let dead_letters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs")
@@ -2193,7 +3759,7 @@ mod tests {
 
         let outcome = worker.run_next_job(claimed).await.unwrap();
         assert!(
-            matches!(&outcome, RunJobOutcome::Completed(Err(_))),
+            matches!(&outcome, RunJobOutcome::Completed(result) if result.is_err()),
             "an unknown row past its age limit must dead-letter"
         );
 
@@ -2601,7 +4167,7 @@ mod tests {
             .unwrap(),
         );
         let claimed = worker.fetch_next_job().await.unwrap().unwrap();
-        let initial: chrono::DateTime<chrono::Utc> =
+        let initial: jiff_sqlx::Timestamp =
             sqlx::query_scalar("SELECT locked_at FROM jobs WHERE job_id = $1")
                 .bind(claimed.job.job_id)
                 .fetch_one(&db)
@@ -2615,7 +4181,7 @@ mod tests {
         });
         wait_until_started(&db, LongJob::NAME).await;
         let advanced = wait_for(|| async {
-            let current: chrono::DateTime<chrono::Utc> =
+            let current: jiff_sqlx::Timestamp =
                 sqlx::query_scalar("SELECT locked_at FROM jobs WHERE name = 'LongJob'")
                     .fetch_one(&db)
                     .await
@@ -2638,7 +4204,7 @@ mod tests {
             assert!(competitor.fetch_next_job().await.unwrap().is_none());
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let row: (i32, chrono::DateTime<chrono::Utc>) =
+        let row: (i32, jiff_sqlx::Timestamp) =
             sqlx::query_as("SELECT error_count, locked_at FROM jobs WHERE name = 'LongJob'")
                 .fetch_one(&db)
                 .await
@@ -3523,12 +5089,23 @@ mod idle_gate_tests {
     async fn pool_failure_releases_permits_before_backoff(db: sqlx::PgPool) {
         use sqlx::postgres::PgPoolOptions;
         setup(&db).await;
+        // The 100ms acquire timeout is for waiting on a busy pool, not for
+        // opening connections: a loaded CI runner can take longer than that
+        // to connect. Open both connections up front, then start the workers.
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .acquire_timeout(Duration::from_millis(100))
-            .connect_with((*db.connect_options()).clone())
-            .await
-            .unwrap();
+            .connect_lazy_with((*db.connect_options()).clone());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut opened = Vec::new();
+            while opened.len() < 2 {
+                if let Ok(conn) = pool.acquire().await {
+                    opened.push(conn);
+                }
+            }
+        })
+        .await
+        .expect("pool opens both connections");
         let gate = IdlePollGate::new(NonZeroUsize::new(2).unwrap());
         let state = make_state(pool.clone(), gate.clone());
         let workers = Workers::start(&state, 100, Duration::from_millis(200), true);

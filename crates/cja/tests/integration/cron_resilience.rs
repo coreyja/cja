@@ -38,8 +38,13 @@ async fn callback_error_does_not_end_the_worker_or_stop_sibling_crons(pool: sqlx
     });
     let shutdown = CancellationToken::new();
     let worker_task = tokio::spawn(
-        Worker::new_with_timezone(state, registry, chrono_tz::UTC, Duration::from_millis(25))
-            .run(shutdown.clone()),
+        Worker::new_with_timezone(
+            state,
+            registry,
+            jiff::tz::TimeZone::UTC,
+            Duration::from_millis(25),
+        )
+        .run(shutdown.clone()),
     );
 
     // Fixture control: the failing cron fires within one tick regardless of
@@ -101,8 +106,13 @@ async fn unreadable_crons_table_skips_ticks_and_recovers(pool: sqlx::PgPool) {
     );
     let shutdown = CancellationToken::new();
     let worker_task = tokio::spawn(
-        Worker::new_with_timezone(state, registry, chrono_tz::UTC, Duration::from_millis(25))
-            .run(shutdown.clone()),
+        Worker::new_with_timezone(
+            state,
+            registry,
+            jiff::tz::TimeZone::UTC,
+            Duration::from_millis(25),
+        )
+        .run(shutdown.clone()),
     );
     // Negative assertion: a fixed settle over ~10 poll periods proves no fire
     // happened while the table was gone. It cannot be polled — waiting for a

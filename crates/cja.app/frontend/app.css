@@ -403,3 +403,52 @@ section {
         transform: translateY(0);
     }
 }
+
+/* Status page */
+
+.status h3 {
+    margin: 48px 0 16px;
+}
+
+.status-summary {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 24px;
+}
+
+@media (max-width: 768px) {
+    .status-summary {
+        grid-template-columns: 1fr;
+    }
+}
+
+.status-stat {
+    background: var(--dark-surface);
+    border: 1px solid var(--dark-elevated);
+    border-radius: 12px;
+    padding: 24px;
+}
+
+.status-stat h4 {
+    color: var(--berry);
+    margin-bottom: 8px;
+}
+
+.status-detail {
+    color: var(--lavender-dim);
+    font-size: 0.9rem;
+}
+
+.status-list {
+    list-style: none;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+}
+
+.status-list li {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 24px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--dark-elevated);
+}

@@ -1,13 +1,22 @@
 //! The generic advancement job.
 
-use cja::jobs::{CancellationToken, Job};
+use cja::jobs::{CancellationToken, ConcurrencySlot, Job};
 use uuid::Uuid;
 
 use super::HasDurable;
 
-/// Advance one agent run. Payload is just the run id: kind, input, and model
-/// are read from the row. Registered in an app's `impl_job_registry!` as the
-/// plain struct — no type parameter.
+/// Advance one agent run — exactly ONE step per job attempt (a model
+/// call, a tool batch, or an ask suspension). The step's final persist
+/// enqueues the next-step job and releases the run lease in the SAME
+/// transaction, reusing any surviving unlocked row for the run so
+/// duplicates converge instead of multiplying. The run advances as a
+/// chain of short attempts, each bounded like any other job — a
+/// per-job-type runtime limit needs no special case or `None` exception
+/// once cja#93 / DEV-2423 lands it. Terminal and waiting states (done,
+/// failed, cancelled, waiting on ask) enqueue nothing. Payload is just
+/// the run id: kind, input, and model are read from the row. Registered
+/// in an app's `impl_job_registry!` as the plain struct — no type
+/// parameter.
 ///
 /// A queued payload can survive a deploy: any field added later must land
 /// with `#[serde(default)]`, or old rows fail to deserialize and dead-letter
@@ -34,8 +43,12 @@ impl<S: HasDurable> Job<S> for AdvanceRunJob {
     const NAME: &'static str = Self::NAME;
 
     async fn run(&self, state: S) -> cja::color_eyre::Result<()> {
-        self.run_with_cancellation(state, CancellationToken::new())
-            .await
+        self.run_with_cancellation(
+            state,
+            CancellationToken::new(),
+            ConcurrencySlot::untracked(),
+        )
+        .await
     }
 
     /// `token` is the worker's shutdown token (`run_job` forwards it): what
@@ -46,6 +59,7 @@ impl<S: HasDurable> Job<S> for AdvanceRunJob {
         &self,
         state: S,
         cancellation_token: CancellationToken,
+        _slot: cja::jobs::ConcurrencySlot,
     ) -> cja::color_eyre::Result<()> {
         state
             .durable()

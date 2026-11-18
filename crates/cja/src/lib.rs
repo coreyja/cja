@@ -156,8 +156,8 @@
 //! use cja::uuid;
 //! use cja::color_eyre;
 //! use cja::maud;
-//! use cja::chrono;
-//! use cja::chrono_tz;
+//! use cja::jiff;
+//! use cja::jiff_sqlx;
 //! ```
 
 pub use eyes_subscriber;
@@ -185,5 +185,5 @@ pub use maud;
 pub mod db;
 pub mod tasks;
 
-pub use chrono;
-pub use chrono_tz;
+pub use jiff;
+pub use jiff_sqlx;
