@@ -93,6 +93,15 @@ impl fmt::Display for SyncReport {
             self.updated.len(),
             self.deleted.len()
         )?;
+        for (action, keys) in [
+            ("created", &self.created),
+            ("updated", &self.updated),
+            ("deleted", &self.deleted),
+        ] {
+            for key in keys {
+                writeln!(f, "{action}: {key}")?;
+            }
+        }
         for warning in &self.skipped {
             writeln!(f, "warning: {warning}")?;
         }
@@ -467,13 +476,28 @@ async fn alerts(
             {
                 continue;
             }
-            api.write(Method::PATCH, &alert_path(&row)?, &body, &tag)
+            let response = api
+                .write(Method::PATCH, &alert_path(&row)?, &body, &tag)
                 .await?;
+            if alert_key(response["name"].as_str().unwrap_or_default(), app) != Some(a.id.as_str())
+            {
+                return Err(SyncError::TagNotPersisted {
+                    object: tag.clone(),
+                    tag,
+                });
+            }
             r.updated.push(tag);
         } else {
             // Creation requires a subscriber list. Only an operator edits it afterwards.
             body["subscribed_users"] = json!([]);
-            api.write(Method::POST, "alerts/", &body, &tag).await?;
+            let response = api.write(Method::POST, "alerts/", &body, &tag).await?;
+            if alert_key(response["name"].as_str().unwrap_or_default(), app) != Some(a.id.as_str())
+            {
+                return Err(SyncError::TagNotPersisted {
+                    object: tag.clone(),
+                    tag,
+                });
+            }
             r.created.push(tag);
         }
     }

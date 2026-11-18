@@ -255,7 +255,42 @@ async fn prune_preserves_other_apps_and_hand_tiles() {
             .unwrap()
             .contains(&json!({"id":12346,"insight":999}))
     );
-    m.sync("demo", &Declarations::new()).await.unwrap();
+    let report = m.sync("demo", &Declarations::new()).await.unwrap();
+    assert!(
+        report
+            .deleted
+            .contains(&"cja:demo:dashboard:activity".into())
+    );
+    assert!(
+        report
+            .deleted
+            .iter()
+            .any(|k| k.starts_with("cja:demo:alert:"))
+    );
+    let writes = m.log();
+    assert!(
+        writes
+            .iter()
+            .any(|(method, path, body)| method == Method::PATCH
+                && path.starts_with("dashboards/")
+                && body == &json!({"deleted":true}))
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(method, path, _)| method == Method::DELETE
+                && path.starts_with("alerts/")
+                && !path.contains("custom"))
+    );
+    assert!(
+        !writes
+            .iter()
+            .any(|(method, path, _)| method == Method::DELETE
+                && (path.starts_with("insights/") || path.starts_with("dashboards/")))
+    );
+    assert!(!writes.iter().any(|(method, path, _)| method != Method::GET
+        && (path == "insights/999/" || path == "alerts/custom/")));
+
     let d = example::declarations().unwrap();
     m.sync("demo", &d).await.unwrap();
     assert_ne!(old, m.row("cja:demo:insight:pages")["id"]);
