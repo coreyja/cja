@@ -1,16 +1,29 @@
 //! The durable worker: drives rig's sans-I/O `AgentRun` one step at a time,
 //! persisting after every state transition.
 //!
-//! The runner (`AgentRunner`) cannot hand its `AgentRun` back, so this module
-//! replays the runner's driving protocol itself (mirroring
-//! `rig-agent/src/agent/engine.rs`): `next_step()` → `CallModel` (prepare,
-//! advertise, `model.call`, `model_response`) → `CallTools` (execute via the
-//! built agent's toolset, `run.answer`) → `Done`. Every `Err` return from the
-//! job goes through [`Durable::retry_or_requeue`]: after persisted progress
-//! it hands the run to a fresh job row, otherwise it releases the lease and
-//! errors so cja's backoff retries the same row — except a deploy-shutdown
-//! notice, which returns [`cja::jobs::JobYield`] and is released uncharged
-//! and immediately claimable by a post-deploy worker.
+//! **One `AdvanceRunJob` attempt advances exactly one step** — one model
+//! call, one tool batch, or one ask suspension. The step's final persist
+//! (`Attempt::persist_step_end`) commits the step's state, the run's
+//! NEXT-STEP job row (deduplicating against an existing unlocked row for
+//! the run so duplicate rows converge instead of multiplying into parallel
+//! chains), and the lease release in ONE transaction, then wakes the
+//! worker; the attempt returns `Ok`. Terminal and waiting states (done,
+//! failed, cancelled, waiting on ask) enqueue nothing. Each attempt is
+//! bounded like any other job — a deploy or shutdown interrupts at most one
+//! step, and queued next-step rows survive it.
+//!
+//! `AgentRunner` cannot hand its `AgentRun` back, so this module replays
+//! the runner's driving protocol (mirroring `rig-agent/src/agent/engine.rs`):
+//! `next_step()` → `CallModel` (prepare, advertise, `model.call`,
+//! `model_response`) → `CallTools` (execute via the built agent's toolset,
+//! `run.answer`) → `Done`. Every `Err` return from the job goes through
+//! [`Durable::retry_or_requeue`]. After persisted progress (now only
+//! the mid-batch case — an early tool answer persisted with progress, then a
+//! retryable error on a later call in the same batch), it hands the run to
+//! a fresh job row. Otherwise, it releases the lease and errors so cja's
+//! backoff retries the same row — except on a deploy-shutdown notice, which
+//! returns [`cja::jobs::JobYield`] and is released uncharged and
+//! immediately claimable by a post-deploy worker.
 //!
 //! No panics or unwraps anywhere on this path: a panic is caught by cja's
 //! worker and retried 20× into dead-letter on a permanent condition,
@@ -44,12 +57,18 @@ const WRITE_BOUND: Duration = Duration::from_secs(5);
 /// default 2s `shutdown_drain_timeout`.
 const RELEASE_BOUND: Duration = Duration::from_secs(1);
 
-/// The outcome of one step for the outer driver loop.
+/// Outcome of a step helper for the attempt driver.
 enum StepOutcome {
-    /// Call `next_step()` again.
+    /// Persisted, keep going WITHIN this step (the pre-call checkpoint, a
+    /// non-final tool answer in a batch). Never escapes a step helper:
+    /// every step path ends in a handoff, a terminal, or a `Retry`.
     Continue,
-    /// The job attempt ends successfully (terminal, suspended, cancelled, or
-    /// ownership lost — nothing more for this attempt to do).
+    /// The step completed, and its end-persist committed the next-step job
+    /// row and released the lease — the attempt ends `Ok`. Returned only
+    /// by [`Attempt::persist_step_end`]'s commit branch.
+    HandedOff,
+    /// The job attempt ends successfully without a successor (terminal,
+    /// suspended, cancelled, or ownership lost — nothing more to do).
     Done,
     /// The job attempt fails: cja backs off and retries.
     Retry(cja::color_eyre::Report),
@@ -110,6 +129,18 @@ impl RunSnapshot {
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
         }
+    }
+}
+
+/// Map a next-step enqueue failure to `sqlx::Error` so the step-end
+/// transaction keeps one error type. Enqueue helpers only produce
+/// [`super::RunError::Storage`]; any other variant is impossible here and
+/// is preserved as a protocol error (still an attempt `Retry`, never a
+/// silent loss).
+fn run_error_into_sqlx(error: super::RunError) -> sqlx::Error {
+    match error {
+        super::RunError::Storage(e) => e,
+        other => sqlx::Error::Protocol(other.to_string()),
     }
 }
 
@@ -369,17 +400,28 @@ impl Durable {
         })
     }
 
-    /// Advance one run as a cja job attempt. Never in the request path;
-    /// `shutdown` is the worker's shutdown token (deploys), a different
-    /// signal from user cancellation. Takes the app state so a
-    /// progress-separated retryable error can enqueue a fresh job row and
-    /// wake the worker ([`Self::retry_or_requeue`]).
+    /// Advance a run ONE STEP as a cja job attempt: claim, execute one
+    /// step (`CallModel`, `CallTools`, or `Done`), and return.
+    /// `Attempt::persist_step_end` has either committed the next-step
+    /// job and released the lease, or the state was terminal/waiting and
+    /// nothing was enqueued. Never called in the request path.
+    /// `shutdown` is the worker's shutdown token (for deploys), distinct
+    /// from user cancellation. Takes the app state so step helpers can
+    /// enqueue the next-step job row and wake the worker, and so a
+    /// progress-separated retryable error can enqueue a fresh job row
+    /// ([`Self::retry_or_requeue`]).
     pub(crate) async fn advance_run<S: super::HasDurable>(
         &self,
         state: &S,
         run_id: Uuid,
         shutdown: CancellationToken,
     ) -> cja::color_eyre::Result<()> {
+        // Deploy shutdown noticed before claiming: no lease is held, so
+        // the `JobYield` makes cja release the row uncharged — never a
+        // silent `Ok`, which would delete the row with the step unrun.
+        if shutdown.is_cancelled() {
+            return Err(cja::jobs::JobYield::new("shutdown requested before claim").into());
+        }
         let db = state.db();
         let me = Uuid::new_v4().to_string();
         // Every Err exit from claim validation releases the lease first: the
@@ -409,77 +451,71 @@ impl Durable {
         // builder and the wire call can never disagree.
         let attempt = self.attempt(db, run_id, &me, kind, &row.model, shutdown);
 
-        loop {
-            // Between-steps shutdown boundary (deploy): abort, release, and
-            // either requeue on a fresh row (progress was made) or yield so
-            // cja releases the row uncharged — the run resumes at the last
-            // persist. A shutdown never marks the run cancelled or failed.
-            if attempt.shutdown.is_cancelled() {
-                return self
-                    .retry_or_requeue(
-                        state,
-                        &attempt,
-                        cja::jobs::JobYield::new("shutdown requested between steps").into(),
-                    )
-                    .await;
-            }
-
-            let step = match run.next_step() {
-                Ok(step) => step,
-                Err(error) => {
-                    let (reason, message) = sanitize_prompt_error(&error);
-                    match attempt.fail_terminal(&run, reason, message).await {
-                        // The terminal write failed: release and let cja
-                        // retry — returning Ok would delete the only job
-                        // row while the run is still `running` under our
-                        // lease.
-                        StepOutcome::Retry(e) => {
-                            return self.fail_retryable(db, run_id, &me, e).await;
-                        }
-                        _ => return Ok(()),
+        let step = match run.next_step() {
+            Ok(step) => step,
+            Err(error) => {
+                let (reason, message) = sanitize_prompt_error(&error);
+                match attempt.fail_terminal(&run, reason, message).await {
+                    // The terminal write failed: release and let cja
+                    // retry — returning Ok would delete the only job
+                    // row while the run is still `running` under our
+                    // lease.
+                    StepOutcome::Retry(e) => {
+                        return self.fail_retryable(db, run_id, &me, e).await;
                     }
+                    _ => return Ok(()),
                 }
-            };
-
-            let outcome = match step {
-                AgentRunStep::CallModel {
-                    prompt,
-                    history,
-                    turn,
-                } => {
-                    attempt
-                        .call_model_step(&mut run, prompt, history, turn)
-                        .await
-                }
-                AgentRunStep::CallTools { calls } => {
-                    // One span per run step — tool executions and ask
-                    // suspensions included — with the same content-free
-                    // fields as the model steps.
-                    let usage = run.usage();
-                    let span = tracing::info_span!(
-                        "agent_run.step",
-                        run.id = %run_id,
-                        run.kind = kind.name,
-                        run.turn = run.turn(),
-                        run.input_tokens = usage.input_tokens.unwrap_or(0),
-                        run.output_tokens = usage.output_tokens.unwrap_or(0),
-                    );
-                    attempt
-                        .call_tools_step(&mut run, calls)
-                        .instrument(span)
-                        .await
-                }
-                AgentRunStep::Done(response) => attempt.done_step(&run, response.output()).await,
-            };
-            match outcome {
-                StepOutcome::Continue => {}
-                StepOutcome::Done => return Ok(()),
-                StepOutcome::Retry(error) => {
-                    return self.retry_or_requeue(state, &attempt, error).await;
-                }
-                #[cfg(feature = "testing")]
-                StepOutcome::Injected(error) => return Err(error),
             }
+        };
+
+        let outcome = match step {
+            AgentRunStep::CallModel {
+                prompt,
+                history,
+                turn,
+            } => {
+                attempt
+                    .call_model_step(state, &mut run, prompt, history, turn)
+                    .await
+            }
+            AgentRunStep::CallTools { calls } => {
+                // One span per run step — tool executions and ask
+                // suspensions included — with the same content-free
+                // fields as the model steps.
+                let usage = run.usage();
+                let span = tracing::info_span!(
+                    "agent_run.step",
+                    run.id = %run_id,
+                    run.kind = kind.name,
+                    run.turn = run.turn(),
+                    run.input_tokens = usage.input_tokens.unwrap_or(0),
+                    run.output_tokens = usage.output_tokens.unwrap_or(0),
+                );
+                attempt
+                    .call_tools_step(state, &mut run, calls)
+                    .instrument(span)
+                    .await
+            }
+            AgentRunStep::Done(response) => attempt.done_step(&run, response.output()).await,
+        };
+        match outcome {
+            StepOutcome::HandedOff | StepOutcome::Done => Ok(()),
+            // Unreachable by construction (every step path ends in a
+            // handoff, a terminal, or a `Retry`): the guard makes the
+            // illegal state a retried error instead of a silent `Ok`
+            // that would delete the only row while the lease is held.
+            StepOutcome::Continue => {
+                self.fail_retryable(
+                    db,
+                    run_id,
+                    &me,
+                    cja::color_eyre::eyre::eyre!("step returned Continue without a handoff"),
+                )
+                .await
+            }
+            StepOutcome::Retry(error) => self.retry_or_requeue(state, &attempt, error).await,
+            #[cfg(feature = "testing")]
+            StepOutcome::Injected(error) => Err(error),
         }
     }
 
@@ -521,21 +557,24 @@ impl Durable {
     }
 
     /// A retryable error ended this attempt. If the attempt persisted at
-    /// least one ADVANCING step since it claimed, hand the run to a FRESH
-    /// job row instead of erroring: release + enqueue in one transaction,
-    /// wake the worker, return `Ok`. cja deletes the errored row on `Ok`,
-    /// and the fresh row starts at `error_count = 0` — so errors separated
-    /// by successful steps never escalate cja's `2^(n+1)`s backoff and
-    /// never dead-letter it through the error path (a shutdown
-    /// [`cja::jobs::JobYield`] takes this path released and uncharged).
-    /// Crashes and lost job leases still charge the same row via cja's
-    /// reclaim; a dead-lettered row orphans the run until
+    /// least one ADVANCING step since claiming (now only the mid-batch
+    /// case: an early tool answer persisted with progress, then a
+    /// retryable error on a later call in the same batch), hand the run
+    /// to a FRESH job row instead of erroring: release + enqueue in one
+    /// transaction, wake the worker, return `Ok`. cja deletes the errored
+    /// row on `Ok`, and the fresh row starts at `error_count = 0` — so
+    /// errors separated by successful steps never escalate cja's
+    /// `2^(n+1)`s backoff or dead-letter it through the error path (a
+    /// shutdown [`cja::jobs::JobYield`] takes this path released and
+    /// uncharged). Crashes and lost job leases still charge the same row
+    /// via cja's reclaim; a dead-lettered row orphans the run until
     /// [`super::recover_orphans`] re-enqueues it.
     /// Zero-progress attempts keep the plain `Err` path (release + cja
-    /// backoff): only consecutive no-progress failures may escalate. A
-    /// crash between this transaction's commit and cja's delete of the old
-    /// row leaves a duplicate — already handled by the claim protocol: the
-    /// duplicate backs off on `Leased` or no-ops on `NothingToDo`.
+    /// backoff): only consecutive no-progress failures escalate. A crash
+    /// between this transaction's commit and cja's delete of the old row
+    /// leaves a duplicate — duplicates converge because every next-step
+    /// enqueue reuses an existing unlocked row for the run
+    /// ([`super::enqueue_next_step_on_tx`]).
     async fn retry_or_requeue<S: super::HasDurable>(
         &self,
         state: &S,
@@ -553,10 +592,13 @@ impl Durable {
 
     /// Release the lease and enqueue a fresh [`super::AdvanceRunJob`] in
     /// ONE transaction, then wake the worker (cja deletes the errored row
-    /// on the caller's `Ok`). Bounded by the lease-write bound; `false` on
-    /// any failure or timeout so the caller falls back to the plain
-    /// release + `Err` path — recovery is then bounded by lease takeover,
-    /// never an orphan.
+    /// on the caller's `Ok`). The enqueue is dedup-aware
+    /// ([`super::enqueue_next_step_on_tx`]): an unlocked row for the run
+    /// (e.g. a lost-delete duplicate) is pulled forward instead of
+    /// inserting a second carrier. Subject to the lease-write bound;
+    /// returns `false` on failure or timeout so the caller falls back to
+    /// the plain release + `Err` path — recovery is then bounded by lease
+    /// takeover, never an orphan.
     async fn requeue_with_fresh_job<S: super::HasDurable>(
         &self,
         state: &S,
@@ -568,7 +610,7 @@ impl Durable {
         let requeue = async {
             let mut tx = state.db().begin().await?;
             db::release_lease(&mut *tx, run_id, me).await?;
-            super::enqueue_on_tx::<S>(&mut tx, run_id, context).await?;
+            super::enqueue_next_step_on_tx::<S>(&mut tx, run_id, context).await?;
             tx.commit().await?;
             Ok::<(), cja::color_eyre::Report>(())
         };
@@ -780,30 +822,39 @@ impl Attempt<'_> {
         }
     }
 
-    /// Persist the run after a state transition, projecting any newly
-    /// committed messages, then check for user cancellation. When `advanced`
-    /// is set (this persist follows a committed model response or tool
-    /// answer — NOT the pre-call checkpoint) and the write lands, the
-    /// attempt is marked as having made progress.
+    /// Crash injection (testing only): die at persist ENTRY, before the
+    /// DB write — simulating process death between persists, so the
+    /// on-disk state is exactly the previous persist's. One-shot: re-armed
+    /// only by the test. Without the reset, a crash before the model call
+    /// would loop forever, as every resume repeats that persist. Shared by
+    /// `persist` and `persist_step_end` so the persist-count rhythm matches
+    /// production.
+    #[cfg(feature = "testing")]
+    fn inject_if_armed(&self) -> Option<StepOutcome> {
+        let count = self.durable.persist_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let armed = self.durable.fail_after_persist.load(Ordering::SeqCst);
+        (armed != 0 && armed == count).then(|| {
+            // Disarm only on fire (one-shot): a `swap` here would
+            // disarm on the first non-matching check and the injection
+            // would never fire for n > 1.
+            self.durable.fail_after_persist.store(0, Ordering::SeqCst);
+            StepOutcome::Injected(cja::color_eyre::eyre::eyre!(
+                "injected failure before persist"
+            ))
+        })
+    }
+
+    /// Persist the run after a state transition that does NOT end the
+    /// step (the pre-call checkpoint, a non-final tool answer in a batch,
+    /// and `done_step`'s pre-persist), projecting newly committed
+    /// messages, then check for user cancellation. When `advanced` is set
+    /// (this persist follows a committed model response or tool answer —
+    /// NOT the pre-call checkpoint) and the write lands, mark the attempt
+    /// as having made progress.
     async fn persist(&self, run: &AgentRun, advanced: bool) -> StepOutcome {
-        // Crash injection (testing only): die at persist ENTRY, before the
-        // DB write — simulating process death between persists, so the
-        // on-disk state is exactly the previous persist's. One-shot: re-armed
-        // only by the test. Without the reset, a crash before the model call
-        // would loop forever (every resume repeats that same persist).
         #[cfg(feature = "testing")]
-        {
-            let count = self.durable.persist_count.fetch_add(1, Ordering::SeqCst) + 1;
-            let armed = self.durable.fail_after_persist.load(Ordering::SeqCst);
-            if armed != 0 && armed == count {
-                // Disarm only on fire (one-shot): a `swap` here would
-                // disarm on the first non-matching check and the injection
-                // would never fire for n > 1.
-                self.durable.fail_after_persist.store(0, Ordering::SeqCst);
-                return StepOutcome::Injected(cja::color_eyre::eyre::eyre!(
-                    "injected failure before persist"
-                ));
-            }
+        if let Some(injected) = self.inject_if_armed() {
+            return injected;
         }
         let snap = match RunSnapshot::of(run) {
             Ok(snap) => snap,
@@ -813,10 +864,10 @@ impl Attempt<'_> {
             Ok(messages) => messages,
             Err(e) => return StepOutcome::Retry(e),
         };
-        let wrote = match tokio::time::timeout(
-            WRITE_BOUND,
-            db::persist_step(
-                self.db,
+        let wrote = match tokio::time::timeout(WRITE_BOUND, async {
+            let mut tx = self.db.begin().await?;
+            let outcome = db::persist_step_on_tx(
+                &mut tx,
                 self.run_id,
                 &self.me,
                 &snap.run_state,
@@ -824,8 +875,15 @@ impl Attempt<'_> {
                 snap.input_tokens,
                 snap.output_tokens,
                 &new_messages,
-            ),
-        )
+            )
+            .await?;
+            if outcome.is_some() {
+                tx.commit().await?;
+            }
+            // Lease lost (`None`): the transaction is dropped here —
+            // dropping it rolls back, and no write of ours lands.
+            Ok::<_, sqlx::Error>(outcome)
+        })
         .await
         {
             Err(_) => {
@@ -892,10 +950,146 @@ impl Attempt<'_> {
         }
     }
 
-    /// One `CallModel` step: prepare + advertise + persist-before-call +
-    /// guarded model call + `model_response` + persist + token budget.
-    async fn call_model_step(
+    /// Persist the completed step and hand the run to the next job attempt
+    /// in ONE transaction: conditional UPDATE (lease proof) + transcript
+    /// projection + next-step `AdvanceRunJob` enqueue (deduplicating
+    /// against an existing unlocked row for the run) + lease release;
+    /// commit; wake the worker only after commit. `Ok` lease-lost is a
+    /// silent stop, as everywhere. On `cancel_requested`, commit the state
+    /// WITHOUT an enqueue (lease kept) and finish the run `cancelled` via
+    /// [`Durable::finish_run`] — a cancelled run must never enqueue a next
+    /// step.
+    async fn persist_step_end<S: super::HasDurable>(
         &self,
+        state: &S,
+        run: &AgentRun,
+    ) -> StepOutcome {
+        #[cfg(feature = "testing")]
+        if let Some(injected) = self.inject_if_armed() {
+            return injected;
+        }
+        let snap = match RunSnapshot::of(run) {
+            Ok(snap) => snap,
+            Err(e) => return StepOutcome::Retry(e),
+        };
+        let new_messages = match project_messages(self.db, self.run_id, run).await {
+            Ok(messages) => messages,
+            Err(e) => return StepOutcome::Retry(e),
+        };
+        // The step-end transaction's outcome, distinct from the attempt's:
+        // everything after the commit runs OUTSIDE the WRITE_BOUND timeout.
+        enum StepEnd {
+            /// Persist + next-step enqueue + lease release all committed.
+            HandedOff,
+            /// The persist committed but the user asked to cancel; the
+            /// lease is kept and the caller finishes the run cancelled.
+            CancelRequested,
+            /// Lease lost: the transaction was discarded — a silent stop.
+            LeaseLost,
+        }
+        let context = format!("agent-run-step:{}", self.kind.name);
+        let end = {
+            let run_id = self.run_id;
+            let me = self.me.as_str();
+            let end_tx = async {
+                let mut tx = self.db.begin().await?;
+                let Some(cancel_requested) = db::persist_step_on_tx(
+                    &mut tx,
+                    run_id,
+                    me,
+                    &snap.run_state,
+                    snap.turns,
+                    snap.input_tokens,
+                    snap.output_tokens,
+                    &new_messages,
+                )
+                .await?
+                else {
+                    // Lease lost: discard the transaction (dropping it rolls
+                    // back) — the silent stop, as everywhere.
+                    return Ok(StepEnd::LeaseLost);
+                };
+                if cancel_requested {
+                    // Commit the step state WITHOUT enqueueing a next step
+                    // (a cancelled run must never enqueue one); the lease
+                    // stays with us for the finish write below.
+                    tx.commit().await?;
+                    return Ok(StepEnd::CancelRequested);
+                }
+                super::enqueue_next_step_on_tx::<S>(&mut tx, run_id, context)
+                    .await
+                    .map_err(run_error_into_sqlx)?;
+                db::release_lease(&mut *tx, run_id, me).await?;
+                tx.commit().await?;
+                Ok(StepEnd::HandedOff)
+            };
+            match tokio::time::timeout(WRITE_BOUND, end_tx).await {
+                Err(_) => {
+                    return StepOutcome::Retry(cja::color_eyre::eyre::eyre!(
+                        "step-end persist timed out"
+                    ));
+                }
+                Ok(Err(e)) => {
+                    // Unstorable content is permanent, exactly as in
+                    // `persist`; anything else (including an enqueue
+                    // failure — the whole transaction drops, persist
+                    // included) is a retryable attempt error.
+                    if db::unstorable_content(&e) {
+                        return match self
+                            .durable
+                            .fail_unstorable(self.db, self.run_id, &self.me, &e)
+                            .await
+                        {
+                            Ok(()) => StepOutcome::Done,
+                            Err(e) => StepOutcome::Retry(e),
+                        };
+                    }
+                    return StepOutcome::Retry(e.into());
+                }
+                Ok(Ok(end)) => end,
+            }
+        };
+        match end {
+            StepEnd::LeaseLost => StepOutcome::Done,
+            StepEnd::CancelRequested => {
+                // The step's state WAS committed: if the finish write
+                // fails below, `retry_or_requeue` must requeue (progress
+                // set), not plain-Err onto a row whose lease we hold.
+                self.progress.store(true, Ordering::SeqCst);
+                match self
+                    .durable
+                    .finish_run(
+                        self.db,
+                        self.run_id,
+                        &self.me,
+                        RunStatus::Cancelled,
+                        None,
+                        None,
+                        Some("cancelled by request".to_owned()),
+                        snap,
+                        Some(run),
+                    )
+                    .await
+                {
+                    Ok(()) => StepOutcome::Done,
+                    Err(e) => StepOutcome::Retry(e),
+                }
+            }
+            StepEnd::HandedOff => {
+                // Not a transaction-commit hook: wake only after commit —
+                // in BOTH the reuse and the insert branch.
+                state.job_enqueued();
+                StepOutcome::HandedOff
+            }
+        }
+    }
+
+    /// One `CallModel` step: prepare + advertise + persist-before-call +
+    /// guarded model call + `model_response` + token budget + step-end
+    /// handoff persist.
+    async fn call_model_step<S: super::HasDurable>(
+        &self,
+        state: &S,
         run: &mut AgentRun,
         prompt: std::sync::Arc<Message>,
         history: Vec<std::sync::Arc<Message>>,
@@ -912,13 +1106,14 @@ impl Attempt<'_> {
             run.input_tokens = usage.input_tokens.unwrap_or(0),
             run.output_tokens = usage.output_tokens.unwrap_or(0),
         );
-        self.call_model_step_inner(run, prompt, history, turn)
+        self.call_model_step_inner(state, run, prompt, history, turn)
             .instrument(span)
             .await
     }
 
-    async fn call_model_step_inner(
+    async fn call_model_step_inner<S: super::HasDurable>(
         &self,
+        state: &S,
         run: &mut AgentRun,
         prompt: std::sync::Arc<Message>,
         history: Vec<std::sync::Arc<Message>>,
@@ -1003,16 +1198,28 @@ impl Attempt<'_> {
                     };
                 }
                 // `TurnRetried` and `Continue` fall through: the corrective
-                // feedback is already committed; the outer loop's
-                // `next_step()` re-issues `CallModel`. (Never `continue` in
-                // a match on the outcome — it would re-match forever.)
+                // feedback is already committed; the step still ends with
+                // the handoff, and the re-issued `CallModel` (which
+                // consumes no turn) lands in the NEXT job attempt.
             }
         }
 
-        // The assistant message is now committed: persist it before anything
-        // else happens to the run.
-        match self.persist(run, true).await {
-            StepOutcome::Continue => {}
+        // The token-budget check MUST precede the handoff persist: the
+        // handoff releases the lease and enqueues a next step, after which
+        // `fail_terminal`'s finish write would match zero rows (a silent
+        // stop) — leaving a budget-exceeded run `running` with a next-step
+        // job that makes one more model call before failing.
+        if total_tokens(run) > self.kind.limits.max_total_tokens {
+            return self
+                .fail_terminal(run, FailReason::TokenBudget, "token budget exceeded")
+                .await;
+        }
+
+        // The assistant message is now committed: the step-end persist
+        // commits it, enqueues the run's next-step job, and releases the
+        // lease — one transaction.
+        match self.persist_step_end(state, run).await {
+            StepOutcome::HandedOff => {}
             other => return other,
         }
 
@@ -1023,20 +1230,18 @@ impl Attempt<'_> {
             run.output_tokens = usage.output_tokens.unwrap_or(0),
             "agent turn committed"
         );
-
-        if total_tokens(run) > self.kind.limits.max_total_tokens {
-            return self
-                .fail_terminal(run, FailReason::TokenBudget, "token budget exceeded")
-                .await;
-        }
-        StepOutcome::Continue
+        StepOutcome::HandedOff
     }
 
     /// One `CallTools` step: intercept `ask` (suspend), execute everything
     /// else through the built agent's toolset with the idempotency key in
-    /// its context, answer malformed calls with corrective feedback.
-    async fn call_tools_step(
+    /// its context, and answer malformed calls with corrective feedback.
+    /// Each answered call persists (crash-resume identity); the LAST call's
+    /// persist is the step-end handoff — the batch's final state, the
+    /// next-step job, and the lease release commit together.
+    async fn call_tools_step<S: super::HasDurable>(
         &self,
+        state: &S,
         run: &mut AgentRun,
         calls: Vec<PendingToolCall>,
     ) -> StepOutcome {
@@ -1044,10 +1249,14 @@ impl Attempt<'_> {
         // not consume a turn when a re-issued attempt fails, so this is
         // stable across crash-resume.
         let turn = run.turn();
-        for call in calls {
+        let mut calls = calls.into_iter().peekable();
+        while let Some(call) = calls.next() {
+            // Only the batch's final call hands off; earlier answers keep
+            // the lease via a plain (progress-marking) persist.
+            let is_last = calls.peek().is_none();
             match call {
                 PendingToolCall::Execute(exec) if exec.name().as_str() == Ask::NAME => {
-                    return self.ask_step(run, exec).await;
+                    return self.ask_step(state, run, exec).await;
                 }
                 PendingToolCall::Execute(exec) => {
                     let mut ctx = ToolContext::new();
@@ -1081,7 +1290,12 @@ impl Attempt<'_> {
                                 let (reason, message) = sanitize_prompt_error(&error);
                                 return self.fail_terminal(run, reason, message).await;
                             }
-                            match self.persist(run, true).await {
+                            let outcome = if is_last {
+                                self.persist_step_end(state, run).await
+                            } else {
+                                self.persist(run, true).await
+                            };
+                            match outcome {
                                 StepOutcome::Continue => {}
                                 other => return other,
                             }
@@ -1095,7 +1309,12 @@ impl Attempt<'_> {
                         let (reason, message) = sanitize_prompt_error(&error);
                         return self.fail_terminal(run, reason, message).await;
                     }
-                    match self.persist(run, true).await {
+                    let outcome = if is_last {
+                        self.persist_step_end(state, run).await
+                    } else {
+                        self.persist(run, true).await
+                    };
+                    match outcome {
                         StepOutcome::Continue => {}
                         other => return other,
                     }
@@ -1109,15 +1328,27 @@ impl Attempt<'_> {
                 }
             }
         }
-        StepOutcome::Continue
+        // An empty tool batch is unreachable with rig 0.45 (a batch whose
+        // whole turn is skipped completes inline inside `next_step`), so
+        // this is a defensive `Retry` — never a handoff of unchanged state
+        // (fresh `error_count = 0` rows with no backoff would hot-loop) and
+        // never a terminal fail (a possibly-legitimate future rig state).
+        StepOutcome::Retry(cja::color_eyre::eyre::eyre!("empty tool batch"))
     }
 
-    /// An `ask` call: parse its arguments; on success suspend the run
+    /// An `ask` call: parse its arguments; on success, suspend the run
     /// (waiting + relational ask identity + lease cleared, atomically) and
-    /// end the attempt Ok — a waiting run holds no worker and no job. An
-    /// ask whose arguments don't parse never suspends: answer it with a
-    /// corrective failure and continue the run.
-    async fn ask_step(&self, run: &mut AgentRun, exec: rig_agent::run::ExecCall) -> StepOutcome {
+    /// end the attempt Ok — a waiting run holds no worker or job. An ask
+    /// whose arguments don't parse never suspends: answer it with a
+    /// corrective failure and end the attempt via the step-end handoff
+    /// (the corrective answer always ends the batch; remaining sibling
+    /// calls re-emit on the next attempt).
+    async fn ask_step<S: super::HasDurable>(
+        &self,
+        state: &S,
+        run: &mut AgentRun,
+        exec: rig_agent::run::ExecCall,
+    ) -> StepOutcome {
         let Ok(args) = serde_json::from_value::<AskArgs>(exec.arguments()) else {
             // An ask that doesn't parse never suspends: answer the call with
             // a corrective failure and continue the run. Never park a run
@@ -1128,8 +1359,9 @@ impl Attempt<'_> {
                 let (reason, message) = sanitize_prompt_error(&error);
                 return self.fail_terminal(run, reason, message).await;
             }
-            // The failed tool result is committed; the run continues.
-            return self.persist(run, true).await;
+            // The failed tool result is committed; the batch's remaining
+            // sibling calls re-emit on the next attempt.
+            return self.persist_step_end(state, run).await;
         };
         let snap = match RunSnapshot::of(run) {
             Ok(snap) => snap,

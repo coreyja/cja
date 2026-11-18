@@ -1,0 +1,4 @@
+# query!/query_as! decode Postgres timestamps as jiff-sqlx wrappers, which
+# convert into `jiff::Timestamp` with `.into()` / `.to_jiff()`.
+[macros.type-overrides]
+'TIMESTAMPTZ' = "jiff_sqlx::Timestamp"

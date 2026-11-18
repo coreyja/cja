@@ -40,8 +40,8 @@ pub async fn seed_test_job(
     .bind(job_name)
     .bind(job_data)
     .bind(0)
-    .bind(chrono::Utc::now())
-    .bind(chrono::Utc::now())
+    .bind(jiff_sqlx::Timestamp::from(jiff::Timestamp::now()))
+    .bind(jiff_sqlx::Timestamp::from(jiff::Timestamp::now()))
     .bind(context)
     .bind(0)
     .execute(pool)
@@ -86,9 +86,9 @@ pub struct JobInfo {
     pub job_id: Uuid,
     pub name: String,
     pub payload: serde_json::Value,
-    pub locked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub locked_at: Option<jiff_sqlx::Timestamp>,
     pub locked_by: Option<String>,
     pub error_count: i32,
     pub last_error_message: Option<String>,
-    pub last_failed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_failed_at: Option<jiff_sqlx::Timestamp>,
 }

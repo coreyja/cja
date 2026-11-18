@@ -296,7 +296,7 @@ my_job.enqueue(app_state, "urgent".into(), Some(10)).await?;
 - Handler panics are caught and recorded like returned errors. An expired lease also increments `error_count` and records its previous worker.
 - With `max_retries = N`, a job may execute N+1 times. A terminal failure moves it to `dead_letter_jobs` with the final incremented count. Success and graceful shutdown do not count as failures.
 
-The single `job_worker` accepts `JobWorkerConfig { heartbeat_interval, reclaim_window, shutdown_drain_timeout, idle_poll_gate }`; pass `Default::default()` unless the application needs custom timings. `idle_poll_gate` defaults to `None`, preserving independent polling. Defaults are 30 seconds between heartbeats, 120 seconds from the last successful heartbeat before reclaim, and the `ShutdownBudget::from_env().job_drain` value (2 seconds when unset). `CJA_SHUTDOWN_JOB_DRAIN_SECS` controls both the default worker drain and a default Supervisor budget. The reclaim window must be at least three heartbeat intervals. A missing heartbeat makes any owned row eligible after the window; actual pickup also depends on the idle poll cadence. A still-running body stops if its worker detects lost ownership or its watchdog expires. Job side effects must remain idempotent.
+The single `job_worker` accepts `JobWorkerConfig { heartbeat_interval, reclaim_window, shutdown_drain_timeout, idle_poll_gate, type_concurrency }`; pass `Default::default()` unless the application needs custom timings. `type_concurrency` carries per-process running counts behind `Job::CONCURRENCY` caps: production uses `ConcurrencyTracker::process_shared()` (also what `Default` gives you) — one shared tracker per process across all workers; `ConcurrencyTracker::isolated()` is for tests embedding independent worker fleets in one process. `idle_poll_gate` defaults to `None`, preserving independent polling. Defaults are 30 seconds between heartbeats, 120 seconds from the last successful heartbeat before reclaim, and the `ShutdownBudget::from_env().job_drain` value (2 seconds when unset). `CJA_SHUTDOWN_JOB_DRAIN_SECS` controls both the default worker drain and a default Supervisor budget. The reclaim window must be at least three heartbeat intervals. A missing heartbeat makes any owned row eligible after the window; actual pickup also depends on the idle poll cadence. A still-running body stops if its worker detects lost ownership or its watchdog expires. Job side effects must remain idempotent.
 
 To limit idle claims, create one `IdlePollGate::new(NonZeroUsize::new(2).unwrap())`, clone it into each worker's `JobWorkerConfig { idle_poll_gate: Some(gate.clone()), ..Default::default() }`, and keep a clone in application state. Override `AppState::job_enqueued` to call `gate.wake_one()`. This local wake follows successful autocommit enqueue only. Direct SQL, other processes, transactional enqueue, due retries, and expired leases still need periodic claims; permits never cover job bodies or heartbeats.
 
@@ -360,7 +360,8 @@ the database clock fires on the next tick and no longer pauses the cron.
 Worker::new(app_state, registry).run(shutdown_token).await;
 
 // Custom timezone and poll interval
-Worker::new_with_timezone(app_state, registry, chrono_tz::US::Eastern, Duration::from_secs(10))
+let eastern = cja::jiff::tz::TimeZone::get("America/New_York")?;
+Worker::new_with_timezone(app_state, registry, eastern, Duration::from_secs(10))
     .run(shutdown_token)
     .await;
 
@@ -512,6 +513,6 @@ use cja::sqlx;
 use cja::uuid;
 use cja::color_eyre;
 use cja::maud;
-use cja::chrono;
-use cja::chrono_tz;
+use cja::jiff;
+use cja::jiff_sqlx;
 ```

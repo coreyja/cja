@@ -941,7 +941,7 @@ async fn credential_model_crud() {
         &pool,
         cred.credential_id_pk,
         new_json.clone(),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .unwrap();
@@ -971,12 +971,14 @@ async fn lock_and_rotate_challenge_lifecycle() {
     PasskeySession::set_challenge_state(&pool, session_id, serde_json::json!({"k": "v"}))
         .await
         .unwrap();
-    let created_before: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT created_at FROM sessions WHERE session_id = $1")
-            .bind(session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let created_before: jiff::Timestamp = sqlx::query_scalar::<_, jiff_sqlx::Timestamp>(
+        "SELECT created_at FROM sessions WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .to_jiff();
 
     let mut tx = pool.begin().await.unwrap();
     assert_eq!(
@@ -1612,7 +1614,7 @@ async fn login_write_failure_leaves_session_anonymous_and_challenge_live() {
     let (status, _) =
         register_over_http(make_router(state.clone()), &reg_cookie, &soft, "alice").await;
     assert_eq!(status, 200);
-    let (cred_json, last_used): (serde_json::Value, Option<chrono::DateTime<chrono::Utc>>) =
+    let (cred_json, last_used): (serde_json::Value, Option<jiff_sqlx::Timestamp>) =
         sqlx::query_as("SELECT credential_json, last_used_at FROM passkey_credentials")
             .fetch_one(&pool)
             .await
@@ -1639,13 +1641,11 @@ async fn login_write_failure_leaves_session_anonymous_and_challenge_live() {
         "challenge must stay usable for a retry"
     );
 
-    let (cred_json_after, last_used_after): (
-        serde_json::Value,
-        Option<chrono::DateTime<chrono::Utc>>,
-    ) = sqlx::query_as("SELECT credential_json, last_used_at FROM passkey_credentials")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let (cred_json_after, last_used_after): (serde_json::Value, Option<jiff_sqlx::Timestamp>) =
+        sqlx::query_as("SELECT credential_json, last_used_at FROM passkey_credentials")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         cred_json_after, cred_json,
         "credential counter must roll back"

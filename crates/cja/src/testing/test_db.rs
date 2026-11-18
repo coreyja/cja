@@ -72,10 +72,12 @@ pub async fn create_test_database(prefix: &str) -> Result<(PgPool, TestDatabaseG
     let db_name = generate_database_name(prefix, SystemTime::now())?;
     let quoted_name = quote_identifier(&db_name);
     continue_after_reap(prefix, reap_result, async {
-        sqlx::query(&format!("CREATE DATABASE {quoted_name}"))
-            .execute(&admin_pool)
-            .await
-            .wrap_err("failed to create test database")
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {quoted_name}"
+        )))
+        .execute(&admin_pool)
+        .await
+        .wrap_err("failed to create test database")
     })
     .await?;
     admin_pool.close().await;
@@ -183,7 +185,9 @@ where
             return Err(error);
         }
         let query = format!("DROP DATABASE IF EXISTS {}", quote_identifier(&name));
-        let result = sqlx::query(&query).execute(&mut *connection).await;
+        let result = sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(&mut *connection)
+            .await;
         let _ = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock(hashtext($1))")
             .bind(&name)
             .fetch_one(&mut *connection)
@@ -276,10 +280,10 @@ async fn cleanup_database(options: &PgConnectOptions, db_name: &str) -> Result<(
     .execute(&pool)
     .await
     .wrap_err("failed to terminate test database connections")?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP DATABASE IF EXISTS {}",
         quote_identifier(db_name)
-    ))
+    )))
     .execute(&pool)
     .await
     .wrap_err("failed to drop test database")?;
@@ -488,10 +492,13 @@ mod tests {
             .unwrap();
         let prefix = format!("r{}_", &Uuid::new_v4().simple().to_string()[..8]);
         let name = format!("{prefix}1_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE DATABASE {}", quote_identifier(&name)))
-            .execute(&admin)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE {}",
+            quote_identifier(&name)
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
 
         let held = Arc::new(Mutex::new(None::<PgConnection>));
         let hook_held = Arc::clone(&held);

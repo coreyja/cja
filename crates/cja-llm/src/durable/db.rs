@@ -186,12 +186,17 @@ where
     .await
 }
 
-/// Persist one step atomically: conditionally update the run state (proving
-/// lease ownership), then insert the newly committed transcript messages, in
-/// one transaction. `Ok(None)` = lease lost (write nothing, stop silently).
+/// Persist one step's state on an OPEN transaction: conditionally update
+/// the run state (proving lease ownership), then insert the newly
+/// committed transcript messages. Does NOT commit or roll back — the
+/// caller adds the step-end writes (next-job enqueue + lease release, or
+/// nothing) and commits, or drops the transaction to discard everything
+/// (dropping a `Transaction` rolls it back; there is no `rollback()` on
+/// a bare `&mut PgConnection`). `Ok(None)` = lease lost (caller discards
+/// the transaction, writes nothing).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(super) async fn persist_step(
-    db: &sqlx::PgPool,
+pub(super) async fn persist_step_on_tx(
+    tx: &mut sqlx::PgConnection,
     run_id: Uuid,
     me: &str,
     run_state_json: &serde_json::Value,
@@ -200,7 +205,6 @@ pub(super) async fn persist_step(
     output_tokens: i64,
     new_messages: &[(i64, String, serde_json::Value)],
 ) -> sqlx::Result<Option<bool>> {
-    let mut tx = db.begin().await?;
     let cancel_requested = sqlx::query_scalar::<_, bool>(
         "UPDATE agent_runs
          SET run_state = $3, turns = $4, input_tokens = $5, output_tokens = $6, locked_at = NOW()
@@ -217,11 +221,9 @@ pub(super) async fn persist_step(
     .fetch_optional(&mut *tx)
     .await?;
     let Some(cancel_requested) = cancel_requested else {
-        tx.rollback().await?;
         return Ok(None);
     };
-    insert_messages(&mut tx, run_id, new_messages).await?;
-    tx.commit().await?;
+    insert_messages(tx, run_id, new_messages).await?;
     Ok(Some(cancel_requested))
 }
 
@@ -590,10 +592,10 @@ pub(super) async fn lock_active_run(
     // covers the later job check and enqueue, whose lock waits are not
     // expected (cja's job inserts do not conflict on a unique key) and
     // would surface as an `Err` the next tick retries anyway.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET LOCAL lock_timeout = '{}s'",
         LOCK_BOUND.as_secs()
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     let statuses: Vec<String> = [RunStatus::Queued, RunStatus::Running]
@@ -686,12 +688,12 @@ mod tests {
         let terminal = matches!(status, "succeeded" | "failed" | "cancelled");
         let fail_reason = if status == "failed" { "'x'" } else { "NULL" };
         let finished_at = if terminal { "NOW()" } else { "NULL" };
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state, \
              pending_call_id, pending_question, fail_reason, finished_at) \
              VALUES ($1, 'k', $2, 'in', 'm', 'a', '{{}}'::jsonb, \
              {pending_call}, {pending_question}, {fail_reason}, {finished_at})"
-        ))
+        )))
         .bind(id)
         .bind(status)
         .execute(db)
@@ -952,7 +954,7 @@ mod tests {
         assert_eq!(pending_call, None, "pending columns cleared");
         assert_eq!(pending_question, None, "pending columns cleared");
         assert_eq!(locked_by, None, "lease cleared");
-        let (error, finished_at): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        let (error, finished_at): (Option<String>, Option<jiff_sqlx::Timestamp>) =
             sqlx::query_as("SELECT error, finished_at FROM agent_runs WHERE id = $1")
                 .bind(id)
                 .fetch_one(&db)
@@ -1036,14 +1038,14 @@ mod tests {
         lease: bool,
     ) -> sqlx::Result<Uuid> {
         let id = Uuid::new_v4();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO agent_runs (id, kind, status, input, model, app, run_state, \
              fail_reason, finished_at, locked_by, locked_at) \
              VALUES ($1, 'k', $2, 'in', 'm', 'a', '{{}}'::jsonb, $3, {}, {}, {})",
             if finished_at { "NOW()" } else { "NULL" },
             if lease { "'x'" } else { "NULL" },
             if lease { "NOW()" } else { "NULL" },
-        ))
+        )))
         .bind(id)
         .bind(status)
         .bind(fail_reason)

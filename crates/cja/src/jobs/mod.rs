@@ -72,12 +72,28 @@
 //! | 20 | ~12 days |
 //!
 //! With `max_retries = N`, a job can execute N+1 times. Returned errors,
-//! caught handler panics, and expired leases each count as a failed attempt.
+//! caught handler panics, expired leases, and bodies that exceed
+//! [`Job::MAX_RUNTIME`] each count as a failed attempt.
 //! A [`JobYield`] error releases the row uncharged; an unknown job name is
 //! released uncharged on an age-scaled delay (30s for the first hour of the
 //! row's life, hourly after that, dead-letter past 14 days); an
 //! undeserializable payload is dead-lettered on first dispatch. The final
 //! incremented count is stored in `dead_letter_jobs`.
+//!
+//! # Maximum Runtime
+//!
+//! Every job attempt runs under a per-job-type wall-clock limit:
+//! [`Job::MAX_RUNTIME`], defaulting to [`DEFAULT_MAX_RUNTIME`] (15 minutes).
+//! A job type whose healthy attempts run longer overrides it with a larger
+//! `Duration` (e.g. `const MAX_RUNTIME: Duration =
+//! Duration::from_secs(2 * 60 * 60);`). On expiry, the worker drops the body
+//! future, stops heartbeating, releases the lease, and records a retryable
+//! failure whose message names the limit; each retry gets a fresh budget.
+//! The timeout cancels **async** work only — work already inside
+//! `spawn_blocking` keeps running after the drop, so jobs that hand work to
+//! blocking threads must bound it themselves. Move the attempt's concurrency
+//! `slot` (see [`Job::run_with_cancellation`]) into the `spawn_blocking`
+//! closure to hold the concurrency budget until that work ends.
 //!
 //! # Idempotency
 //!
@@ -92,7 +108,28 @@
 //!
 //! Multiple [`worker::job_worker`] instances can run safely — the worker SQL
 //! uses `FOR UPDATE SKIP LOCKED` to prevent duplicate processing at the
-//! database level.
+//! database level. Each worker process also tracks running counts per job
+//! type: a type declaring `Job::CONCURRENCY = PerProcess(n)` is excluded
+//! from claims while at its cap, and types sharing a
+//! `Concurrency::PerProcessShared` key are excluded while the shared
+//! budget is saturated. A saturated scope never blocks other types.
+//!
+//! # Per-Process Concurrency
+//!
+//! A job type can declare `CONCURRENCY = Concurrency::PerProcess(n)` to cap
+//! concurrent attempts, or `Concurrency::PerProcessShared { key, limit }` to
+//! share a named budget across job types — every type with the same `key`
+//! (and `limit`; conflicting limits fail worker startup) counts against one
+//! in-process counter. The cap is per worker process (in-memory, shared by
+//! all `job_worker` tasks via `JobWorkerConfig::type_concurrency`,
+//! process-shared by default). Saturated scopes are skipped at claim
+//! (`name <> ALL(...)`), so a worker claims the next runnable job of another
+//! type. A raced claim is released uncharged via [`JobYield`], and a slot is
+//! released when the attempt finalizes (success, failure,
+//! [`Job::MAX_RUNTIME`] expiry, yield, lease loss, shutdown drain). A body
+//! can also move its `slot` into `spawn_blocking` to hold the budget until
+//! that blocking work ends. The cap bounds in-process resources only — for
+//! outside resources (APIs, quotas), the effective limit is cap × instances.
 //!
 //! # Cancellation Support
 //!
@@ -138,7 +175,11 @@
 //! | `created_at` | TIMESTAMPTZ | Original creation time |
 //! | `failed_at` | TIMESTAMPTZ | When moved to dead letter |
 
+use std::num::NonZeroUsize;
+use std::time::Duration;
+
 use crate::app_state::AppState as AS;
+use jiff_sqlx::ToSqlx as _;
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tracing::{Instrument, instrument};
@@ -147,7 +188,7 @@ pub(crate) fn enqueue_span<AppState: AS, J: Job<AppState>>(
     job: &J,
     context: &str,
     priority: Option<i32>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     job_id: uuid::Uuid,
 ) -> tracing::Span {
     tracing::info_span!(
@@ -169,7 +210,7 @@ pub(crate) async fn enqueue_on_connection<AppState: AS, J: Job<AppState>>(
     job: J,
     context: &str,
     priority: Option<i32>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     job_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, EnqueueError> {
     sqlx::query(
@@ -180,8 +221,8 @@ pub(crate) async fn enqueue_on_connection<AppState: AS, J: Job<AppState>>(
     .bind(J::NAME)
     .bind(serde_json::to_value(job)?)
     .bind(priority.unwrap_or(0))
-    .bind(created_at)
-    .bind(created_at)
+    .bind(created_at.to_sqlx())
+    .bind(created_at.to_sqlx())
     .bind(context)
     .execute(conn)
     .await?;
@@ -205,7 +246,7 @@ async fn enqueue_core<AppState: AS, J: Job<AppState>>(
     job: J,
     context: &str,
     priority: Option<i32>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     job_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, EnqueueError> {
     let result =
@@ -224,9 +265,18 @@ pub mod registry;
 
 pub use tokio_util::sync::CancellationToken;
 pub use worker::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_MAX_RETRIES, DEFAULT_RECLAIM_WINDOW, IdlePollGate,
-    JobWorkerConfig,
+    ConcurrencyScope, ConcurrencySlot, ConcurrencyTracker, DEFAULT_HEARTBEAT_INTERVAL,
+    DEFAULT_MAX_RETRIES, DEFAULT_RECLAIM_WINDOW, IdlePollGate, JobWorkerConfig,
 };
+
+/// Default maximum runtime per job attempt ([`Job::MAX_RUNTIME`]).
+///
+/// 15 minutes is ~30 default heartbeat intervals and 3× the 5-minute stopgap
+/// arena shipped for its wedged backups (BattlesnakeOfficial/arena#341): long
+/// enough that no healthy job notices, short enough that a hung body releases
+/// its worker slot and lease in bounded time. Renders as `900s` in
+/// [`crate::jobs::JobMaxRuntimeExceeded`]'s message (`Duration`'s `Debug`).
+pub const DEFAULT_MAX_RUNTIME: Duration = Duration::from_mins(15);
 
 #[derive(Debug, Error)]
 pub enum EnqueueError {
@@ -282,6 +332,118 @@ pub struct UnknownJobType(pub String);
 #[error("job payload is not deserializable")]
 pub struct InvalidJobPayload(#[from] serde_json::Error);
 
+/// A single job attempt exceeded [`Job::MAX_RUNTIME`] and was dropped by the
+/// worker. Charged like any other failure: the attempt increments
+/// `error_count`, takes the normal exponential backoff, and eventually
+/// dead-letters. Dropping the future cancels async work only — work already
+/// inside `spawn_blocking` keeps running.
+///
+/// The message renders the limit via `Duration`'s `Debug` (`900s` at the
+/// 15-minute default, `2s` for a 2-second override).
+#[derive(Debug, Error)]
+#[error("job exceeded its max runtime of {limit:?}")]
+pub struct JobMaxRuntimeExceeded {
+    /// The `Job::MAX_RUNTIME` that expired.
+    pub limit: Duration,
+}
+
+/// A job type's declared concurrency limit, enforced by the worker at claim
+/// time. See [`Job::CONCURRENCY`].
+///
+/// This enum is `non_exhaustive`: a cross-instance (`Global`) or rate-limit
+/// variant may be added later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Concurrency {
+    /// No limit (the default): any number of attempts of this type may run
+    /// concurrently in this process.
+    Unlimited,
+    /// At most `N` attempts of this job type run concurrently **per worker
+    /// process**. All `job_worker` tasks in the process share one counter
+    /// (via [`crate::jobs::worker::JobWorkerConfig::type_concurrency`],
+    /// process-shared by default), so the cap holds across every worker the
+    /// process spawns.
+    ///
+    /// This bounds **in-process** resources (CPU, memory, blocking-pool
+    /// threads an attempt occupies). It is NOT a ticket for outside
+    /// resources: with M processes (instances), the effective limit on an
+    /// external API or quota is `N x M`, since each process counts only its
+    /// own attempts. Use it for semaphore-style in-process limits, not to
+    /// protect a rate-limited third-party API.
+    ///
+    /// Saturated types are excluded from the worker's claim query, so
+    /// workers claim the next runnable job of another type instead of
+    /// parking. Combined with [`Job::MAX_RUNTIME`], a hung attempt releases
+    /// its slot in bounded time.
+    PerProcess(NonZeroUsize),
+    /// At most `limit` attempts run concurrently per worker process across
+    /// **every job type declaring the same `key`**: one shared in-process
+    /// counter per key, tracked through
+    /// [`crate::jobs::worker::JobWorkerConfig::type_concurrency`] like
+    /// [`Concurrency::PerProcess`]. Job types contending for one resource
+    /// — e.g., Arena's archive types sharing a backup slot on a 1-vCPU box
+    /// — share a budget by declaring the same `key` and `limit`.
+    ///
+    /// Every type sharing a key MUST declare the same `limit`: conflicting
+    /// limits fail worker startup instead of being silently min'd or
+    /// max'd. Validation runs per registry at worker build; conflicting
+    /// limits across two registries in one process sharing the
+    /// process-shared tracker are not detected.
+    /// Shared keys and [`Concurrency::PerProcess`] scopes use separate
+    /// namespaces: a key matching a job type name has a separate budget
+    /// from that type's per-type scope.
+    ///
+    /// Enforced like [`Concurrency::PerProcess`]: types with a saturated
+    /// key are excluded from the claim query (so the worker claims an
+    /// unrelated runnable job instead of parking), raced claims release
+    /// uncharged via [`JobYield`], and the slot is held for the whole
+    /// attempt. The cap bounds **in-process** resources only — for
+    /// external resources (APIs, quotas), the effective limit is
+    /// `limit x instances`.
+    ///
+    /// A body can hold the shared budget across blocking work that
+    /// outlives its attempt — e.g., preventing the next archive from
+    /// starting while CPU work from a `MAX_RUNTIME`-expired attempt
+    /// finishes: override [`Job::run_with_cancellation`] and move `slot`
+    /// into the `spawn_blocking` closure (`let _held = slot;` at the top).
+    /// The budget stays held until the closure exits. Slot-holding
+    /// blocking work must bound itself with its own timeout: an unbounded
+    /// closure saturates the key until process exit — fail-closed, never
+    /// fail-open.
+    PerProcessShared {
+        /// Shared budget name: job types declaring the same `key` (and
+        /// `limit`) share one in-process counter.
+        key: &'static str,
+        /// The maximum concurrent attempts across all types declaring
+        /// `key`.
+        limit: NonZeroUsize,
+    },
+}
+
+impl Concurrency {
+    /// The in-process scope and limit this declaration counts within, or
+    /// `None` for `Unlimited`. `PerProcess` scopes by type name;
+    /// `PerProcessShared` scopes by its key. The two scope kinds are
+    /// separate namespaces: a shared key spelled like a job type name is
+    /// a different budget from that type's implicit per-type scope.
+    pub(crate) fn scope_and_limit(
+        &self,
+        type_name: &str,
+    ) -> Option<(crate::jobs::worker::ConcurrencyScope, NonZeroUsize)> {
+        match self {
+            Self::Unlimited => None,
+            Self::PerProcess(limit) => Some((
+                crate::jobs::worker::ConcurrencyScope::Type(type_name.to_owned()),
+                *limit,
+            )),
+            Self::PerProcessShared { key, limit } => Some((
+                crate::jobs::worker::ConcurrencyScope::Shared((*key).to_owned()),
+                *limit,
+            )),
+        }
+    }
+}
+
 /// A trait for defining background jobs that can be enqueued and processed asynchronously.
 ///
 /// Jobs must be serializable and provide a unique name identifier. The job system
@@ -304,6 +466,10 @@ pub struct InvalidJobPayload(#[from] serde_json::Error);
 /// - A missing heartbeat makes the job claimable after 120 seconds by default
 /// - Every expired lease counts as a failed attempt
 /// - This ensures jobs are eventually processed even after worker failures
+///
+/// A crashed worker is the lease-based case; a body that is alive but stuck
+/// (the process keeps heartbeating while the job never progresses) is bounded
+/// by [`Job::MAX_RUNTIME`] instead — see "Maximum Runtime".
 ///
 /// # Example
 ///
@@ -430,6 +596,57 @@ pub trait Job<AppState: AS>:
     /// This is used for routing jobs to their handlers.
     const NAME: &'static str;
 
+    /// Maximum wall-clock time a single attempt of this job may run before
+    /// the worker drops the body future. Defaults to
+    /// [`DEFAULT_MAX_RUNTIME`] (15 minutes). Job types whose healthy
+    /// attempts take longer can override it with a larger `Duration`, e.g.
+    /// `const MAX_RUNTIME: Duration = Duration::from_secs(2 * 60 * 60);`.
+    ///
+    /// On expiry, the worker drops the future, stops heartbeating, releases
+    /// the lease, and charges the attempt as a normal retryable failure
+    /// (the error message names the limit). Each retry gets a fresh budget.
+    ///
+    /// # Caveat
+    ///
+    /// The limit cancels **async** work only. Work running inside
+    /// `tokio::task::spawn_blocking` (or a detached `tokio::spawn`) continues
+    /// after the job future is dropped. Jobs that hand work to blocking
+    /// threads must bound it themselves (e.g. with their own timeout around
+    /// the blocking call) if it must not outlive the attempt.
+    const MAX_RUNTIME: Duration = DEFAULT_MAX_RUNTIME;
+
+    /// Maximum concurrent attempts of this job type in one worker process.
+    /// Defaults to [`Concurrency::Unlimited`].
+    ///
+    /// Enforced at claim time: a worker in a process already running
+    /// `PerProcess(n)` attempts of this type will not claim another row of
+    /// this type (claiming the next runnable job of another type instead),
+    /// and a raced claim is released uncharged. The slot is held for the
+    /// whole attempt — body plus finalization — and released on success,
+    /// failure, [`Job::MAX_RUNTIME`] expiry, yield, lease loss, and shutdown
+    /// drain.
+    ///
+    /// `Concurrency::PerProcessShared { key, limit }` instead caps the
+    /// **combined** attempts of all job types declaring the same `key`
+    /// (they must declare the same `limit`; conflicts fail worker
+    /// startup) — one named budget for several types contending for a
+    /// single resource. See that variant's docs for the full story,
+    /// including holding the budget across blocking work that outlives
+    /// the attempt by moving this attempt's `slot` (the
+    /// `run_with_cancellation` parameter) into the `spawn_blocking`
+    /// closure.
+    ///
+    /// # Caveat
+    ///
+    /// Per **process**: bounds in-process resources only. The effective limit
+    /// on an outside resource (API, quota) is the cap times your instance
+    /// count. Work already in `spawn_blocking` is not cancelled when an
+    /// attempt ends; the count tracks attempts, not OS threads, so blocking
+    /// work that outlives its attempt (see `MAX_RUNTIME`'s caveat) is
+    /// invisible to the counter — unless the body moves its `slot` into the
+    /// closure, holding the budget until the closure exits.
+    const CONCURRENCY: Concurrency = Concurrency::Unlimited;
+
     /// Execute the job logic.
     ///
     /// This method has access to the full application state,
@@ -445,6 +662,15 @@ pub trait Job<AppState: AS>:
     /// periodically and exit early during shutdown. The default implementation
     /// ignores the token and calls `run()`, so existing jobs continue to work
     /// without changes.
+    ///
+    /// `slot` is the worker's handle on this attempt's concurrency budget
+    /// ([`Job::CONCURRENCY`]). The worker keeps its own handle for the whole
+    /// attempt, so the default implementation — and any override that ignores
+    /// `slot` — is safe: dropping this clone early releases nothing. A body
+    /// that hands work to `spawn_blocking` can move `slot` into the closure
+    /// (`let _held = slot;` at the top) to hold the budget until that blocking
+    /// work ends — for a shared key, this is how the next archive waits out
+    /// the CPU work of an attempt whose `MAX_RUNTIME` expired.
     ///
     /// When the token fires, a job body has three options:
     ///
@@ -487,6 +713,7 @@ pub trait Job<AppState: AS>:
     ///         &self,
     ///         app_state: MyAppState,
     ///         cancellation_token: CancellationToken,
+    ///         _slot: cja::jobs::ConcurrencySlot,
     ///     ) -> color_eyre::Result<()> {
     ///         for i in 0..self.iterations {
     ///             // Check if shutdown was requested
@@ -509,8 +736,13 @@ pub trait Job<AppState: AS>:
         &self,
         app_state: AppState,
         _cancellation_token: CancellationToken,
+        _slot: crate::jobs::worker::ConcurrencySlot,
     ) -> color_eyre::Result<()> {
-        // Default implementation ignores cancellation token
+        // Default implementation ignores the cancellation token AND the
+        // slot: the worker holds its own handle for the whole attempt, so
+        // dropping this clone early is safe. Override and move `slot`
+        // into `spawn_blocking` to hold your budget for blocking work that
+        // outlives the attempt.
         self.run(app_state).await
     }
 
@@ -520,15 +752,16 @@ pub trait Job<AppState: AS>:
     /// A payload that fails to deserialize is wrapped in [`InvalidJobPayload`]
     /// (its `serde_json::Error` rides along as the source); the worker
     /// dead-letters such rows on the first dispatch instead of retrying.
-    #[instrument(name = "jobs.run_from_value", skip(app_state, cancellation_token), fields(job.name = Self::NAME), err)]
+    #[instrument(name = "jobs.run_from_value", skip(app_state, cancellation_token, slot), fields(job.name = Self::NAME), err)]
     async fn run_from_value(
         value: serde_json::Value,
         app_state: AppState,
         cancellation_token: CancellationToken,
+        slot: crate::jobs::worker::ConcurrencySlot,
     ) -> color_eyre::Result<()> {
         let job: Self = serde_json::from_value(value).map_err(InvalidJobPayload)?;
 
-        job.run_with_cancellation(app_state, cancellation_token)
+        job.run_with_cancellation(app_state, cancellation_token, slot)
             .await
     }
 
@@ -551,7 +784,7 @@ pub trait Job<AppState: AS>:
         priority: Option<i32>,
     ) -> Result<uuid::Uuid, EnqueueError> {
         let job_id = uuid::Uuid::new_v4();
-        let created_at = chrono::Utc::now();
+        let created_at = jiff::Timestamp::now();
         // Eyes captures fields at span creation; same constructor as `enqueue`
         // so an enqueue stays linkable to its worker attempts.
         let span = enqueue_span::<AppState, Self>(&self, &context, priority, created_at, job_id);
@@ -606,7 +839,7 @@ pub trait Job<AppState: AS>:
         priority: Option<i32>,
     ) -> Result<(), EnqueueError> {
         let job_id = uuid::Uuid::new_v4();
-        let created_at = chrono::Utc::now();
+        let created_at = jiff::Timestamp::now();
         // Same span (same field list) as `enqueue_on`: a pool-acquire
         // failure is an enqueue failure and is recorded inside the span
         // through `enqueue_failure`, exactly like an insert failure — the

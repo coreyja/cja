@@ -26,15 +26,22 @@
 //! )?;
 //! ```
 //!
+//! Seconds are required and the year is optional. Day of week runs from
+//! 1 = Sunday to 7 = Saturday (names like `MON` work too), and a day must
+//! match both the day-of-month and day-of-week fields. See
+//! [`parse_cron`].
+//!
 //! # Running the Worker
 //!
 //! ```rust,ignore
 //! use cja::cron::Worker;
-//! use chrono_tz::US::Eastern;
+//! use cja::jiff::tz::TimeZone;
 //! use std::time::Duration;
 //!
-//! // With timezone and custom poll interval
-//! Worker::new_with_timezone(app_state, registry, Eastern, Duration::from_secs(30))
+//! // With timezone and custom poll interval. cja bundles the tz database, so
+//! // this works in containers without /usr/share/zoneinfo.
+//! let eastern = TimeZone::get("America/New_York")?;
+//! Worker::new_with_timezone(app_state, registry, eastern, Duration::from_secs(30))
 //!     .run(shutdown_token)
 //!     .await;
 //!
@@ -191,7 +198,7 @@
 //! Mitigations: use longer intervals, add job-level deduplication, or set timeouts.
 
 pub(crate) mod registry;
-pub use registry::{CronRegistry, CronSchedule, IntervalSchedule, Schedule};
+pub use registry::{CronRegistry, CronSchedule, IntervalSchedule, Schedule, parse_cron};
 pub use tokio_util::sync::CancellationToken;
 
 mod worker;
