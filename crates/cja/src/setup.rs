@@ -210,7 +210,14 @@ fn setup_posthog(
             Ok((None, None))
         }
         posthog::PostHogEnv::Enabled(config) => {
-            let sink = posthog::PostHogSink::build(&config, crate_name, version, process, 8192)?;
+            let sink =
+                match posthog::PostHogSink::build(&config, crate_name, version, process, 8192) {
+                    Ok(sink) => sink,
+                    Err(error) => {
+                        println!("Skipping PostHog layer: exporter setup failed: {error:#}");
+                        return Ok((None, None));
+                    }
+                };
             println!(
                 "PostHog OTLP layer configured (host: {}, log level: {}, traces sample ratio: {})",
                 config.host, config.log_level, config.traces_sample_ratio

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt, time::Duration};
 
-use color_eyre::eyre::{Result, ensure, eyre};
+use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::{OpenTelemetryTracingBridge, TracingSpanAttributes};
@@ -47,18 +47,20 @@ impl PostHogEnv {
             .map_err(|_| eyre!("invalid POSTHOG_PROJECT_TOKEN"))?;
         let log_level = read("POSTHOG_LOG_LEVEL")
             .map(|s| s.parse())
-            .transpose()?
+            .transpose()
+            .wrap_err("invalid POSTHOG_LOG_LEVEL")?
             .unwrap_or(LevelFilter::INFO);
         let ratio = read("POSTHOG_TRACES_SAMPLE_RATIO")
             .map(|s| s.parse::<f64>())
-            .transpose()?
+            .transpose()
+            .wrap_err("invalid POSTHOG_TRACES_SAMPLE_RATIO")?
             .unwrap_or(1.0);
         ensure!(
             (0.0..=1.0).contains(&ratio),
             "invalid POSTHOG_TRACES_SAMPLE_RATIO"
         );
         Ok(Self::Enabled(PostHogConfig {
-            host: host.trim_end_matches('/').to_owned(),
+            host: url.as_str().trim_end_matches('/').to_owned(),
             token,
             log_level,
             traces_sample_ratio: ratio,
@@ -157,7 +159,8 @@ impl PostHogSink {
             // https://posthog.com/docs/logs/installation/rust
             let client = reqwest::blocking::Client::builder()
                 .timeout(TIMEOUT)
-                .build()?;
+                .build()
+                .wrap_err("building PostHog exporter or HTTP client")?;
             let headers = HashMap::from([(
                 "Authorization".to_owned(),
                 format!("Bearer {}", config.token),
@@ -169,7 +172,8 @@ impl PostHogSink {
                 .with_timeout(TIMEOUT)
                 .with_http_client(client.clone())
                 .with_headers(headers.clone())
-                .build()?;
+                .build()
+                .wrap_err("building PostHog exporter or HTTP client")?;
             let spans = SpanExporter::builder()
                 .with_http()
                 .with_endpoint(format!("{}/i/v1/traces", config.host))
@@ -177,7 +181,8 @@ impl PostHogSink {
                 .with_timeout(TIMEOUT)
                 .with_http_client(client)
                 .with_headers(headers)
-                .build()?;
+                .build()
+                .wrap_err("building PostHog exporter or HTTP client")?;
             Ok((logs, spans))
         })?;
         let resource = posthog_resource(crate_name, version, process);
