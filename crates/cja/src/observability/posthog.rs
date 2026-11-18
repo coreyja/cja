@@ -71,11 +71,8 @@ impl SyncConfig {
     }
 }
 /// Build the TLS-enabled client used by the CI binary.
-pub fn http_client() -> Client {
-    Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("initialize HTTP client")
+pub fn http_client() -> Result<Client, reqwest::Error> {
+    Client::builder().timeout(Duration::from_secs(30)).build()
 }
 /// Changes and unsupported declarations encountered during reconciliation.
 #[derive(Debug, Default)]
@@ -132,8 +129,19 @@ pub enum SyncError {
         object: String,
         source: serde_json::Error,
     },
-    #[error("{object}: PostHog did not persist our identity {tag}; check project tagging support")]
-    TagNotPersisted { object: String, tag: String },
+    #[error(
+        "{object}: PostHog did not persist our identity {tag}; {cleanup}; check project tagging support"
+    )]
+    TagNotPersisted {
+        object: String,
+        tag: String,
+        /// What happened to the object the failed write touched.
+        cleanup: String,
+    },
+    #[error(
+        "{alert}: alert name is {length} characters and PostHog allows at most {ALERT_NAME_LIMIT}; shorten the alert description"
+    )]
+    AlertNameTooLong { alert: String, length: usize },
     #[error("{0}")]
     Invalid(String),
 }
@@ -339,6 +347,40 @@ fn id(row: &Value, key: &str) -> Result<i64, SyncError> {
 fn insight_id(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v["id"].as_i64())
 }
+const LEFT_IN_PLACE: &str = "the existing object was left in place";
+/// Remove an object `PostHog` just created without our identity. Left alone
+/// it would be invisible to every later sync: one orphan per deploy.
+async fn discard(api: &Api<'_>, kind: &str, row: &Value, key: &str) -> String {
+    let removed = if kind == "alerts" {
+        match alert_path(row) {
+            Ok(path) => api
+                .call(Method::DELETE, &format!("{}{path}", api.base), None, key)
+                .await
+                .map(drop),
+            Err(e) => Err(e),
+        }
+    } else {
+        match id(row, key) {
+            Ok(n) => api
+                .write(
+                    Method::PATCH,
+                    &format!("{kind}/{n}/"),
+                    &json!({"deleted":true}),
+                    key,
+                )
+                .await
+                .map(drop),
+            Err(e) => Err(e),
+        }
+    };
+    match removed {
+        Ok(()) => "the object just created was removed".into(),
+        Err(e) => format!(
+            "removing the object just created failed, remove it by hand: {}",
+            message(&e)
+        ),
+    }
+}
 async fn upsert(
     api: &Api<'_>,
     kind: &str,
@@ -371,9 +413,15 @@ async fn upsert(
         .as_array()
         .is_some_and(|t| t.iter().any(|x| x == key))
     {
+        let cleanup = if old.is_some() {
+            LEFT_IN_PLACE.into()
+        } else {
+            discard(api, kind, &row, key).await
+        };
         return Err(SyncError::TagNotPersisted {
             object: key.into(),
             tag: key.into(),
+            cleanup,
         });
     }
     let n = id(&row, key)?;
@@ -434,6 +482,16 @@ async fn tiles(
     }
     Ok(())
 }
+/// `PostHog` caps an alert name at this many characters.
+const ALERT_NAME_LIMIT: usize = 255;
+/// Display name plus the identity suffix that marks the alert as ours.
+fn alert_name(app: &str, a: &Alert) -> String {
+    format!(
+        "{} [cja:{app}:alert:{}]",
+        a.description.as_ref().unwrap_or(&a.id),
+        a.id
+    )
+}
 fn alert_key<'a>(name: &'a str, app: &str) -> Option<&'a str> {
     let (_, key) = name
         .strip_suffix(']')?
@@ -469,7 +527,7 @@ async fn alerts(
         let cadence =
             ["hourly", "daily", "weekly", "monthly"][interval(a.evaluation_interval_seconds)];
         let mut body = json!({
-            "name": format!("{} [{tag}]", a.description.as_ref().unwrap_or(&a.id)),
+            "name": alert_name(app, a),
             "insight": n,
             "enabled": a.enabled,
             "condition": {"type": "absolute_value"},
@@ -499,6 +557,7 @@ async fn alerts(
                 return Err(SyncError::TagNotPersisted {
                     object: tag.clone(),
                     tag,
+                    cleanup: LEFT_IN_PLACE.into(),
                 });
             }
             r.updated.push(tag);
@@ -508,9 +567,11 @@ async fn alerts(
             let response = api.write(Method::POST, "alerts/", &body, &tag).await?;
             if alert_key(response["name"].as_str().unwrap_or_default(), app) != Some(a.id.as_str())
             {
+                let cleanup = discard(api, "alerts", &response, &tag).await;
                 return Err(SyncError::TagNotPersisted {
                     object: tag.clone(),
                     tag,
+                    cleanup,
                 });
             }
             r.created.push(tag);
@@ -581,6 +642,15 @@ pub async fn sync(
     slug(&config.app)
         .and_then(|()| declarations.validate())
         .map_err(SyncError::Invalid)?;
+    for alert in &declarations.alerts {
+        let length = alert_name(&config.app, alert).chars().count();
+        if length > ALERT_NAME_LIMIT {
+            return Err(SyncError::AlertNameTooLong {
+                alert: format!("cja:{}:alert:{}", config.app, alert.id),
+                length,
+            });
+        }
+    }
     let api = Api {
         config,
         http,
@@ -665,13 +735,14 @@ fn message(error: &dyn Error) -> String {
     line.replace(['\n', '\r'], " ")
 }
 /// Run the CI command and translate its result to a process exit status.
-pub async fn run_from_env(app: &str, d: &Declarations) -> ExitCode {
+/// Pass the client from [`http_client`].
+pub async fn run_from_env(app: &str, d: &Declarations, http: &Client) -> ExitCode {
     if let Err(e) = d.validate() {
         eprintln!("invalid declarations: {e}");
         return ExitCode::from(2);
     }
     match SyncConfig::from_env(app) {
-        Ok(Some(c)) => match sync(&c, d, &http_client()).await {
+        Ok(Some(c)) => match sync(&c, d, http).await {
             Ok(r) => {
                 println!("{r}");
                 ExitCode::SUCCESS
@@ -760,6 +831,7 @@ mod tests {
     #[tokio::test]
     async fn https_error_prints_os_cause() {
         let source = http_client()
+            .unwrap()
             .get("https://127.0.0.1:1/")
             .send()
             .await

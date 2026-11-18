@@ -10,8 +10,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use cja::observability::{
-    AggregateFunction, AlertBuilder, Comparison, Declarations, Item, Link, RatioMetricBuilder,
-    TelemetryMetricBuilder,
+    AggregateFunction, AlertBuilder, Comparison, Declarations, FilterOperator, Item, Link,
+    MetricQuery, PropertyFilter, RatioMetricBuilder, TelemetryMetricBuilder,
     posthog::{self, SyncConfig, SyncError, SyncReport},
 };
 use serde_json::{Value, json};
@@ -28,6 +28,8 @@ struct Store {
     next: u32,
     drop_tag: bool,
     fail: bool,
+    /// Kind whose next create comes back with its identity mangled.
+    mangle: Option<&'static str>,
 }
 type Shared = Arc<Mutex<Store>>;
 struct Mock {
@@ -54,13 +56,20 @@ impl Mock {
         .unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
-            posthog::sync(&config, d, &posthog::http_client()),
+            posthog::sync(&config, d, &posthog::http_client().unwrap()),
         )
         .await
         .unwrap()
     }
     fn log(&self) -> Vec<(Method, String, Value)> {
         std::mem::take(&mut self.state.lock().unwrap().log)
+    }
+    /// Drain the request log, keeping only the writes.
+    fn writes(&self) -> Vec<(Method, String, Value)> {
+        self.log()
+            .into_iter()
+            .filter(|(method, _, _)| method != Method::GET)
+            .collect()
     }
     fn row(&self, key: &str) -> Value {
         self.state
@@ -73,6 +82,42 @@ impl Mock {
             .clone()
     }
 }
+/// Create one row the way `PostHog` does, including its server defaults.
+fn create(s: &mut Store, kind: &str, mut body: Value) -> Result<Value, &'static str> {
+    if s.mangle == Some(kind) {
+        s.mangle = None;
+        if kind == "alerts" {
+            body["name"] = json!("renamed by the server");
+        } else {
+            body["tags"] = json!(["cja:mangled"]);
+        }
+    }
+    if kind == "alerts" && !body["subscribed_users"].is_array() {
+        return Err("subscribed_users is required");
+    }
+    s.next += 1;
+    let n = s.next;
+    let key = if kind == "alerts" {
+        uuid::Uuid::from_u128(n.into()).to_string()
+    } else {
+        n.to_string()
+    };
+    body["id"] = if kind == "alerts" {
+        json!(key)
+    } else {
+        json!(n)
+    };
+    if kind == "dashboards" {
+        body["tiles"] = json!([]);
+    }
+    if kind == "insights" {
+        body["query"]["source"]["version"] = json!(2);
+        body["query"]["source"]["trendsFilter"] = json!({});
+    }
+    s.rows.insert((kind.into(), key), body.clone());
+    Ok(body)
+}
+
 async fn handle(
     State(shared): State<Shared>,
     OriginalUri(uri): OriginalUri,
@@ -88,6 +133,12 @@ async fn handle(
         .unwrap();
     let parts = path.trim_end_matches('/').split('/').collect::<Vec<_>>();
     let mut body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    // PostHog normalizes every tag on write: `tag.strip().lower()`.
+    if let Some(tags) = body.get_mut("tags").and_then(Value::as_array_mut) {
+        for tag in tags {
+            *tag = json!(tag.as_str().unwrap().trim().to_lowercase());
+        }
+    }
     let mut s = shared.lock().unwrap();
     s.log.push((method.clone(), path.into(), body.clone()));
     if method != Method::GET && std::mem::take(&mut s.fail) {
@@ -106,36 +157,12 @@ async fn handle(
                 .collect::<Vec<_>>();
             list_page(&results, &uri, &headers, kind)
         }
-        (Method::POST, [kind]) => {
-            if *kind == "alerts" && !body["subscribed_users"].is_array() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"detail": "subscribed_users is required"})),
-                )
-                    .into_response();
+        (Method::POST, [kind]) => match create(&mut s, kind, body) {
+            Ok(row) => row,
+            Err(detail) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"detail":detail}))).into_response();
             }
-            s.next += 1;
-            let n = s.next;
-            let key = if *kind == "alerts" {
-                uuid::Uuid::from_u128(n.into()).to_string()
-            } else {
-                n.to_string()
-            };
-            body["id"] = if *kind == "alerts" {
-                json!(key)
-            } else {
-                json!(n)
-            };
-            if *kind == "dashboards" {
-                body["tiles"] = json!([]);
-            }
-            if *kind == "insights" {
-                body["query"]["source"]["version"] = json!(2);
-                body["query"]["source"]["trendsFilter"] = json!({});
-            }
-            s.rows.insert(((*kind).into(), key), body.clone());
-            body
-        }
+        },
         (Method::GET, [kind, id]) => s.rows[&((*kind).into(), (*id).into())].clone(),
         (Method::PATCH, [kind, id]) => {
             let row = s.rows.get_mut(&((*kind).into(), (*id).into())).unwrap();
@@ -179,7 +206,7 @@ async fn handle(
 #[tokio::test]
 async fn reconcile_example_and_repeat() {
     let m = Mock::start().await;
-    let mut d = example::declarations().unwrap();
+    let d = example::declarations().unwrap();
     m.sync("demo", &d).await.unwrap();
     let writes = m
         .log()
@@ -202,18 +229,149 @@ async fn reconcile_example_and_repeat() {
     let report = m.sync("demo", &d).await.unwrap();
     assert!(m.log().iter().all(|(v, _, _)| v == Method::GET));
     assert!(report.created.is_empty() && report.updated.is_empty() && report.deleted.is_empty());
+}
+
+#[tokio::test]
+async fn changed_declarations_patch_in_place_and_keep_foreign_tags() {
+    let m = Mock::start().await;
+    let mut d = example::declarations().unwrap();
+    m.sync("demo", &d).await.unwrap();
+    let insight = m.row("cja:demo:insight:pages")["id"].clone();
+    let dashboard = m.row("cja:demo:dashboard:activity")["id"].clone();
+    // Someone tagged both objects by hand in PostHog.
+    for (kind, id) in [("insights", &insight), ("dashboards", &dashboard)] {
+        let mut state = m.state.lock().unwrap();
+        let row = state.rows.get_mut(&(kind.into(), id.to_string())).unwrap();
+        row["tags"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, json!("team-growth"));
+    }
+    m.log();
+    let service = json!({"type":"event","key":"service.name","operator":"exact","value":"demo"});
+    let query = |properties: Value| {
+        json!({"kind":"InsightVizNode","source":{
+            "kind":"TrendsQuery",
+            "series":[{"kind":"EventsNode","event":"page_view","math":"total","properties":properties}],
+            "interval":"day",
+            "dateRange":{"date_from":"-30d"},
+            "filterTestAccounts":false,
+            "breakdownFilter":{"breakdowns":[{"property":"path","type":"event"}]}
+        }})
+    };
+
     d.metrics[0].display_name = Some("Views".into());
     d.dashboards[0].title = "Usage".into();
     let report = m.sync("demo", &d).await.unwrap();
-    assert_eq!(report.updated.len(), 2);
     assert_eq!(
-        m.log()
-            .iter()
-            .filter(|(v, _, _)| v != Method::GET)
-            .map(|(v, _, _)| v)
-            .collect::<Vec<_>>(),
-        [Method::PATCH, Method::PATCH]
+        report.updated,
+        ["cja:demo:dashboard:activity", "cja:demo:insight:pages"]
     );
+    assert!(report.created.is_empty() && report.deleted.is_empty());
+    assert_eq!(
+        m.writes(),
+        [
+            (
+                Method::PATCH,
+                format!("dashboards/{dashboard}/"),
+                json!({
+                    "name":"Usage",
+                    "description":"",
+                    "tags":["team-growth","cja:demo:dashboard:activity"]
+                })
+            ),
+            (
+                Method::PATCH,
+                format!("insights/{insight}/"),
+                json!({
+                    "name":"Views",
+                    "query":query(json!([service])),
+                    "tags":["team-growth","cja:demo:insight:pages"]
+                })
+            ),
+        ]
+    );
+
+    // A property-filter change alone also updates the insight in place.
+    let MetricQuery::ProductEvent(product) = &mut d.metrics[0].query else {
+        panic!("expected a product metric")
+    };
+    product.property_filters.push(PropertyFilter {
+        property: "plan".into(),
+        operator: FilterOperator::Eq,
+        value: "pro".into(),
+    });
+    let report = m.sync("demo", &d).await.unwrap();
+    assert_eq!(report.updated, ["cja:demo:insight:pages"]);
+    let plan = json!({"type":"event","key":"plan","operator":"exact","value":"pro"});
+    assert_eq!(
+        m.writes(),
+        [(
+            Method::PATCH,
+            format!("insights/{insight}/"),
+            json!({
+                "name":"Views",
+                "query":query(json!([service, plan])),
+                "tags":["team-growth","cja:demo:insight:pages"]
+            })
+        )]
+    );
+    m.sync("demo", &d).await.unwrap();
+    assert_eq!(m.writes(), []);
+}
+
+#[tokio::test]
+async fn unchanged_alert_with_an_embedded_insight_object_makes_no_writes() {
+    let m = Mock::start().await;
+    let d = example::declarations().unwrap();
+    m.sync("demo", &d).await.unwrap();
+    {
+        // PostHog returns the alert's insight as an object, not a bare id.
+        let mut state = m.state.lock().unwrap();
+        let (_, row) = state
+            .rows
+            .iter_mut()
+            .find(|((kind, _), _)| kind == "alerts")
+            .unwrap();
+        row["insight"] = json!({"id":row["insight"],"short_id":"aBcD1234","name":"daily"});
+    }
+    m.log();
+    let report = m.sync("demo", &d).await.unwrap();
+    assert_eq!(m.writes(), []);
+    assert!(report.created.is_empty() && report.updated.is_empty() && report.deleted.is_empty());
+}
+
+#[tokio::test]
+async fn removing_a_breakdown_updates_the_insight() {
+    let m = Mock::start().await;
+    let mut d = example::declarations().unwrap();
+    m.sync("demo", &d).await.unwrap();
+    let insight = m.row("cja:demo:insight:pages")["id"].clone();
+    m.log();
+    let MetricQuery::ProductEvent(product) = &mut d.metrics[0].query else {
+        panic!("expected a product metric")
+    };
+    assert_eq!(product.breakdown_property.take().as_deref(), Some("path"));
+    // Without its breakdown the metric is a scalar, so it needs a stat tile.
+    d.dashboards[0].sections[0].items[0] = Item::stat("pages");
+    let report = m.sync("demo", &d).await.unwrap();
+    assert_eq!(report.updated, ["cja:demo:insight:pages"]);
+    let writes = m.writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let (method, path, body) = &writes[0];
+    assert_eq!(
+        (method, path),
+        (&Method::PATCH, &format!("insights/{insight}/"))
+    );
+    assert_eq!(body["query"]["source"]["kind"], "TrendsQuery");
+    assert!(body["query"]["source"].get("breakdownFilter").is_none());
+    assert!(
+        m.row("cja:demo:insight:pages")["query"]["source"]
+            .get("breakdownFilter")
+            .is_none()
+    );
+    m.sync("demo", &d).await.unwrap();
+    assert_eq!(m.writes(), []);
 }
 
 #[tokio::test]
@@ -572,4 +730,93 @@ fn dashboard_limits_accept_the_exact_maximum() {
         .items
         .push(Item::health_summary());
     assert!(declarations.validate().is_err());
+}
+
+#[tokio::test]
+async fn unidentified_creates_are_removed_before_the_error_returns() {
+    for (kind, tag) in [
+        ("dashboards", "cja:demo:dashboard:activity"),
+        ("insights", "cja:demo:insight:pages"),
+        ("alerts", "cja:demo:alert:quiet"),
+    ] {
+        let mock = Mock::start().await;
+        let declarations = example::declarations().unwrap();
+        mock.state.lock().unwrap().mangle = Some(kind);
+        let error = mock.sync("demo", &declarations).await.unwrap_err();
+        let SyncError::TagNotPersisted {
+            tag: reported,
+            cleanup,
+            ..
+        } = &error
+        else {
+            panic!("{kind}: expected TagNotPersisted, got {error}")
+        };
+        assert_eq!(reported, tag);
+        assert_eq!(cleanup, "the object just created was removed");
+        let writes = mock
+            .log()
+            .into_iter()
+            .filter(|(method, _, _)| method != Method::GET)
+            .collect::<Vec<_>>();
+        // The cleanup is the last write, straight after the mangled create.
+        let [.., (create, create_path, _), (method, path, body)] = writes.as_slice() else {
+            panic!("{kind}: expected a create and a cleanup, got {writes:?}")
+        };
+        assert_eq!(
+            (create, create_path.as_str()),
+            (&Method::POST, &*format!("{kind}/"))
+        );
+        let state = mock.state.lock().unwrap();
+        if kind == "alerts" {
+            assert_eq!(method, Method::DELETE);
+            assert!(path.starts_with("alerts/"), "{path}");
+            assert!(!state.rows.keys().any(|(k, _)| k == "alerts"));
+        } else {
+            assert_eq!(method, Method::PATCH);
+            assert_eq!(body, &json!({"deleted":true}));
+            let mangled = state
+                .rows
+                .iter()
+                .find(|((k, _), row)| k == kind && row["tags"] == json!(["cja:mangled"]))
+                .map(|((_, id), row)| (id.clone(), row.clone()))
+                .unwrap();
+            assert_eq!(path, &format!("{kind}/{}/", mangled.0));
+            assert_eq!(mangled.1["deleted"], true);
+        }
+    }
+}
+
+#[tokio::test]
+async fn alert_names_over_the_posthog_limit_fail_before_any_request() {
+    let mock = Mock::start().await;
+    let mut declarations = example::declarations().unwrap();
+    // "<description> [cja:demo:alert:quiet]": the suffix is 23 characters.
+    declarations.alerts[0].description = Some("d".repeat(232));
+    mock.sync("demo", &declarations).await.unwrap();
+    assert_eq!(
+        mock.state
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|((kind, _), _)| kind == "alerts")
+            .unwrap()
+            .1["name"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        255
+    );
+    mock.log();
+    declarations.alerts[0].description = Some("d".repeat(233));
+    let error = mock.sync("demo", &declarations).await.unwrap_err();
+    assert!(
+        matches!(&error, SyncError::AlertNameTooLong { alert, length: 256 } if alert == "cja:demo:alert:quiet"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("at most 255"), "{error}");
+    // The same description fits a shorter app slug: the bound is on the name.
+    assert_eq!(mock.log(), Vec::new());
+    mock.sync("dem", &declarations).await.unwrap();
 }
