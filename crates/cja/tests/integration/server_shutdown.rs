@@ -32,6 +32,7 @@ async fn shutdown_drains_the_active_response_and_keeps_cookie_middleware() {
         routes,
         shutdown.clone().cancelled_owned(),
     ));
+    cja::setup::install_crypto_provider();
     let request = tokio::spawn(reqwest::get(format!("http://{addr}/active")));
     tokio::time::timeout(Duration::from_secs(2), started.notified())
         .await

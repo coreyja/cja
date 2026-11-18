@@ -20,6 +20,7 @@ async fn serve_until_dispatches_an_app_by_host() {
         shutdown.clone().cancelled_owned(),
     ));
 
+    cja::setup::install_crypto_provider();
     let client = reqwest::Client::new();
     for (host, expected) in [
         (None, "site"),

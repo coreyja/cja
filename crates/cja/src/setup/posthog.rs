@@ -177,6 +177,8 @@ impl PostHogSink {
         process: Option<&eyes_subscriber::ProcessIdentity>,
         max_queue_size: usize,
     ) -> Result<Self> {
+        // The exporter's reqwest client needs a process-default provider.
+        super::install_crypto_provider();
         let (logs, spans) = build_on_sync_thread(|| {
             // The async client can panic on the batch worker. Construct and drop blocking clients outside Tokio.
             // https://posthog.com/docs/logs/installation/rust

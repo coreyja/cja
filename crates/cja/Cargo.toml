@@ -14,10 +14,18 @@ testing = ["serde_urlencoded"]
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "logs", "internal-logs"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "logs", "internal-logs"] }
 # PostHog requires rustls for HTTPS: https://posthog.com/docs/logs/installation/rust
-opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "logs"] }
+# No `reqwest-rustls` here: it turns on reqwest's `rustls` feature, which links
+# aws-lc-rs next to ring. Two linked providers make rustls'
+# `ClientConfig::builder()` panic in every downstream app. TLS comes from the
+# `reqwest` line below instead.
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.33.1", default-features = false, features = ["experimental_span_attributes"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
-reqwest = { workspace = true, features = ["blocking"] }
+# Ring-only TLS: `rustls-no-provider` links no crypto backend, and
+# `setup::install_crypto_provider` installs ring as the process default. CI's
+# "ring only" job fails if aws-lc-rs ever enters cja's dependency graph.
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Pin async-trait at >= 0.1.92: Rust 1.99 clippy breaks double must_use on
 # <= 0.1.88; the lockfile resolves 0.1.92 — don't let a cargo update regress it.
 async-trait.workspace = true
