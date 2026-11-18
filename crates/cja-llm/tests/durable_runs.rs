@@ -303,7 +303,11 @@ async fn setup(kinds: &[&'static AgentKind]) -> Env {
 /// helper) instead of inserting.
 async fn drive(state: &TestState, run: RunId) -> cja::color_eyre::Result<()> {
     AdvanceRunJob { run_id: run.0 }
-        .run_with_cancellation(state.clone(), CancellationToken::new())
+        .run_with_cancellation(
+            state.clone(),
+            CancellationToken::new(),
+            cja::jobs::ConcurrencySlot::untracked(),
+        )
         .await
 }
 
@@ -1642,7 +1646,7 @@ async fn shutdown_mid_model_call_aborts_promptly_and_releases_lease() {
             AdvanceRunJob {
                 run_id: run_for_task.0,
             }
-            .run_with_cancellation(state, token)
+            .run_with_cancellation(state, token, cja::jobs::ConcurrencySlot::untracked())
             .await
         })
     };
@@ -1793,7 +1797,7 @@ async fn mid_batch_shutdown_requeues_on_a_fresh_job_row() {
         let token = token.clone();
         tokio::spawn(async move {
             AdvanceRunJob { run_id: run.0 }
-                .run_with_cancellation(state, token)
+                .run_with_cancellation(state, token, cja::jobs::ConcurrencySlot::untracked())
                 .await
         })
     };
@@ -2951,7 +2955,11 @@ async fn heartbeat_db_error_does_not_complete_the_job() {
     let state = env.state.clone();
     let task = tokio::spawn(async move {
         AdvanceRunJob { run_id: run.0 }
-            .run_with_cancellation(state, CancellationToken::new())
+            .run_with_cancellation(
+                state,
+                CancellationToken::new(),
+                cja::jobs::ConcurrencySlot::untracked(),
+            )
             .await
     });
     wait_until(|| async { (env.fake.requests().len() == 1).then_some(()) }).await;
@@ -3014,7 +3022,11 @@ async fn heartbeat_timeout_does_not_complete_the_job() {
     let state = env.state.clone();
     let task = tokio::spawn(async move {
         AdvanceRunJob { run_id: run.0 }
-            .run_with_cancellation(state, CancellationToken::new())
+            .run_with_cancellation(
+                state,
+                CancellationToken::new(),
+                cja::jobs::ConcurrencySlot::untracked(),
+            )
             .await
     });
     wait_until(|| async { (env.fake.requests().len() == 1).then_some(()) }).await;
