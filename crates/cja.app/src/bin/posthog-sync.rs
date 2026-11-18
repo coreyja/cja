@@ -13,6 +13,6 @@ async fn main() -> color_eyre::Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
     };
-    let http = posthog::http_client().wrap_err("initialize the PostHog HTTP client")?;
+    let http = posthog::SyncClient::new().wrap_err("initialize the PostHog HTTP client")?;
     Ok(posthog::run_from_env("cja-site", &declarations, &http).await)
 }

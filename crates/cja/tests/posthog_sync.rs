@@ -56,7 +56,7 @@ impl Mock {
         .unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
-            posthog::sync(&config, d, &posthog::http_client().unwrap()),
+            posthog::sync(&config, d, &posthog::SyncClient::new().unwrap()),
         )
         .await
         .unwrap()

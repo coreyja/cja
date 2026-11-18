@@ -1,6 +1,6 @@
 # Sync an application's observability declarations
 
-Define a function returning `cja::observability::Declarations` in your app library. At boot, pass its result to `attach_to_eyes_manifest` on the manifest from `build_boot_manifest`, then send that manifest through the usual Eyes transport. In a separate `posthog-sync` binary build the client with `posthog::http_client()`, then call `posthog::run_from_env` with the same declarations, your stable app slug and that client. `crates/cja.app/src/bin/posthog-sync.rs` is the pattern to copy. The cja-site example demonstrates both scalar and bucketed session counts and a page-view breakdown. Emit the corresponding product events with the app slug as their `service.name` event property.
+Define a function returning `cja::observability::Declarations` in your app library. At boot, pass its result to `attach_to_eyes_manifest` on the manifest from `build_boot_manifest`, then send that manifest through the usual Eyes transport. In a separate `posthog-sync` binary build the client with `posthog::SyncClient::new()`, then call `posthog::run_from_env` with the same declarations, your stable app slug and that client. `crates/cja.app/src/bin/posthog-sync.rs` is the pattern to copy. The cja-site example demonstrates both scalar and bucketed session counts and a page-view breakdown. Emit the corresponding product events with the app slug as their `service.name` event property.
 
 After the shared workflow lands, add a job to the caller's deploy workflow:
 

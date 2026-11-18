@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, io::Read as _, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, io::Read as _, time::Duration};
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use opentelemetry::KeyValue;
@@ -13,7 +13,6 @@ use opentelemetry_sdk::{
     logs::{self, BatchLogProcessor, SdkLogger, SdkLoggerProvider},
     trace::{self, BatchSpanProcessor, Sampler, SdkTracer, SdkTracerProvider},
 };
-use rustls_platform_verifier::BuilderVerifierExt as _;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
 /// Per-request bound on one OTLP export (client and exporter).
@@ -186,14 +185,7 @@ struct PostHogHttpClient(reqwest_012::blocking::Client);
 
 impl PostHogHttpClient {
     fn new() -> Result<Self> {
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .wrap_err("selecting TLS protocol versions")?
-        .with_platform_verifier()
-        .wrap_err("loading the platform certificate verifier")?
-        .with_no_client_auth();
+        let tls = crate::tls::ring_client_config()?;
         let client = reqwest_012::blocking::Client::builder()
             .use_preconfigured_tls(tls)
             .timeout(TIMEOUT)

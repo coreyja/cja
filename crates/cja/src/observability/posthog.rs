@@ -3,7 +3,7 @@ use super::{
     Alert, Bucket, Comparison, Dashboard, Declarations, FilterOperator, FilterValue, Item,
     MetricQuery, ProductEventMetric,
 };
-use reqwest::{Client, Method};
+use http::Method;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -70,9 +70,43 @@ impl SyncConfig {
         )
     }
 }
-/// Build the TLS-enabled client used by the CI binary.
-pub fn http_client() -> Result<Client, reqwest::Error> {
-    Client::builder().timeout(Duration::from_secs(30)).build()
+/// The sync engine's HTTPS client: rustls on ring with the platform verifier
+/// (system roots) and a 30 second request timeout.
+///
+/// It carries its own TLS configuration, so building it installs no
+/// process-wide rustls `CryptoProvider`.
+#[derive(Debug, Clone)]
+pub struct SyncClient(reqwest_012::Client);
+impl SyncClient {
+    /// Build the client. Fails when the platform certificate verifier cannot
+    /// load (for example an empty system root store).
+    pub fn new() -> Result<Self, SyncClientError> {
+        let tls = crate::tls::ring_client_config().map_err(|e| SyncClientError(Box::new(e)))?;
+        reqwest_012::Client::builder()
+            .use_preconfigured_tls(tls)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map(Self)
+            .map_err(|e| SyncClientError(Box::new(e)))
+    }
+}
+/// [`SyncClient::new`] could not build the client; the cause is its `source`.
+#[derive(Debug, thiserror::Error)]
+#[error("building the PostHog sync HTTP client")]
+pub struct SyncClientError(#[source] Box<dyn Error + Send + Sync>);
+/// A request that never produced an HTTP response (connect, TLS, timeout or
+/// body read). Displays the transport's message; the OS cause is its `source`.
+#[derive(Debug)]
+pub struct TransportError(reqwest_012::Error);
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl Error for TransportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.0.source()
+    }
 }
 /// Changes and unsupported declarations encountered during reconciliation.
 #[derive(Debug, Default)]
@@ -122,7 +156,7 @@ pub enum SyncError {
         object: String,
         operation: &'static str,
         #[source]
-        source: reqwest::Error,
+        source: TransportError,
     },
     #[error("{object}: decoding response")]
     Decode {
@@ -147,7 +181,7 @@ pub enum SyncError {
 }
 struct Api<'a> {
     config: &'a SyncConfig,
-    http: &'a Client,
+    http: &'a SyncClient,
     base: String,
 }
 impl Api<'_> {
@@ -161,15 +195,16 @@ impl Api<'_> {
         let error = |source| SyncError::Http {
             object: object.into(),
             operation: "requesting PostHog",
-            source,
+            source: TransportError(source),
         };
         let mut req = self
             .http
+            .0
             .request(method.clone(), url)
             .bearer_auth(&self.config.api_key)
             .header("Content-Type", "application/json");
         if let Some(v) = body {
-            req = req.json(v);
+            req = req.body(v.to_string());
         }
         let res = req.send().await.map_err(error)?;
         let status = res.status();
@@ -218,9 +253,9 @@ impl Api<'_> {
                     )));
                 }
             };
-            let origin = reqwest::Url::parse(&self.config.host)
+            let origin = url::Url::parse(&self.config.host)
                 .map_err(|e| SyncError::Invalid(format!("{kind}: invalid API host: {e}")))?;
-            let next_url = reqwest::Url::parse(next)
+            let next_url = url::Url::parse(next)
                 .map_err(|e| SyncError::Invalid(format!("{kind}: invalid pagination URL: {e}")))?;
             if origin.origin() != next_url.origin() {
                 return Err(SyncError::Invalid(format!(
@@ -637,7 +672,7 @@ fn alert_path(row: &Value) -> Result<String, SyncError> {
 pub async fn sync(
     config: &SyncConfig,
     declarations: &Declarations,
-    http: &Client,
+    http: &SyncClient,
 ) -> Result<SyncReport, SyncError> {
     slug(&config.app)
         .and_then(|()| declarations.validate())
@@ -735,8 +770,8 @@ fn message(error: &dyn Error) -> String {
     line.replace(['\n', '\r'], " ")
 }
 /// Run the CI command and translate its result to a process exit status.
-/// Pass the client from [`http_client`].
-pub async fn run_from_env(app: &str, d: &Declarations, http: &Client) -> ExitCode {
+/// Pass a client from [`SyncClient::new`].
+pub async fn run_from_env(app: &str, d: &Declarations, http: &SyncClient) -> ExitCode {
     if let Err(e) = d.validate() {
         eprintln!("invalid declarations: {e}");
         return ExitCode::from(2);
@@ -830,8 +865,9 @@ mod tests {
     }
     #[tokio::test]
     async fn https_error_prints_os_cause() {
-        let source = http_client()
+        let source = SyncClient::new()
             .unwrap()
+            .0
             .get("https://127.0.0.1:1/")
             .send()
             .await
@@ -839,7 +875,7 @@ mod tests {
         let err = SyncError::Http {
             object: "test-app".into(),
             operation: "listing",
-            source,
+            source: TransportError(source),
         };
         let text = message(&err);
         assert!(text.contains("test-app: listing"));
