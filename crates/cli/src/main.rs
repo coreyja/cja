@@ -1225,6 +1225,14 @@ fn generate_run_application(no_jobs: bool, no_cron: bool) -> String {
 async fn run_application() -> cja::Result<()> {
     let telemetry_handle = TracingConfig::new(env!("CARGO_CRATE_NAME")).version(env!("CARGO_PKG_VERSION")).init()?;
 
+    // Hold the outcome while telemetry flushes, so an early `?` inside
+    // `run_tasks` (a boot failure) still gets its last events out.
+    let result = run_tasks().await;
+    telemetry_handle.shutdown().await?;
+    result
+}
+
+async fn run_tasks() -> cja::Result<()> {
     let app_state = AppState::from_env().await?;
 
     // Registers SIGTERM/SIGINT and owns the shutdown sequence.
@@ -1284,9 +1292,7 @@ async fn run_application() -> cja::Result<()> {
 
     tasks.push_str(
         r"
-    let result = supervisor.run().await;
-    telemetry_handle.shutdown().await?;
-    result
+    supervisor.run().await
 }
 ",
     );
@@ -1454,6 +1460,24 @@ mod tests {
     fn full_featured_wiring_matches_current_api() {
         let main_rs = generate_main_rs(false, false, false);
         assert!(main_rs.contains(r#"TracingConfig::new(env!("CARGO_CRATE_NAME")).version(env!("CARGO_PKG_VERSION")).init()?"#));
+        // Telemetry flushes on the error path too: everything fallible after
+        // `.init()?` lives in `run_tasks`, whose result is held across the flush.
+        assert!(main_rs.contains(
+            "    let result = run_tasks().await;\n    telemetry_handle.shutdown().await?;\n    result\n}"
+        ));
+        let (boot, tasks) = main_rs
+            .split_once("async fn run_tasks() -> cja::Result<()> {")
+            .expect("generated main.rs defines run_tasks");
+        let boot = boot
+            .split_once("async fn run_application() -> cja::Result<()> {")
+            .expect("generated main.rs defines run_application")
+            .1;
+        assert_eq!(
+            boot.matches("?;").count(),
+            2,
+            "only init and the flush may use `?` beside the telemetry handle: {boot}"
+        );
+        assert!(tasks.contains("    supervisor.run().await\n}"));
         assert!(main_rs.contains("Supervisor::new(ShutdownBudget::from_env())"));
         assert!(main_rs.contains("cja::jobs::worker::job_worker("));
         assert!(main_rs.contains("cja::impl_job_registry!(crate::AppState, ExampleJob)"));

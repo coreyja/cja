@@ -115,6 +115,14 @@ async fn run_application() -> cja::Result<()> {
         .version(env!("CARGO_PKG_VERSION"))
         .init()?;
 
+    // Hold the outcome while telemetry flushes, so an early `?` inside
+    // `run_tasks` (a boot failure) still gets its last events out.
+    let result = run_tasks().await;
+    telemetry_handle.shutdown().await?;
+    result
+}
+
+async fn run_tasks() -> cja::Result<()> {
     let cron_registry = heartbeat::cron_registry()?;
     let app_state = AppState::from_env(heartbeat::schedule(&cron_registry)).await?;
 
@@ -166,9 +174,7 @@ async fn run_application() -> cja::Result<()> {
         info!("Cron Disabled");
     }
 
-    let result = supervisor.run().await;
-    telemetry_handle.shutdown().await?;
-    result
+    supervisor.run().await
 }
 
 fn is_feature_enabled(feature: &str) -> bool {

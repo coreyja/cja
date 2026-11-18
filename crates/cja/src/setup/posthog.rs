@@ -14,7 +14,30 @@ use opentelemetry_sdk::{
 };
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
+/// Per-request bound on one OTLP export (client and exporter).
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// Records each batch queue holds before it drops (and counts) on overflow.
+pub(super) const MAX_QUEUE_SIZE: usize = 8192;
+/// Records per export request; clamped to the queue size in [`PostHogSink::build`].
+const MAX_EXPORT_BATCH_SIZE: usize = 512;
+/// How often the log worker exports a partial batch.
+const LOGS_SCHEDULED_DELAY: Duration = Duration::from_secs(1);
+/// How often the span worker exports a partial batch.
+const TRACES_SCHEDULED_DELAY: Duration = Duration::from_secs(5);
+/// How long each provider's final flush may take. Both providers flush in
+/// parallel, so this is also the whole sink's flush time.
+///
+/// Invariant: `PROVIDER_SHUTDOWN_TIMEOUT` < [`SHUTDOWN_WORKER_TIMEOUT`] <=
+/// [`super::TELEMETRY_SHUTDOWN_BUDGET`]. The inner bound has to fire first so
+/// the SDK reports its own timeout and the blocking worker is never abandoned
+/// mid-flush. It is deliberately shorter than [`TIMEOUT`]: a request stalled
+/// at shutdown is abandoned so the flush fits the platform kill window.
+const PROVIDER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Backstop on the blocking task that runs both provider flushes.
+const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_millis(2500);
+const _: () = assert!(PROVIDER_SHUTDOWN_TIMEOUT.as_millis() < SHUTDOWN_WORKER_TIMEOUT.as_millis());
+const _: () =
+    assert!(SHUTDOWN_WORKER_TIMEOUT.as_millis() <= super::TELEMETRY_SHUTDOWN_BUDGET.as_millis());
 
 pub(super) enum PostHogEnv {
     Enabled(PostHogConfig),
@@ -190,8 +213,8 @@ impl PostHogSink {
             .with_batch_config(
                 logs::BatchConfigBuilder::default()
                     .with_max_queue_size(max_queue_size)
-                    .with_max_export_batch_size(512.min(max_queue_size))
-                    .with_scheduled_delay(Duration::from_secs(1))
+                    .with_max_export_batch_size(MAX_EXPORT_BATCH_SIZE.min(max_queue_size))
+                    .with_scheduled_delay(LOGS_SCHEDULED_DELAY)
                     .build(),
             )
             .build();
@@ -199,8 +222,8 @@ impl PostHogSink {
             .with_batch_config(
                 trace::BatchConfigBuilder::default()
                     .with_max_queue_size(max_queue_size)
-                    .with_max_export_batch_size(512.min(max_queue_size))
-                    .with_scheduled_delay(Duration::from_secs(5))
+                    .with_max_export_batch_size(MAX_EXPORT_BATCH_SIZE.min(max_queue_size))
+                    .with_scheduled_delay(TRACES_SCHEDULED_DELAY)
                     .build(),
             )
             .build();
@@ -248,10 +271,12 @@ impl fmt::Debug for PostHogShutdownHandle {
     }
 }
 impl PostHogShutdownHandle {
+    /// Flushes both providers in parallel, each bounded by
+    /// [`PROVIDER_SHUTDOWN_TIMEOUT`]. Failures are logged, never returned.
     pub async fn shutdown(self) {
         let job = tokio::task::spawn_blocking(move || {
             std::thread::scope(|s| {
-                let timeout = Duration::from_secs(6);
+                let timeout = PROVIDER_SHUTDOWN_TIMEOUT;
                 let logs = s.spawn(move || self.logs.shutdown_with_timeout(timeout));
                 let spans = s.spawn(move || self.spans.shutdown_with_timeout(timeout));
                 for result in [logs.join(), spans.join()] {
@@ -261,7 +286,7 @@ impl PostHogShutdownHandle {
                 }
             });
         });
-        let result = tokio::time::timeout(Duration::from_secs(8), job).await;
+        let result = tokio::time::timeout(SHUTDOWN_WORKER_TIMEOUT, job).await;
         if !matches!(result, Ok(Ok(()))) {
             tracing::warn!(target:"posthog", ?result, "PostHog shutdown worker failed");
         }

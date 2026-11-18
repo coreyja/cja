@@ -180,8 +180,8 @@ fn main() -> cja::Result<()> {
 }
 
 async fn run() -> cja::Result<()> {
-    // Keep the Eyes handle alive for graceful shutdown
-    let _telemetry_handle = setup_tracing("my-app")?;
+    // Flushes Eyes and PostHog when shutdown() is called below
+    let telemetry = setup_tracing("my-app")?;
 
     let app_state = MyApp { /* ... */ };
     let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
@@ -203,7 +203,10 @@ async fn run() -> cja::Result<()> {
         )
     );
 
-    supervisor.run().await
+    let result = supervisor.run().await;
+    // Flush telemetry on every exit path: bounded at 3s, always Ok
+    telemetry.shutdown().await?;
+    result
 }
 ```
 
@@ -220,7 +223,13 @@ See `crates/cja.app/` in the repository for a complete working example.
 | `JOBS_DISABLED` | No | `false` | Set to `"true"` to skip starting the job worker |
 | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |
 | `RUST_LOG` | No | `info` | Tracing filter directive |
+| `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `2` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked |
+| `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `2` | Extra time for tasks to exit after the job drain. Drain + grace + the telemetry flush (`TelemetryShutdownHandle::shutdown`, up to 3s when a sink is stalled) must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default) |
 | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
+| `POSTHOG_PROJECT_TOKEN` | No | — | Enable OTLP logs and traces to PostHog at boot |
+| `POSTHOG_HOST` | No | `https://us.i.posthog.com` | PostHog OTLP host |
+| `POSTHOG_LOG_LEVEL` | No | `info` | Minimum level for BOTH PostHog log records and PostHog spans (one shared filter): `off` sends no traces either |
+| `POSTHOG_TRACES_SAMPLE_RATIO` | No | `1.0` | Root trace sampling probability |
 | `EYES_ORG_ID` | No | — | Eyes tracing org ID (both `ORG_ID` and `APP_ID` required) |
 | `EYES_APP_ID` | No | — | Eyes tracing app ID |
 | `EYES_URL` | No | `https://eyes.coreyja.com` | Eyes server URL |
@@ -503,7 +512,9 @@ let telemetry = setup_tracing("my-app")?;
 telemetry.shutdown().await?;
 ```
 
-Call `shutdown().await?` on the returned `TelemetryShutdownHandle` to flush Eyes and PostHog. Set `POSTHOG_PROJECT_TOKEN` in the process environment before tracing setup. `POSTHOG_HOST` defaults to `https://us.i.posthog.com`, `POSTHOG_LOG_LEVEL` to `info`, and `POSTHOG_TRACES_SAMPLE_RATIO` to `1.0`. Both signals honor scoped `RUST_LOG` and the rig content cap.
+Call `shutdown().await?` on the returned `TelemetryShutdownHandle` to flush Eyes and PostHog, on the error path too. Each flush is bounded: the call returns within 3 seconds even when a sink is stalled, always returns `Ok`, and logs failures. It runs after the supervisor's drain and grace, so count it against the platform's kill window. Set `POSTHOG_PROJECT_TOKEN` in the process environment before tracing setup. `POSTHOG_HOST` defaults to `https://us.i.posthog.com`, `POSTHOG_LOG_LEVEL` to `info`, and `POSTHOG_TRACES_SAMPLE_RATIO` to `1.0`. Both signals honor scoped `RUST_LOG` and the rig content cap.
+
+`POSTHOG_LOG_LEVEL` gates both PostHog log records and PostHog spans through one shared per-layer filter, so `off` sends no traces either (the sample ratio only applies to spans the level admits). The same filter always excludes the exporter's own crates, matched by target prefix (tracing-subscriber `Targets` uses `starts_with`): `opentelemetry`, `tracing_opentelemetry`, `hyper`, `hyper_util`, `h2`, `reqwest`, `rustls`, `want`, `mio` and `posthog`, so `opentelemetry` also covers `opentelemetry_sdk`, `opentelemetry_otlp` and the rest of the family. While PostHog is enabled, Eyes also drops `opentelemetry*` targets, so the OTel SDK's own diagnostics (queue drops, export errors) reach stdout only; with no token, Eyes is unfiltered as before.
 
 ## Re-exports
 

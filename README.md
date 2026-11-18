@@ -121,6 +121,12 @@ cargo fmt --check
 For process-aware telemetry, initialize tracing with
 `cja::setup::TracingConfig::new("my_app").process(identity.clone()).init()` and
 attach the same `ProcessIdentity` to the boot manifest and heartbeat config.
-Call `TelemetryShutdownHandle::shutdown` to flush configured Eyes and PostHog sinks. The
+Call `TelemetryShutdownHandle::shutdown` to flush configured Eyes and PostHog sinks; it is
+bounded at 3 seconds, which counts against the platform's kill window alongside
+`CJA_SHUTDOWN_JOB_DRAIN_SECS` and `CJA_SHUTDOWN_EXIT_GRACE_SECS`. `POSTHOG_LOG_LEVEL`
+(default `info`) gates both PostHog log records and PostHog spans, so `off` sends no
+traces either. The PostHog exclusion list (`opentelemetry`, `hyper`, `h2`, `reqwest`,
+`rustls`, ...) matches by target prefix, and Eyes drops `opentelemetry*` targets while
+PostHog is enabled. The
 `eyes_manifest` module re-exports the subscriber's metric, threshold, dashboard,
 and process-lifecycle builders. These APIs require eyes-subscriber 0.8.
