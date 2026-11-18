@@ -820,3 +820,65 @@ async fn alert_names_over_the_posthog_limit_fail_before_any_request() {
     assert_eq!(mock.log(), Vec::new());
     mock.sync("dem", &declarations).await.unwrap();
 }
+
+/// Insert a copy of the live row matching `pick` under a fresh id, the way
+/// duplicating an object in the `PostHog` UI does (tags and name come along).
+fn duplicate(m: &Mock, kind: &str, pick: impl Fn(&Value) -> bool) -> (String, String) {
+    let mut s = m.state.lock().unwrap();
+    let mut copy = s
+        .rows
+        .iter()
+        .find(|((k, _), row)| k == kind && pick(row))
+        .map(|(_, row)| row.clone())
+        .unwrap();
+    s.next += 1;
+    let key = if kind == "alerts" {
+        uuid::Uuid::from_u128(s.next.into()).to_string()
+    } else {
+        s.next.to_string()
+    };
+    copy["id"] = if kind == "alerts" {
+        json!(key)
+    } else {
+        json!(s.next)
+    };
+    s.rows.insert((kind.into(), key.clone()), copy);
+    (kind.into(), key)
+}
+
+/// The error text and recovery steps quoted in `docs/posthog-sync.md`
+/// ("Duplicating a managed object in `PostHog`").
+#[tokio::test]
+async fn a_duplicated_managed_object_fails_until_the_copy_loses_its_identity() {
+    let m = Mock::start().await;
+    let d = example::declarations().unwrap();
+    m.sync("demo", &d).await.unwrap();
+    m.log();
+
+    let copy = duplicate(&m, "insights", |r| {
+        r["tags"] == json!(["cja:demo:insight:pages"])
+    });
+    let error = m.sync("demo", &d).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "duplicate identity cja:demo:insight:pages"
+    );
+    assert!(m.writes().is_empty(), "fails before any write");
+    m.state.lock().unwrap().rows.get_mut(&copy).unwrap()["tags"] = json!([]);
+    let report = m.sync("demo", &d).await.unwrap();
+    assert_eq!(m.writes(), vec![]);
+    assert!(report.created.is_empty() && report.updated.is_empty() && report.deleted.is_empty());
+
+    let copy = duplicate(&m, "alerts", |r| {
+        r["name"]
+            .as_str()
+            .is_some_and(|n| n.ends_with("[cja:demo:alert:quiet]"))
+    });
+    let error = m.sync("demo", &d).await.unwrap_err();
+    assert_eq!(error.to_string(), "duplicate alert quiet");
+    m.state.lock().unwrap().rows.get_mut(&copy).unwrap()["name"] = json!("Quiet (Copy)");
+    m.log();
+    let report = m.sync("demo", &d).await.unwrap();
+    assert_eq!(m.writes(), vec![]);
+    assert!(report.created.is_empty() && report.updated.is_empty() && report.deleted.is_empty());
+}

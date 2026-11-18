@@ -42,6 +42,31 @@ If PostHog accepts a create but does not return the identity, the sync removes t
 
 Pruning runs on every sync. An empty declaration set removes every owned object. Dashboards and insights are soft-deleted, alerts hard-deleted. Hand-made objects and other apps' objects retain their identities. A hand-made dashboard that uses a managed insight can lose that tile's contents when the underlying insight is pruned. Avoid concurrent manual and CI syncs because PostHog assigns identities at creation.
 
+## Duplicating a managed object in PostHog
+
+Duplicating a managed insight or dashboard in the PostHog UI copies its tags, including the `cja:<app>:<type>:<key>` identity tag. Two live objects then claim one identity, and the next sync refuses to guess which is real. It fails while indexing the project, before it writes anything, with exit code 1 and this line on stderr:
+
+```text
+duplicate identity cja:my-app:insight:signups
+```
+
+The text after `duplicate identity` is the copied tag. Every deploy's sync fails the same way until someone fixes it by hand:
+
+1. In PostHog, search insights (or dashboards, for a `:dashboard:` tag) for the tag printed in the error. Two results carry it.
+2. Open the copy: the one whose name ends in `(Copy)`, or failing that the newer "Created" date.
+3. Remove the `cja:<app>:<type>:<key>` tag from the copy and save. Leave its other tags and the original alone. Deleting the copy works too.
+4. Re-run the failed sync job. It should report zero creates, updates and deletes for that object.
+
+Removing the tag from the original instead makes the copy the managed object: the next sync overwrites the copy's name and query from the declaration and re-tiles it onto the declared dashboards, while the original becomes a hand-made object.
+
+Alerts have no tags; their identity is the trailing `[cja:<app>:alert:<key>]` in the name. A duplicated alert that keeps that suffix at the end of its name fails the sync with:
+
+```text
+duplicate alert signups-low
+```
+
+The text after `duplicate alert` is the alert key. This check runs after dashboards and insights have synced, so those changes have already been applied. Rename the copy so it no longer ends in the suffix (or delete it), then re-run the job. A copy whose name does not end in the suffix is treated as hand-made and never causes this error.
+
 ## Mapping
 
 | Declaration | Result |
