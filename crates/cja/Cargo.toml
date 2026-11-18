@@ -12,6 +12,27 @@ testing = ["serde_urlencoded"]
 
 [dependencies]
 reqwest = { workspace = true, features = ["rustls"] }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "logs", "internal-logs"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "logs", "internal-logs"] }
+# PostHog requires rustls for HTTPS: https://posthog.com/docs/logs/installation/rust
+# No reqwest feature here: the exporter's HTTP client is `PostHogHttpClient` in
+# src/setup/posthog.rs, over `reqwest_012` below.
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "trace", "logs"] }
+opentelemetry-http = { version = "0.33.1", default-features = false }
+opentelemetry-appender-tracing = { version = "0.33.1", default-features = false, features = ["experimental_span_attributes"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+# The PostHog exporter's HTTP client. reqwest 0.12, not the workspace's 0.13:
+# 0.13's only bundled rustls provider is aws-lc-rs (linked next to ring, two
+# providers make rustls' `ClientConfig::builder()` panic), and its
+# `rustls-no-provider` would leak into every downstream app's reqwest 0.13,
+# whose clients then panic unless a process-default provider is installed.
+# 0.12 already ships in every cja graph (eyes-subscriber) on ring. The client
+# carries its own ring config, so nothing is installed process-wide. CI's
+# "ring only" job fails if aws-lc-rs enters cja's dependency graph.
+reqwest_012 = { package = "reqwest", version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls-manual-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+url = "2"
 # Pin async-trait at >= 0.1.92: Rust 1.99 clippy breaks double must_use on
 # <= 0.1.88; the lockfile resolves 0.1.92 — don't let a cargo update regress it.
 async-trait.workspace = true

@@ -1036,7 +1036,7 @@ use cja::{
 
     imports.push_str(
         r"    },
-    setup::setup_tracing,
+    setup::TracingConfig,
     tasks::{ShutdownBudget, Supervisor},
 };
 use maud::html;
@@ -1223,8 +1223,16 @@ fn generate_run_application(no_jobs: bool, no_cron: bool) -> String {
     let mut tasks = String::from(
         r#"
 async fn run_application() -> cja::Result<()> {
-    let _eyes_handle = setup_tracing(env!("CARGO_CRATE_NAME"))?;
+    let telemetry_handle = TracingConfig::new(env!("CARGO_CRATE_NAME")).version(env!("CARGO_PKG_VERSION")).init()?;
 
+    // Hold the outcome while telemetry flushes, so an early `?` inside
+    // `run_tasks` (a boot failure) still gets its last events out.
+    let result = run_tasks().await;
+    telemetry_handle.shutdown().await?;
+    result
+}
+
+async fn run_tasks() -> cja::Result<()> {
     let app_state = AppState::from_env().await?;
 
     // Registers SIGTERM/SIGINT and owns the shutdown sequence.
@@ -1451,6 +1459,25 @@ mod tests {
     #[test]
     fn full_featured_wiring_matches_current_api() {
         let main_rs = generate_main_rs(false, false, false);
+        assert!(main_rs.contains(r#"TracingConfig::new(env!("CARGO_CRATE_NAME")).version(env!("CARGO_PKG_VERSION")).init()?"#));
+        // Telemetry flushes on the error path too: everything fallible after
+        // `.init()?` lives in `run_tasks`, whose result is held across the flush.
+        assert!(main_rs.contains(
+            "    let result = run_tasks().await;\n    telemetry_handle.shutdown().await?;\n    result\n}"
+        ));
+        let (boot, tasks) = main_rs
+            .split_once("async fn run_tasks() -> cja::Result<()> {")
+            .expect("generated main.rs defines run_tasks");
+        let boot = boot
+            .split_once("async fn run_application() -> cja::Result<()> {")
+            .expect("generated main.rs defines run_application")
+            .1;
+        assert_eq!(
+            boot.matches("?;").count(),
+            2,
+            "only init and the flush may use `?` beside the telemetry handle: {boot}"
+        );
+        assert!(tasks.contains("    supervisor.run().await\n}"));
         assert!(main_rs.contains("Supervisor::new(ShutdownBudget::from_env())"));
         assert!(main_rs.contains("cja::jobs::worker::job_worker("));
         assert!(main_rs.contains("cja::impl_job_registry!(crate::AppState, ExampleJob)"));

@@ -4,7 +4,7 @@ use cja::{
         eyre::{Context as _, eyre},
     },
     server::{cookies::CookieKey, run_server_until},
-    setup::setup_tracing,
+    setup::TracingConfig,
     tasks::{ShutdownBudget, Supervisor},
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -111,8 +111,18 @@ pub async fn migrate(pool: &PgPool) -> cja::Result<()> {
 }
 
 async fn run_application() -> cja::Result<()> {
-    setup_tracing("cja-site")?;
+    let telemetry_handle = TracingConfig::new("cja-site")
+        .version(env!("CARGO_PKG_VERSION"))
+        .init()?;
 
+    // Hold the outcome while telemetry flushes, so an early `?` inside
+    // `run_tasks` (a boot failure) still gets its last events out.
+    let result = run_tasks().await;
+    telemetry_handle.shutdown().await?;
+    result
+}
+
+async fn run_tasks() -> cja::Result<()> {
     let cron_registry = heartbeat::cron_registry()?;
     let app_state = AppState::from_env(heartbeat::schedule(&cron_registry)).await?;
 
