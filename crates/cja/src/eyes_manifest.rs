@@ -30,9 +30,7 @@
 //! `app_version` and `git_sha` are explicit because cja cannot read the
 //! application's compile-time environment. Pass `None` when unavailable.
 
-#[cfg(test)]
-use crate::app_state::HttpMethod;
-use crate::app_state::HttpMonitor;
+pub use crate::app_state::{HttpMethod, HttpMonitor};
 use std::collections::HashSet;
 
 use crate::{app_state::AppState, jobs::registry::JobRegistry};

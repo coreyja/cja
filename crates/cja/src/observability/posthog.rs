@@ -209,7 +209,11 @@ impl Api<'_> {
                     )));
                 }
             };
-            if next.split('?').next() != Some(path.as_str()) {
+            let origin = reqwest::Url::parse(&self.config.host)
+                .map_err(|e| SyncError::Invalid(format!("{kind}: invalid API host: {e}")))?;
+            let next_url = reqwest::Url::parse(next)
+                .map_err(|e| SyncError::Invalid(format!("{kind}: invalid pagination URL: {e}")))?;
+            if origin.origin() != next_url.origin() {
                 return Err(SyncError::Invalid(format!(
                     "{kind}: unexpected pagination URL"
                 )));

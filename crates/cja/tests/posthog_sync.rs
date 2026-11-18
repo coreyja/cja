@@ -80,7 +80,11 @@ async fn handle(
     bytes: Bytes,
 ) -> Response {
     assert_eq!(headers["authorization"], "Bearer test");
-    let path = uri.path().strip_prefix("/api/projects/1/").unwrap();
+    let path = uri
+        .path()
+        .strip_prefix("/api/projects/1/")
+        .or_else(|| uri.path().strip_prefix("/api/environments/1/"))
+        .unwrap();
     let parts = path.trim_end_matches('/').split('/').collect::<Vec<_>>();
     let mut body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let mut s = shared.lock().unwrap();
@@ -444,7 +448,7 @@ fn list_page(results: &[Value], uri: &axum::http::Uri, headers: &HeaderMap, kind
         .map_or(0, |n| n.parse().unwrap());
     let next = (offset + 2 < results.len()).then(|| {
         format!(
-            "http://{}/api/projects/1/{kind}/?limit=2&offset={}",
+            "http://{}/api/environments/1/{kind}/?limit=2&offset={}",
             headers["host"].to_str().unwrap(),
             offset + 2
         )
