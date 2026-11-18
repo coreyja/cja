@@ -773,7 +773,7 @@ pub trait Job<AppState: AS>:
     /// `enqueue_receipt` as [`Job::enqueue`], and performs the same single
     /// INSERT. The receipt (and the span) mark the INSERT, not the commit:
     /// if the caller's transaction rolls back afterward, the receipt
-    /// remains in telemetry. It does NOT call [`AppState::job_enqueued`]:
+    /// remains in telemetry. It does NOT call [`crate::app_state::AppState::job_enqueued`]:
     /// that is not a transaction-commit hook. The caller MUST call
     /// `state.job_enqueued()` on its `AppState` after its transaction
     /// commits, so an idle worker is woken for the new row.
