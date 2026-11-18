@@ -43,6 +43,10 @@ async fn flood() {
     let baseline = memory_kib("VmRSS:");
     let start = Instant::now();
     for i in 0..100_000 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "emit loop blocked"
+        );
         tracing::info!(target:"test_app", i, payload = "x".repeat(16*1024));
     }
     assert!(start.elapsed() < Duration::from_secs(30));

@@ -44,6 +44,7 @@ use uuid::Uuid;
 // Re-export for consumers
 pub use eyes_subscriber::EyesShutdownHandle;
 
+#[must_use = "call .shutdown().await to flush telemetry"]
 #[derive(Debug)]
 pub struct TelemetryShutdownHandle {
     eyes: Option<EyesShutdownHandle>,
@@ -166,22 +167,32 @@ fn initialize_tracing(
         hierarchical.boxed()
     };
 
-    let registry = Registry::default().with(stdout_layer).with(eyes_layer);
     let (sink, posthog) = setup_posthog(crate_name, process, version)?;
-    if let Some(sink) = sink {
-        registry
-            .with(
-                tracing_opentelemetry::layer()
-                    .with_tracer(sink.tracer())
-                    .with_filter(sink.filter()),
-            )
-            .with(sink.log_bridge().with_filter(sink.filter()))
-            .with(env_filter)
-            .with(rig_cap)
-            .try_init()?;
-    } else {
-        registry.with(env_filter).with(rig_cap).try_init()?;
-    }
+    let eyes_filter = tracing_subscriber::filter::Targets::new()
+        .with_default(tracing_subscriber::filter::LevelFilter::TRACE)
+        .with_target(
+            "opentelemetry",
+            if sink.is_some() {
+                tracing_subscriber::filter::LevelFilter::OFF
+            } else {
+                tracing_subscriber::filter::LevelFilter::TRACE
+            },
+        );
+    Registry::default()
+        .with(stdout_layer)
+        .with(eyes_layer.map(|layer| layer.with_filter(eyes_filter)))
+        .with(sink.as_ref().map(|sink| {
+            tracing_opentelemetry::layer()
+                .with_tracer(sink.tracer())
+                .with_filter(sink.filter())
+        }))
+        .with(
+            sink.as_ref()
+                .map(|sink| sink.log_bridge().with_filter(sink.filter())),
+        )
+        .with(env_filter)
+        .with(rig_cap)
+        .try_init()?;
     Ok(TelemetryShutdownHandle {
         eyes: eyes_shutdown_handle,
         posthog,

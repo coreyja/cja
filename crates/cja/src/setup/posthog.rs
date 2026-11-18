@@ -33,7 +33,7 @@ impl PostHogEnv {
             });
         };
         let host = read("POSTHOG_HOST").unwrap_or_else(|| "https://us.i.posthog.com".into());
-        let url = reqwest::Url::parse(&host).map_err(|_| eyre!("invalid POSTHOG_HOST"))?;
+        let url = reqwest::Url::parse(host.trim()).map_err(|_| eyre!("invalid POSTHOG_HOST"))?;
         ensure!(
             matches!(url.scheme(), "http" | "https")
                 && url.host().is_some()
@@ -328,6 +328,21 @@ mod tests {
             assert!(parse(&[token, ("POSTHOG_TRACES_SAMPLE_RATIO", value)]).is_err());
         }
         assert!(parse(&[token, ("POSTHOG_LOG_LEVEL", "bad")]).is_err());
+        for (key, value) in [
+            ("POSTHOG_LOG_LEVEL", "bad"),
+            ("POSTHOG_TRACES_SAMPLE_RATIO", "bad"),
+        ] {
+            let error = parse(&[token, (key, value)]).err().unwrap();
+            assert!(format!("{error:#}").contains(key));
+        }
+        for host in ["https://us.i.posthog.com\n", " https://us.i.posthog.com"] {
+            let PostHogEnv::Enabled(config) = parse(&[token, ("POSTHOG_HOST", host)]).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(config.host, "https://us.i.posthog.com");
+        }
+
         let PostHogEnv::Enabled(custom) = parse(&[
             token,
             ("POSTHOG_TRACES_SAMPLE_RATIO", "0"),
