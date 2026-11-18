@@ -78,7 +78,7 @@
 //!
 //! async fn run() -> cja::Result<()> {
 //!     // Keep the Eyes handle alive for graceful shutdown
-//!     let _eyes_handle = setup_tracing("my-app")?;
+//!     let _telemetry_handle = setup_tracing("my-app")?;
 //!
 //!     let app_state = MyAppState { /* ... */ };
 //!
@@ -128,6 +128,10 @@
 //! | `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `2` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked |
 //! | `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `2` | Extra time for tasks to exit after the job drain. Drain + grace must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default) |
 //! | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
+//! | `POSTHOG_PROJECT_TOKEN` | No | — | Enable OTLP logs and traces at boot |
+//! | `POSTHOG_HOST` | No | `https://us.i.posthog.com` | OTLP host |
+//! | `POSTHOG_LOG_LEVEL` | No | info | Minimum `PostHog` level |
+//! | `POSTHOG_TRACES_SAMPLE_RATIO` | No | 1.0 | Root trace sampling probability |
 //! | `EYES_ORG_ID` | No | — | Eyes tracing org ID (both `ORG_ID` and `APP_ID` required) |
 //! | `EYES_APP_ID` | No | — | Eyes tracing app ID |
 //! | `EYES_URL` | No | `https://eyes.coreyja.com` | Eyes server URL |
@@ -144,7 +148,7 @@
 //!
 //! Disabling `jobs` at compile time also disables `cron`.
 //! [`testing::test_db`] is always available; `testing` enables only
-//! [`testing::mock_oauth`].
+//! `testing::mock_oauth`.
 //!
 //! ## Re-exports
 //!

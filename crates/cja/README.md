@@ -181,7 +181,7 @@ fn main() -> cja::Result<()> {
 
 async fn run() -> cja::Result<()> {
     // Keep the Eyes handle alive for graceful shutdown
-    let _eyes_handle = setup_tracing("my-app")?;
+    let _telemetry_handle = setup_tracing("my-app")?;
 
     let app_state = MyApp { /* ... */ };
     let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
@@ -498,11 +498,12 @@ migrations, see the "App migrations" section of the `cja::db` module docs.
 ```rust
 use cja::setup::setup_tracing;
 
-// Keep the handle alive — dropping it shuts down Eyes
-let _eyes_handle = setup_tracing("my-app")?;
+let telemetry = setup_tracing("my-app")?;
+// After application tasks finish
+telemetry.shutdown().await?;
 ```
 
-`setup_tracing()` returns `Result<Option<EyesShutdownHandle>>`. If Eyes is configured (both `EYES_ORG_ID` and `EYES_APP_ID` set), the handle must stay alive in your `main` scope.
+Call `shutdown().await?` on the returned `TelemetryShutdownHandle` to flush Eyes and PostHog. Set `POSTHOG_PROJECT_TOKEN` in the process environment before tracing setup. `POSTHOG_HOST` defaults to `https://us.i.posthog.com`, `POSTHOG_LOG_LEVEL` to `info`, and `POSTHOG_TRACES_SAMPLE_RATIO` to `1.0`. Both signals honor scoped `RUST_LOG` and the rig content cap.
 
 ## Re-exports
 

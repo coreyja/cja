@@ -17,7 +17,7 @@
 //! Call once at boot after constructing job and cron registries:
 //!
 //! ```rust,ignore
-//! let _eyes_handle = cja::setup::setup_tracing("my-app")?;
+//! let _telemetry_handle = cja::setup::setup_tracing("my-app")?;
 //! let app_state = AppState::from_env().await?;
 //! let cron_registry = cron_registry();
 //! cja::eyes_manifest::send_boot_manifest::<Jobs, AppState>(

@@ -52,7 +52,7 @@ migrations/         — Partial, best-effort copy of crates/cja/migrations/ (see
 ```
 lib.rs             — Re-exports (sqlx, uuid, color_eyre, maud, chrono, chrono_tz)
 app_state.rs       — AppState trait
-setup.rs           — tracing initialization (stdout + Eyes)
+setup.rs           — tracing initialization (stdout + Eyes + optional PostHog OTLP)
 db.rs              — run_migrations() via sqlx::migrate!("./migrations")
 tasks.rs           — Supervisor, ShutdownBudget, NamedTask, wait_for_first_error
 jobs/

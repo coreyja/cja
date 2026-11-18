@@ -1036,7 +1036,7 @@ use cja::{
 
     imports.push_str(
         r"    },
-    setup::setup_tracing,
+    setup::TracingConfig,
     tasks::{ShutdownBudget, Supervisor},
 };
 use maud::html;
@@ -1223,7 +1223,7 @@ fn generate_run_application(no_jobs: bool, no_cron: bool) -> String {
     let mut tasks = String::from(
         r#"
 async fn run_application() -> cja::Result<()> {
-    let _eyes_handle = setup_tracing(env!("CARGO_CRATE_NAME"))?;
+    let telemetry_handle = TracingConfig::new(env!("CARGO_CRATE_NAME")).version(env!("CARGO_PKG_VERSION")).init()?;
 
     let app_state = AppState::from_env().await?;
 
@@ -1284,7 +1284,9 @@ async fn run_application() -> cja::Result<()> {
 
     tasks.push_str(
         r"
-    supervisor.run().await
+    let result = supervisor.run().await;
+    telemetry_handle.shutdown().await?;
+    result
 }
 ",
     );
@@ -1451,6 +1453,7 @@ mod tests {
     #[test]
     fn full_featured_wiring_matches_current_api() {
         let main_rs = generate_main_rs(false, false, false);
+        assert!(main_rs.contains(r#"TracingConfig::new(env!("CARGO_CRATE_NAME")).version(env!("CARGO_PKG_VERSION")).init()?"#));
         assert!(main_rs.contains("Supervisor::new(ShutdownBudget::from_env())"));
         assert!(main_rs.contains("cja::jobs::worker::job_worker("));
         assert!(main_rs.contains("cja::impl_job_registry!(crate::AppState, ExampleJob)"));

@@ -4,7 +4,7 @@ use cja::{
         eyre::{Context as _, eyre},
     },
     server::{cookies::CookieKey, run_server_until},
-    setup::setup_tracing,
+    setup::TracingConfig,
     tasks::{ShutdownBudget, Supervisor},
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -111,7 +111,9 @@ pub async fn migrate(pool: &PgPool) -> cja::Result<()> {
 }
 
 async fn run_application() -> cja::Result<()> {
-    setup_tracing("cja-site")?;
+    let telemetry_handle = TracingConfig::new("cja-site")
+        .version(env!("CARGO_PKG_VERSION"))
+        .init()?;
 
     let cron_registry = heartbeat::cron_registry()?;
     let app_state = AppState::from_env(heartbeat::schedule(&cron_registry)).await?;
@@ -164,7 +166,9 @@ async fn run_application() -> cja::Result<()> {
         info!("Cron Disabled");
     }
 
-    supervisor.run().await
+    let result = supervisor.run().await;
+    telemetry_handle.shutdown().await?;
+    result
 }
 
 fn is_feature_enabled(feature: &str) -> bool {

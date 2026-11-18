@@ -1,16 +1,36 @@
 //! Application setup: tracing/observability initialization.
 //!
-//! Call [`setup_tracing`] inside the async context. It returns an optional
-//! [`EyesShutdownHandle`] — keep it alive in your `main` scope:
+//! Call [`setup_tracing`] inside the async context. It returns a
+//! [`TelemetryShutdownHandle`] for flushing configured sinks:
 //!
 //! ```rust,ignore
-//! let _eyes_handle = setup_tracing("my-app")?;
+//! let telemetry = setup_tracing("my-app")?;
+//! telemetry.shutdown().await?;
 //! ```
 //!
 //! # Supported Backends
 //!
 //! - **Console**: Tree-formatted logs (default) or JSON with `JSON_LOGS` env var
 //! - **Eyes**: Distributed tracing via `EYES_ORG_ID` + `EYES_APP_ID` (both required)
+//! - **`PostHog`**: Set `POSTHOG_PROJECT_TOKEN` at boot to enable OTLP logs and spans.
+//!   `POSTHOG_HOST` defaults to `https://us.i.posthog.com`, `POSTHOG_LOG_LEVEL` to info,
+//!   and `POSTHOG_TRACES_SAMPLE_RATIO` to 1.0. Both signals respect scoped
+//!   `RUST_LOG` and the global rig content cap.
+
+mod posthog;
+
+#[doc(hidden)]
+pub mod posthog_test_support {
+    pub use super::posthog::{PostHogConfig, PostHogShutdownHandle, PostHogSink};
+    pub fn filter_stack(
+        rust_log: &str,
+    ) -> color_eyre::Result<(
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::filter::Targets,
+    )> {
+        super::filter_stack(rust_log)
+    }
+}
 
 use color_eyre::eyre::Context;
 use eyes_subscriber::{EyesLayer, EyesSubscriberBuilder};
@@ -24,10 +44,37 @@ use uuid::Uuid;
 // Re-export for consumers
 pub use eyes_subscriber::EyesShutdownHandle;
 
-/// Sets up tracing with optional Eyes and stdout layers.
-///
-/// Returns an optional `EyesShutdownHandle` that should be used for graceful shutdown
-/// when Eyes is configured (via `EYES_ORG_ID` and `EYES_APP_ID` environment variables).
+#[derive(Debug)]
+pub struct TelemetryShutdownHandle {
+    eyes: Option<EyesShutdownHandle>,
+    posthog: Option<posthog::PostHogShutdownHandle>,
+}
+
+impl TelemetryShutdownHandle {
+    pub async fn shutdown(self) -> color_eyre::Result<()> {
+        tokio::join!(
+            async {
+                if let Some(eyes) = self.eyes {
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), eyes.shutdown())
+                            .await;
+                    if !matches!(result, Ok(Ok(()))) {
+                        tracing::warn!(?result, "Eyes shutdown failed");
+                    }
+                }
+            },
+            async {
+                if let Some(handle) = self.posthog {
+                    handle.shutdown().await;
+                }
+            }
+        );
+        Ok(())
+    }
+}
+
+/// Installs stdout and the configured Eyes and `PostHog` sinks.
+/// Call the returned handle's shutdown method before exiting.
 ///
 /// # Environment Variables
 ///
@@ -35,12 +82,12 @@ pub use eyes_subscriber::EyesShutdownHandle;
 ///   rig's content-bearing targets are always capped regardless of this
 ///   value, including span-scoped directives: `rig::completions` and
 ///   `rig::streaming` at DEBUG, `rig_agent::agent::typed` at ERROR (see
-///   [`filter_stack`]).
+///   `filter_stack`).
 /// - `JSON_LOGS`: If set, outputs JSON logs instead of hierarchical
 /// - `EYES_ORG_ID`: Eyes organization ID (UUID)
 /// - `EYES_APP_ID`: Eyes application ID (UUID)
 /// - `EYES_URL`: Eyes server URL (defaults to `https://eyes.coreyja.com`)
-pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<Option<EyesShutdownHandle>> {
+pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<TelemetryShutdownHandle> {
     TracingConfig::new(crate_name).init()
 }
 
@@ -48,6 +95,7 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<Option<EyesShutdown
 /// Use the same identity in the boot manifest and heartbeat configuration.
 pub struct TracingConfig<'a> {
     crate_name: &'a str,
+    service_version: Option<String>,
     process: Option<eyes_subscriber::ProcessIdentity>,
 }
 
@@ -57,6 +105,7 @@ impl<'a> TracingConfig<'a> {
         Self {
             crate_name,
             process: None,
+            service_version: None,
         }
     }
 
@@ -66,15 +115,26 @@ impl<'a> TracingConfig<'a> {
         self
     }
 
-    pub fn init(self) -> color_eyre::Result<Option<EyesShutdownHandle>> {
-        initialize_tracing(self.crate_name, self.process.as_ref())
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.service_version = Some(version.into());
+        self
+    }
+
+    pub fn init(self) -> color_eyre::Result<TelemetryShutdownHandle> {
+        initialize_tracing(
+            self.crate_name,
+            self.process.as_ref(),
+            self.service_version.as_deref(),
+        )
     }
 }
 
 fn initialize_tracing(
     crate_name: &str,
     process: Option<&eyes_subscriber::ProcessIdentity>,
-) -> color_eyre::Result<Option<EyesShutdownHandle>> {
+    version: Option<&str>,
+) -> color_eyre::Result<TelemetryShutdownHandle> {
     let rust_log = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| format!("info,{crate_name}=trace,tower_http=debug,serenity=error"));
 
@@ -106,14 +166,59 @@ fn initialize_tracing(
         hierarchical.boxed()
     };
 
-    Registry::default()
-        .with(stdout_layer)
-        .with(eyes_layer)
-        .with(env_filter)
-        .with(rig_cap)
-        .try_init()?;
+    let registry = Registry::default().with(stdout_layer).with(eyes_layer);
+    let (sink, posthog) = setup_posthog(crate_name, process, version)?;
+    if let Some(sink) = sink {
+        registry
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(sink.tracer())
+                    .with_filter(sink.filter()),
+            )
+            .with(sink.log_bridge().with_filter(sink.filter()))
+            .with(env_filter)
+            .with(rig_cap)
+            .try_init()?;
+    } else {
+        registry.with(env_filter).with(rig_cap).try_init()?;
+    }
+    Ok(TelemetryShutdownHandle {
+        eyes: eyes_shutdown_handle,
+        posthog,
+    })
+}
 
-    Ok(eyes_shutdown_handle)
+fn setup_posthog(
+    crate_name: &str,
+    process: Option<&eyes_subscriber::ProcessIdentity>,
+    version: Option<&str>,
+) -> color_eyre::Result<(
+    Option<posthog::PostHogSink>,
+    Option<posthog::PostHogShutdownHandle>,
+)> {
+    match posthog::PostHogEnv::from_env()? {
+        posthog::PostHogEnv::Skipped {
+            host_set_without_token,
+        } => {
+            if host_set_without_token {
+                println!(
+                    "Skipping PostHog layer: POSTHOG_HOST set but POSTHOG_PROJECT_TOKEN missing"
+                );
+            } else {
+                println!("Skipping PostHog layer");
+            }
+            Ok((None, None))
+        }
+        posthog::PostHogEnv::Enabled(config) => {
+            let sink = posthog::PostHogSink::build(&config, crate_name, version, process, 8192)?;
+            println!(
+                "PostHog OTLP layer configured (host: {}, log level: {}, traces sample ratio: {})",
+                config.host, config.log_level, config.traces_sample_ratio
+            );
+            let handle = sink.shutdown_handle();
+            Ok((Some(sink), Some(handle)))
+        }
+    }
 }
 
 /// Builds the tracing filter stack for a `RUST_LOG` string: the parsed

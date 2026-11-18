@@ -11,6 +11,13 @@ jobs = []
 testing = ["serde_urlencoded"]
 
 [dependencies]
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "logs", "internal-logs"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "logs", "internal-logs"] }
+# PostHog requires rustls for HTTPS: https://posthog.com/docs/logs/installation/rust
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "logs"] }
+opentelemetry-appender-tracing = { version = "0.33.1", default-features = false, features = ["experimental_span_attributes"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+reqwest = { workspace = true, features = ["blocking"] }
 # Pin async-trait at >= 0.1.92: Rust 1.99 clippy breaks double must_use on
 # <= 0.1.88; the lockfile resolves 0.1.92 — don't let a cargo update regress it.
 async-trait.workspace = true
