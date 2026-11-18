@@ -1,3 +1,5 @@
+use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Redirect;
 use axum::{Router, response::IntoResponse, routing::get};
 use tower_http::services::ServeDir;
@@ -14,6 +16,7 @@ pub fn router(app_state: AppState) -> Result<Router, cja::assets::AssetError> {
 
     Ok(Router::new()
         .route("/", get(landing))
+        .route("/status", get(status))
         .nest_service("/docs", docs_service)
         .merge(cja::assets::router::<AppState>(&[
             &crate::site_assets::MANIFEST,
@@ -23,4 +26,19 @@ pub fn router(app_state: AppState) -> Result<Router, cja::assets::AssetError> {
 
 async fn landing() -> impl IntoResponse {
     templates::landing_page()
+}
+
+async fn status(State(app_state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
+    let status = crate::heartbeat::status(
+        &app_state.db,
+        &app_state.heartbeat_schedule,
+        cja::chrono::Utc::now(),
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(error = %format_args!("{error:#}"), "failed to load heartbeat status");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(templates::status_page(&status))
 }

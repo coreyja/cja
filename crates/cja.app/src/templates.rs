@@ -4,6 +4,79 @@ pub fn landing_page() -> Markup {
     base_layout("CJA — Cron, Jobs, and Axum", &landing_content())
 }
 
+pub fn status_page(status: &crate::heartbeat::Status) -> Markup {
+    base_layout("CJA — Status", &status_content(status))
+}
+
+fn status_content(status: &crate::heartbeat::Status) -> Markup {
+    use crate::heartbeat::{TIMEZONE, ago};
+
+    let local = |at: &cja::chrono::DateTime<cja::chrono::Utc>| {
+        at.with_timezone(&TIMEZONE)
+            .format("%b %-d, %-I:%M:%S %p %Z")
+            .to_string()
+    };
+
+    html! {
+        section class="status" {
+            div class="site-container" {
+                div class="section-heading" {
+                    h2 { "Status" }
+                    p {
+                        "This site runs on cja. A cron fires every five minutes ("
+                        (TIMEZONE.name())
+                        "), enqueues a job, and the job records a heartbeat."
+                    }
+                }
+                div class="status-summary" {
+                    div class="status-stat" {
+                        h4 { "Last fired" }
+                        @if let Some(at) = &status.last_fired_at {
+                            p { (ago(status.now, *at)) }
+                            p class="status-detail" { (local(at)) }
+                        } @else {
+                            p { "Never" }
+                        }
+                    }
+                    div class="status-stat" {
+                        h4 { "Next fire" }
+                        p { (status.next_fire_at.format("%-I:%M %p %Z")) }
+                    }
+                }
+                h3 { "Recent heartbeats" }
+                @if status.recent.is_empty() {
+                    p class="status-detail" { "No heartbeats yet." }
+                } @else {
+                    ul class="status-list" {
+                        @for beat in &status.recent {
+                            li {
+                                span { (local(&beat.started_at)) }
+                                span class="status-detail" { (ago(status.now, beat.started_at)) }
+                                @match beat.finished_at {
+                                    Some(finished) => span class="status-detail" {
+                                        "took " ((finished - beat.started_at).num_milliseconds()) "ms"
+                                    },
+                                    None => span class="status-detail" { "unfinished" },
+                                }
+                            }
+                        }
+                    }
+                }
+                h3 { "Heartbeats per day" }
+                ul class="status-list" {
+                    @for day in &status.days {
+                        li {
+                            span { (day.local_date.format("%a %b %-d")) }
+                            span class="status-detail" { (day.beats) }
+                        }
+                    }
+                }
+            }
+        }
+        (footer_section())
+    }
+}
+
 fn base_layout(title: &str, content: &Markup) -> Markup {
     html! {
         (DOCTYPE)
@@ -274,6 +347,7 @@ fn footer_section() -> Markup {
                             li { a href="/docs/cja/index.html" { "Documentation" } }
                             li { a href="https://github.com/coreyja/cja" { "GitHub" } }
                             li { a href="https://crates.io/crates/cja" { "Crates.io" } }
+                            li { a href="/status" { "Status" } }
                         }
                     }
                     div class="footer-about" {
@@ -316,6 +390,22 @@ fn server_icon() -> Markup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_page_renders_empty_state() {
+        let now = cja::chrono::Utc::now();
+        let status = crate::heartbeat::Status {
+            now,
+            recent: vec![],
+            days: vec![],
+            last_fired_at: None,
+            next_fire_at: now.with_timezone(&crate::heartbeat::TIMEZONE),
+        };
+        let html = super::status_page(&status).into_string();
+        assert!(html.contains("Never"));
+        assert!(html.contains("No heartbeats yet."));
+        assert!(html.contains("America/New_York"));
+    }
+
     #[test]
     fn landing_page_resolves_all_assets() {
         let html = super::landing_page().into_string();

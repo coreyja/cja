@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT started_at, finished_at\n         FROM heartbeats\n         ORDER BY started_at DESC\n         LIMIT 12",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "06ee6d3da99765926f1a2872782fa1724747c30b4f1bba9e83332b8f6761abf7"
+}
