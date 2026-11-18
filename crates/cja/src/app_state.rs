@@ -1,3 +1,5 @@
+pub use eyes_subscriber::{HttpMethod, HttpMonitor};
+
 use crate::server::cookies::CookieKey;
 
 /// A trait representing the application state that must be implemented by users of the cja framework.
@@ -112,14 +114,14 @@ pub trait AppState: Clone + Send + Sync + 'static {
     /// re-export without depending on `eyes-subscriber` directly:
     ///
     /// ```
-    /// use cja::eyes_subscriber::{HttpMethod, HttpMonitor};
+    /// use cja::app_state::{HttpMethod, HttpMonitor};
     /// let monitors = vec![
     ///     HttpMonitor::new("health", "/health"),
     ///     HttpMonitor::new("headers", "https://example.com/").method(HttpMethod::Head),
     /// ];
     /// assert_eq!(monitors.len(), 2);
     /// ```
-    fn eyes_http_monitors(&self) -> Vec<crate::eyes_subscriber::HttpMonitor> {
+    fn eyes_http_monitors(&self) -> Vec<eyes_subscriber::HttpMonitor> {
         Vec::new()
     }
 }
