@@ -2,7 +2,8 @@
 //!
 //! Attach the declarations to an Eyes boot manifest at startup. A separate CI
 //! binary calls [`posthog::sync`] to reconcile product-event trends, dashboard
-//! tiles and alert bounds. Span metrics and health widgets stay in Eyes.
+//! tiles and alert bounds. Span metrics, ratio metrics and health widgets
+//! stay in Eyes. Declaration ids must be lowercase.
 //! See the repository guide at `docs/posthog-sync.md` for the mapping matrix,
 //! required credentials, and reusable workflow.
 
