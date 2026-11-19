@@ -44,6 +44,25 @@ async fn invalid_id_token_claims_cannot_authenticate() {
 }
 
 #[tokio::test]
+async fn small_issuer_clock_skew_is_accepted_but_large_future_nbf_is_rejected() {
+    for (skew, expected) in [(1, StatusCode::SEE_OTHER), (120, StatusCode::UNAUTHORIZED)] {
+        let fixture = Fixture::new().await;
+        let (_, cookie, state) = fixture.start("/auth/login").await;
+        let nonce = fixture.nonce().await;
+        let now = jiff::Timestamp::now().as_second();
+        let claims = json!({
+            "iss": fixture.server.base_url(), "sub": "userid:123",
+            "aud": "test-client", "exp": now + 300, "iat": now + skew,
+            "nbf": now + skew, "jti": "test-jti", "nonce": nonce
+        });
+        fixture.token_mock(jwt_claims(&claims), "refresh-1").await;
+        let callback = fixture.callback(&cookie, &state).await;
+        assert_eq!(callback.status(), expected, "skew={skew}");
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
 async fn bad_signature_unknown_kid_and_access_hash_are_rejected() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     for variant in ["signature", "kid", "at_hash"] {
@@ -145,11 +164,13 @@ async fn refreshed_id_token_with_same_subject_does_not_require_old_nonce() {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-    let refreshed_id = common::jwt(
-        &fixture.server.base_url(),
-        "new-nonce-not-from-login",
-        "userid:123",
-    );
+    let now = jiff::Timestamp::now().as_second();
+    let refreshed_id = common::jwt_claims(&json!({
+        "iss": fixture.server.base_url(), "sub": "userid:123",
+        "aud": "test-client", "exp": now + 300, "iat": now + 1,
+        "nbf": now + 1, "jti": "refreshed-jti",
+        "nonce": "new-nonce-not-from-login"
+    }));
     let refresh = fixture
         .server
         .mock_async(|when, then| {
@@ -174,5 +195,12 @@ async fn refreshed_id_token_with_same_subject_does_not_require_old_nonce() {
         .await
         .unwrap();
     assert_eq!(stored, "refresh-2");
+    let snapshots: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT email, preferred_username FROM passport_users")
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(snapshots.0.as_deref(), Some("user@example.test"));
+    assert_eq!(snapshots.1.as_deref(), Some("user"));
     fixture.close().await;
 }

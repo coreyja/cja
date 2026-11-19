@@ -140,10 +140,9 @@ async fn refresh_locked(
         match oidc::refresh(config, &refresh_token, (&user.issuer, &user.subject)).await {
             Ok(tokens) => {
                 if let Some(identity) = tokens.identity {
-                    user::upsert(
+                    user::refresh_display(
                         &mut tx,
-                        &identity.issuer,
-                        &identity.subject,
+                        user_id,
                         identity.email.as_deref(),
                         identity.preferred_username.as_deref(),
                         identity.picture.as_deref(),
@@ -186,7 +185,26 @@ pub async fn resolve_user(
     config: &PassportConfig,
     id: Uuid,
 ) -> cja::Result<Option<User>> {
-    tokio::time::timeout(Duration::from_secs(12), refresh_locked(pool, config, id))
+    // Most requests are not due. Avoid a row lock and transaction until a
+    // refresh or hard-cap expiry needs to mutate the binding.
+    let due_or_expired: Option<bool> = sqlx::query_scalar(
+        "SELECT next_refresh_at <= now() OR
+                authenticated_at + make_interval(secs => $2) <= now()
+         FROM passport_sessions WHERE session_id = $1",
+    )
+    .bind(id)
+    .bind(config.timings.max_age.as_secs_f64())
+    .fetch_optional(pool)
+    .await?;
+    if due_or_expired == Some(false) {
+        return select_user(pool, config, id).await;
+    }
+    if due_or_expired.is_none() {
+        return Ok(None);
+    }
+    // Discovery, token exchange, and unknown-kid JWKS reload can each take
+    // five seconds. Leave time for the database write and commit.
+    tokio::time::timeout(Duration::from_secs(20), refresh_locked(pool, config, id))
         .await
         .map_err(|_| cja::color_eyre::eyre::eyre!("passport session refresh timed out"))?
 }

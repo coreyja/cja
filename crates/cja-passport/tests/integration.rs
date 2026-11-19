@@ -326,6 +326,52 @@ async fn server_error_preserves_session_until_original_hard_cap() {
 }
 
 #[tokio::test]
+async fn refused_token_connection_defers_refresh_without_revoking_session() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+    let fixture = Fixture::new_with_token_endpoint(Some(token_endpoint)).await;
+    let (_, cookie, _) = fixture.start("/auth/login").await;
+    let session_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT session_id FROM passport_login_attempts")
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO passport_users (issuer, subject) VALUES ($1, 'userid:123') RETURNING user_id",
+    )
+    .bind(fixture.server.base_url())
+    .fetch_one(&fixture.state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO passport_sessions
+         (session_id, user_id, authenticated_at, last_refresh_at, next_refresh_at, refresh_token)
+         VALUES ($1, $2, now(), now() - interval '2 hours', now() - interval '1 second', 'refresh-1')",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&fixture.state.pool)
+    .await
+    .unwrap();
+    drop(listener);
+
+    let response = fixture
+        .request("GET", "/private", Some(&cookie), None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let row: (String, bool) = sqlx::query_as(
+        "SELECT refresh_token, next_refresh_at > now() FROM passport_sessions WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&fixture.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "refresh-1");
+    assert!(row.1);
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn rotated_refresh_token_is_persisted_and_used_next_time() {
     let fixture = Fixture::new().await;
     let (_, old_cookie, state) = fixture.start("/auth/login").await;

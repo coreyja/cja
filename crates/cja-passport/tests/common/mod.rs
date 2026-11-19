@@ -119,19 +119,24 @@ async fn optional(OptionalUser(user): OptionalUser) -> String {
 
 impl Fixture {
     pub async fn new() -> Self {
+        Self::new_with_token_endpoint(None).await
+    }
+
+    pub async fn new_with_token_endpoint(token_endpoint: Option<String>) -> Self {
         let (pool, guard) = cja::testing::test_db::create_test_database("cja_passport_test_")
             .await
             .unwrap();
         cja_passport::run_migrations(&pool).await.unwrap();
         let server = MockServer::start_async().await;
         let issuer = server.base_url();
+        let token_endpoint = token_endpoint.unwrap_or_else(|| format!("{issuer}/token"));
         server
             .mock_async(|when, then| {
                 when.method(GET).path("/.well-known/openid-configuration");
                 then.status(200).json_body(json!({
                     "issuer": issuer,
                     "authorization_endpoint": format!("{issuer}/authorize"),
-                    "token_endpoint": format!("{issuer}/token"),
+                    "token_endpoint": token_endpoint,
                     "jwks_uri": format!("{issuer}/jwks"),
                     "response_types_supported": ["code"],
                     "subject_types_supported": ["public"],

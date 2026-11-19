@@ -264,24 +264,22 @@ async fn finish_login<S: AppState + HasPassportConfig>(
     .await
     .map_err(internal)?;
 
-    let target = if let Destination::Native(native_uri) = destination {
-        let handoff = random_secret();
-        sqlx::query(
-            "INSERT INTO passport_handoffs (code_hash, session_id, expires_at)
-             VALUES ($1, $2, now() + interval '60 seconds')",
-        )
-        .bind(hash(&handoff))
-        .bind(new_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-        let mut uri = url::Url::parse(&native_uri).map_err(internal)?;
-        uri.query_pairs_mut().append_pair("code", &handoff);
-        uri.to_string()
-    } else {
-        match destination {
-            Destination::Browser(path) => path,
-            Destination::Native(_) => unreachable!(),
+    let target = match destination {
+        Destination::Browser(path) => path,
+        Destination::Native(native_uri) => {
+            let handoff = random_secret();
+            sqlx::query(
+                "INSERT INTO passport_handoffs (code_hash, session_id, expires_at)
+                 VALUES ($1, $2, now() + interval '60 seconds')",
+            )
+            .bind(hash(&handoff))
+            .bind(new_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+            let mut uri = url::Url::parse(&native_uri).map_err(internal)?;
+            uri.query_pairs_mut().append_pair("code", &handoff);
+            uri.to_string()
         }
     };
     tx.commit().await.map_err(internal)?;

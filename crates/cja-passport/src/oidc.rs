@@ -107,7 +107,10 @@ struct RequiredClaims {
     exp: i64,
 }
 
-fn check_required(id_token: &openidconnect::core::CoreIdToken) -> Result<(), TokenFailure> {
+fn check_required(
+    id_token: &openidconnect::core::CoreIdToken,
+    now: i64,
+) -> Result<(), TokenFailure> {
     let encoded = id_token.to_string();
     let payload = encoded.split('.').nth(1).ok_or(TokenFailure::Rejected)?;
     let bytes = URL_SAFE_NO_PAD
@@ -115,8 +118,14 @@ fn check_required(id_token: &openidconnect::core::CoreIdToken) -> Result<(), Tok
         .map_err(|_| TokenFailure::Rejected)?;
     let required: RequiredClaims =
         serde_json::from_slice(&bytes).map_err(|_| TokenFailure::Rejected)?;
-    let now = jiff::Timestamp::now().as_second();
-    if required.nbf > now || required.iat > now || required.exp <= now || required.jti.is_empty() {
+    // tsidp and the relying party run on different hosts. Allow small clock skew
+    // for issuance claims while keeping expiration strict.
+    const CLOCK_SKEW_SECONDS: i64 = 60;
+    if required.nbf > now + CLOCK_SKEW_SECONDS
+        || required.iat > now + CLOCK_SKEW_SECONDS
+        || required.exp <= now
+        || required.jti.is_empty()
+    {
         return Err(TokenFailure::Rejected);
     }
     Ok(())
@@ -156,7 +165,8 @@ fn verify(
         ) => VerifyFailure::UnknownKid,
         _ => VerifyFailure::Rejected,
     })?;
-    check_required(id_token).map_err(|_| VerifyFailure::Rejected)?;
+    check_required(id_token, jiff::Timestamp::now().as_second())
+        .map_err(|_| VerifyFailure::Rejected)?;
     if let Some(expected) = claims.access_token_hash() {
         let actual = AccessTokenHash::from_token(
             token.access_token(),

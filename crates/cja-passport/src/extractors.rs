@@ -78,11 +78,13 @@ async fn load<A: AppState + HasPassportConfig + Send + Sync>(
             None => None,
         }
     };
-    if let Some(ref user) = user {
-        let _ = cja::server::trace::record_request_user(
+    if let Some(ref user) = user
+        && !cja::server::trace::record_request_user(
             user.user_id,
             cja::server::trace::AUTH_TYPE_PASSPORT,
-        );
+        )
+    {
+        tracing::debug!("passport request user could not be recorded outside request scope");
     }
     Ok(user)
 }
@@ -102,8 +104,12 @@ impl<A: AppState + HasPassportConfig + Send + Sync> FromRequestParts<A> for Curr
                 .is_some_and(|v| v.contains("text/html"))
         {
             let mut url = url::Url::parse("https://localhost/auth/login").expect("literal URL");
-            url.query_pairs_mut()
-                .append_pair("return_to", &parts.uri.to_string());
+            let original = parts
+                .extensions
+                .get::<axum::extract::OriginalUri>()
+                .map_or(&parts.uri, |original| &original.0);
+            let return_to = original.path_and_query().map_or("/", |pq| pq.as_str());
+            url.query_pairs_mut().append_pair("return_to", return_to);
             let location = format!("{}?{}", url.path(), url.query().unwrap_or_default());
             return Err((
                 StatusCode::SEE_OTHER,

@@ -58,3 +58,24 @@ pub async fn upsert(
     .await?;
     decode(&row)
 }
+
+pub async fn refresh_display(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: uuid::Uuid,
+    email: Option<&str>,
+    preferred_username: Option<&str>,
+    picture: Option<&str>,
+) -> cja::Result<()> {
+    sqlx::query(
+        "UPDATE passport_users SET email = COALESCE($2, email),
+         preferred_username = COALESCE($3, preferred_username),
+         picture = COALESCE($4, picture) WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .bind(email)
+    .bind(preferred_username)
+    .bind(picture)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
