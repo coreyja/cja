@@ -518,3 +518,48 @@ fn bare_properties_keep_tracing_types() {
     assert!(!fields.contains(&"debug:first".to_string()));
     assert!(!fields.contains(&"debug:slug".to_string()));
 }
+
+#[test]
+fn capture_v1_event_drop_is_reported() {
+    if boot::is_child() {
+        boot::child(
+            &[&|| {
+                cja::product_event!(name: "rejected_view", user_id: None, message: "Rejected view", properties: {});
+            }],
+            |_| {},
+        );
+        return;
+    }
+    boot::block_on(async {
+        let app = axum::Router::new().fallback(|body: axum::body::Bytes| async move {
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let uuid = request["batch"][0]["uuid"].as_str().unwrap();
+            let mut results = serde_json::Map::new();
+            results.insert(
+                uuid.to_owned(),
+                serde_json::json!({"result": "drop", "details": "invalid_options"}),
+            );
+            axum::Json(serde_json::json!({"results": results}))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut child = boot::spawn(
+            "capture_v1_event_drop_is_reported",
+            &[
+                ("POSTHOG_HOST", &host),
+                ("POSTHOG_PROJECT_TOKEN", "phc_fixture"),
+            ],
+        );
+        assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
+        child.release();
+        let exit = child.finish();
+        server.abort();
+        assert!(exit.success, "{}", exit.output());
+        assert!(
+            exit.stdout.contains("capture rejected events"),
+            "{}",
+            exit.output()
+        );
+    });
+}
