@@ -34,9 +34,9 @@ The CI process calls PostHog directly. A failed sync fails that job after deploy
 
 Dashboard and insight tags take the form `cja:<app>:<dashboard|insight>:<key>`. Alerts carry a trailing `[cja:<app>:alert:<key>]` in the name. Keep those identifiers stable.
 
-Every declaration ID must be lowercase. PostHog lowercases tags when it stores them, so an uppercase ID would never match its own tag again. Metric and alert IDs use `[a-z0-9._:_-]`. Dashboard IDs use the same set without `_`, which Eyes does not accept there. `Declarations::validate` rejects anything else, in the app at boot and in the sync before any request.
+Every declaration ID must be lowercase. PostHog lowercases tags when it stores them, so an uppercase ID would never match its own tag again. Metric, alert and dashboard IDs use `[a-z0-9._:-]`, including underscore. `Declarations::validate` rejects anything else, in the app at boot and in the sync before any request.
 
-An alert's name is its description, or its ID when it has none, followed by the suffix. PostHog caps names at 255 characters. The sync rejects a longer name with `AlertNameTooLong` before it sends anything, so shorten the description.
+An alert's name is its description, or its ID when it has none, followed by the suffix. PostHog caps names at 255 characters. The sync rejects a longer product-metric alert name with `AlertNameTooLong` before it sends anything: shorten the description, or the ID when there is no description. Eyes-only alerts are skipped by the PostHog sync.
 
 If PostHog accepts a create but does not return the identity, the sync removes the object it just created and fails with `TagNotPersisted`. The error says whether the removal worked. Editing the display name or query updates the object in place. Changing a key replaces it. Renaming the app orphans its old objects.
 

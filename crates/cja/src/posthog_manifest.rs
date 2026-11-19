@@ -1000,6 +1000,7 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let mock_host = format!("http://{}", listener.local_addr().unwrap());
             let mut command = Command::new(std::env::current_exe().unwrap());
+            crate::testing::scrub_telemetry_env(&mut command);
             command
                 .args([
                     "--exact",
@@ -1361,6 +1362,7 @@ mod tests {
         ] {
             let start = Instant::now();
             let mut command = Command::new(std::env::current_exe().unwrap());
+            crate::testing::scrub_telemetry_env(&mut command);
             command
                 .args([
                     "--exact",

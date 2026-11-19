@@ -8,7 +8,7 @@ use cja::{
     tasks::{ShutdownBudget, Supervisor},
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use tracing::info;
+use tracing::{error, info};
 
 mod heartbeat;
 mod routes;
@@ -118,7 +118,13 @@ async fn run_application() -> cja::Result<()> {
     // Hold the outcome while telemetry flushes, so an early `?` inside
     // `run_tasks` (a boot failure) still gets its last events out.
     let result = run_tasks().await;
-    telemetry_handle.shutdown().await?;
+    if let Err(error) = &result {
+        error!(error = %format_args!("{error:#}"), "application tasks failed");
+    }
+    let flush = telemetry_handle.shutdown().await;
+    if result.is_ok() {
+        flush?;
+    }
     result
 }
 

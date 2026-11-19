@@ -1225,10 +1225,16 @@ fn generate_run_application(no_jobs: bool, no_cron: bool) -> String {
 async fn run_application() -> cja::Result<()> {
     let telemetry_handle = TracingConfig::new(env!("CARGO_CRATE_NAME")).version(env!("CARGO_PKG_VERSION")).init()?;
 
+    // Keep this handle and call shutdown on every exit path. Binding it to
+    // `_handle` only hides must_use; it loses buffered Eyes/PostHog data.
     // Hold the outcome while telemetry flushes, so an early `?` inside
     // `run_tasks` (a boot failure) still gets its last events out.
     let result = run_tasks().await;
-    telemetry_handle.shutdown().await?;
+    if let Err(error) = &result {
+        tracing::error!(error = %format_args!("{error:#}"), "application tasks failed");
+    }
+    let flush = telemetry_handle.shutdown().await;
+    if result.is_ok() { flush?; }
     result
 }
 
@@ -1462,9 +1468,12 @@ mod tests {
         assert!(main_rs.contains(r#"TracingConfig::new(env!("CARGO_CRATE_NAME")).version(env!("CARGO_PKG_VERSION")).init()?"#));
         // Telemetry flushes on the error path too: everything fallible after
         // `.init()?` lives in `run_tasks`, whose result is held across the flush.
-        assert!(main_rs.contains(
-            "    let result = run_tasks().await;\n    telemetry_handle.shutdown().await?;\n    result\n}"
-        ));
+        let run = main_rs.find("let result = run_tasks().await;").unwrap();
+        let error = main_rs.find("application tasks failed").unwrap();
+        let flush = main_rs
+            .find("let flush = telemetry_handle.shutdown().await;")
+            .unwrap();
+        assert!(run < error && error < flush);
         let (boot, tasks) = main_rs
             .split_once("async fn run_tasks() -> cja::Result<()> {")
             .expect("generated main.rs defines run_tasks");
@@ -1475,7 +1484,7 @@ mod tests {
         assert_eq!(
             boot.matches("?;").count(),
             2,
-            "only init and the flush may use `?` beside the telemetry handle: {boot}"
+            "only init and the successful flush may use `?` beside the telemetry handle: {boot}"
         );
         assert!(tasks.contains("    supervisor.run().await\n}"));
         assert!(main_rs.contains("Supervisor::new(ShutdownBudget::from_env())"));

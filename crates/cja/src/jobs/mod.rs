@@ -878,6 +878,8 @@ mod enqueue_on_tests {
     use super::*;
     use crate::app_state::AppState;
     use crate::server::cookies::CookieKey;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
     #[derive(Clone)]
     struct TestAppState {
@@ -911,6 +913,120 @@ mod enqueue_on_tests {
         async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
             Ok(())
         }
+    }
+
+    #[derive(Clone)]
+    struct RawSpans(Arc<Mutex<Vec<String>>>);
+    struct DebugVisitor<'a>(&'a mut Vec<String>);
+    impl tracing::field::Visit for DebugVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+    impl<S: tracing::Subscriber> Layer<S> for RawSpans {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: Context<'_, S>,
+        ) {
+            attrs.record(&mut DebugVisitor(&mut self.0.lock().unwrap()));
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+    struct EmailJob {
+        recipient_override: String,
+    }
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for EmailJob {
+        const NAME: &'static str = "EmailJob";
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_enqueue_span_keeps_raw_sibling_but_drops_debug_from_posthog() {
+        let captures = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let requests_for_server = captures.clone();
+        let app =
+            axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let requests = requests_for_server.clone();
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((uri.path().into(), body.to_vec()));
+                    axum::http::StatusCode::OK
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sink = crate::setup::posthog_test_support::PostHogSink::build(
+            &crate::setup::posthog_test_support::PostHogConfig::new_for_tests(
+                host,
+                "phc_test",
+                tracing_subscriber::filter::LevelFilter::TRACE,
+                1.0,
+            ),
+            "jobs-test",
+            None,
+            None,
+            8192,
+        )
+        .unwrap();
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(sink.tracer())
+                    .with_filter(sink.filter()),
+            )
+            .with(sink.log_bridge().with_filter(sink.filter()))
+            .with(RawSpans(raw.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let job = EmailJob {
+                recipient_override: "synthetic@example.test".into(),
+            };
+            let span = enqueue_span::<TestAppState, EmailJob>(
+                &job,
+                "test-context",
+                Some(7),
+                jiff::Timestamp::now(),
+                uuid::Uuid::nil(),
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "fixture", "job-event");
+        });
+        sink.shutdown_handle().shutdown().await;
+        let raw = raw.lock().unwrap().join(" ");
+        assert!(
+            raw.contains("synthetic@example.test") && raw.contains("self="),
+            "{raw}"
+        );
+        let captures = captures.lock().unwrap();
+        for path in ["/i/v1/traces", "/i/v1/logs"] {
+            let body = captures
+                .iter()
+                .filter(|(p, _)| p == path)
+                .flat_map(|(_, b)| b.iter().copied())
+                .collect::<Vec<_>>();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("job.id")
+                    && text.contains("job.name")
+                    && text.contains("job.context")
+                    && text.contains("job.priority"),
+                "{path}"
+            );
+            assert!(
+                !text.contains("synthetic@example.test") && !text.contains("recipient_override"),
+                "{path}: leaked job Debug"
+            );
+        }
+        server.abort();
     }
 
     #[sqlx::test]

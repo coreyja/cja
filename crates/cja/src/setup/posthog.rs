@@ -8,11 +8,18 @@ use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response, Respon
 use opentelemetry_otlp::{
     LogExporter, Protocol, SpanExporter, WithExportConfig as _, WithHttpConfig as _,
 };
+use opentelemetry_proto::tonic::collector::{
+    logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
+};
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, KeyValue as ProtoKeyValue, any_value::Value,
+};
 use opentelemetry_sdk::{
     Resource,
     logs::{self, BatchLogProcessor, SdkLogger, SdkLoggerProvider},
     trace::{self, BatchSpanProcessor, Sampler, SdkTracer, SdkTracerProvider},
 };
+use prost::Message as _;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 
 /// Per-request bound on one OTLP export (client and exporter).
@@ -93,12 +100,14 @@ impl PostHogEnv {
             });
         };
         let log_level = read("POSTHOG_LOG_LEVEL")
-            .map(|s| s.parse())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse())
             .transpose()
             .wrap_err("invalid POSTHOG_LOG_LEVEL")?
             .unwrap_or(LevelFilter::INFO);
         let ratio = read("POSTHOG_TRACES_SAMPLE_RATIO")
-            .map(|s| s.parse::<f64>())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse::<f64>())
             .transpose()
             .wrap_err("invalid POSTHOG_TRACES_SAMPLE_RATIO")?
             .unwrap_or(1.0);
@@ -203,25 +212,220 @@ const MAX_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
 /// process-wide crypto provider and leaves the app's TLS setup alone. Why
 /// reqwest 0.12 and not the workspace's 0.13: see `reqwest_012` in
 /// `crates/cja/Cargo.toml`.
-#[derive(Debug, Clone)]
-struct PostHogHttpClient(reqwest_012::blocking::Client);
+#[derive(Clone)]
+struct PostHogHttpClient {
+    client: reqwest_012::blocking::Client,
+    authorization: http::HeaderValue,
+}
+
+impl fmt::Debug for PostHogHttpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PostHogHttpClient")
+    }
+}
 
 impl PostHogHttpClient {
-    fn new() -> Result<Self> {
+    fn new(token: &str) -> Result<Self> {
         let tls = crate::tls::ring_client_config()?;
         let client = reqwest_012::blocking::Client::builder()
             .use_preconfigured_tls(tls)
             .timeout(TIMEOUT)
+            .redirect(reqwest_012::redirect::Policy::none())
             .build()
             .wrap_err("building the HTTP client")?;
-        Ok(Self(client))
+        let mut authorization = http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| eyre!("invalid POSTHOG_PROJECT_TOKEN"))?;
+        authorization.set_sensitive(true);
+        Ok(Self {
+            client,
+            authorization,
+        })
+    }
+}
+
+fn redact_attribute(key: &str, value: &mut String) -> bool {
+    let header = key
+        .rsplit('.')
+        .next()
+        .unwrap_or(key)
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    if matches!(
+        header.as_str(),
+        "authorization" | "proxy_authorization" | "cookie" | "set_cookie"
+    ) {
+        return false;
+    }
+    let query = match key.to_ascii_lowercase().as_str() {
+        "uri" | "http.request.header.referer" => {
+            if let Some((prefix, query)) = value.split_once('?') {
+                Some((format!("{prefix}?"), query.to_owned()))
+            } else {
+                None
+            }
+        }
+        "url.query" => Some((String::new(), value.clone())),
+        _ => None,
+    };
+    if let Some((prefix, query)) = query {
+        let (query_text, fragment) = query
+            .split_once('#')
+            .map_or((query.as_str(), ""), |(q, f)| (q, f));
+        let redacted = redact_query(query_text);
+        *value = if redacted == "[REDACTED]" || fragment.is_empty() {
+            format!("{prefix}{redacted}")
+        } else {
+            format!("{prefix}{redacted}#{fragment}")
+        };
+    }
+    true
+}
+
+fn redact_query(query: &str) -> String {
+    let mut parts = Vec::new();
+    for segment in query.split('&') {
+        let (key, value) = segment.split_once('=').unwrap_or((segment, ""));
+        if ![key, value].iter().all(|part| valid_percent_encoding(part)) {
+            return "[REDACTED]".into();
+        }
+        let form_key = key.replace('+', " ");
+        let Ok(decoded) = percent_encoding::percent_decode_str(&form_key).decode_utf8() else {
+            return "[REDACTED]".into();
+        };
+        if percent_encoding::percent_decode_str(&value.replace('+', " "))
+            .decode_utf8()
+            .is_err()
+        {
+            return "[REDACTED]".into();
+        }
+        let key_lower = decoded.to_ascii_lowercase();
+        let sensitive = matches!(
+            key_lower.as_str(),
+            "code"
+                | "state"
+                | "token"
+                | "access_token"
+                | "id_token"
+                | "refresh_token"
+                | "code_verifier"
+                | "password"
+                | "secret"
+                | "client_secret"
+                | "key"
+                | "api_key"
+                | "apikey"
+                | "signature"
+                | "sig"
+                | "otp"
+        ) || ["token", "secret", "password", "passwd", "signature"]
+            .iter()
+            .any(|part| key_lower.contains(part));
+        if sensitive {
+            parts.push(format!("{key}=[REDACTED]"));
+        } else {
+            parts.push(segment.to_owned());
+        }
+    }
+    parts.join("&")
+}
+
+fn valid_percent_encoding(part: &str) -> bool {
+    let mut bytes = part.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%'
+            && !matches!((bytes.next(), bytes.next()), (Some(a), Some(b)) if a.is_ascii_hexdigit() && b.is_ascii_hexdigit())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn sanitize_attributes(attributes: &mut Vec<ProtoKeyValue>, job_span: bool) {
+    attributes.retain_mut(|attribute| {
+        if attribute.key == "self" && job_span {
+            return false;
+        }
+        let header = attribute
+            .key
+            .rsplit('.')
+            .next()
+            .unwrap_or(&attribute.key)
+            .to_ascii_lowercase()
+            .replace('-', "_");
+        if matches!(
+            header.as_str(),
+            "authorization" | "proxy_authorization" | "cookie" | "set_cookie"
+        ) {
+            return false;
+        }
+        let Some(AnyValue {
+            value: Some(Value::StringValue(value)),
+        }) = attribute.value.as_mut()
+        else {
+            return true;
+        };
+        redact_attribute(&attribute.key, value)
+    });
+}
+
+fn sanitize_body(path: &str, body: &[u8]) -> Result<Vec<u8>> {
+    if path.ends_with("/i/v1/logs") {
+        let mut request =
+            ExportLogsServiceRequest::decode(body).wrap_err("invalid OTLP logs batch")?;
+        for resource in &mut request.resource_logs {
+            for scope in &mut resource.scope_logs {
+                for record in &mut scope.log_records {
+                    sanitize_attributes(&mut record.attributes, true);
+                }
+            }
+        }
+        Ok(request.encode_to_vec())
+    } else if path.ends_with("/i/v1/traces") {
+        let mut request =
+            ExportTraceServiceRequest::decode(body).wrap_err("invalid OTLP traces batch")?;
+        for resource in &mut request.resource_spans {
+            for scope in &mut resource.scope_spans {
+                for span in &mut scope.spans {
+                    let job_span = span.name == "jobs.enqueue";
+                    sanitize_attributes(&mut span.attributes, job_span);
+                    for event in &mut span.events {
+                        sanitize_attributes(&mut event.attributes, job_span);
+                    }
+                    for link in &mut span.links {
+                        sanitize_attributes(&mut link.attributes, job_span);
+                    }
+                }
+            }
+        }
+        Ok(request.encode_to_vec())
+    } else {
+        Err(eyre!("unexpected PostHog export path"))
     }
 }
 
 #[async_trait::async_trait]
 impl HttpClient for PostHogHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let mut response = self.0.execute(request.try_into()?)?;
+        let path = request.uri().path().to_owned();
+        let body = sanitize_body(&path, request.body()).map_err(|error| {
+            tracing::warn!(target: "posthog", "PostHog export batch rejected: {error}");
+            std::io::Error::other("PostHog export batch rejected")
+        })?;
+        let mut outgoing: reqwest_012::blocking::Request = request.try_into()?;
+        *outgoing.body_mut() = Some(body.into());
+        outgoing
+            .headers_mut()
+            .remove(http::header::CONTENT_ENCODING);
+        outgoing.headers_mut().remove(http::header::CONTENT_LENGTH);
+        outgoing
+            .headers_mut()
+            .insert(http::header::AUTHORIZATION, self.authorization.clone());
+        let mut response = self.client.execute(outgoing)?;
+        if response.status().is_redirection() {
+            tracing::warn!(target: "posthog", "PostHog export redirect rejected");
+            return Err(std::io::Error::other("PostHog export redirect rejected").into());
+        }
         let status = response.status();
         let headers = std::mem::take(response.headers_mut());
         let mut body = Vec::new();
@@ -245,11 +449,24 @@ impl PostHogSink {
         process: Option<&eyes_subscriber::ProcessIdentity>,
         max_queue_size: usize,
     ) -> Result<Self> {
+        for key in [
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "OTEL_EXPORTER_OTLP_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+        ] {
+            if std::env::var_os(key).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+            {
+                return Err(eyre!("PostHog exporter rejects {key}"));
+            }
+        }
         let (logs, spans) = build_on_sync_thread(|| {
             // The async client can panic on the batch worker. Construct and drop blocking clients outside Tokio.
             // https://posthog.com/docs/logs/installation/rust
-            let client =
-                PostHogHttpClient::new().wrap_err("building PostHog exporter or HTTP client")?;
+            let client = PostHogHttpClient::new(&config.token)
+                .wrap_err("building PostHog exporter or HTTP client")?;
             let headers = HashMap::from([(
                 "Authorization".to_owned(),
                 format!("Bearer {}", config.token),
@@ -362,6 +579,363 @@ impl PostHogShutdownHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    fn attribute(key: &str, value: &str) -> ProtoKeyValue {
+        ProtoKeyValue {
+            key: key.into(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue(value.into())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn value<'a>(attributes: &'a [ProtoKeyValue], key: &str) -> Option<&'a str> {
+        attributes
+            .iter()
+            .find(|attribute| attribute.key == key)
+            .and_then(
+                |attribute| match attribute.value.as_ref()?.value.as_ref()? {
+                    Value::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                },
+            )
+    }
+
+    #[test]
+    fn query_policy_covers_all_sensitive_keys_and_fail_closed() {
+        for key in [
+            "code",
+            "state",
+            "token",
+            "access_token",
+            "id_token",
+            "refresh_token",
+            "code_verifier",
+            "password",
+            "secret",
+            "client_secret",
+            "key",
+            "api_key",
+            "apikey",
+            "signature",
+            "sig",
+            "otp",
+            "magicToken",
+            "mySecret",
+            "passWordHint",
+            "Passwd",
+            "X-Amz-Signature",
+            "%74oken",
+        ] {
+            let query = format!("{key}=synthetic&page=2");
+            assert_eq!(redact_query(&query), format!("{key}=[REDACTED]&page=2"));
+            assert_eq!(redact_query(&redact_query(&query)), redact_query(&query));
+        }
+        for query in [
+            "code=%GG&page=2",
+            "code=%FF&page=2",
+            "page=%GG&code=x",
+            "page=%FF",
+        ] {
+            assert_eq!(redact_query(query), "[REDACTED]");
+        }
+        assert_eq!(redact_query("page=2&sort=asc"), "page=2&sort=asc");
+        assert_eq!(redact_query("CODE=&page=2"), "CODE=[REDACTED]&page=2");
+        for (key, raw, expected) in [
+            (
+                "uri",
+                "/callback?code=synthetic&page=2",
+                "/callback?code=[REDACTED]&page=2",
+            ),
+            (
+                "url.query",
+                "code=synthetic&page=2",
+                "code=[REDACTED]&page=2",
+            ),
+            (
+                "http.request.header.referer",
+                "https://local/callback?code=synthetic&page=2",
+                "https://local/callback?code=[REDACTED]&page=2",
+            ),
+            ("uri", "/callback?code=%GG", "/callback?[REDACTED]"),
+            (
+                "http.request.header.referer",
+                "https://local/callback?code=%FF",
+                "https://local/callback?[REDACTED]",
+            ),
+            (
+                "http.request.header.referer",
+                "https://local/callback?code=synthetic&page=2#section",
+                "https://local/callback?code=[REDACTED]&page=2#section",
+            ),
+            ("uri", "/callback", "/callback"),
+        ] {
+            let mut actual = raw.to_owned();
+            assert!(redact_attribute(key, &mut actual));
+            assert_eq!(actual, expected);
+        }
+    }
+
+    fn privacy_fields() -> Vec<ProtoKeyValue> {
+        vec![
+            attribute("uri", "/callback?code=synthetic&page=2"),
+            attribute("url.query", "state=synthetic&page=2"),
+            attribute(
+                "http.request.header.referer",
+                "https://local/?token=synthetic&page=2",
+            ),
+            attribute("http.request.header.Authorization", "synthetic"),
+            attribute("http.request.header.proxy-authorization", "synthetic"),
+            attribute("http.request.header.cookie", "synthetic"),
+            attribute("http.request.header.set-cookie", "synthetic"),
+            attribute("self", "Job { recipient_override: synthetic@example.test }"),
+            attribute("user_agent.original", "test-agent"),
+            attribute("http.request.header.x-forwarded-for", "127.0.0.1"),
+            attribute("http.request.header.host", "local"),
+            attribute("http.request.header.via", "local"),
+            attribute("http.request.header.x-forwarded-proto", "https"),
+            attribute("http.request.header.x-forwarded-ssl", "on"),
+            attribute("http.request.header.fly-region", "ewr"),
+            attribute("url.path", "/callback"),
+            attribute("http.route", "/callback"),
+            attribute("job.id", "job-1"),
+            attribute("job.name", "Mail"),
+            attribute("job.context", "test"),
+            attribute("job.priority", "5"),
+        ]
+    }
+
+    #[test]
+    fn otlp_policy_covers_spans_events_links_and_copied_logs() {
+        use opentelemetry_proto::tonic::{
+            logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+            trace::v1::{
+                ResourceSpans, ScopeSpans, Span,
+                span::{Event, Link},
+            },
+        };
+        let fields = privacy_fields();
+        let traces = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        name: "jobs.enqueue".into(),
+                        attributes: fields.clone(),
+                        events: vec![Event {
+                            attributes: fields.clone(),
+                            ..Default::default()
+                        }],
+                        links: vec![Link {
+                            attributes: fields.clone(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let encoded = sanitize_body("/base/i/v1/traces", &traces.encode_to_vec()).unwrap();
+        let decoded = ExportTraceServiceRequest::decode(encoded.as_slice()).unwrap();
+        let span = &decoded.resource_spans[0].scope_spans[0].spans[0];
+        for attributes in [
+            &span.attributes,
+            &span.events[0].attributes,
+            &span.links[0].attributes,
+        ] {
+            assert_eq!(
+                value(attributes, "uri"),
+                Some("/callback?code=[REDACTED]&page=2")
+            );
+            assert_eq!(
+                value(attributes, "url.query"),
+                Some("state=[REDACTED]&page=2")
+            );
+            assert_eq!(
+                value(attributes, "http.request.header.referer"),
+                Some("https://local/?token=[REDACTED]&page=2")
+            );
+            for key in [
+                "self",
+                "http.request.header.Authorization",
+                "http.request.header.proxy-authorization",
+                "http.request.header.cookie",
+                "http.request.header.set-cookie",
+            ] {
+                assert!(value(attributes, key).is_none(), "{key}");
+            }
+            for key in [
+                "user_agent.original",
+                "http.request.header.x-forwarded-for",
+                "http.request.header.host",
+                "http.request.header.via",
+                "http.request.header.x-forwarded-proto",
+                "http.request.header.x-forwarded-ssl",
+                "http.request.header.fly-region",
+                "url.path",
+                "http.route",
+                "job.id",
+                "job.name",
+                "job.context",
+                "job.priority",
+            ] {
+                assert!(value(attributes, key).is_some(), "{key}");
+            }
+        }
+        let logs = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        attributes: fields,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let encoded = sanitize_body("/base/i/v1/logs", &logs.encode_to_vec()).unwrap();
+        let decoded = ExportLogsServiceRequest::decode(encoded.as_slice()).unwrap();
+        let attributes = &decoded.resource_logs[0].scope_logs[0].log_records[0].attributes;
+        assert_eq!(
+            value(attributes, "uri"),
+            Some("/callback?code=[REDACTED]&page=2")
+        );
+        assert!(value(attributes, "self").is_none());
+        assert!(value(attributes, "http.request.header.Authorization").is_none());
+        assert_eq!(value(attributes, "job.id"), Some("job-1"));
+        assert!(sanitize_body("/other", &logs.encode_to_vec()).is_err());
+        assert!(sanitize_body("/i/v1/traces", b"not protobuf").is_err());
+    }
+
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+    struct Message<'a>(&'a mut String);
+    impl tracing::field::Visit for Message<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+    impl<S: tracing::Subscriber> Layer<S> for Warnings {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut message = String::new();
+                event.record(&mut Message(&mut message));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:{message}", event.metadata().target()));
+            }
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_pins_authorization_rejects_bad_batches_and_redirects() {
+        let captures = Arc::new(Mutex::new(Vec::<(String, http::HeaderMap)>::new()));
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let seen = captures.clone();
+        let app = axum::Router::new().fallback(move |uri: http::Uri, headers: http::HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push((uri.path().into(), headers));
+                if uri.path().ends_with("/logs") {
+                    http::StatusCode::FOUND
+                } else {
+                    http::StatusCode::OK
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = std::thread::spawn(|| PostHogHttpClient::new("phc_test").unwrap())
+            .join()
+            .unwrap();
+        assert!(!format!("{client:?}").contains("phc_test"));
+        let send = |path: &'static str, body: Vec<u8>| {
+            let client = client.clone();
+            let uri = format!("{host}{path}");
+            let warnings = warnings.clone();
+            std::thread::spawn(move || {
+                let request = Request::builder()
+                    .uri(uri)
+                    .header(http::header::AUTHORIZATION, "Bearer foreign")
+                    .header(http::header::CONTENT_ENCODING, "gzip")
+                    .body(Bytes::from(body))
+                    .unwrap();
+                tracing::subscriber::with_default(
+                    tracing_subscriber::registry().with(Warnings(warnings)),
+                    || {
+                        futures::executor::block_on(client.send_bytes(request))
+                            .map(|response| response.status())
+                    },
+                )
+            })
+            .join()
+            .unwrap()
+        };
+        assert_eq!(
+            send(
+                "/base/i/v1/traces",
+                ExportTraceServiceRequest::default().encode_to_vec()
+            )
+            .unwrap(),
+            http::StatusCode::OK
+        );
+        assert!(
+            send(
+                "/base/i/v1/logs",
+                ExportLogsServiceRequest::default().encode_to_vec()
+            )
+            .is_err()
+        );
+        assert!(send("/base/i/v1/traces", b"malformed-protobuf".to_vec()).is_err());
+        assert!(
+            send(
+                "/unknown",
+                ExportLogsServiceRequest::default().encode_to_vec()
+            )
+            .is_err()
+        );
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.starts_with("posthog:")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("batch rejected")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("redirect rejected")),
+            "{warnings:?}"
+        );
+        let requests = captures.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "redirect followed or invalid batch leaked"
+        );
+        assert_eq!(requests[0].0, "/base/i/v1/traces");
+        assert_eq!(requests[1].0, "/base/i/v1/logs");
+        for (_, headers) in requests.iter() {
+            assert_eq!(headers[http::header::AUTHORIZATION], "Bearer phc_test");
+            assert!(!headers.contains_key(http::header::CONTENT_ENCODING));
+        }
+        drop(requests);
+        server.abort();
+    }
 
     fn parse(vars: &[(&str, &str)]) -> Result<PostHogEnv> {
         PostHogEnv::from_env_with(|key| {
@@ -415,6 +989,28 @@ mod tests {
         assert_eq!(default.log_level, LevelFilter::INFO);
         assert_eq!(default.traces_sample_ratio.to_bits(), 1.0_f64.to_bits());
         assert!(!format!("{default:?}").contains("sensitive"));
+        for blank in ["", "   "] {
+            let PostHogEnv::Enabled(config) = parse(&[
+                token,
+                ("POSTHOG_LOG_LEVEL", blank),
+                ("POSTHOG_TRACES_SAMPLE_RATIO", blank),
+            ])
+            .unwrap() else {
+                panic!()
+            };
+            assert_eq!(config.log_level, LevelFilter::INFO);
+            assert_eq!(config.traces_sample_ratio, 1.0);
+        }
+        let PostHogEnv::Enabled(trimmed) = parse(&[
+            token,
+            ("POSTHOG_LOG_LEVEL", " warn "),
+            ("POSTHOG_TRACES_SAMPLE_RATIO", " 0.25 "),
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(trimmed.log_level, LevelFilter::WARN);
+        assert_eq!(trimmed.traces_sample_ratio, 0.25);
         for value in ["NaN", "1.01", "-0.01", "bad"] {
             assert!(parse(&[token, ("POSTHOG_TRACES_SAMPLE_RATIO", value)]).is_err());
         }

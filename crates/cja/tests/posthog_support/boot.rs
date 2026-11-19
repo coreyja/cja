@@ -105,7 +105,9 @@ pub struct Exit {
 pub fn spawn(test: &str, envs: &[(&str, &str)]) -> Running {
     let dir = tempfile::tempdir().unwrap();
     let file = |name: &str| std::fs::File::create(dir.path().join(name)).unwrap();
-    let child = Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    cja::testing::scrub_telemetry_env(&mut command);
+    let child = command
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .stdin(Stdio::piped())
         .stdout(file("stdout"))

@@ -164,7 +164,7 @@ pub enum SyncError {
         source: serde_json::Error,
     },
     #[error(
-        "{object}: PostHog did not persist our identity {tag}; {cleanup}; check project tagging support"
+        "{object}: PostHog did not persist our identity {tag} (a tag for dashboards/insights, a name suffix for alerts); {cleanup}"
     )]
     TagNotPersisted {
         object: String,
@@ -173,9 +173,13 @@ pub enum SyncError {
         cleanup: String,
     },
     #[error(
-        "{alert}: alert name is {length} characters and PostHog allows at most {ALERT_NAME_LIMIT}; shorten the alert description"
+        "{alert}: alert name is {length} characters and PostHog allows at most {ALERT_NAME_LIMIT}; shorten the {hint}"
     )]
-    AlertNameTooLong { alert: String, length: usize },
+    AlertNameTooLong {
+        alert: String,
+        length: usize,
+        hint: &'static str,
+    },
     #[error("{0}")]
     Invalid(String),
 }
@@ -678,11 +682,21 @@ pub async fn sync(
         .and_then(|()| declarations.validate())
         .map_err(SyncError::Invalid)?;
     for alert in &declarations.alerts {
+        if !declarations.metrics.iter().any(|metric| {
+            metric.id == alert.metric_id && matches!(metric.query, MetricQuery::ProductEvent(_))
+        }) {
+            continue;
+        }
         let length = alert_name(&config.app, alert).chars().count();
         if length > ALERT_NAME_LIMIT {
             return Err(SyncError::AlertNameTooLong {
                 alert: format!("cja:{}:alert:{}", config.app, alert.id),
                 length,
+                hint: if alert.description.is_some() {
+                    "alert description"
+                } else {
+                    "alert ID"
+                },
             });
         }
     }

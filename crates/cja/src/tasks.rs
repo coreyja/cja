@@ -81,7 +81,7 @@ pub async fn wait_for_first_error(tasks: Vec<NamedTask>) -> crate::Result<()> {
 /// mostly out of the app's hands: Cloud Run sends `SIGKILL` a fixed 10 seconds
 /// after `SIGTERM`; Fly waits `kill_timeout`, 5 seconds unless `fly.toml` says
 /// otherwise. Whatever is still running when the platform kills the process
-/// keeps its job locks until the lock timeout, so the defaults (2s + 2s) are
+/// keeps its job locks until the lock timeout, so the defaults (1s + 0.5s + up to 3s telemetry flush) are
 /// sized for the smallest of those windows. Raise them where there is room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShutdownBudget {
@@ -97,8 +97,8 @@ pub struct ShutdownBudget {
 impl Default for ShutdownBudget {
     fn default() -> Self {
         Self {
-            job_drain: Duration::from_secs(2),
-            exit_grace: Duration::from_secs(2),
+            job_drain: Duration::from_secs(1),
+            exit_grace: Duration::from_millis(500),
         }
     }
 }
@@ -108,14 +108,22 @@ impl ShutdownBudget {
     /// falling back to the defaults for anything unset or unparseable.
     #[must_use]
     pub fn from_env() -> Self {
+        Self::from_env_with(|name| std::env::var(name).ok())
+    }
+
+    fn from_env_with(read: impl Fn(&str) -> Option<String>) -> Self {
         let defaults = Self::default();
         Self {
-            job_drain: env_secs("CJA_SHUTDOWN_JOB_DRAIN_SECS").unwrap_or(defaults.job_drain),
-            exit_grace: env_secs("CJA_SHUTDOWN_EXIT_GRACE_SECS").unwrap_or(defaults.exit_grace),
+            job_drain: read("CJA_SHUTDOWN_JOB_DRAIN_SECS")
+                .and_then(|s| s.parse().ok())
+                .map_or(defaults.job_drain, Duration::from_secs),
+            exit_grace: read("CJA_SHUTDOWN_EXIT_GRACE_SECS")
+                .and_then(|s| s.parse().ok())
+                .map_or(defaults.exit_grace, Duration::from_secs),
         }
     }
 
-    /// Total time from the shutdown signal until remaining tasks are aborted.
+    /// Supervisor drain and grace time; telemetry flush runs afterward.
     #[must_use]
     pub fn deadline(&self) -> Duration {
         self.job_drain + self.exit_grace
@@ -125,25 +133,22 @@ impl ShutdownBudget {
     /// Cloud Run qualifies: its window is fixed, while Fly's is configurable
     /// and not visible to the process.
     fn warn_if_over_platform_window(&self) {
+        self.warn_if_over_platform_window_for(std::env::var_os("K_SERVICE").is_some());
+    }
+
+    fn warn_if_over_platform_window_for(&self, cloud_run: bool) {
         const CLOUD_RUN_WINDOW: Duration = Duration::from_secs(10);
 
-        if std::env::var_os("K_SERVICE").is_some() && self.deadline() >= CLOUD_RUN_WINDOW {
+        let total = self.deadline() + crate::setup::TELEMETRY_SHUTDOWN_BUDGET;
+        if cloud_run && total >= CLOUD_RUN_WINDOW {
             tracing::warn!(
-                deadline_secs = self.deadline().as_secs(),
+                total_secs = total.as_secs_f64(),
                 window_secs = CLOUD_RUN_WINDOW.as_secs(),
                 "Shutdown budget does not fit Cloud Run's termination window; \
                  in-flight job locks will be stranded on every deploy"
             );
         }
     }
-}
-
-fn env_secs(name: &str) -> Option<Duration> {
-    std::env::var(name)
-        .ok()?
-        .parse()
-        .ok()
-        .map(Duration::from_secs)
 }
 
 /// Runs an app's long-lived tasks and owns their shutdown.
@@ -159,7 +164,9 @@ fn env_secs(name: &str) -> Option<Duration> {
 ///    [`ShutdownBudget::job_drain`] to finish, and whatever is left is
 ///    dropped with its lock released so another instance re-runs it at once
 ///    instead of after the lock timeout.
-/// 3. Tasks still running at [`ShutdownBudget::deadline`] are aborted. With
+/// 3. Tasks still running at [`ShutdownBudget::deadline`] are aborted. The
+///    telemetry handle then needs up to 3 more seconds to flush. The default
+///    total is 4.5 seconds, within Fly's default 5-second kill window. With
 ///    websockets or other long-lived connections that is routine, since they
 ///    hold axum's graceful shutdown open indefinitely.
 ///
@@ -402,9 +409,11 @@ mod tests {
         let jobs = spawn_cooperative(&mut supervisor, "jobs");
         let cron = spawn_cooperative(&mut supervisor, "cron");
 
+        let started = tokio::time::Instant::now();
         let result = supervisor.run_until(async { "SIGTERM" }).await;
 
         assert!(result.is_ok(), "a signal is a clean exit: {result:?}");
+        assert!(started.elapsed() < BUDGET.deadline());
         assert!(shutdown.is_cancelled());
         assert!(jobs.load(Ordering::SeqCst) && cron.load(Ordering::SeqCst));
     }
@@ -478,6 +487,59 @@ mod tests {
     #[test]
     fn default_budget_fits_the_smallest_platform_window() {
         // Fly's default `kill_timeout` is 5 seconds.
-        assert!(ShutdownBudget::default().deadline() < Duration::from_secs(5));
+        assert!(
+            ShutdownBudget::default().deadline() + crate::setup::TELEMETRY_SHUTDOWN_BUDGET
+                < Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn cloud_run_override_budget_includes_flush() {
+        let override_budget = ShutdownBudget::from_env_with(|key| match key {
+            "CJA_SHUTDOWN_JOB_DRAIN_SECS" => Some("4".into()),
+            "CJA_SHUTDOWN_EXIT_GRACE_SECS" => Some("2".into()),
+            _ => None,
+        });
+        assert_eq!(
+            override_budget.deadline() + crate::setup::TELEMETRY_SHUTDOWN_BUDGET,
+            Duration::from_secs(9)
+        );
+        assert!(
+            override_budget.deadline() + crate::setup::TELEMETRY_SHUTDOWN_BUDGET
+                < Duration::from_secs(10)
+        );
+        let over = ShutdownBudget {
+            job_drain: Duration::from_secs(5),
+            exit_grace: Duration::from_secs(2),
+        };
+        assert_eq!(
+            over.deadline() + crate::setup::TELEMETRY_SHUTDOWN_BUDGET,
+            Duration::from_secs(10)
+        );
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracing_subscriber::{Layer, layer::Context, prelude::*};
+        struct Warnings(std::sync::Arc<AtomicBool>);
+        impl<S: tracing::Subscriber> Layer<S> for Warnings {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let warned = std::sync::Arc::new(AtomicBool::new(false));
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(Warnings(warned.clone())),
+            || {
+                override_budget.warn_if_over_platform_window_for(true);
+                assert!(!warned.load(Ordering::SeqCst), "9s should not warn");
+                over.warn_if_over_platform_window_for(false);
+                assert!(
+                    !warned.load(Ordering::SeqCst),
+                    "non-Cloud-Run should not warn"
+                );
+                over.warn_if_over_platform_window_for(true);
+                assert!(warned.load(Ordering::SeqCst), "10s must warn");
+            },
+        );
     }
 }
