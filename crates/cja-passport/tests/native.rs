@@ -27,6 +27,15 @@ async fn native_handoff_is_single_use_and_bearer_is_revoked_on_logout() {
     assert_eq!(params[0].0, "code");
     let handoff = params[0].1.to_string();
     let new_cookie = cookie(&callback);
+    let expected_expiry: jiff_sqlx::Timestamp = sqlx::query_scalar(
+        "SELECT authenticated_at + make_interval(secs => $1) FROM passport_sessions",
+    )
+    .bind(fixture.state.config.timings.max_age.as_secs_f64())
+    .fetch_one(&fixture.state.pool)
+    .await
+    .unwrap();
+    // Delay exchange so an accidental `now() + max_age` deadline is observable.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
     let exchange = fixture
         .request(
@@ -44,6 +53,7 @@ async fn native_handoff_is_single_use_and_bearer_is_revoked_on_logout() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["token_type"], "Bearer");
+    assert_eq!(json["expires_at"], expected_expiry.to_jiff().to_string());
     let bearer = format!("Bearer {}", json["token"].as_str().unwrap());
     let replay = fixture
         .request(

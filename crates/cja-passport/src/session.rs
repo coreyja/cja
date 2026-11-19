@@ -176,6 +176,24 @@ async fn refresh_locked(
             }
         }
     }
+    // `now()` is fixed at transaction start. The token call may have crossed
+    // the hard cap while this row was locked, so check the live database clock.
+    let expired_after_refresh: bool = sqlx::query_scalar(
+        "SELECT authenticated_at + make_interval(secs => $2) <= clock_timestamp()
+         FROM passport_sessions WHERE session_id = $1",
+    )
+    .bind(id)
+    .bind(config.timings.max_age.as_secs_f64())
+    .fetch_one(&mut *tx)
+    .await?;
+    if expired_after_refresh {
+        sqlx::query("DELETE FROM sessions WHERE session_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(None);
+    }
     tx.commit().await?;
     Ok(Some(user))
 }
