@@ -341,9 +341,19 @@ fn valid_percent_encoding(part: &str) -> bool {
     true
 }
 
-fn sanitize_attributes(attributes: &mut Vec<ProtoKeyValue>, job_span: bool) {
+fn sanitize_attributes(
+    attributes: &mut Vec<ProtoKeyValue>,
+    span_name: Option<&str>,
+    log_record: bool,
+) {
+    let job_log = log_record
+        && attributes
+            .iter()
+            .any(|attribute| attribute.key == "job.name");
     attributes.retain_mut(|attribute| {
-        if attribute.key == "self" && job_span {
+        if (attribute.key == "self" && (log_record || span_name == Some("jobs.enqueue")))
+            || (attribute.key == "value" && (span_name == Some("jobs.run_from_value") || job_log))
+        {
             return false;
         }
         let header = attribute
@@ -376,7 +386,7 @@ fn sanitize_body(path: &str, body: &[u8]) -> Result<Vec<u8>> {
         for resource in &mut request.resource_logs {
             for scope in &mut resource.scope_logs {
                 for record in &mut scope.log_records {
-                    sanitize_attributes(&mut record.attributes, true);
+                    sanitize_attributes(&mut record.attributes, None, true);
                 }
             }
         }
@@ -387,13 +397,12 @@ fn sanitize_body(path: &str, body: &[u8]) -> Result<Vec<u8>> {
         for resource in &mut request.resource_spans {
             for scope in &mut resource.scope_spans {
                 for span in &mut scope.spans {
-                    let job_span = span.name == "jobs.enqueue";
-                    sanitize_attributes(&mut span.attributes, job_span);
+                    sanitize_attributes(&mut span.attributes, Some(&span.name), false);
                     for event in &mut span.events {
-                        sanitize_attributes(&mut event.attributes, job_span);
+                        sanitize_attributes(&mut event.attributes, Some(&span.name), false);
                     }
                     for link in &mut span.links {
-                        sanitize_attributes(&mut link.attributes, job_span);
+                        sanitize_attributes(&mut link.attributes, Some(&span.name), false);
                     }
                 }
             }
@@ -409,7 +418,7 @@ impl HttpClient for PostHogHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
         let path = request.uri().path().to_owned();
         let body = sanitize_body(&path, request.body()).map_err(|error| {
-            tracing::warn!(target: "posthog", "PostHog export batch rejected: {error}");
+            tracing::warn!(target: "posthog", "PostHog export batch rejected: {error:#}");
             std::io::Error::other("PostHog export batch rejected")
         })?;
         let mut outgoing: reqwest_012::blocking::Request = request.try_into()?;
@@ -812,6 +821,77 @@ mod tests {
         assert!(sanitize_body("/i/v1/traces", b"not protobuf").is_err());
     }
 
+    #[test]
+    fn job_run_value_is_removed_only_in_job_context() {
+        use opentelemetry_proto::tonic::{
+            logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+            trace::v1::{
+                ResourceSpans, ScopeSpans, Span,
+                span::{Event, Link},
+            },
+        };
+        let fields = vec![
+            attribute("value", "synthetic-run@example.test"),
+            attribute("job.name", "Mail"),
+        ];
+        let traces = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        name: "jobs.run_from_value".into(),
+                        attributes: fields.clone(),
+                        events: vec![Event {
+                            attributes: fields.clone(),
+                            ..Default::default()
+                        }],
+                        links: vec![Link {
+                            attributes: fields.clone(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let body = sanitize_body("/i/v1/traces", &traces.encode_to_vec()).unwrap();
+        let decoded = ExportTraceServiceRequest::decode(body.as_slice()).unwrap();
+        let span = &decoded.resource_spans[0].scope_spans[0].spans[0];
+        for attrs in [
+            &span.attributes,
+            &span.events[0].attributes,
+            &span.links[0].attributes,
+        ] {
+            assert!(value(attrs, "value").is_none());
+            assert_eq!(value(attrs, "job.name"), Some("Mail"));
+        }
+        let logs = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![
+                        LogRecord {
+                            attributes: fields,
+                            ..Default::default()
+                        },
+                        LogRecord {
+                            attributes: vec![attribute("value", "keep-me")],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let body = sanitize_body("/i/v1/logs", &logs.encode_to_vec()).unwrap();
+        let decoded = ExportLogsServiceRequest::decode(body.as_slice()).unwrap();
+        let records = &decoded.resource_logs[0].scope_logs[0].log_records;
+        assert!(value(&records[0].attributes, "value").is_none());
+        assert_eq!(value(&records[0].attributes, "job.name"), Some("Mail"));
+        assert_eq!(value(&records[1].attributes, "value"), Some("keep-me"));
+    }
+
     struct Warnings(Arc<Mutex<Vec<String>>>);
     struct Message<'a>(&'a mut String);
     impl tracing::field::Visit for Message<'_> {
@@ -833,8 +913,10 @@ mod tests {
             }
         }
     }
+    #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_client_pins_authorization_rejects_bad_batches_and_redirects() {
+        use axum::response::IntoResponse as _;
         let captures = Arc::new(Mutex::new(Vec::<(String, http::HeaderMap)>::new()));
         let warnings = Arc::new(Mutex::new(Vec::new()));
         let seen = captures.clone();
@@ -843,9 +925,13 @@ mod tests {
             async move {
                 seen.lock().unwrap().push((uri.path().into(), headers));
                 if uri.path().ends_with("/logs") {
-                    http::StatusCode::FOUND
+                    (
+                        http::StatusCode::FOUND,
+                        [(http::header::LOCATION, "/followed")],
+                    )
+                        .into_response()
                 } else {
-                    http::StatusCode::OK
+                    http::StatusCode::OK.into_response()
                 }
             }
         });

@@ -1431,7 +1431,10 @@ impl Declarations {
                     }
                     ratio.eyes(m, &singular)
                 }
-                _ => Ok(singular[m.id.as_str()].clone()),
+                _ => singular
+                    .get(m.id.as_str())
+                    .cloned()
+                    .ok_or_else(|| format!("metric {} did not convert", m.id)),
             })
             .collect()
     }
@@ -1451,8 +1454,18 @@ impl Declarations {
             let MetricQuery::Ratio(ratio) = &metric.query else {
                 continue;
             };
-            let numerator = singular[ratio.numerator.as_str()];
-            let denominator = singular[ratio.denominator.as_str()];
+            let numerator = singular.get(ratio.numerator.as_str()).ok_or_else(|| {
+                format!(
+                    "ratio {} has missing numerator {}",
+                    metric.id, ratio.numerator
+                )
+            })?;
+            let denominator = singular.get(ratio.denominator.as_str()).ok_or_else(|| {
+                format!(
+                    "ratio {} has missing denominator {}",
+                    metric.id, ratio.denominator
+                )
+            })?;
             let (num_groups, num_bucket) = ratio_groups(numerator);
             let (den_groups, den_bucket) = ratio_groups(denominator);
             let compatible = match (numerator.result_shape, denominator.result_shape) {
@@ -1973,6 +1986,29 @@ mod parity_tests {
         metric
     }
 
+    fn with_first_group_alias(mut metric: Metric, alias: String) -> Metric {
+        let MetricQuery::Telemetry(TelemetryMetric(eyes)) = &mut metric.query else {
+            panic!()
+        };
+        let groups = eyes
+            .query
+            .as_mut()
+            .unwrap()
+            .query
+            .stages
+            .iter_mut()
+            .find_map(|stage| {
+                if let Stage::Aggregate { groups, .. } = stage {
+                    Some(groups)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        groups[0].alias = alias;
+        metric
+    }
+
     #[test]
     fn ratio_operands_must_match_bucket_and_group_expressions() {
         let make = |id: &str, width: Option<u64>, group: &str| {
@@ -2030,6 +2066,14 @@ mod parity_tests {
                 make("den", None, "fields.kind")
             )
             .is_ok()
+        );
+        let num = make("num", None, "fields.kind");
+        let alias = ratio_groups(&num.eyes().unwrap()).0[0].alias.clone();
+        let den = with_first_group_alias(make("den", None, "fields.other"), alias);
+        let error = validate(num, den).unwrap_err();
+        assert!(
+            error.contains("share") && error.contains("num") && error.contains("den"),
+            "{error}"
         );
         let den = with_bucket_origin(make("den", Some(60), "fields.kind"), 1_000_000);
         let error = validate(make("num", Some(60), "fields.kind"), den).unwrap_err();

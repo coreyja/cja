@@ -344,7 +344,7 @@ pub struct JobWorkerConfig {
     /// reclaim and charge the attempt (120 seconds by default).
     pub reclaim_window: Duration,
     /// Time allowed for the running job body after cancellation. Defaults to
-    /// `ShutdownBudget::from_env().job_drain` (2 seconds when unset). This should
+    /// `ShutdownBudget::from_env().job_drain` (1 second when unset). This should
     /// match the `job_drain` of the `ShutdownBudget` given to the `Supervisor`;
     /// apps constructing a custom budget must set this field to the same value.
     pub shutdown_drain_timeout: Duration,
@@ -1210,7 +1210,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 ///
 /// If a worker crashes or becomes unresponsive while processing a job, the job will remain
 /// locked in the database. `JobWorkerConfig` defaults to a 30-second heartbeat,
-/// a 120-second reclaim window, and the shutdown budget's job drain (2 seconds
+/// a 120-second reclaim window, and the shutdown budget's job drain (1 second
 /// when unset). An expired lock is charged as a failed attempt.
 ///
 /// # Example

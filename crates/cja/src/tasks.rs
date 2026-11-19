@@ -126,7 +126,7 @@ impl ShutdownBudget {
     /// Supervisor drain and grace time; telemetry flush runs afterward.
     #[must_use]
     pub fn deadline(&self) -> Duration {
-        self.job_drain + self.exit_grace
+        self.job_drain.saturating_add(self.exit_grace)
     }
 
     /// Warn when the budget cannot fit a kill window cja can detect. Only
@@ -139,7 +139,9 @@ impl ShutdownBudget {
     fn warn_if_over_platform_window_for(&self, cloud_run: bool) {
         const CLOUD_RUN_WINDOW: Duration = Duration::from_secs(10);
 
-        let total = self.deadline() + crate::setup::TELEMETRY_SHUTDOWN_BUDGET;
+        let total = self
+            .deadline()
+            .saturating_add(crate::setup::TELEMETRY_SHUTDOWN_BUDGET);
         if cloud_run && total >= CLOUD_RUN_WINDOW {
             tracing::warn!(
                 total_secs = total.as_secs_f64(),
@@ -264,7 +266,7 @@ impl Supervisor {
             signal = signal => {
                 tracing::info!(
                     signal,
-                    deadline_secs = self.budget.deadline().as_secs(),
+                    deadline_secs = self.budget.deadline().as_secs_f64(),
                     "Shutdown signal received; draining"
                 );
                 Ok(())

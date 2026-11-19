@@ -942,8 +942,141 @@ mod enqueue_on_tests {
     impl Job<TestAppState> for EmailJob {
         const NAME: &'static str = "EmailJob";
         async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            tracing::info!(target: "fixture", "run-event");
             Ok(())
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_run_from_value_keeps_eyes_raw_and_drops_payload_from_posthog() {
+        use opentelemetry_proto::tonic::collector::{
+            logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
+        };
+        use prost::Message as _;
+
+        let captures = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let requests = captures.clone();
+        let app =
+            axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let requests = requests.clone();
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((uri.path().into(), body.to_vec()));
+                    axum::http::StatusCode::OK
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sink = crate::setup::posthog_test_support::PostHogSink::build(
+            &crate::setup::posthog_test_support::PostHogConfig::new_for_tests(
+                host,
+                "phc_test",
+                tracing_subscriber::filter::LevelFilter::TRACE,
+                1.0,
+            ),
+            "jobs-test",
+            None,
+            None,
+            8192,
+        )
+        .unwrap();
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(sink.tracer())
+                    .with_filter(sink.filter()),
+            )
+            .with(sink.log_bridge().with_filter(sink.filter()))
+            .with(RawSpans(raw.clone()));
+        let state = TestAppState {
+            db: sqlx::PgPool::connect_lazy("postgres:///cja_dev").unwrap(),
+            cookie_key: CookieKey::generate(),
+        };
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::info!(target: "fixture", value = "keep-me", "outside-job");
+            EmailJob::run_from_value(
+                serde_json::json!({"recipient_override": "synthetic-run@example.test"}),
+                state,
+                CancellationToken::new(),
+                crate::jobs::worker::ConcurrencySlot::untracked(),
+            )
+            .await
+            .unwrap();
+        }
+        sink.shutdown_handle().shutdown().await;
+        let raw = raw.lock().unwrap().join(" ");
+        assert!(
+            raw.contains("value=") && raw.contains("synthetic-run@example.test"),
+            "{raw}"
+        );
+        let captures = captures.lock().unwrap();
+        let spans = captures
+            .iter()
+            .filter(|(p, _)| p == "/i/v1/traces")
+            .flat_map(|(_, body)| {
+                ExportTraceServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_spans
+            })
+            .flat_map(|resource| resource.scope_spans)
+            .flat_map(|scope| scope.spans)
+            .collect::<Vec<_>>();
+        let run_span = spans
+            .iter()
+            .find(|span| span.name == "jobs.run_from_value")
+            .expect("run span exported");
+        assert!(
+            run_span
+                .attributes
+                .iter()
+                .any(|attr| attr.key == "job.name")
+        );
+        assert!(!run_span.attributes.iter().any(|attr| attr.key == "value"));
+        let logs = captures
+            .iter()
+            .filter(|(p, _)| p == "/i/v1/logs")
+            .flat_map(|(_, body)| {
+                ExportLogsServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_logs
+            })
+            .flat_map(|resource| resource.scope_logs)
+            .flat_map(|scope| scope.log_records)
+            .collect::<Vec<_>>();
+        let job_log = logs
+            .iter()
+            .find(|record| {
+                record
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| format!("{body:?}").contains("run-event"))
+            })
+            .expect("job log exported");
+        assert!(job_log.attributes.iter().any(|attr| attr.key == "job.name"));
+        assert!(!job_log.attributes.iter().any(|attr| attr.key == "value"));
+        let outside_log = logs
+            .iter()
+            .find(|record| {
+                record
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| format!("{body:?}").contains("outside-job"))
+            })
+            .expect("outside log exported");
+        assert!(
+            outside_log
+                .attributes
+                .iter()
+                .any(|attr| attr.key == "value" && format!("{:?}", attr.value).contains("keep-me"))
+        );
+        assert!(!format!("{spans:?}{logs:?}").contains("synthetic-run@example.test"));
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

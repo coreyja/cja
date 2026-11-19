@@ -889,9 +889,32 @@ async fn alert_names_over_the_posthog_limit_fail_before_any_request() {
         "{error}"
     );
     assert!(error.to_string().contains("at most 255"), "{error}");
+    assert!(
+        error.to_string().contains("shorten the alert description"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains("shorten the alert ID"),
+        "{error}"
+    );
     // The same description fits a shorter app slug: the bound is on the name.
     assert_eq!(mock.log(), Vec::new());
     mock.sync("dem", &declarations).await.unwrap();
+
+    mock.log();
+    declarations.alerts[0].id = "a".repeat(128);
+    declarations.alerts[0].description = None;
+    let error = mock.sync("demo", &declarations).await.unwrap_err();
+    assert!(matches!(error, SyncError::AlertNameTooLong { .. }));
+    assert!(
+        error.to_string().contains("shorten the alert ID"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains("shorten the alert description"),
+        "{error}"
+    );
+    assert_eq!(mock.log(), Vec::new());
 }
 
 #[tokio::test]

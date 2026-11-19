@@ -222,6 +222,24 @@ fn dual_sink_privacy_keeps_eyes_raw_and_redacts_posthog() {
             "Eyes raw event missing: {eyes_raw}"
         );
         let captures = posthog.lock().unwrap();
+        let logs = captures
+            .iter()
+            .filter(|c| c.uri.path() == "/i/v1/logs")
+            .map(|c| String::from_utf8_lossy(&c.body).into_owned())
+            .collect::<String>();
+        let traces = captures
+            .iter()
+            .filter(|c| c.uri.path() == "/i/v1/traces")
+            .map(|c| String::from_utf8_lossy(&c.body).into_owned())
+            .collect::<String>();
+        assert!(
+            logs.contains("privacy-event"),
+            "privacy event absent from logs"
+        );
+        assert!(
+            traces.contains("privacy-event"),
+            "privacy event absent from span events"
+        );
         for path in ["/i/v1/traces", "/i/v1/logs"] {
             let bodies = captures
                 .iter()
@@ -542,7 +560,7 @@ fn production_stack_filters_posthog_logs() {
     if boot::is_child() {
         return boot::child(
             &[&|| {
-                let _span = tracing::info_span!("filter-span").entered();
+                let _span = tracing::info_span!(target: "fixture", "filter-span").entered();
                 tracing::trace!(target: "rig::completions", "{RIG}");
                 tracing::debug!(target: "fixture", "{DEBUG}");
                 tracing::info!(target: "fixture", "{CONTROL}");
@@ -581,6 +599,11 @@ fn production_stack_filters_posthog_logs() {
             "an event below RUST_LOG reached PostHog"
         );
         let everything = payload(&captures, |_| true);
+        let traces = payload(&captures, |path| path == "/i/v1/traces");
+        assert!(
+            traces.contains("filter-span") || traces.contains(CONTROL),
+            "filter trace never exported"
+        );
         assert!(!everything.contains(RIG) && !everything.contains(DEBUG));
     });
 }
