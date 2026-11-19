@@ -39,7 +39,11 @@ fn capture_payload() {
             "{}",
             exit.output()
         );
-        assert!(!exit.stdout.contains("capture response unreadable"), "{}", exit.output());
+        assert!(
+            !exit.stdout.contains("capture response unreadable"),
+            "{}",
+            exit.output()
+        );
         assert!(exit.stdout.contains("game_phase"));
         let requests = captures.lock().unwrap();
         let request = requests
@@ -67,8 +71,28 @@ fn capture_payload() {
         assert_eq!(event["event"], "achievement_earned");
         assert_eq!(event["distinct_id"], "11111111-1111-4111-8111-111111111111");
         assert!(event.get("options").is_none());
-        assert!(body["created_at"].as_str().is_some());
-        assert!(event["timestamp"].as_str().is_some());
+        for timestamp in [
+            body["created_at"].as_str().unwrap(),
+            event["timestamp"].as_str().unwrap(),
+            request.headers["posthog-request-timestamp"]
+                .to_str()
+                .unwrap(),
+        ] {
+            let parsed: jiff::Timestamp = timestamp.parse().unwrap();
+            let _ = parsed;
+            assert!(timestamp.contains('.'));
+            assert_eq!(
+                timestamp
+                    .split('.')
+                    .nth(1)
+                    .unwrap()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .count(),
+                3,
+                "{timestamp}"
+            );
+        }
         assert_eq!(event["properties"]["first"], true);
         assert_eq!(event["properties"]["slug"], "winner");
         assert_eq!(event["properties"]["display_value"], "42");
@@ -186,11 +210,20 @@ fn anonymous_and_ops_isolation() {
         assert_ne!(event["distinct_id"], event["uuid"]);
         let other = &body["batch"][1];
         for item in [event, other] {
-            assert_eq!(uuid::Uuid::parse_str(item["distinct_id"].as_str().unwrap()).unwrap().get_version_num(), 4);
+            assert_eq!(
+                uuid::Uuid::parse_str(item["distinct_id"].as_str().unwrap())
+                    .unwrap()
+                    .get_version_num(),
+                4
+            );
             assert_ne!(item["distinct_id"], item["uuid"]);
         }
         assert_ne!(event["distinct_id"], other["distinct_id"]);
-        let line = exit.stdout.lines().find(|line| line.contains("Anonymous view")).unwrap();
+        let line = exit
+            .stdout
+            .lines()
+            .find(|line| line.contains("Anonymous view"))
+            .unwrap();
         assert!(!line.contains("user_id"), "{line}");
     });
 }
@@ -641,8 +674,16 @@ fn capture_verdict_case(test: &str, verdict: &str, duplicates: u64, rejected: bo
         server.abort();
         assert!(exit.success, "{}", exit.output());
         assert_eq!(received.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert!(!exit.stdout.contains("capture request failed"), "{}", exit.output());
-        assert!(!exit.stdout.contains("capture response unreadable"), "{}", exit.output());
+        assert!(
+            !exit.stdout.contains("capture request failed"),
+            "{}",
+            exit.output()
+        );
+        assert!(
+            !exit.stdout.contains("capture response unreadable"),
+            "{}",
+            exit.output()
+        );
         assert_eq!(
             exit.stdout.contains("capture rejected events"),
             rejected,
@@ -674,14 +715,24 @@ fn shutdown_drains_events_queued_during_flush() {
             ],
         );
         assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
-        assert!(boot::eventually(|| captures.lock().unwrap().iter().any(|r| r.uri.path() == "/i/v1/analytics/events")).await);
+        assert!(
+            boot::eventually(|| captures
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.uri.path() == "/i/v1/analytics/events"))
+            .await
+        );
         child.release();
         child.release();
         let exit = child.finish();
         assert!(exit.success, "{}", exit.output());
         let requests = captures.lock().unwrap();
-        let batches: Vec<serde_json::Value> = requests.iter().filter(|r| r.uri.path() == "/i/v1/analytics/events")
-            .map(|r| serde_json::from_slice(&r.body).unwrap()).collect();
+        let batches: Vec<serde_json::Value> = requests
+            .iter()
+            .filter(|r| r.uri.path() == "/i/v1/analytics/events")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
         assert_eq!(batches.len(), 2, "{batches:?}");
         assert_eq!(batches[0]["batch"][0]["event"], "drain_a");
         assert_eq!(batches[0]["batch"].as_array().unwrap().len(), 1);
@@ -693,23 +744,40 @@ fn shutdown_drains_events_queued_during_flush() {
 #[test]
 fn hundred_event_batch_limit() {
     if boot::is_child() {
-        boot::child(&[&|| {
-            for marker in 0..150 {
-                cja::product_event!(name: "batch_limit", user_id: None, message: "Batch limit", properties: { marker = marker });
-            }
-        }], |_| {});
+        boot::child(
+            &[&|| {
+                for marker in 0..150 {
+                    cja::product_event!(name: "batch_limit", user_id: None, message: "Batch limit", properties: { marker = marker });
+                }
+            }],
+            |_| {},
+        );
         return;
     }
     boot::block_on(async {
         let (host, captures) = mock(Duration::ZERO).await;
-        let mut child = boot::spawn("hundred_event_batch_limit", &[("POSTHOG_HOST", &host), ("POSTHOG_PROJECT_TOKEN", "phc_fixture")]);
+        let mut child = boot::spawn(
+            "hundred_event_batch_limit",
+            &[
+                ("POSTHOG_HOST", &host),
+                ("POSTHOG_PROJECT_TOKEN", "phc_fixture"),
+            ],
+        );
         assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
         child.release();
         let exit = child.finish();
         assert!(exit.success, "{}", exit.output());
         let requests = captures.lock().unwrap();
-        let lengths: Vec<usize> = requests.iter().filter(|r| r.uri.path() == "/i/v1/analytics/events")
-            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["batch"].as_array().unwrap().len()).collect();
+        let lengths: Vec<usize> = requests
+            .iter()
+            .filter(|r| r.uri.path() == "/i/v1/analytics/events")
+            .map(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["batch"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .collect();
         assert_eq!(lengths, [100, 50]);
     });
 }

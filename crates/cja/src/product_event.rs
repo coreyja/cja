@@ -81,7 +81,7 @@ pub fn submit(name: &str, id: Option<&str>, mut properties: Map<String, Value>) 
         event: name.to_owned(),
         uuid: Uuid::now_v7(),
         distinct_id: id.map_or_else(|| Uuid::new_v4().to_string(), str::to_owned),
-        timestamp: jiff::Timestamp::now().to_string(),
+        timestamp: format!("{:.3}", jiff::Timestamp::now()),
         options: id.is_none().then_some(CaptureOptions {
             process_person_profile: false,
         }),
@@ -206,7 +206,7 @@ async fn worker(
                 let sent_uuids: Vec<String> =
                     chunk.iter().map(|event| event.uuid.to_string()).collect();
                 let body =
-                    json!({"created_at": jiff::Timestamp::now().to_string(), "batch": chunk});
+                    json!({"created_at": format!("{:.3}", jiff::Timestamp::now()), "batch": chunk});
                 let Ok(bytes) = serde_json::to_vec(&body) else {
                     dropped("batch serialization failed");
                     continue;
@@ -227,7 +227,7 @@ async fn worker(
                     .header("PostHog-Attempt", "1")
                     .header(
                         "PostHog-Request-Timestamp",
-                        jiff::Timestamp::now().to_string(),
+                        format!("{:.3}", jiff::Timestamp::now()),
                     )
                     .header("Content-Type", "application/json")
                     .body(bytes)
@@ -238,19 +238,31 @@ async fn worker(
                         match capture_result(response, &sent_uuids).await {
                             CaptureResult::Delivered => {}
                             CaptureResult::Rejected => {
-                                if let Some(count) = report_failure() { tracing::warn!(target: "posthog", count, "capture rejected events"); }
+                                if let Some(count) = report_failure() {
+                                    tracing::warn!(target: "posthog", count, "capture rejected events");
+                                }
                             }
                             CaptureResult::Unreadable => {
-                                if let Some(count) = report_failure() { tracing::warn!(target: "posthog", count, "capture response unreadable"); }
+                                if let Some(count) = report_failure() {
+                                    tracing::warn!(target: "posthog", count, "capture response unreadable");
+                                }
                             }
                         }
                     }
                     Ok(response) => {
-                        if let Some(count) = report_failure() { tracing::warn!(target: "posthog", count, status = %response.status(), "capture request failed"); }
+                        if let Some(count) = report_failure() {
+                            tracing::warn!(target: "posthog", count, status = %response.status(), "capture request failed");
+                        }
                     }
                     Err(error) => {
                         if let Some(count) = report_failure() {
-                            let kind = if error.is_timeout() { "timeout" } else if error.is_connect() { "connect" } else { "transport" };
+                            let kind = if error.is_timeout() {
+                                "timeout"
+                            } else if error.is_connect() {
+                                "connect"
+                            } else {
+                                "transport"
+                            };
                             tracing::warn!(target: "posthog", count, kind, "capture request failed");
                         }
                     }
@@ -378,9 +390,7 @@ mod tests {
             let _ = accepted_tx.send(());
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
-        let handle = start(&host, "phc_fixture", "fixture", 1)
-            .unwrap()
-            .unwrap();
+        let handle = start(&host, "phc_fixture", "fixture", 1).unwrap().unwrap();
         submit("first", None, Map::new());
         tokio::time::timeout(Duration::from_secs(3), accepted_rx)
             .await
