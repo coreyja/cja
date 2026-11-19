@@ -655,7 +655,7 @@ fn shutdown_drains_events_queued_during_flush() {
         return;
     }
     boot::block_on(async {
-        let (host, captures) = mock(Duration::from_millis(700)).await;
+        let (host, captures) = mock(Duration::from_millis(1500)).await;
         let mut child = boot::spawn(
             "shutdown_drains_events_queued_during_flush",
             &[
@@ -664,12 +664,18 @@ fn shutdown_drains_events_queued_during_flush() {
             ],
         );
         assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
+        assert!(boot::eventually(|| captures.lock().unwrap().iter().any(|r| r.uri.path() == "/i/v1/analytics/events")).await);
         child.release();
-        assert!(boot::eventually(|| !captures.lock().unwrap().is_empty()).await);
         child.release();
         let exit = child.finish();
         assert!(exit.success, "{}", exit.output());
-        let payload = posthog_support::payload(&captures, |path| path == "/i/v1/analytics/events");
-        assert!(payload.contains("drain_b"), "missing drain_b: {payload}");
+        let requests = captures.lock().unwrap();
+        let batches: Vec<serde_json::Value> = requests.iter().filter(|r| r.uri.path() == "/i/v1/analytics/events")
+            .map(|r| serde_json::from_slice(&r.body).unwrap()).collect();
+        assert_eq!(batches.len(), 2, "{batches:?}");
+        assert_eq!(batches[0]["batch"][0]["event"], "drain_a");
+        assert_eq!(batches[0]["batch"].as_array().unwrap().len(), 1);
+        assert_eq!(batches[1]["batch"][0]["event"], "drain_b");
+        assert_eq!(batches[1]["batch"].as_array().unwrap().len(), 1);
     });
 }
