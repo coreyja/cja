@@ -20,7 +20,7 @@ pub struct SyncConfig {
     pub project_id: i64,
     pub app: String,
 }
-fn slug(app: &str) -> Result<(), String> {
+pub(crate) fn slug(app: &str) -> Result<(), String> {
     if app.is_empty()
         || app.starts_with('-')
         || !app
