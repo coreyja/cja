@@ -326,6 +326,52 @@ async fn server_error_preserves_session_until_original_hard_cap() {
 }
 
 #[tokio::test]
+async fn refresh_must_not_authenticate_after_hard_cap_passes_during_token_call() {
+    let fixture = Fixture::new().await;
+    let (_, old_cookie, state) = fixture.start("/auth/login").await;
+    let nonce = fixture.nonce().await;
+    fixture
+        .token_mock(
+            jwt(&fixture.server.base_url(), &nonce, "userid:123"),
+            "refresh-1",
+        )
+        .await;
+    let callback = fixture.callback(&old_cookie, &state).await;
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let cookie = cookie(&callback);
+    let slow_outage = fixture
+        .server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/token")
+                .form_urlencoded_tuple("refresh_token", "refresh-1");
+            then.status(503)
+                .delay(std::time::Duration::from_secs(3))
+                .body("unavailable");
+        })
+        .await;
+    sqlx::query(
+        "UPDATE passport_sessions SET authenticated_at = now() - interval '8 hours' + interval '2 seconds',
+         next_refresh_at = now() - interval '1 second'",
+    )
+    .execute(&fixture.state.pool)
+    .await
+    .unwrap();
+
+    let response = fixture
+        .request("GET", "/private", Some(&cookie), None, None)
+        .await;
+    slow_outage.assert_calls_async(1).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM passport_sessions")
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn refused_token_connection_defers_refresh_without_revoking_session() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
