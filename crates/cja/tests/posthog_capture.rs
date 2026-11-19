@@ -689,3 +689,27 @@ fn shutdown_drains_events_queued_during_flush() {
         assert_eq!(batches[1]["batch"].as_array().unwrap().len(), 1);
     });
 }
+
+#[test]
+fn hundred_event_batch_limit() {
+    if boot::is_child() {
+        boot::child(&[&|| {
+            for marker in 0..150 {
+                cja::product_event!(name: "batch_limit", user_id: None, message: "Batch limit", properties: { marker = marker });
+            }
+        }], |_| {});
+        return;
+    }
+    boot::block_on(async {
+        let (host, captures) = mock(Duration::ZERO).await;
+        let mut child = boot::spawn("hundred_event_batch_limit", &[("POSTHOG_HOST", &host), ("POSTHOG_PROJECT_TOKEN", "phc_fixture")]);
+        assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
+        child.release();
+        let exit = child.finish();
+        assert!(exit.success, "{}", exit.output());
+        let requests = captures.lock().unwrap();
+        let lengths: Vec<usize> = requests.iter().filter(|r| r.uri.path() == "/i/v1/analytics/events")
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["batch"].as_array().unwrap().len()).collect();
+        assert_eq!(lengths, [100, 50]);
+    });
+}
