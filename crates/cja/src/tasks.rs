@@ -105,7 +105,8 @@ impl Default for ShutdownBudget {
 
 impl ShutdownBudget {
     /// Read `CJA_SHUTDOWN_JOB_DRAIN_SECS` and `CJA_SHUTDOWN_EXIT_GRACE_SECS`,
-    /// falling back to the defaults for anything unset or unparseable.
+    /// falling back to the defaults for anything unset or unparseable. An
+    /// invalid override emits a warning naming the variable.
     #[must_use]
     pub fn from_env() -> Self {
         Self::from_env_with(|name| std::env::var(name).ok())
@@ -113,13 +114,22 @@ impl ShutdownBudget {
 
     fn from_env_with(read: impl Fn(&str) -> Option<String>) -> Self {
         let defaults = Self::default();
+        let parse = |name: &'static str, fallback| {
+            read(name).map_or(fallback, |raw| {
+                if let Ok(seconds) = raw.trim().parse::<u64>() {
+                    Duration::from_secs(seconds)
+                } else {
+                    tracing::warn!(
+                        variable = name,
+                        "Invalid shutdown budget override; using default"
+                    );
+                    fallback
+                }
+            })
+        };
         Self {
-            job_drain: read("CJA_SHUTDOWN_JOB_DRAIN_SECS")
-                .and_then(|s| s.parse().ok())
-                .map_or(defaults.job_drain, Duration::from_secs),
-            exit_grace: read("CJA_SHUTDOWN_EXIT_GRACE_SECS")
-                .and_then(|s| s.parse().ok())
-                .map_or(defaults.exit_grace, Duration::from_secs),
+            job_drain: parse("CJA_SHUTDOWN_JOB_DRAIN_SECS", defaults.job_drain),
+            exit_grace: parse("CJA_SHUTDOWN_EXIT_GRACE_SECS", defaults.exit_grace),
         }
     }
 
@@ -492,6 +502,47 @@ mod tests {
         assert!(
             ShutdownBudget::default().deadline() + crate::setup::TELEMETRY_SHUTDOWN_BUDGET
                 < Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn invalid_shutdown_overrides_warn_and_use_defaults() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        struct Fields<'a>(&'a mut Vec<String>);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push(format!("{}={value:?}", field.name()));
+            }
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                assert_eq!(*event.metadata().level(), tracing::Level::WARN);
+                event.record(&mut Fields(&mut self.0.lock().unwrap()));
+            }
+        }
+
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let actual = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(Capture(fields.clone())),
+            || {
+                ShutdownBudget::from_env_with(|key| match key {
+                    "CJA_SHUTDOWN_JOB_DRAIN_SECS" | "CJA_SHUTDOWN_EXIT_GRACE_SECS" => {
+                        Some("1.5".into())
+                    }
+                    _ => None,
+                })
+            },
+        );
+        assert_eq!(actual, ShutdownBudget::default());
+        let fields = fields.lock().unwrap().join(" ");
+        assert!(fields.contains("CJA_SHUTDOWN_JOB_DRAIN_SECS"));
+        assert!(fields.contains("CJA_SHUTDOWN_EXIT_GRACE_SECS"));
+        assert_eq!(
+            fields.matches("Invalid shutdown budget override").count(),
+            2
         );
     }
 

@@ -353,6 +353,7 @@ fn sanitize_attributes(
     attributes.retain_mut(|attribute| {
         if (attribute.key == "self" && (log_record || span_name == Some("jobs.enqueue")))
             || (attribute.key == "value" && (span_name == Some("jobs.run_from_value") || job_log))
+            || (attribute.key == "error.detail" && job_log)
         {
             return false;
         }
@@ -837,19 +838,26 @@ mod tests {
         let traces = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 scope_spans: vec![ScopeSpans {
-                    spans: vec![Span {
-                        name: "jobs.run_from_value".into(),
-                        attributes: fields.clone(),
-                        events: vec![Event {
+                    spans: vec![
+                        Span {
+                            name: "jobs.run_from_value".into(),
                             attributes: fields.clone(),
+                            events: vec![Event {
+                                attributes: fields.clone(),
+                                ..Default::default()
+                            }],
+                            links: vec![Link {
+                                attributes: fields.clone(),
+                                ..Default::default()
+                            }],
                             ..Default::default()
-                        }],
-                        links: vec![Link {
-                            attributes: fields.clone(),
+                        },
+                        Span {
+                            name: "unrelated".into(),
+                            attributes: vec![attribute("value", "keep-me")],
                             ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
+                        },
+                    ],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -866,6 +874,8 @@ mod tests {
             assert!(value(attrs, "value").is_none());
             assert_eq!(value(attrs, "job.name"), Some("Mail"));
         }
+        let unrelated = &decoded.resource_spans[0].scope_spans[0].spans[1];
+        assert_eq!(value(&unrelated.attributes, "value"), Some("keep-me"));
         let logs = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 scope_logs: vec![ScopeLogs {

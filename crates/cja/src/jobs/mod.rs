@@ -751,7 +751,8 @@ pub trait Job<AppState: AS>:
     /// You typically won't call this directly - it's used by the job worker.
     /// A payload that fails to deserialize is wrapped in [`InvalidJobPayload`]
     /// (its `serde_json::Error` rides along as the source); the worker
-    /// dead-letters such rows on the first dispatch instead of retrying.
+    /// dead-letters such rows on the first dispatch instead of retrying. The
+    /// full error detail stays in Eyes and the dead-letter row; `PostHog` drops it.
     #[instrument(name = "jobs.run_from_value", skip(app_state, cancellation_token, slot), fields(job.name = Self::NAME), err)]
     async fn run_from_value(
         value: serde_json::Value,
