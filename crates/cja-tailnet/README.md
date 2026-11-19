@@ -1,0 +1,35 @@
+# cja-tailnet
+
+`cja-tailnet` joins an in-process, ephemeral Tailscale node at boot. It gets a
+platform OIDC token from GCP or Fly Machines, exchanges it through Tailscale
+workload identity federation (WIF), then mints a single-use, preauthorized auth
+key. No Tailscale key is stored. Offline ephemeral nodes are reaped by Tailscale.
+
+## Fly Machines setup
+
+Infra DEV-2539 owns the home-server federated identity and ACL. Its Tailscale
+identity uses issuer `https://oidc.fly.io/coreyja-studio`, subject
+`coreyja-studio:home-coreyja:*`, scope `auth_keys`, and allowed tag `tag:home`.
+The wildcard covers changing machine IDs while pinning the app. For another
+workload, use `<org>:<app>:*`, never `<org>:*`. Follow infra's
+[Adding a workload](https://github.com/coreyja-studio/infra/blob/main/stacks/tailnet/README.md#adding-a-workload)
+pattern; this crate does not create identities or ACL grants. See also
+[Fly Machines OIDC](https://fly.io/blog/oidc-cloud-roles/) and
+[Tailscale WIF](https://tailscale.com/docs/features/workload-identity-federation).
+
+Set `TS_WIF_CLIENT_ID` to the federated identity's client ID and `TS_TAG=tag:home`.
+`TS_WIF_AUDIENCE` defaults to `api.tailscale.com/<client ID>`; set it explicitly
+if infra configures a different audience. `TS_WIF_PROVIDER=fly` is optional on
+Fly when `FLY_APP_NAME` or `FLY_MACHINE_ID` is present. `TS_HOSTNAME` overrides
+the default Fly app name (or machine ID when the app name is absent).
+
+At runtime the crate requests a plain-text OIDC token over the `/.fly/api`
+Unix socket. It uses neither a stored Tailscale auth key nor
+`/.fly/oidc_token` (the latter depends on `AWS_ROLE_ARN` and has an AWS
+audience).
+
+The credential creating a Tailscale federated identity needs `federated_keys`
+and the `auth_keys` scope it grants. It must directly own `tag:home` in
+`tagOwners`. A create-only Terraform plan does not exercise the credential.
+If first boot reports “tags are invalid or not permitted,” inspect the
+federated identity's allowed tag before its generated key expires.

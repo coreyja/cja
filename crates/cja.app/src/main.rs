@@ -4,11 +4,11 @@ use cja::{
         eyre::{Context as _, eyre},
     },
     server::{cookies::CookieKey, run_server_until},
-    setup::setup_tracing,
+    setup::TracingConfig,
     tasks::{ShutdownBudget, Supervisor},
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use tracing::info;
+use tracing::{error, info};
 
 mod heartbeat;
 mod routes;
@@ -111,10 +111,39 @@ pub async fn migrate(pool: &PgPool) -> cja::Result<()> {
 }
 
 async fn run_application() -> cja::Result<()> {
-    setup_tracing("cja-site")?;
+    let telemetry_handle = TracingConfig::new("cja-site")
+        .version(env!("CARGO_PKG_VERSION"))
+        .init()?;
 
+    // Hold the outcome while telemetry flushes, so an early `?` inside
+    // `run_tasks` (a boot failure) still gets its last events out.
+    let result = run_tasks().await;
+    if let Err(error) = &result {
+        error!(error = %format_args!("{error:#}"), "application tasks failed");
+    }
+    let flush = telemetry_handle.shutdown().await;
+    if result.is_ok() {
+        flush?;
+    }
+    result
+}
+
+async fn run_tasks() -> cja::Result<()> {
     let cron_registry = heartbeat::cron_registry()?;
     let app_state = AppState::from_env(heartbeat::schedule(&cron_registry)).await?;
+
+    // This process has the complete cron and job registries; emit before the
+    // registry moves into the worker. Other roles must not send partial snapshots.
+    cja::posthog_manifest::emit_boot_manifest::<Jobs, AppState>(
+        &app_state,
+        &cja::posthog_manifest::BootManifest::new(
+            "cja-site",
+            &cron_registry,
+            &heartbeat::TIMEZONE,
+            &[],
+            &[],
+        ),
+    )?;
 
     info!("Spawning application tasks");
     let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;

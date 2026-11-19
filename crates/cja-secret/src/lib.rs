@@ -36,7 +36,8 @@
 //! network, for hosts running `tailscaled`. With the `tailnet` feature,
 //! [`Transport::Tailnet`] joins the tailnet in-process as an ephemeral node,
 //! keyless via workload identity federation (see `cja-tailnet`), for platforms
-//! like Cloud Run that can't run `tailscaled`. With `Transport::Tailnet`,
+//! like Cloud Run or Fly Machines that can't run `tailscaled`. With
+//! `Transport::Tailnet`,
 //! three consecutive polls in which every secret failed with a transport
 //! error end the process so a restart rejoins with a fresh node;
 //! `Transport::Host` keeps serving last-good values through any outage.

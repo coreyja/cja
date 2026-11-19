@@ -77,9 +77,41 @@
 //! }
 //!
 //! async fn run() -> cja::Result<()> {
-//!     // Keep the Eyes handle alive for graceful shutdown
-//!     let _eyes_handle = setup_tracing("my-app")?;
+//!     // Flushes Eyes and PostHog when shutdown() is called below
+//!     let telemetry = setup_tracing("my-app")?;
+//!     let result = run_tasks().await;
+//!     if let Err(error) = &result {
+//!         tracing::error!(error = %format_args!("{error:#}"), "application tasks failed");
+//!     }
+//!     let flush = telemetry.shutdown().await;
+//!     if result.is_ok() { flush?; }
+//!     result
+//! }
 //!
+//! // For platform-specific stdout, load the Eyes token before setup and
+//! // configure its local filter on the stdout layer. This filter does not
+//! // restrict Eyes, PostHog OTLP, or product capture.
+//! async fn run_with_custom_stdout(
+//!     org_id: uuid::Uuid,
+//!     app_id: uuid::Uuid,
+//! ) -> cja::Result<()> {
+//!     use tracing_subscriber::Layer as _;
+//!     let token = load_eyes_token().await?;
+//!     let stdout = tracing_subscriber::fmt::layer()
+//!         .json()
+//!         .with_writer(std::io::stdout)
+//!         .with_filter(tracing_subscriber::EnvFilter::new("info"));
+//!     let telemetry = cja::setup::TracingConfig::new("my-app")
+//!         .stdout_layer(stdout)
+//!         .eyes_ids(org_id, app_id)
+//!         .eyes_token(token)
+//!         .init()?;
+//!     let result = run_tasks().await;
+//!     telemetry.shutdown().await?;
+//!     result
+//! }
+//!
+//! async fn run_tasks() -> cja::Result<()> {
 //!     let app_state = MyAppState { /* ... */ };
 //!
 //!     // Registers SIGTERM/SIGINT and owns the shutdown sequence
@@ -113,6 +145,19 @@
 //! ```
 //!
 //! See `crates/cja.app/` in the repository for a complete working example.
+//! Keep the telemetry handle and call `shutdown().await` after every application
+//! exit path. An underscore binding suppresses `must_use` but loses buffered
+//! Eyes and `PostHog` data. `PostHog`'s OTLP copy redacts sensitive query values
+//! (`code`, `state`, token, password, secret, key, signature and OTP keys),
+//! drops authorization/cookie headers, `jobs.enqueue.self`, and
+//! `jobs.run_from_value.value` (also copied onto job log records). The worker's
+//! deserialize-failure detail goes to Eyes and the dead-letter row, while
+//! `PostHog` sees only the top-level error. Eyes keeps raw fields. App-owned
+//! spans remain the app's responsibility: use
+//! `#[instrument(skip(self))]` on `Job::run` to avoid exporting its payload.
+//! Explicit product events and boot manifests are app-owned payloads.
+//! Returned `PostHog` construction errors skip that sink. A dependency panic
+//! during construction aborts in a `panic = "abort"` build.
 //!
 //! ## Configuration
 //!
@@ -125,9 +170,13 @@
 //! | `JOBS_DISABLED` | No | `false` | Set to `"true"` to skip starting the job worker |
 //! | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |
 //! | `RUST_LOG` | No | `info` | Tracing filter directive. rig's content-bearing targets are always capped: `rig::completions`/`rig::streaming` at DEBUG, `rig_agent::agent::typed` at ERROR |
-//! | `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `2` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked |
-//! | `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `2` | Extra time for tasks to exit after the job drain. Drain + grace must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default) |
+//! | `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `1` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked. Invalid values warn and use the default |
+//! | `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `500ms when unset; whole seconds when set` | Extra time for tasks to exit after the job drain. Drain + grace + the telemetry flush (`TelemetryShutdownHandle::shutdown`, up to 3s when a sink is stalled) must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default). Invalid values warn and use the default |
 //! | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
+//! | `POSTHOG_PROJECT_TOKEN` | No | — | Enable OTLP logs/traces and explicit [`product_event!`] capture at boot |
+//! | `POSTHOG_HOST` | No | `https://us.i.posthog.com` | OTLP and capture host |
+//! | `POSTHOG_LOG_LEVEL` | No | info | Minimum level for BOTH `PostHog` log records and `PostHog` spans (one shared filter): `off` sends no traces either. Exporter crates (`opentelemetry*`, `hyper*`, `h2`, `reqwest`, `rustls`, `want`, `mio`, `posthog`) are always excluded, matched by target prefix |
+//! | `POSTHOG_TRACES_SAMPLE_RATIO` | No | 1.0 | Root trace sampling probability |
 //! | `EYES_ORG_ID` | No | — | Eyes tracing org ID (both `ORG_ID` and `APP_ID` required) |
 //! | `EYES_APP_ID` | No | — | Eyes tracing app ID |
 //! | `EYES_URL` | No | `https://eyes.coreyja.com` | Eyes server URL |
@@ -144,14 +193,13 @@
 //!
 //! Disabling `jobs` at compile time also disables `cron`.
 //! [`testing::test_db`] is always available; `testing` enables only
-//! [`testing::mock_oauth`].
+//! `testing::mock_oauth`.
 //!
 //! ## Re-exports
 //!
 //! CJA re-exports key dependencies so you don't need to add them directly:
 //!
 //! ```rust
-//! use cja::eyes_subscriber;
 //! use cja::sqlx;
 //! use cja::uuid;
 //! use cja::color_eyre;
@@ -160,8 +208,10 @@
 //! use cja::jiff_sqlx;
 //! ```
 
-pub use eyes_subscriber;
 pub mod assets;
+pub mod observability;
+#[cfg(feature = "jobs")]
+pub mod posthog_manifest;
 pub use sqlx;
 pub use uuid;
 
@@ -184,6 +234,15 @@ pub use maud;
 
 pub mod db;
 pub mod tasks;
+mod tls;
 
 pub use jiff;
 pub use jiff_sqlx;
+
+mod product_event;
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::product_event::{bare, enabled, identity, submit};
+    pub use serde_json;
+    pub use tracing;
+}
