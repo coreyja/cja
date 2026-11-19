@@ -132,7 +132,7 @@ impl TelemetryShutdownHandle {
             },
             async {
                 if let Some(handle) = capture {
-                    handle.shutdown().await;
+                    handle.shutdown(TELEMETRY_SHUTDOWN_BUDGET).await;
                 }
             }
         );
@@ -274,11 +274,12 @@ fn initialize_tracing(
         .with(rig_cap)
         .try_init()?;
     let capture = capture_config.and_then(|config| {
-        if let Ok(handle) = crate::product_event::start(&config.host, &config.token, crate_name) {
-            handle
-        } else {
-            println!("Skipping PostHog capture: client setup failed");
-            None
+        match crate::product_event::start(&config.host, &config.token, crate_name) {
+            Ok(handle) => handle,
+            Err(error) => {
+                println!("Skipping PostHog capture: client setup failed: {error:#}");
+                None
+            }
         }
     });
     Ok(TelemetryShutdownHandle {

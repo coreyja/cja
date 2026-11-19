@@ -199,7 +199,7 @@ mod product_event;
 mod tls;
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::product_event::{bare, identity, submit};
+    pub use crate::product_event::{bare, enabled, identity, submit};
     pub use serde_json;
     pub use tracing;
 }
