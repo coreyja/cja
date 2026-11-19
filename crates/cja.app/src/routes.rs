@@ -25,6 +25,7 @@ pub fn router(app_state: AppState) -> Result<Router, cja::assets::AssetError> {
 }
 
 async fn landing() -> impl IntoResponse {
+    cja::product_event!(name: "site_landing_view", user_id: None, message: "Site landing view", properties: { page = "/" });
     templates::landing_page()
 }
 

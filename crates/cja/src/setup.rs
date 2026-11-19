@@ -92,6 +92,7 @@ const TELEMETRY_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from
 pub struct TelemetryShutdownHandle {
     eyes: Option<EyesShutdownHandle>,
     posthog: Option<posthog::PostHogShutdownHandle>,
+    capture: Option<crate::product_event::CaptureShutdownHandle>,
 }
 
 impl TelemetryShutdownHandle {
@@ -113,6 +114,7 @@ impl TelemetryShutdownHandle {
     /// the call still returns `Ok(())`, because a dead telemetry sink must not
     /// fail application shutdown. The `Result` is kept so callers can `?` it.
     pub async fn shutdown(self) -> color_eyre::Result<()> {
+        let capture = self.capture;
         tokio::join!(
             async {
                 if let Some(eyes) = self.eyes {
@@ -125,6 +127,11 @@ impl TelemetryShutdownHandle {
             },
             async {
                 if let Some(handle) = self.posthog {
+                    handle.shutdown().await;
+                }
+            },
+            async {
+                if let Some(handle) = capture {
                     handle.shutdown().await;
                 }
             }
@@ -240,7 +247,7 @@ fn initialize_tracing(
         hierarchical.boxed()
     };
 
-    let (sink, posthog) = setup_posthog(crate_name, process, version)?;
+    let (sink, posthog, capture_config) = setup_posthog(crate_name, process, version)?;
     let eyes_filter = tracing_subscriber::filter::Targets::new()
         .with_default(tracing_subscriber::filter::LevelFilter::TRACE)
         .with_target(
@@ -266,9 +273,18 @@ fn initialize_tracing(
         .with(env_filter)
         .with(rig_cap)
         .try_init()?;
+    let capture = capture_config.and_then(|config| {
+        if let Ok(handle) = crate::product_event::start(&config.host, &config.token, crate_name) {
+            handle
+        } else {
+            println!("Skipping PostHog capture: client setup failed");
+            None
+        }
+    });
     Ok(TelemetryShutdownHandle {
         eyes: eyes_shutdown_handle,
         posthog,
+        capture,
     })
 }
 
@@ -279,6 +295,7 @@ fn setup_posthog(
 ) -> color_eyre::Result<(
     Option<posthog::PostHogSink>,
     Option<posthog::PostHogShutdownHandle>,
+    Option<posthog::PostHogConfig>,
 )> {
     match posthog::PostHogEnv::from_env()? {
         posthog::PostHogEnv::Skipped {
@@ -291,7 +308,7 @@ fn setup_posthog(
             } else {
                 println!("Skipping PostHog layer");
             }
-            Ok((None, None))
+            Ok((None, None, None))
         }
         posthog::PostHogEnv::Enabled(config) => {
             let sink = match posthog::PostHogSink::build(
@@ -304,7 +321,7 @@ fn setup_posthog(
                 Ok(sink) => sink,
                 Err(error) => {
                     println!("Skipping PostHog layer: exporter setup failed: {error:#}");
-                    return Ok((None, None));
+                    return Ok((None, None, Some(config)));
                 }
             };
             println!(
@@ -312,7 +329,7 @@ fn setup_posthog(
                 config.host, config.log_level, config.traces_sample_ratio
             );
             let handle = sink.shutdown_handle();
-            Ok((Some(sink), Some(handle)))
+            Ok((Some(sink), Some(handle), Some(config)))
         }
     }
 }

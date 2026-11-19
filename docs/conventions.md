@@ -80,3 +80,11 @@ Use the re-exports for version consistency.
 - Use `IF NOT EXISTS` in CREATE TABLE statements
 - Use `DEFAULT gen_random_uuid()` for auto-generated IDs
 - The `sessions` table has an auto-update trigger for `updated_at`
+
+Product analytics uses `cja::product_event!` with a name, literal message, optional
+`user_id`, and explicitly typed properties. The macro emits tracing for stdout
+and Eyes and queues PostHog capture when `POSTHOG_PROJECT_TOKEN` is set. Ordinary
+`event_type` tracing fields are operational and are never captured. The capture
+queue is bounded and drops when full. Anonymous events use a fresh distinct ID
+and disable person profile processing; identified events use the acting user ID.
+`service.name` is reserved and comes from the `setup_tracing` crate name.
