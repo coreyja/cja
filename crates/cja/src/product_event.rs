@@ -182,6 +182,8 @@ async fn worker(
                 chunks.push(chunk);
             }
             for chunk in chunks {
+                let sent_uuids: Vec<String> =
+                    chunk.iter().map(|event| event.uuid.to_string()).collect();
                 let body =
                     json!({"created_at": jiff::Timestamp::now().to_string(), "batch": chunk});
                 let Ok(bytes) = serde_json::to_vec(&body) else {
@@ -211,19 +213,8 @@ async fn worker(
                     .send()
                     .await;
                 match result {
-                    Ok(mut response) if response.status().is_success() => {
-                        let mut body = Vec::new();
-                        while let Ok(Some(chunk)) = response.chunk().await {
-                            if body.len() + chunk.len() > 65536 {
-                                break;
-                            }
-                            body.extend_from_slice(&chunk);
-                        }
-                        if serde_json::from_slice::<Value>(&body).is_ok_and(|v| {
-                            v.get("rejected")
-                                .and_then(Value::as_u64)
-                                .is_some_and(|n| n > 0)
-                        }) {
+                    Ok(response) if response.status().is_success() => {
+                        if !capture_results_ok(response, &sent_uuids).await {
                             tracing::warn!(target: "posthog", "capture rejected events");
                         }
                     }
@@ -235,6 +226,32 @@ async fn worker(
             break;
         }
     }
+}
+
+async fn capture_results_ok(mut response: reqwest_012::Response, sent_uuids: &[String]) -> bool {
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if body.len() + chunk.len() <= 65536 => body.extend_from_slice(&chunk),
+            Ok(None) => break,
+            _ => return false,
+        }
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+        return false;
+    };
+    let Some(results) = value.get("results").and_then(Value::as_object) else {
+        return false;
+    };
+    sent_uuids.iter().all(|uuid| {
+        matches!(
+            results
+                .get(uuid)
+                .and_then(|entry| entry.get("result"))
+                .and_then(Value::as_str),
+            Some("ok")
+        )
+    })
 }
 
 #[macro_export]
