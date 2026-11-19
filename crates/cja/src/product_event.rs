@@ -94,6 +94,7 @@ impl CaptureShutdownHandle {
         let mut task = self.task;
         if tokio::time::timeout(budget, &mut task).await.is_err() {
             task.abort();
+            let _ = task.await;
         }
     }
 }
