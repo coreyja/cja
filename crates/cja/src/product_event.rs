@@ -11,7 +11,7 @@ use std::{
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
-const MAX_CAPTURE_QUEUE: usize = 1024;
+pub(crate) const MAX_CAPTURE_QUEUE: usize = 1024;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_BODY_BYTES: usize = 9 * 1024 * 1024;
 static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -113,14 +113,6 @@ pub(crate) fn start(
     host: &str,
     token: &str,
     service: &str,
-) -> color_eyre::Result<Option<CaptureShutdownHandle>> {
-    start_with_capacity(host, token, service, MAX_CAPTURE_QUEUE)
-}
-
-fn start_with_capacity(
-    host: &str,
-    token: &str,
-    service: &str,
     capacity: usize,
 ) -> color_eyre::Result<Option<CaptureShutdownHandle>> {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -132,7 +124,8 @@ fn start_with_capacity(
             crate::tls::ring_client_config().wrap_err("building the PostHog capture TLS config")?,
         )
         .timeout(Duration::from_secs(2))
-        .build()?;
+        .build()
+        .wrap_err("building the PostHog capture HTTP client")?;
     let (tx, rx) = mpsc::channel(capacity);
     let url = format!("{host}/i/v1/analytics/events");
     let bearer = format!("Bearer {token}");
@@ -367,7 +360,7 @@ mod tests {
             let _ = accepted_tx.send(());
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
-        let handle = start_with_capacity(&host, "phc_fixture", "fixture", 1)
+        let handle = start(&host, "phc_fixture", "fixture", 1)
             .unwrap()
             .unwrap();
         submit("first", None, Map::new());
