@@ -1,5 +1,6 @@
 [package]
 name = "cja-site"
+default-run = "cja-site"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

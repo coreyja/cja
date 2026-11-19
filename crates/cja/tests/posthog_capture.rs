@@ -29,6 +29,16 @@ fn capture_payload() {
         let exit = child.finish();
         assert!(exit.success, "{}", exit.output());
         assert!(exit.stdout.contains("Achievement earned"));
+        assert!(
+            !exit.stdout.contains("capture rejected events"),
+            "{}",
+            exit.output()
+        );
+        assert!(
+            !exit.stdout.contains("capture request failed"),
+            "{}",
+            exit.output()
+        );
         assert!(exit.stdout.contains("game_phase"));
         let requests = captures.lock().unwrap();
         let request = requests
@@ -561,5 +571,96 @@ fn capture_v1_event_drop_is_reported() {
             "{}",
             exit.output()
         );
+    });
+}
+
+#[test]
+fn capture_warning_is_delivered() {
+    capture_verdict_case("capture_warning_is_delivered", "warning", 0, false);
+}
+
+#[test]
+fn capture_duplicate_is_rejected() {
+    capture_verdict_case("capture_duplicate_is_rejected", "ok", 1, true);
+}
+
+fn capture_verdict_case(test: &str, verdict: &str, duplicates: u64, rejected: bool) {
+    if boot::is_child() {
+        boot::child(
+            &[&|| {
+                cja::product_event!(name: "verdict_view", user_id: None, message: "Verdict view", properties: {});
+            }],
+            |_| {},
+        );
+        return;
+    }
+    boot::block_on(async {
+        let verdict = verdict.to_owned();
+        let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+            let verdict = verdict.clone();
+            async move {
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let uuid = request["batch"][0]["uuid"].as_str().unwrap();
+                let mut results = serde_json::Map::new();
+                results.insert(
+                    uuid.to_owned(),
+                    serde_json::json!({"result": verdict, "duplicates_dropped": duplicates}),
+                );
+                axum::Json(serde_json::json!({"results": results}))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut child = boot::spawn(
+            test,
+            &[
+                ("POSTHOG_HOST", &host),
+                ("POSTHOG_PROJECT_TOKEN", "phc_fixture"),
+            ],
+        );
+        assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
+        child.release();
+        let exit = child.finish();
+        server.abort();
+        assert!(exit.success, "{}", exit.output());
+        assert_eq!(
+            exit.stdout.contains("capture rejected events"),
+            rejected,
+            "{}",
+            exit.output()
+        );
+    });
+}
+
+#[test]
+fn shutdown_drains_events_queued_during_flush() {
+    if boot::is_child() {
+        boot::child(
+            &[
+                &|| cja::product_event!(name: "drain_a", user_id: None, message: "Drain A", properties: {}),
+                &|| cja::product_event!(name: "drain_b", user_id: None, message: "Drain B", properties: {}),
+            ],
+            |_| {},
+        );
+        return;
+    }
+    boot::block_on(async {
+        let (host, captures) = mock(Duration::from_millis(700)).await;
+        let mut child = boot::spawn(
+            "shutdown_drains_events_queued_during_flush",
+            &[
+                ("POSTHOG_HOST", &host),
+                ("POSTHOG_PROJECT_TOKEN", "phc_fixture"),
+            ],
+        );
+        assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
+        child.release();
+        assert!(boot::eventually(|| !captures.lock().unwrap().is_empty()).await);
+        child.release();
+        let exit = child.finish();
+        assert!(exit.success, "{}", exit.output());
+        let payload = posthog_support::payload(&captures, |path| path == "/i/v1/analytics/events");
+        assert!(payload.contains("drain_b"), "missing drain_b: {payload}");
     });
 }

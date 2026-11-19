@@ -7,6 +7,7 @@ use axum::{
     Router,
     body::Bytes,
     http::{HeaderMap, StatusCode, Uri},
+    response::IntoResponse,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -32,9 +33,19 @@ pub async fn mock_with(delay: Duration, status: StatusCode) -> (String, Captures
     let app = Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
         let state = Arc::clone(&state);
         async move {
+            let capture_path = uri.path() == "/i/v1/analytics/events";
             state.lock().unwrap().push(Capture { uri, headers, body });
             tokio::time::sleep(delay).await;
-            status
+            if capture_path && status == StatusCode::OK {
+                (
+                    status,
+                    [("content-type", "application/json")],
+                    r#"{"results":{}}"#,
+                )
+                    .into_response()
+            } else {
+                status.into_response()
+            }
         }
     });
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

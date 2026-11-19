@@ -1,4 +1,5 @@
 //! Explicit product analytics declarations. Ordinary tracing events never enter capture.
+use color_eyre::eyre::WrapErr as _;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,11 +59,17 @@ pub fn bare<T: Serialize>(value: &T) -> Option<Value> {
 }
 #[doc(hidden)]
 pub fn enabled() -> bool {
-    registry().read().unwrap().is_some()
+    registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
 }
 #[doc(hidden)]
 pub fn submit(name: &str, id: Option<&str>, mut properties: Map<String, Value>) {
-    let sender = registry().read().unwrap().clone();
+    let sender = registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let Some(sender) = sender else { return };
     properties.insert("service.name".into(), sender.service.into());
     let event = CaptureEvent {
@@ -90,7 +97,10 @@ impl fmt::Debug for CaptureShutdownHandle {
 }
 impl CaptureShutdownHandle {
     pub(crate) async fn shutdown(self, budget: Duration) {
-        registry().write().unwrap().take();
+        registry()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let mut task = self.task;
         if tokio::time::timeout(budget, &mut task).await.is_err() {
             task.abort();
@@ -118,14 +128,18 @@ fn start_with_capacity(
         return Ok(None);
     };
     let client = reqwest_012::Client::builder()
-        .use_preconfigured_tls(crate::tls::ring_client_config()?)
+        .use_preconfigured_tls(
+            crate::tls::ring_client_config().wrap_err("building the PostHog capture TLS config")?,
+        )
         .timeout(Duration::from_secs(2))
         .build()?;
     let (tx, rx) = mpsc::channel(capacity);
     let url = format!("{host}/i/v1/analytics/events");
     let bearer = format!("Bearer {token}");
     let task = runtime.spawn(worker(rx, client, url, bearer));
-    *registry().write().unwrap() = Some(Sender {
+    *registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Sender {
         tx,
         service: service.to_owned(),
     });
@@ -141,13 +155,17 @@ async fn worker(
     let mut batch = Vec::new();
     let mut deadline = None;
     loop {
-        let next = if batch.is_empty() {
-            rx.recv().await
+        let (next, channel_drained) = if let Some(batch_deadline) = deadline {
+            match tokio::time::timeout_at(batch_deadline, rx.recv()).await {
+                Ok(Some(event)) => (Some(event), false),
+                Ok(None) => (None, true),
+                Err(_) => (None, false),
+            }
         } else {
-            tokio::time::timeout_at(deadline.expect("nonempty batch has deadline"), rx.recv())
-                .await
-                .ok()
-                .flatten()
+            match rx.recv().await {
+                Some(event) => (Some(event), false),
+                None => (None, true),
+            }
         };
         let received = next.is_some();
         if let Some(event) = next {
@@ -214,44 +232,69 @@ async fn worker(
                     .await;
                 match result {
                     Ok(response) if response.status().is_success() => {
-                        if !capture_results_ok(response, &sent_uuids).await {
-                            tracing::warn!(target: "posthog", "capture rejected events");
+                        match capture_result(response, &sent_uuids).await {
+                            CaptureResult::Delivered => {}
+                            CaptureResult::Rejected => {
+                                tracing::warn!(target: "posthog", "capture rejected events");
+                            }
+                            CaptureResult::Unreadable => {
+                                tracing::warn!(target: "posthog", "capture response unreadable");
+                            }
                         }
                     }
                     _ => tracing::warn!(target: "posthog", "capture request failed"),
                 }
             }
         }
-        if !received && rx.is_closed() {
+        if channel_drained {
             break;
         }
     }
 }
 
-async fn capture_results_ok(mut response: reqwest_012::Response, sent_uuids: &[String]) -> bool {
+#[derive(Clone, Copy)]
+enum CaptureResult {
+    Delivered,
+    Rejected,
+    Unreadable,
+}
+
+async fn capture_result(
+    mut response: reqwest_012::Response,
+    sent_uuids: &[String],
+) -> CaptureResult {
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) if body.len() + chunk.len() <= 65536 => body.extend_from_slice(&chunk),
             Ok(None) => break,
-            _ => return false,
+            _ => return CaptureResult::Unreadable,
         }
     }
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
-        return false;
+        return CaptureResult::Unreadable;
     };
-    let Some(results) = value.get("results").and_then(Value::as_object) else {
-        return false;
+    let Some(raw_results) = value.get("results") else {
+        return CaptureResult::Delivered;
     };
-    sent_uuids.iter().all(|uuid| {
-        matches!(
-            results
-                .get(uuid)
-                .and_then(|entry| entry.get("result"))
-                .and_then(Value::as_str),
-            Some("ok")
-        )
-    })
+    let Some(results) = raw_results.as_object() else {
+        return CaptureResult::Unreadable;
+    };
+    let rejected = results.iter().any(|(uuid, entry)| {
+        sent_uuids.iter().any(|sent| sent == uuid)
+            && (matches!(
+                entry.get("result").and_then(Value::as_str),
+                Some("drop" | "retry")
+            ) || entry
+                .get("duplicates_dropped")
+                .and_then(Value::as_u64)
+                .is_some_and(|n| n > 0))
+    });
+    if rejected {
+        CaptureResult::Rejected
+    } else {
+        CaptureResult::Delivered
+    }
 }
 
 #[macro_export]
