@@ -177,18 +177,19 @@ fn build_monitors<S: AppState>(
         if m.target.contains(['\\', '\t', '\r', '\n']) {
             return Err(invalid("invalid monitor target"));
         }
-        let parsed = if m.target.starts_with('/') {
-            base.as_ref()
-                .ok_or_else(|| invalid("relative monitor requires base URL"))?
-                .join(&m.target)
-        } else {
-            url::Url::parse(&m.target)
-        }
-        .map_err(|_| invalid("invalid monitor target"))?;
+        let (parsed, relative) = match url::Url::parse(&m.target) {
+            Ok(url) => (url, false),
+            Err(_) => (
+                base.as_ref()
+                    .ok_or_else(|| invalid("relative monitor requires base URL"))?
+                    .join(&m.target)
+                    .map_err(|_| invalid("invalid monitor target"))?,
+                true,
+            ),
+        };
         if !matches!(parsed.scheme(), "http" | "https")
             || parsed.host().is_none()
-            || (m.target.starts_with('/')
-                && base.as_ref().is_some_and(|b| b.origin() != parsed.origin()))
+            || (relative && base.as_ref().is_some_and(|b| b.origin() != parsed.origin()))
         {
             return Err(invalid("invalid monitor origin"));
         }
@@ -263,13 +264,10 @@ where
     S: AppState,
 {
     crate::observability::posthog::slug(input.app).map_err(invalid)?;
-    let zone = input
-        .timezone
-        .iana_name()
-        .ok_or_else(|| invalid("timezone must be IANA"))?;
-    let mut crons = Vec::new();
+    #[cfg(feature = "cron")]
+    let mut crons: Vec<CronDeclaration> = Vec::new();
     #[cfg(not(feature = "cron"))]
-    let _ = zone;
+    let crons: Vec<CronDeclaration> = Vec::new();
     #[cfg(feature = "cron")]
     for job in input.registry.jobs().values() {
         let (kind, interval_ms, expression, timezone) = match &job.schedule {
@@ -283,6 +281,10 @@ where
                 ("interval", Some(ms), None, None)
             }
             crate::cron::Schedule::Cron(cron) => {
+                let zone = input
+                    .timezone
+                    .iana_name()
+                    .ok_or_else(|| invalid("timezone must be IANA"))?;
                 let expr = cron.0.to_string();
                 crate::cron::parse_cron(&expr)
                     .map_err(|_| invalid("unparseable cron expression"))?;
@@ -299,6 +301,7 @@ where
         });
     }
     validate_names(crons.iter().map(|c| c.name.as_str()))?;
+    #[cfg(feature = "cron")]
     crons.sort_by(|a, b| a.name.cmp(&b.name));
     validate_names(J::job_names().iter().copied())?;
     validate_names(input.critical_jobs.iter().copied())?;
@@ -359,7 +362,11 @@ where
     // Validate even without capture credentials.
     let id = Uuid::new_v4();
     let booted_at = jiff::Timestamp::now()
-        .round(jiff::Unit::Microsecond)
+        .round(
+            jiff::TimestampRound::new()
+                .smallest(jiff::Unit::Microsecond)
+                .mode(jiff::RoundMode::Trunc),
+        )
         .map_err(|_| invalid("invalid boot time"))?
         .to_string();
     let validation = snapshot::<J, S>(state, input, "", id, &booted_at)?;
@@ -508,6 +515,57 @@ mod tests {
         assert!(validate_names(names.iter().map(String::as_str)).is_ok());
         let names: Vec<_> = (0..101).map(|n| format!("item-{n}")).collect();
         assert!(validate_names(names.iter().map(String::as_str)).is_err());
+    }
+    #[test]
+    fn invalid_checks_are_rejected_without_credentials() {
+        let invalid = [
+            HogqlCheck::new(
+                "bad name",
+                "SELECT 1",
+                HogqlComparison::Gt,
+                1.0,
+                300,
+                HogqlSeverity::Warning,
+            ),
+            HogqlCheck::new(
+                "ok",
+                "SELECT 1",
+                HogqlComparison::Gt,
+                f64::NAN,
+                300,
+                HogqlSeverity::Warning,
+            ),
+            HogqlCheck::new(
+                "ok",
+                "SELECT 1",
+                HogqlComparison::Gt,
+                1.0,
+                299,
+                HogqlSeverity::Warning,
+            ),
+        ];
+        for check in invalid {
+            assert!(build_checks(&[check]).is_err());
+        }
+        let duplicates = [
+            HogqlCheck::new(
+                "same",
+                "SELECT 1",
+                HogqlComparison::Gt,
+                1.0,
+                300,
+                HogqlSeverity::Warning,
+            ),
+            HogqlCheck::new(
+                "same",
+                "SELECT 1",
+                HogqlComparison::Gt,
+                1.0,
+                300,
+                HogqlSeverity::Warning,
+            ),
+        ];
+        assert!(build_checks(&duplicates).is_err());
     }
     #[test]
     fn retry_after_is_bounded() {
@@ -707,17 +765,23 @@ mod tests {
             bodies
         });
         let id = Uuid::new_v4();
+        let state = state();
+        let registry = crate::cron::CronRegistry::new();
+        let zone = jiff::tz::TimeZone::UTC;
+        let input = BootManifest::new("demo", &registry, &zone, &[], &[]);
         let bytes =
-            serde_json::to_vec(&serde_json::json!({"uuid":id,"event":"cja_manifest"})).unwrap();
+            snapshot::<Jobs, State>(&state, &input, "test-token", id, "2026-11-18T18:00:00Z")
+                .unwrap();
         tokio::time::timeout(Duration::from_secs(4), send(bytes.clone(), host))
             .await
             .unwrap();
         let received = server.await.unwrap();
         assert_eq!(received, [bytes.clone(), bytes]);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&received[0]).unwrap()["uuid"],
-            id.to_string()
-        );
+        let event: serde_json::Value = serde_json::from_slice(&received[0]).unwrap();
+        assert_eq!(event["uuid"], id.to_string());
+        assert_eq!(event["properties"]["event_id"], id.to_string());
+        assert_eq!(event["api_key"], "test-token");
+        assert_eq!(event["distinct_id"], "cja:demo");
     }
 
     #[tokio::test]
@@ -749,6 +813,33 @@ mod tests {
                 .unwrap();
             assert!(server.await.unwrap(), "{status} was retried");
         }
+    }
+
+    #[tokio::test]
+    async fn retry_after_delays_second_capture_attempt() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut attempts = Vec::new();
+            for response in [
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                attempts.push(tokio::time::Instant::now());
+                let mut request = [0; 4096];
+                let count = stream.read(&mut request).await.unwrap();
+                assert!(request[..count].starts_with(b"POST /i/v0/e/ HTTP/1.1"));
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            attempts
+        });
+        tokio::time::timeout(Duration::from_secs(4), send(b"{}".to_vec(), host))
+            .await
+            .unwrap();
+        let attempts = server.await.unwrap();
+        assert!(attempts[1].duration_since(attempts[0]) >= Duration::from_secs(2));
     }
 
     #[tokio::test(start_paused = true)]
