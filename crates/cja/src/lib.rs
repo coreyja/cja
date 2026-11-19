@@ -88,6 +88,29 @@
 //!     result
 //! }
 //!
+//! // For platform-specific stdout, load the Eyes token before setup and
+//! // configure its local filter on the stdout layer. This filter does not
+//! // restrict Eyes, PostHog OTLP, or product capture.
+//! async fn run_with_custom_stdout(
+//!     org_id: uuid::Uuid,
+//!     app_id: uuid::Uuid,
+//! ) -> cja::Result<()> {
+//!     use tracing_subscriber::Layer as _;
+//!     let token = load_eyes_token().await?;
+//!     let stdout = tracing_subscriber::fmt::layer()
+//!         .json()
+//!         .with_writer(std::io::stdout)
+//!         .with_filter(tracing_subscriber::EnvFilter::new("info"));
+//!     let telemetry = cja::setup::TracingConfig::new("my-app")
+//!         .stdout_layer(stdout)
+//!         .eyes_ids(org_id, app_id)
+//!         .eyes_token(token)
+//!         .init()?;
+//!     let result = run_tasks().await;
+//!     telemetry.shutdown().await?;
+//!     result
+//! }
+//!
 //! async fn run_tasks() -> cja::Result<()> {
 //!     let app_state = MyAppState { /* ... */ };
 //!

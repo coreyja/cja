@@ -121,6 +121,32 @@ cargo fmt --check
 For process-aware telemetry, initialize tracing with
 `cja::setup::TracingConfig::new("my_app").process(identity.clone()).init()` and
 attach the same `ProcessIdentity` to the boot manifest and heartbeat config.
+For an app with its own stdout format and a runtime Eyes secret, use the same
+entry point (inside Tokio):
+
+```rust,ignore
+use tracing_subscriber::Layer as _;
+
+let eyes_token = load_eyes_token().await?;
+let stdout = tracing_subscriber::fmt::layer()
+    .json()
+    .with_writer(std::io::stdout)
+    .with_filter(tracing_subscriber::EnvFilter::new("info"));
+let telemetry = cja::setup::TracingConfig::new("my_app")
+    .stdout_layer(stdout)
+    .eyes_ids(org_id, app_id)
+    .eyes_token(eyes_token)
+    .init()?;
+let result = run_app().await;
+telemetry.shutdown().await?;
+result
+```
+
+The local stdout filter affects only stdout. Keep INFO operational lines used
+by platform metrics; a WARN-only filter is unsuitable for those metrics.
+Explicit Eyes IDs and token override their respective env values. If omitted,
+the existing env/default behavior applies. `POSTHOG_PROJECT_TOKEN` alone gates
+PostHog OTLP and capture; no PostHog personal key belongs in the app runtime.
 Call `TelemetryShutdownHandle::shutdown` to flush configured Eyes and PostHog sinks; it is
 bounded at 3 seconds, which counts against the platform's kill window alongside
 `CJA_SHUTDOWN_JOB_DRAIN_SECS` and `CJA_SHUTDOWN_EXIT_GRACE_SECS`. `POSTHOG_LOG_LEVEL`
