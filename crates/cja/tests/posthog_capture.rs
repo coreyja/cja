@@ -135,6 +135,56 @@ fn downstream_modes_compile() {
 }
 
 #[test]
+fn borrowed_properties_preserve_values_and_names() {
+    if boot::is_child() {
+        boot::child(
+            &[&|| {
+                #[derive(Debug)]
+                struct DebugValue(String);
+                let display = String::from("display");
+                let debug = DebugValue(String::from("debug"));
+                let raw = vec![String::from("raw")];
+                let bare = String::from("bare");
+                let amount = 250;
+                cja::product_event!(name: "borrowed_values", user_id: None, message: "Borrowed values", properties: { shown = %display, debugged = ?debug, items = ?raw, bare = bare, amount = amount / 100, raw_amount = amount });
+                assert_eq!(display, "display");
+                assert_eq!(debug.0, "debug");
+                assert_eq!(raw, ["raw"]);
+                assert_eq!(bare, "bare");
+                assert_eq!(amount, 250);
+            }],
+            |_| {},
+        );
+        return;
+    }
+    boot::block_on(async {
+        let (host, captures) = mock(Duration::ZERO).await;
+        let mut child = boot::spawn(
+            "borrowed_properties_preserve_values_and_names",
+            &[
+                ("POSTHOG_HOST", &host),
+                ("POSTHOG_PROJECT_TOKEN", "phc_fixture"),
+            ],
+        );
+        assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
+        child.release();
+        let exit = child.finish();
+        assert!(exit.success, "{}", exit.output());
+        assert!(exit.stdout.contains("raw_amount=250"), "{}", exit.output());
+        let payload: serde_json::Value =
+            serde_json::from_str(&posthog_support::payload(&captures, |p| {
+                p == "/i/v1/analytics/events"
+            }))
+            .unwrap();
+        let props = &payload["batch"][0]["properties"];
+        assert_eq!(props["amount"], 2);
+        assert_eq!(props["raw_amount"], 250);
+        assert_eq!(props["items"], "[\"raw\"]");
+        assert_eq!(props["bare"], "bare");
+    });
+}
+
+#[test]
 fn stalled_capture_respects_shutdown_budget() {
     if boot::is_child() {
         boot::child(
@@ -252,6 +302,22 @@ fn blank_token_disables_capture() {
         assert!(exit.success, "{}", exit.output());
         assert!(exit.stdout.contains("No capture"));
         assert!(captures.lock().unwrap().is_empty());
+        let (positive_host, positive_captures) = mock(Duration::ZERO).await;
+        let mut positive = boot::spawn(
+            "blank_token_disables_capture",
+            &[
+                ("POSTHOG_HOST", &positive_host),
+                ("POSTHOG_PROJECT_TOKEN", "phc_fixture"),
+            ],
+        );
+        assert!(boot::eventually(|| positive.stdout().contains(boot::BOOTED)).await);
+        positive.release();
+        let exit = positive.finish();
+        assert!(exit.success, "{}", exit.output());
+        assert!(
+            posthog_support::payload(&positive_captures, |p| p == "/i/v1/analytics/events")
+                .contains("no_capture")
+        );
     });
 }
 
@@ -415,6 +481,7 @@ fn large_event_drops_without_request() {
             &[&|| {
                 let text = "x".repeat(1024 * 1024);
                 cja::product_event!(name: "large_view", user_id: None, message: "Large view", properties: { text = text });
+                cja::product_event!(name: "small_companion", user_id: None, message: "Small companion", properties: {});
             }],
             |_| {},
         );
@@ -433,10 +500,9 @@ fn large_event_drops_without_request() {
         child.release();
         let exit = child.finish();
         assert!(exit.success, "{}", exit.output());
-        assert_eq!(
-            posthog_support::payload(&captures, |p| p == "/i/v1/analytics/events"),
-            ""
-        );
+        let payload = posthog_support::payload(&captures, |p| p == "/i/v1/analytics/events");
+        assert!(payload.contains("small_companion"), "{payload}");
+        assert!(!payload.contains("large_view"), "{payload}");
     });
 }
 
@@ -695,6 +761,47 @@ fn capture_verdict_case(test: &str, verdict: &str, duplicates: u64, rejected: bo
 }
 
 #[test]
+fn shutdown_drains_single_event_promptly() {
+    if boot::is_child() {
+        boot::child(
+            &[
+                &|| cja::product_event!(name: "quick_drain", user_id: None, message: "Quick drain", properties: {}),
+            ],
+            |elapsed| {
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "shutdown took {elapsed:?}"
+                );
+            },
+        );
+        return;
+    }
+    boot::block_on(async {
+        let (host, captures) = mock(Duration::ZERO).await;
+        let mut child = boot::spawn(
+            "shutdown_drains_single_event_promptly",
+            &[
+                ("POSTHOG_HOST", &host),
+                ("POSTHOG_PROJECT_TOKEN", "phc_fixture"),
+            ],
+        );
+        assert!(boot::eventually(|| child.stdout().contains(boot::BOOTED)).await);
+        child.release();
+        let exit = child.finish();
+        assert!(exit.success, "{}", exit.output());
+        assert!(
+            !exit.stdout.contains("budget exceeded"),
+            "{}",
+            exit.output()
+        );
+        assert!(
+            posthog_support::payload(&captures, |p| p == "/i/v1/analytics/events")
+                .contains("quick_drain")
+        );
+    });
+}
+
+#[test]
 fn shutdown_drains_events_queued_during_flush() {
     if boot::is_child() {
         boot::child(
@@ -707,7 +814,7 @@ fn shutdown_drains_events_queued_during_flush() {
         return;
     }
     boot::block_on(async {
-        let (host, captures) = mock(Duration::from_millis(1500)).await;
+        let (host, captures) = mock(Duration::from_millis(800)).await;
         let mut child = boot::spawn(
             "shutdown_drains_events_queued_during_flush",
             &[
@@ -728,6 +835,11 @@ fn shutdown_drains_events_queued_during_flush() {
         child.release();
         let exit = child.finish();
         assert!(exit.success, "{}", exit.output());
+        assert!(
+            !exit.stdout.contains("budget exceeded"),
+            "{}",
+            exit.output()
+        );
         let requests = captures.lock().unwrap();
         let batches: Vec<serde_json::Value> = requests
             .iter()

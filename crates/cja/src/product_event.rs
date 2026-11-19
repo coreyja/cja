@@ -1,7 +1,7 @@
 //! Explicit product analytics declarations. Ordinary tracing events never enter capture.
 use color_eyre::eyre::WrapErr as _;
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     fmt,
@@ -42,9 +42,14 @@ struct CaptureOptions {
     process_person_profile: bool,
 }
 
+struct SerializedEvent {
+    uuid: Uuid,
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone)]
 struct Sender {
-    tx: mpsc::Sender<CaptureEvent>,
+    tx: mpsc::Sender<SerializedEvent>,
     service: String,
 }
 static SENDER: OnceLock<RwLock<Option<Sender>>> = OnceLock::new();
@@ -87,7 +92,22 @@ pub fn submit(name: &str, id: Option<&str>, mut properties: Map<String, Value>) 
         }),
         properties,
     };
-    if sender.tx.try_send(event).is_err() {
+    let Ok(bytes) = serde_json::to_vec(&event) else {
+        dropped("event serialization failed");
+        return;
+    };
+    if bytes.len() >= MAX_EVENT_BYTES {
+        dropped("event too large");
+        return;
+    }
+    if sender
+        .tx
+        .try_send(SerializedEvent {
+            uuid: event.uuid,
+            bytes,
+        })
+        .is_err()
+    {
         dropped("queue full or closed");
     }
 }
@@ -151,7 +171,7 @@ pub(crate) fn start(
 
 #[allow(clippy::too_many_lines)]
 async fn worker(
-    mut rx: mpsc::Receiver<CaptureEvent>,
+    mut rx: mpsc::Receiver<SerializedEvent>,
     client: reqwest_012::Client,
     url: String,
     bearer: String,
@@ -173,14 +193,10 @@ async fn worker(
         };
         let received = next.is_some();
         if let Some(event) = next {
-            if serde_json::to_vec(&event).is_ok_and(|v| v.len() < MAX_EVENT_BYTES) {
-                if batch.is_empty() {
-                    deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-                }
-                batch.push(event);
-            } else {
-                dropped("event too large or invalid");
+            if batch.is_empty() {
+                deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
             }
+            batch.push(event);
         }
         if batch.len() < 100 && received {
             continue;
@@ -188,11 +204,11 @@ async fn worker(
         if !batch.is_empty() {
             let events = std::mem::take(&mut batch);
             deadline = None;
-            let mut chunks: Vec<Vec<CaptureEvent>> = Vec::new();
+            let mut chunks: Vec<Vec<SerializedEvent>> = Vec::new();
             let mut chunk = Vec::new();
             let mut size = 128;
             for event in events {
-                let event_size = serde_json::to_vec(&event).map_or(0, |bytes| bytes.len() + 1);
+                let event_size = event.bytes.len() + 1;
                 if size + event_size >= MAX_BODY_BYTES && !chunk.is_empty() {
                     chunks.push(std::mem::take(&mut chunk));
                     size = 128;
@@ -206,12 +222,22 @@ async fn worker(
             for chunk in chunks {
                 let sent_uuids: Vec<String> =
                     chunk.iter().map(|event| event.uuid.to_string()).collect();
-                let body =
-                    json!({"created_at": format!("{:.3}", jiff::Timestamp::now()), "batch": chunk});
-                let Ok(bytes) = serde_json::to_vec(&body) else {
+                let created_at = format!("{:.3}", jiff::Timestamp::now());
+                let Ok(created_at) = serde_json::to_vec(&created_at) else {
                     dropped("batch serialization failed");
                     continue;
                 };
+                let mut bytes = Vec::with_capacity(size);
+                bytes.extend_from_slice(b"{\"created_at\":");
+                bytes.extend_from_slice(&created_at);
+                bytes.extend_from_slice(b",\"batch\":[");
+                for (index, event) in chunk.iter().enumerate() {
+                    if index != 0 {
+                        bytes.push(b',');
+                    }
+                    bytes.extend_from_slice(&event.bytes);
+                }
+                bytes.extend_from_slice(b"]}");
                 if bytes.len() >= MAX_BODY_BYTES {
                     dropped("batch too large");
                     continue;
@@ -328,6 +354,9 @@ async fn capture_result(
 /// `message` are reserved fields; cja sets the capture `service.name` property.
 /// `user_id` accepts `Option<&dyn std::fmt::Display>`. Anonymous events use a
 /// fresh random distinct ID and `process_person_profile = false`.
+/// `user_id` must be an opaque internal ID, never an email, name, or other PII.
+/// Property values, especially `?` Debug output, are sent to `PostHog` verbatim;
+/// callers must not include PII or secrets.
 ///
 /// `POSTHOG_PROJECT_TOKEN` enables capture. Explicit capture is independent of
 /// `RUST_LOG`, `EnvFilter`, and `POSTHOG_LOG_LEVEL`. Capture uses a bounded,
@@ -358,21 +387,21 @@ macro_rules! __product_fields {
         if $ok { $crate::__private::submit($name, $id.as_deref(), $props); }
     }};
     (@parse [$name:expr] [$msg:literal] [$id:ident] [$props:ident] [$ok:ident] [$($trace:tt)*] $key:ident = % $value:expr $(, $($rest:tt)*)?) => {{
-        let $key = $value;
-        if $crate::__private::enabled() { $props.insert(stringify!($key).into(), $crate::__private::serde_json::Value::String(format!("{}", $key))); }
-        $crate::__product_fields! { @parse [$name] [$msg] [$id] [$props] [$ok] [$($trace)* $key = %$key,] $($($rest)*)? }
+        let __value = &$value;
+        if $crate::__private::enabled() { $props.insert(stringify!($key).into(), $crate::__private::serde_json::Value::String(format!("{}", __value))); }
+        $crate::__product_fields! { @parse [$name] [$msg] [$id] [$props] [$ok] [$($trace)* $key = %__value,] $($($rest)*)? }
     }};
     (@parse [$name:expr] [$msg:literal] [$id:ident] [$props:ident] [$ok:ident] [$($trace:tt)*] $key:ident = ? $value:expr $(, $($rest:tt)*)?) => {{
-        let $key = $value;
-        if $crate::__private::enabled() { $props.insert(stringify!($key).into(), $crate::__private::serde_json::Value::String(format!("{:?}", $key))); }
-        $crate::__product_fields! { @parse [$name] [$msg] [$id] [$props] [$ok] [$($trace)* $key = ?$key,] $($($rest)*)? }
+        let __value = &$value;
+        if $crate::__private::enabled() { $props.insert(stringify!($key).into(), $crate::__private::serde_json::Value::String(format!("{:?}", __value))); }
+        $crate::__product_fields! { @parse [$name] [$msg] [$id] [$props] [$ok] [$($trace)* $key = ?__value,] $($($rest)*)? }
     }};
     (@parse [$name:expr] [$msg:literal] [$id:ident] [$props:ident] [$ok:ident] [$($trace:tt)*] $key:ident = $value:expr $(, $($rest:tt)*)?) => {{
-        let $key = $value;
+        let __value = &$value;
         if $crate::__private::enabled() {
-            if let Some(value) = $crate::__private::bare(&$key) { $props.insert(stringify!($key).into(), value); } else { $ok = false; }
+            if let Some(value) = $crate::__private::bare(__value) { $props.insert(stringify!($key).into(), value); } else { $ok = false; }
         }
-        $crate::__product_fields! { @parse [$name] [$msg] [$id] [$props] [$ok] [$($trace)* $key = $key,] $($($rest)*)? }
+        $crate::__product_fields! { @parse [$name] [$msg] [$id] [$props] [$ok] [$($trace)* $key = __value,] $($($rest)*)? }
     }};
 }
 
@@ -397,7 +426,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let before_large = DROPPED.load(Ordering::Relaxed);
+        let mut properties = Map::new();
+        properties.insert("text".into(), Value::String("x".repeat(MAX_EVENT_BYTES)));
+        submit("large", None, properties);
+        assert_eq!(DROPPED.load(Ordering::Relaxed), before_large + 1);
+        assert_eq!(
+            registry().read().unwrap().as_ref().unwrap().tx.capacity(),
+            1
+        );
         submit("queued", None, Map::new());
+        assert_eq!(
+            registry().read().unwrap().as_ref().unwrap().tx.capacity(),
+            0
+        );
         let before = DROPPED.load(Ordering::Relaxed);
         let start = std::time::Instant::now();
         submit("overflow", None, Map::new());

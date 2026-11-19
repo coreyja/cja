@@ -88,3 +88,7 @@ and Eyes and queues PostHog capture when `POSTHOG_PROJECT_TOKEN` is set. Ordinar
 queue is bounded and drops when full. Anonymous events use a fresh distinct ID
 and disable person profile processing; identified events use the acting user ID.
 `service.name` is reserved and comes from the `setup_tracing` crate name.
+
+Use only an opaque internal ID for `user_id`, never an email, name, or other PII.
+Property values, especially `?` Debug output, are sent to PostHog verbatim;
+do not pass PII or secrets.
