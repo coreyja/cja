@@ -528,3 +528,21 @@ use cja::maud;
 use cja::jiff;
 use cja::jiff_sqlx;
 ```
+
+# PostHog boot manifests
+
+When `POSTHOG_PROJECT_TOKEN` is set, call `posthog_manifest::emit_boot_manifest`
+once after constructing the complete cron registry and app state, before moving
+the registry to its worker. Pass `BootManifest::new(app_slug, &registry,
+&worker_timezone, &critical_jobs, &hogql_checks)` with explicit lists, including
+empty lists. The slug must be stable across boots and is independent of
+`EYES_APP_ID`. Cron expressions use cja's parser: seconds are required, the
+year is optional, day of month and day of week both apply, and weekday 1 is
+Sunday. Interval schedules are sent as milliseconds.
+
+The emitter validates declarations synchronously, then sends a complete
+`cja_manifest` capture asynchronously. Capture uses `POSTHOG_HOST` (default
+`https://us.i.posthog.com`) and does not read OTLP filter knobs. Network
+failures never delay boot; retried snapshots retain their event ID and expire
+after 24 hours or process exit. A successful HTTP response acknowledges receipt,
+not later query visibility.

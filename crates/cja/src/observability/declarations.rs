@@ -1,6 +1,57 @@
 //! App-owned declarations shared by both observability sinks.
 use super::{AggregateFunction, MetricValueType};
 use eyes_subscriber as eyes;
+/// Numeric comparison applied to the first `HogQL` result cell.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HogqlComparison {
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Eq,
+    Neq,
+}
+
+/// Alert severity for a `HogQL` check.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HogqlSeverity {
+    Critical,
+    Warning,
+    Info,
+}
+
+/// A declarative `HogQL` health check; cja does not execute it.
+#[derive(Debug, Clone)]
+pub struct HogqlCheck {
+    pub name: String,
+    pub query: String,
+    pub comparison: HogqlComparison,
+    pub threshold: f64,
+    pub interval_seconds: u64,
+    pub severity: HogqlSeverity,
+}
+
+impl HogqlCheck {
+    pub fn new(
+        name: impl Into<String>,
+        query: impl Into<String>,
+        comparison: HogqlComparison,
+        threshold: f64,
+        interval_seconds: u64,
+        severity: HogqlSeverity,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            query: query.into(),
+            comparison,
+            threshold,
+            interval_seconds,
+            severity,
+        }
+    }
+}
 /// A named dashboard with ordered sections and a stable remote identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]

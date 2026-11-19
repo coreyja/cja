@@ -126,6 +126,19 @@ async fn run_tasks() -> cja::Result<()> {
     let cron_registry = heartbeat::cron_registry()?;
     let app_state = AppState::from_env(heartbeat::schedule(&cron_registry)).await?;
 
+    // This process has the complete cron and job registries; emit before the
+    // registry moves into the worker. Other roles must not send partial snapshots.
+    cja::posthog_manifest::emit_boot_manifest::<Jobs, AppState>(
+        &app_state,
+        &cja::posthog_manifest::BootManifest::new(
+            "cja-site",
+            &cron_registry,
+            &heartbeat::TIMEZONE,
+            &[],
+            &[],
+        ),
+    )?;
+
     info!("Spawning application tasks");
     let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
 
