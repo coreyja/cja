@@ -297,6 +297,18 @@ async fn capture_result(
     }
 }
 
+/// Declares a product event for tracing and optional PostHog capture.
+///
+/// `properties` accepts bare `key = value` (typed tracing value, JSON serialized),
+/// `%value` (Display string), and `?value` (Debug string). `user_id` and
+/// `message` are reserved fields; cja sets the capture `service.name` property.
+/// `user_id` accepts `Option<&dyn std::fmt::Display>`. Anonymous events use a
+/// fresh random distinct ID and `process_person_profile = false`.
+///
+/// `POSTHOG_PROJECT_TOKEN` enables capture. Explicit capture is independent of
+/// `RUST_LOG`, `EnvFilter`, and `POSTHOG_LOG_LEVEL`. Capture uses a bounded,
+/// lossy queue (1024 events): full queues and events of at least 1 MiB are
+/// dropped, with no retry. The tracing event is still emitted.
 #[macro_export]
 macro_rules! product_event {
     (name: $name:expr, user_id: $user:expr, message: $message:literal, properties: { $($fields:tt)* }) => {{
