@@ -128,5 +128,8 @@ bounded at 3 seconds, which counts against the platform's kill window alongside
 traces either. The PostHog exclusion list (`opentelemetry`, `hyper`, `h2`, `reqwest`,
 `rustls`, ...) matches by target prefix, and Eyes drops `opentelemetry*` targets while
 PostHog is enabled. The
-`eyes_manifest` module re-exports the subscriber's metric, threshold, dashboard,
-and process-lifecycle builders. These APIs require eyes-subscriber 0.8.
+`eyes_manifest` module re-exports the subscriber's manifest and process-lifecycle
+types (`AppManifest`, `CronEntry`, `ProcessIdentity`, `ProcessHeartbeat` and friends).
+It no longer re-exports the metric, threshold and dashboard builders: declare
+metrics, dashboards and alerts with `cja::observability::declarations` and attach
+them with `Declarations::attach_to_eyes_manifest`. These APIs require eyes-subscriber 0.8.

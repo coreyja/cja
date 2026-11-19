@@ -158,7 +158,6 @@
 //! CJA re-exports key dependencies so you don't need to add them directly:
 //!
 //! ```rust
-//! use cja::eyes_subscriber;
 //! use cja::sqlx;
 //! use cja::uuid;
 //! use cja::color_eyre;
@@ -167,8 +166,8 @@
 //! use cja::jiff_sqlx;
 //! ```
 
-pub use eyes_subscriber;
 pub mod assets;
+pub mod observability;
 pub use sqlx;
 pub use uuid;
 
@@ -191,6 +190,7 @@ pub use maud;
 
 pub mod db;
 pub mod tasks;
+mod tls;
 
 pub use jiff;
 pub use jiff_sqlx;

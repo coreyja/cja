@@ -30,16 +30,23 @@
 //!
 //! `app_version` and `git_sha` are explicit because cja cannot read the
 //! application's compile-time environment. Pass `None` when unavailable.
+//!
+//! # Metrics, dashboards and alerts
+//!
+//! This module re-exports the subscriber's manifest and process-lifecycle
+//! types only. Metric, threshold and dashboard declarations are cja-owned:
+//! build them with [`crate::observability::declarations`] and attach them to a
+//! manifest with `Declarations::attach_to_eyes_manifest`.
 
+pub use crate::app_state::{HttpMethod, HttpMonitor};
 use std::collections::HashSet;
 
 use crate::{app_state::AppState, jobs::registry::JobRegistry};
 
 pub use eyes_subscriber::{
-    AppManifest, CronEntry, DashboardItem, DashboardLink, DashboardSection, ExpectedProcessRole,
-    HttpMethod, HttpMonitor, ManifestError, MetricThresholdBuilder, MonitorTargetError,
-    NamedDashboard, NamedMetric, NamedMetricBuilder, ProcessHeartbeat, ProcessHeartbeatConfig,
-    ProcessHeartbeatHandle, ProcessIdentity, ThresholdComparison,
+    AppManifest, CronEntry, ExpectedProcessRole, ManifestError, MonitorTargetError,
+    ProcessHeartbeat, ProcessHeartbeatConfig, ProcessHeartbeatHandle, ProcessIdentity,
+    RetentionPolicy,
 };
 
 /// A locally invalid HTTP monitor declaration.
