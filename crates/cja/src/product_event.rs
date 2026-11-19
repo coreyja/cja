@@ -15,6 +15,11 @@ pub(crate) const MAX_CAPTURE_QUEUE: usize = 1024;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_BODY_BYTES: usize = 9 * 1024 * 1024;
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static FAILURES: AtomicU64 = AtomicU64::new(0);
+fn report_failure() -> Option<u64> {
+    let count = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    count.is_power_of_two().then_some(count)
+}
 fn dropped(reason: &str) {
     let count = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
     if count.is_power_of_two() {
@@ -102,9 +107,14 @@ impl CaptureShutdownHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         let mut task = self.task;
-        if tokio::time::timeout(budget, &mut task).await.is_err() {
-            task.abort();
-            let _ = task.await;
+        match tokio::time::timeout(budget, &mut task).await {
+            Err(_) => {
+                tracing::warn!(target: "posthog", "capture shutdown budget exceeded; queued events dropped");
+                task.abort();
+                let _ = task.await;
+            }
+            Ok(Err(error)) => tracing::warn!(target: "posthog", ?error, "capture worker failed"),
+            Ok(Ok(())) => {}
         }
     }
 }
@@ -228,14 +238,22 @@ async fn worker(
                         match capture_result(response, &sent_uuids).await {
                             CaptureResult::Delivered => {}
                             CaptureResult::Rejected => {
-                                tracing::warn!(target: "posthog", "capture rejected events");
+                                if let Some(count) = report_failure() { tracing::warn!(target: "posthog", count, "capture rejected events"); }
                             }
                             CaptureResult::Unreadable => {
-                                tracing::warn!(target: "posthog", "capture response unreadable");
+                                if let Some(count) = report_failure() { tracing::warn!(target: "posthog", count, "capture response unreadable"); }
                             }
                         }
                     }
-                    _ => tracing::warn!(target: "posthog", "capture request failed"),
+                    Ok(response) => {
+                        if let Some(count) = report_failure() { tracing::warn!(target: "posthog", count, status = %response.status(), "capture request failed"); }
+                    }
+                    Err(error) => {
+                        if let Some(count) = report_failure() {
+                            let kind = if error.is_timeout() { "timeout" } else if error.is_connect() { "connect" } else { "transport" };
+                            tracing::warn!(target: "posthog", count, kind, "capture request failed");
+                        }
+                    }
                 }
             }
         }
