@@ -1,5 +1,6 @@
 [package]
 name = "cja"
+version.workspace = true
 description = "Cron, Jobs and Axum a meta-framework for building web applications"
 edition.workspace = true
 authors.workspace = true
