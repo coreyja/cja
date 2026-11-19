@@ -398,6 +398,7 @@ async fn send(bytes: Vec<u8>, host: String) {
     };
     let client = match reqwest_012::Client::builder()
         .use_preconfigured_tls(tls)
+        .redirect(reqwest_012::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .build()
@@ -465,10 +466,46 @@ mod tests {
     use crate::{app_state::HttpMonitor, server::cookies::CookieKey};
 
     #[derive(Clone)]
+    struct EventLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLog {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+    }
+    fn count_log(log: &EventLog, needle: &str) -> usize {
+        log.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.contains(needle))
+            .count()
+    }
+
+    #[derive(Clone)]
     struct State {
         db: sqlx::PgPool,
         key: CookieKey,
         target: &'static str,
+        monitor: Option<HttpMonitor>,
+        base_url: Option<&'static str>,
     }
     impl AppState for State {
         fn version(&self) -> &'static str {
@@ -481,10 +518,14 @@ mod tests {
             &self.key
         }
         fn eyes_base_url(&self) -> Option<&str> {
-            Some("https://demo.example.com")
+            self.base_url
         }
         fn eyes_http_monitors(&self) -> Vec<HttpMonitor> {
-            vec![HttpMonitor::new("home", self.target)]
+            vec![
+                self.monitor
+                    .clone()
+                    .unwrap_or_else(|| HttpMonitor::new("home", self.target)),
+            ]
         }
     }
     fn state() -> State {
@@ -494,6 +535,8 @@ mod tests {
                 .unwrap(),
             key: CookieKey::from_env_or_generate().unwrap(),
             target: "/health",
+            monitor: None,
+            base_url: Some("https://demo.example.com"),
         }
     }
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -506,6 +549,19 @@ mod tests {
         }
     }
     crate::impl_job_registry!(State, Work);
+    mod invalid_jobs {
+        use super::*;
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        pub(super) struct Invalid;
+        #[async_trait::async_trait]
+        impl crate::jobs::Job<State> for Invalid {
+            const NAME: &'static str = "bad job";
+            async fn run(&self, _: State) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+        crate::impl_job_registry!(State, Invalid);
+    }
     #[test]
     fn declaration_name_limits_and_duplicates() {
         assert!(validate_names(["A".repeat(128).as_str()]).is_ok());
@@ -579,6 +635,186 @@ mod tests {
         assert_eq!(retry_after(&headers), Some(Duration::from_secs(300)));
         headers.insert("retry-after", "bogus".parse().unwrap());
         assert_eq!(retry_after(&headers), None);
+    }
+    #[allow(clippy::too_many_lines)] // Boundary table exercises one public snapshot entry point.
+    #[tokio::test]
+    async fn snapshot_validates_declaration_boundaries() {
+        let id = Uuid::new_v4();
+        let zone = jiff::tz::TimeZone::UTC;
+        let registry = crate::cron::CronRegistry::new();
+        let valid = |state: &State,
+                     registry: &crate::cron::CronRegistry<State>,
+                     zone: &jiff::tz::TimeZone,
+                     checks: &[HogqlCheck]| {
+            let input = BootManifest::new("demo", registry, zone, &["work"], checks);
+            snapshot::<Jobs, State>(state, &input, "", id, "2026-11-18T18:00:00Z").is_ok()
+        };
+        for (label, monitor, base, expected) in [
+            (
+                "interval zero",
+                HttpMonitor::new("home", "/health").interval_seconds(0),
+                Some("https://demo.example.com"),
+                false,
+            ),
+            (
+                "interval one",
+                HttpMonitor::new("home", "/health")
+                    .interval_seconds(1)
+                    .timeout_seconds(1),
+                Some("https://demo.example.com"),
+                true,
+            ),
+            (
+                "timeout zero",
+                HttpMonitor::new("home", "/health").timeout_seconds(0),
+                Some("https://demo.example.com"),
+                false,
+            ),
+            (
+                "timeout greater",
+                HttpMonitor::new("home", "/health")
+                    .interval_seconds(1)
+                    .timeout_seconds(2),
+                Some("https://demo.example.com"),
+                false,
+            ),
+            (
+                "timeout equal",
+                HttpMonitor::new("home", "/health")
+                    .interval_seconds(10)
+                    .timeout_seconds(10),
+                Some("https://demo.example.com"),
+                true,
+            ),
+            (
+                "failure zero",
+                HttpMonitor::new("home", "/health").failure_threshold(0),
+                Some("https://demo.example.com"),
+                false,
+            ),
+            (
+                "status 99",
+                HttpMonitor::new("home", "/health").expected_status(99, 200),
+                Some("https://demo.example.com"),
+                false,
+            ),
+            (
+                "status 100",
+                HttpMonitor::new("home", "/health").expected_status(100, 100),
+                Some("https://demo.example.com"),
+                true,
+            ),
+            (
+                "status 599",
+                HttpMonitor::new("home", "/health").expected_status(599, 599),
+                Some("https://demo.example.com"),
+                true,
+            ),
+            (
+                "status 600",
+                HttpMonitor::new("home", "/health").expected_status(200, 600),
+                Some("https://demo.example.com"),
+                false,
+            ),
+            (
+                "status reversed",
+                HttpMonitor::new("home", "/health").expected_status(300, 200),
+                Some("https://demo.example.com"),
+                false,
+            ),
+            (
+                "missing base",
+                HttpMonitor::new("home", "health"),
+                None,
+                false,
+            ),
+            (
+                "cross origin relative",
+                HttpMonitor::new("home", "//evil.example/x"),
+                Some("https://demo.example.com"),
+                false,
+            ),
+            (
+                "other absolute origin",
+                HttpMonitor::new("home", "https://other.example/x"),
+                Some("https://demo.example.com"),
+                true,
+            ),
+            (
+                "invalid id",
+                HttpMonitor::new("bad id", "/health"),
+                Some("https://demo.example.com"),
+                false,
+            ),
+        ] {
+            let state = State {
+                monitor: Some(monitor),
+                base_url: base,
+                ..state()
+            };
+            assert_eq!(valid(&state, &registry, &zone, &[]), expected, "{label}");
+        }
+        let state = state();
+        for (label, interval, query, expected) in [
+            ("check interval 299", 299, "SELECT 1".to_owned(), false),
+            ("check interval 300", 300, "SELECT 1".to_owned(), true),
+            ("empty query", 300, String::new(), false),
+            ("query 16KiB", 300, "x".repeat(16 * 1024), true),
+            ("query 16KiB+1", 300, "x".repeat(16 * 1024 + 1), false),
+        ] {
+            let checks = [HogqlCheck::new(
+                "check",
+                query,
+                HogqlComparison::Gt,
+                1.0,
+                interval,
+                HogqlSeverity::Warning,
+            )];
+            assert_eq!(
+                valid(&state, &registry, &zone, &checks),
+                expected,
+                "{label}"
+            );
+        }
+        for (count, query) in [(20, "x".repeat(15 * 1024)), (101, "SELECT 1".to_owned())] {
+            let checks: Vec<_> = (0..count)
+                .map(|i| {
+                    HogqlCheck::new(
+                        format!("check-{i}"),
+                        query.clone(),
+                        HogqlComparison::Gt,
+                        1.0,
+                        300,
+                        HogqlSeverity::Warning,
+                    )
+                })
+                .collect();
+            assert!(!valid(&state, &registry, &zone, &checks), "count={count}");
+        }
+        let mut zero = crate::cron::CronRegistry::new();
+        zero.register_job(Work, None, Duration::ZERO);
+        assert!(!valid(&state, &zero, &zone, &[]));
+        let fixed = jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(3600).unwrap());
+        let mut interval = crate::cron::CronRegistry::new();
+        interval.register_job(Work, None, Duration::from_secs(300));
+        assert!(valid(&state, &interval, &fixed, &[]));
+        let mut cron = crate::cron::CronRegistry::new();
+        cron.register_job_with_cron(Work, None, "0 * * * * *")
+            .unwrap();
+        assert!(!valid(&state, &cron, &fixed, &[]));
+        let unknown = BootManifest::new("demo", &registry, &zone, &["missing"], &[]);
+        assert!(snapshot::<Jobs, State>(&state, &unknown, "", id, "2026-11-18T18:00:00Z").is_err());
+        let invalid_job = BootManifest::new("demo", &registry, &zone, &[], &[]);
+        assert!(
+            snapshot::<invalid_jobs::Jobs, State>(
+                &state,
+                &invalid_job,
+                "",
+                id,
+                "2026-11-18T18:00:00Z"
+            )
+            .is_err()
+        );
     }
     #[tokio::test]
     async fn exact_fixture_shape_and_validation() {
@@ -717,6 +953,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_emit_and_linger() {
+        if std::env::var_os("CJA_MANIFEST_EMIT_CHILD").is_none() {
+            return;
+        }
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = state();
+        let mut registry = crate::cron::CronRegistry::new();
+        registry.register_job(Work, None, Duration::from_secs(300));
+        let zone = jiff::tz::TimeZone::UTC;
+        let checks = [HogqlCheck::new(
+            "errors",
+            "SELECT count() FROM events",
+            HogqlComparison::Gt,
+            0.0,
+            300,
+            HogqlSeverity::Warning,
+        )];
+        let input =
+            BootManifest::new("demo", &registry, &zone, &["work"], &checks).git_sha("abc123");
+        emit_boot_manifest::<Jobs, State>(&state, &input).unwrap();
+        println!("BOOT_READY");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    #[allow(clippy::too_many_lines)] // The child-process cases share one real capture harness.
+    #[test]
+    fn emitter_reads_capture_credentials_independently_of_otlp() {
+        use std::{
+            io::{Read, Write},
+            process::{Command, Stdio},
+            time::Instant,
+        };
+        for (host_override, token, bad_otlp, expect_capture, expect_warning) in [
+            (None, Some("test-token"), false, true, false),
+            (None, Some("test-token"), true, true, false),
+            (Some("not a url"), Some("test-token"), false, false, true),
+            (Some("ftp://x"), Some("test-token"), false, false, true),
+            (None, Some("bad\ntoken"), false, false, true),
+            (None, None, false, false, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mock_host = format!("http://{}", listener.local_addr().unwrap());
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "posthog_manifest::tests::child_emit_and_linger",
+                    "--nocapture",
+                ])
+                .env("CJA_MANIFEST_EMIT_CHILD", "1")
+                .env("POSTHOG_HOST", host_override.unwrap_or(&mock_host))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(token) = token {
+                command.env("POSTHOG_PROJECT_TOKEN", token);
+            } else {
+                command.env_remove("POSTHOG_PROJECT_TOKEN");
+            }
+            if bad_otlp {
+                command
+                    .env("POSTHOG_LOG_LEVEL", "bogus")
+                    .env("POSTHOG_TRACES_SAMPLE_RATIO", "7");
+            } else {
+                command
+                    .env_remove("POSTHOG_LOG_LEVEL")
+                    .env_remove("POSTHOG_TRACES_SAMPLE_RATIO");
+            }
+            let mut child = command.spawn().unwrap();
+            let started = Instant::now();
+            let mut captured = None;
+            while started.elapsed() < Duration::from_secs(4) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut data = Vec::new();
+                        let header_end;
+                        loop {
+                            let mut chunk = [0; 4096];
+                            let n = stream.read(&mut chunk).unwrap();
+                            assert!(n > 0);
+                            data.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                header_end = pos + 4;
+                                break;
+                            }
+                        }
+                        let headers =
+                            String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
+                        assert!(headers.starts_with("post /i/v0/e/ http/1.1\r\n"));
+                        let len: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        while data.len() < header_end + len {
+                            let mut chunk = [0; 4096];
+                            let n = stream.read(&mut chunk).unwrap();
+                            assert!(n > 0);
+                            data.extend_from_slice(&chunk[..n]);
+                        }
+                        captured = Some(
+                            serde_json::from_slice::<serde_json::Value>(
+                                &data[header_end..header_end + len],
+                            )
+                            .unwrap(),
+                        );
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if child.try_wait().unwrap().is_none() {
+                child.kill().unwrap();
+                panic!("child did not exit");
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("BOOT_READY"));
+            assert_eq!(captured.is_some(), expect_capture);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("skipping PostHog manifest capture"),
+                expect_warning
+            );
+            if let Some(body) = captured {
+                assert_eq!(body["event"], "cja_manifest");
+                assert_eq!(body["api_key"], "test-token");
+                assert_eq!(body["distinct_id"], "cja:demo");
+                assert_eq!(body["uuid"], body["properties"]["event_id"]);
+                let fixture: serde_json::Value =
+                    serde_json::from_str(include_str!("../tests/fixtures/cja_manifest_v1.json"))
+                        .unwrap();
+                let actual: std::collections::BTreeSet<_> =
+                    body["properties"].as_object().unwrap().keys().collect();
+                let expected: std::collections::BTreeSet<_> =
+                    fixture["properties"].as_object().unwrap().keys().collect();
+                assert_eq!(actual, expected);
+                assert_eq!(body["properties"]["crons"].as_array().unwrap().len(), 1);
+                assert_eq!(body["properties"]["jobs"][0]["critical"], true);
+                assert_eq!(body["properties"]["monitors"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    body["properties"]["hogql_checks"].as_array().unwrap().len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn retry_reuses_identical_capture_bytes_and_uuid() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -785,6 +1186,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sender_logs_only_transitions_and_never_follows_redirects() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tracing_subscriber::prelude::*;
+        for (statuses, retries, recovered, rejected) in [
+            (vec![503, 503, 200], 1, 1, 0),
+            (vec![503, 0, 200], 2, 1, 0),
+            (vec![503, 400], 1, 0, 1),
+            (vec![400], 0, 0, 1),
+            (vec![302], 0, 0, 1),
+        ] {
+            let log = EventLog(std::sync::Arc::default());
+            let _guard =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let host = format!("http://{}", listener.local_addr().unwrap());
+            let destination = host.clone();
+            let expected = statuses.len();
+            let server = tokio::spawn(async move {
+                for code in statuses {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0u8; 4096];
+                    let n = stream.read(&mut request).await.unwrap();
+                    assert!(request[..n].starts_with(b"POST /i/v0/e/ HTTP/1.1"));
+                    if code == 0 {
+                        continue;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {code} test\r\nLocation: {destination}/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err()
+            });
+            tokio::time::timeout(Duration::from_secs(6), send(b"{}".to_vec(), host))
+                .await
+                .unwrap();
+            assert!(
+                server.await.unwrap(),
+                "unexpected request after {expected} expected attempts"
+            );
+            assert_eq!(count_log(&log, "manifest capture retrying"), retries);
+            assert_eq!(count_log(&log, "manifest capture recovered"), recovered);
+            assert_eq!(count_log(&log, "manifest capture rejected"), rejected);
+        }
+    }
+
+    #[tokio::test]
     async fn permanent_capture_rejections_stop() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         for status in ["400 Bad Request", "413 Payload Too Large"] {
@@ -845,26 +1295,49 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retry_queue_expires_after_twenty_four_hours() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tracing_subscriber::prelude::*;
+        let log = EventLog(std::sync::Arc::default());
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let host = format!("http://{}", listener.local_addr().unwrap());
-        let (sent, received) = tokio::sync::oneshot::channel();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = attempts.clone();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = [0u8; 4096];
-            let count = stream.read(&mut bytes).await.unwrap();
-            assert!(bytes[..count].starts_with(b"POST /i/v0/e/ HTTP/1.1"));
-            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-            sent.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .is_err()
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0u8; 4096];
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert!(bytes[..count].starts_with(b"POST /i/v0/e/ HTTP/1.1"));
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
         });
         let sender = tokio::spawn(send(b"{}".to_vec(), host));
-        received.await.unwrap();
-        tokio::task::yield_now().await;
+        for _ in 0..10 {
+            if attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "sender did not retry before expiry"
+        );
         tokio::time::advance(Duration::from_hours(24)).await;
         sender.await.unwrap();
-        assert!(server.await.unwrap(), "capture retried after queue expiry");
+        assert_eq!(
+            count_log(&log, "manifest capture expired after 24 hours"),
+            1
+        );
+        let at_expiry = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            at_expiry,
+            "capture retried after queue expiry"
+        );
+        server.abort();
     }
 
     #[test]
