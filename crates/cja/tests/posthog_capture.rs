@@ -144,6 +144,7 @@ fn anonymous_and_ops_isolation() {
         boot::child(
             &[&|| {
                 cja::product_event!(name: "anonymous_view", user_id: None, message: "Anonymous view", properties: {});
+                cja::product_event!(name: "anonymous_view", user_id: None, message: "Anonymous view", properties: {});
                 tracing::info!(event_type = "job_enqueued", job_id = 42);
             }],
             |_| {},
@@ -174,12 +175,20 @@ fn anonymous_and_ops_isolation() {
         )
         .unwrap();
         let event = &body["batch"][0];
-        assert_eq!(body["batch"].as_array().unwrap().len(), 1);
+        assert_eq!(body["batch"].as_array().unwrap().len(), 2);
         assert_eq!(event["event"], "anonymous_view");
         assert_eq!(event["options"]["process_person_profile"], false);
         assert!(event["properties"].get("$process_person_profile").is_none());
         assert_eq!(event["properties"]["service.name"], "fixture");
         assert_ne!(event["distinct_id"], event["uuid"]);
+        let other = &body["batch"][1];
+        for item in [event, other] {
+            assert_eq!(uuid::Uuid::parse_str(item["distinct_id"].as_str().unwrap()).unwrap().get_version_num(), 4);
+            assert_ne!(item["distinct_id"], item["uuid"]);
+        }
+        assert_ne!(event["distinct_id"], other["distinct_id"]);
+        let line = exit.stdout.lines().find(|line| line.contains("Anonymous view")).unwrap();
+        assert!(!line.contains("user_id"), "{line}");
     });
 }
 
