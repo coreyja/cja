@@ -8,7 +8,7 @@ fn capture_payload() {
         boot::child(
             &[&|| {
                 let user = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
-                cja::product_event!(name: "achievement_earned", user_id: Some(&user), message: "Achievement earned", properties: { first = true, slug = "winner" });
+                cja::product_event!(name: "achievement_earned", user_id: Some(&user), message: "Achievement earned", properties: { first = true, slug = "winner", display_value = %42, debug_value = ?Some(7) });
                 tracing::info!(event_type = "game_phase", phase = "ready");
             }],
             |_| {},
@@ -39,6 +39,7 @@ fn capture_payload() {
             "{}",
             exit.output()
         );
+        assert!(!exit.stdout.contains("capture response unreadable"), "{}", exit.output());
         assert!(exit.stdout.contains("game_phase"));
         let requests = captures.lock().unwrap();
         let request = requests
@@ -70,6 +71,8 @@ fn capture_payload() {
         assert!(event["timestamp"].as_str().is_some());
         assert_eq!(event["properties"]["first"], true);
         assert_eq!(event["properties"]["slug"], "winner");
+        assert_eq!(event["properties"]["display_value"], "42");
+        assert_eq!(event["properties"]["debug_value"], "Some(7)");
         assert_eq!(event["properties"]["service.name"], "fixture");
         assert!(event["properties"].get("user_id").is_none());
         assert_eq!(
