@@ -168,6 +168,8 @@
 
 pub mod assets;
 pub mod observability;
+#[cfg(feature = "jobs")]
+pub mod posthog_manifest;
 pub use sqlx;
 pub use uuid;
 

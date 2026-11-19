@@ -40,7 +40,7 @@
 //! supervisor's drain and grace, so job drain + exit grace + flush must fit
 //! the platform's kill window (Fly 5s by default, Cloud Run 10s).
 
-mod posthog;
+pub(crate) mod posthog;
 
 #[doc(hidden)]
 pub mod posthog_test_support {

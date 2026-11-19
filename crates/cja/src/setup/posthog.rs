@@ -45,16 +45,21 @@ pub(super) enum PostHogEnv {
     Skipped { host_set_without_token: bool },
 }
 
-impl PostHogEnv {
-    pub(super) fn from_env() -> Result<Self> {
+/// Capture credentials are independent of OTLP filtering knobs.
+pub(crate) struct PostHogCredentials {
+    pub(crate) host: String,
+    pub(crate) token: String,
+}
+
+impl PostHogCredentials {
+    #[cfg(feature = "jobs")]
+    pub(crate) fn from_env() -> Result<Option<Self>> {
         Self::from_env_with(|key| std::env::var(key).ok())
     }
 
-    fn from_env_with(read: impl Fn(&str) -> Option<String>) -> Result<Self> {
+    fn from_env_with(read: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
         let Some(token) = read("POSTHOG_PROJECT_TOKEN").filter(|t| !t.trim().is_empty()) else {
-            return Ok(Self::Skipped {
-                host_set_without_token: read("POSTHOG_HOST").is_some(),
-            });
+            return Ok(None);
         };
         let host = read("POSTHOG_HOST").unwrap_or_else(|| "https://us.i.posthog.com".into());
         let url = url::Url::parse(host.trim()).map_err(|_| eyre!("invalid POSTHOG_HOST"))?;
@@ -69,6 +74,24 @@ impl PostHogEnv {
         );
         http::HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| eyre!("invalid POSTHOG_PROJECT_TOKEN"))?;
+        Ok(Some(Self {
+            host: url.as_str().trim_end_matches('/').to_owned(),
+            token,
+        }))
+    }
+}
+
+impl PostHogEnv {
+    pub(super) fn from_env() -> Result<Self> {
+        Self::from_env_with(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_with(read: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let Some(credentials) = PostHogCredentials::from_env_with(&read)? else {
+            return Ok(Self::Skipped {
+                host_set_without_token: read("POSTHOG_HOST").is_some(),
+            });
+        };
         let log_level = read("POSTHOG_LOG_LEVEL")
             .map(|s| s.parse())
             .transpose()
@@ -84,8 +107,8 @@ impl PostHogEnv {
             "invalid POSTHOG_TRACES_SAMPLE_RATIO"
         );
         Ok(Self::Enabled(PostHogConfig {
-            host: url.as_str().trim_end_matches('/').to_owned(),
-            token,
+            host: credentials.host,
+            token: credentials.token,
             log_level,
             traces_sample_ratio: ratio,
         }))
