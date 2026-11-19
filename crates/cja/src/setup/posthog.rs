@@ -117,7 +117,7 @@ impl PostHogEnv {
 
 pub struct PostHogConfig {
     pub(super) host: String,
-    token: String,
+    pub(super) token: String,
     pub(super) log_level: LevelFilter,
     pub(super) traces_sample_ratio: f64,
 }

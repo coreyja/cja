@@ -131,8 +131,8 @@
 //! | `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `2` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked |
 //! | `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `2` | Extra time for tasks to exit after the job drain. Drain + grace + the telemetry flush (`TelemetryShutdownHandle::shutdown`, up to 3s when a sink is stalled) must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default) |
 //! | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
-//! | `POSTHOG_PROJECT_TOKEN` | No | — | Enable OTLP logs and traces at boot |
-//! | `POSTHOG_HOST` | No | `https://us.i.posthog.com` | OTLP host |
+//! | `POSTHOG_PROJECT_TOKEN` | No | — | Enable OTLP logs/traces and explicit [`product_event!`] capture at boot |
+//! | `POSTHOG_HOST` | No | `https://us.i.posthog.com` | OTLP and capture host |
 //! | `POSTHOG_LOG_LEVEL` | No | info | Minimum level for BOTH `PostHog` log records and `PostHog` spans (one shared filter): `off` sends no traces either. Exporter crates (`opentelemetry*`, `hyper*`, `h2`, `reqwest`, `rustls`, `want`, `mio`, `posthog`) are always excluded, matched by target prefix |
 //! | `POSTHOG_TRACES_SAMPLE_RATIO` | No | 1.0 | Root trace sampling probability |
 //! | `EYES_ORG_ID` | No | — | Eyes tracing org ID (both `ORG_ID` and `APP_ID` required) |
@@ -196,3 +196,11 @@ mod tls;
 
 pub use jiff;
 pub use jiff_sqlx;
+
+mod product_event;
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::product_event::{bare, enabled, identity, submit};
+    pub use serde_json;
+    pub use tracing;
+}

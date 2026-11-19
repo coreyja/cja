@@ -133,18 +133,16 @@ where
     J: JobRegistry<S>,
     S: AppState,
 {
-    let crons = cron_registry
-        .map(|registry| {
-            registry
-                .entries()
-                .into_iter()
-                .map(|(name, schedule)| CronEntry {
-                    name: name.to_string(),
-                    schedule,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let crons = cron_registry.map_or_else(Vec::new, |registry| {
+        registry
+            .entries()
+            .into_iter()
+            .map(|(name, schedule)| CronEntry {
+                name: name.to_string(),
+                schedule,
+            })
+            .collect()
+    });
     legacy_manifest::<J, S>(app_version, git_sha, crons)
 }
 

@@ -275,5 +275,5 @@ impl<Body> OnResponse<Body> for Tracer {
 fn http_route<B>(req: &http::Request<B>) -> &str {
     req.extensions()
         .get::<axum::extract::MatchedPath>()
-        .map_or_else(|| "", |mp| mp.as_str())
+        .map_or("", |mp| mp.as_str())
 }

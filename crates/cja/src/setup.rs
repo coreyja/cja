@@ -12,7 +12,7 @@
 //!
 //! - **Console**: Tree-formatted logs (default) or JSON with `JSON_LOGS` env var
 //! - **Eyes**: Distributed tracing via `EYES_ORG_ID` + `EYES_APP_ID` (both required)
-//! - **`PostHog`**: Set `POSTHOG_PROJECT_TOKEN` at boot to enable OTLP logs and spans.
+//! - **`PostHog`**: Set `POSTHOG_PROJECT_TOKEN` at boot to enable OTLP logs/spans and explicit product-event capture.
 //!   `POSTHOG_HOST` defaults to `https://us.i.posthog.com`, `POSTHOG_LOG_LEVEL` to info,
 //!   and `POSTHOG_TRACES_SAMPLE_RATIO` to 1.0. Both signals respect scoped
 //!   `RUST_LOG` and the global rig content cap.
@@ -35,7 +35,7 @@
 //!
 //! # Shutdown
 //!
-//! [`TelemetryShutdownHandle::shutdown`] flushes both sinks concurrently and
+//! [`TelemetryShutdownHandle::shutdown`] flushes Eyes, OTLP, and capture concurrently and
 //! returns within 3 seconds even when a sink is stalled. It runs after the
 //! supervisor's drain and grace, so job drain + exit grace + flush must fit
 //! the platform's kill window (Fly 5s by default, Cloud Run 10s).
@@ -67,7 +67,7 @@ use uuid::Uuid;
 // Re-export for consumers
 pub use eyes_subscriber::EyesShutdownHandle;
 
-/// Upper bound on [`TelemetryShutdownHandle::shutdown`]: the Eyes and `PostHog`
+/// Upper bound on [`TelemetryShutdownHandle::shutdown`]: Eyes and both `PostHog`
 /// flushes run concurrently and each is cut off at or before this.
 ///
 /// The flush runs after `Supervisor::run` returns, so it adds to the shutdown
@@ -81,8 +81,8 @@ pub use eyes_subscriber::EyesShutdownHandle;
 const TELEMETRY_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Graceful-shutdown handle for the telemetry sinks installed by
-/// [`setup_tracing`] / [`TracingConfig::init`]: Eyes and/or the `PostHog` OTLP
-/// sink, whichever are configured.
+/// [`setup_tracing`] / [`TracingConfig::init`]: Eyes, `PostHog` OTLP, and
+/// explicit product-event capture, whichever are configured.
 ///
 /// Dropping the handle does not flush. Hold it for the life of the process and
 /// call [`shutdown`](Self::shutdown) on every exit path, including the error
@@ -92,6 +92,7 @@ const TELEMETRY_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from
 pub struct TelemetryShutdownHandle {
     eyes: Option<EyesShutdownHandle>,
     posthog: Option<posthog::PostHogShutdownHandle>,
+    capture: Option<crate::product_event::CaptureShutdownHandle>,
 }
 
 impl TelemetryShutdownHandle {
@@ -100,6 +101,7 @@ impl TelemetryShutdownHandle {
     /// - **Eyes**: drains the subscriber's transport queue.
     /// - **`PostHog`**: exports the queued OTLP log records and spans, then
     ///   stops both batch workers.
+    /// - **Capture**: drains queued product events within the same budget.
     ///
     /// Each flush is bounded, so the whole call returns within 3 seconds
     /// (`TELEMETRY_SHUTDOWN_BUDGET`) even when a sink is down or stalled;
@@ -113,6 +115,7 @@ impl TelemetryShutdownHandle {
     /// the call still returns `Ok(())`, because a dead telemetry sink must not
     /// fail application shutdown. The `Result` is kept so callers can `?` it.
     pub async fn shutdown(self) -> color_eyre::Result<()> {
+        let capture = self.capture;
         tokio::join!(
             async {
                 if let Some(eyes) = self.eyes {
@@ -127,13 +130,18 @@ impl TelemetryShutdownHandle {
                 if let Some(handle) = self.posthog {
                     handle.shutdown().await;
                 }
+            },
+            async {
+                if let Some(handle) = capture {
+                    handle.shutdown(TELEMETRY_SHUTDOWN_BUDGET).await;
+                }
             }
         );
         Ok(())
     }
 }
 
-/// Installs stdout and the configured Eyes and `PostHog` sinks.
+/// Installs stdout and the configured Eyes, `PostHog` OTLP, and capture sinks.
 /// Call the returned handle's shutdown method before exiting.
 ///
 /// # Environment Variables
@@ -147,7 +155,7 @@ impl TelemetryShutdownHandle {
 /// - `EYES_ORG_ID`: Eyes organization ID (UUID)
 /// - `EYES_APP_ID`: Eyes application ID (UUID)
 /// - `EYES_URL`: Eyes server URL (defaults to `https://eyes.coreyja.com`)
-/// - `POSTHOG_PROJECT_TOKEN`: enables the `PostHog` OTLP sink; unset, empty
+/// - `POSTHOG_PROJECT_TOKEN`: enables `PostHog` OTLP and product capture; unset, empty
 ///   or blank leaves it off and no other `POSTHOG_*` variable is read
 /// - `POSTHOG_HOST`: `PostHog` host (defaults to `https://us.i.posthog.com`)
 /// - `POSTHOG_LOG_LEVEL`: minimum level for `PostHog` log records AND spans
@@ -240,7 +248,7 @@ fn initialize_tracing(
         hierarchical.boxed()
     };
 
-    let (sink, posthog) = setup_posthog(crate_name, process, version)?;
+    let (sink, posthog, capture_config) = setup_posthog(crate_name, process, version)?;
     let eyes_filter = tracing_subscriber::filter::Targets::new()
         .with_default(tracing_subscriber::filter::LevelFilter::TRACE)
         .with_target(
@@ -266,9 +274,24 @@ fn initialize_tracing(
         .with(env_filter)
         .with(rig_cap)
         .try_init()?;
+    let capture = capture_config.and_then(|config| {
+        match crate::product_event::start(
+            &config.host,
+            &config.token,
+            crate_name,
+            crate::product_event::MAX_CAPTURE_QUEUE,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                println!("Skipping PostHog capture: client setup failed: {error:#}");
+                None
+            }
+        }
+    });
     Ok(TelemetryShutdownHandle {
         eyes: eyes_shutdown_handle,
         posthog,
+        capture,
     })
 }
 
@@ -279,6 +302,7 @@ fn setup_posthog(
 ) -> color_eyre::Result<(
     Option<posthog::PostHogSink>,
     Option<posthog::PostHogShutdownHandle>,
+    Option<posthog::PostHogConfig>,
 )> {
     match posthog::PostHogEnv::from_env()? {
         posthog::PostHogEnv::Skipped {
@@ -291,7 +315,7 @@ fn setup_posthog(
             } else {
                 println!("Skipping PostHog layer");
             }
-            Ok((None, None))
+            Ok((None, None, None))
         }
         posthog::PostHogEnv::Enabled(config) => {
             let sink = match posthog::PostHogSink::build(
@@ -304,7 +328,7 @@ fn setup_posthog(
                 Ok(sink) => sink,
                 Err(error) => {
                     println!("Skipping PostHog layer: exporter setup failed: {error:#}");
-                    return Ok((None, None));
+                    return Ok((None, None, Some(config)));
                 }
             };
             println!(
@@ -312,7 +336,7 @@ fn setup_posthog(
                 config.host, config.log_level, config.traces_sample_ratio
             );
             let handle = sink.shutdown_handle();
-            Ok((Some(sink), Some(handle)))
+            Ok((Some(sink), Some(handle), Some(config)))
         }
     }
 }
