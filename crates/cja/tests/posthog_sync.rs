@@ -28,6 +28,7 @@ struct Store {
     next: u32,
     drop_tag: bool,
     fail: bool,
+    fail_cleanup: bool,
     /// Kind whose next create comes back with its identity mangled.
     mangle: Option<&'static str>,
 }
@@ -143,6 +144,16 @@ async fn handle(
     s.log.push((method.clone(), path.into(), body.clone()));
     if method != Method::GET && std::mem::take(&mut s.fail) {
         return (StatusCode::BAD_REQUEST, Json(json!({"detail":"bad"}))).into_response();
+    }
+    if s.fail_cleanup
+        && (method == Method::DELETE || (method == Method::PATCH && body["deleted"] == true))
+    {
+        s.fail_cleanup = false;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"detail":"cleanup denied"})),
+        )
+            .into_response();
     }
     if method != Method::GET && std::mem::take(&mut s.drop_tag) {
         body["tags"] = json!([]);
@@ -787,6 +798,68 @@ async fn unidentified_creates_are_removed_before_the_error_returns() {
 }
 
 #[tokio::test]
+async fn unidentified_update_keeps_the_existing_object() {
+    let mock = Mock::start().await;
+    let mut declarations = example::declarations().unwrap();
+    mock.sync("demo", &declarations).await.unwrap();
+    let old = mock.row("cja:demo:dashboard:activity");
+    let id = old["id"].as_i64().unwrap().to_string();
+    mock.log();
+    declarations.dashboards[0].title.push_str(" updated");
+    mock.state.lock().unwrap().drop_tag = true;
+    let error = mock.sync("demo", &declarations).await.unwrap_err();
+    let SyncError::TagNotPersisted { cleanup, .. } = &error else {
+        panic!("{error}")
+    };
+    assert_eq!(cleanup, "the existing object was left in place");
+    let writes = mock.writes();
+    assert_eq!(writes.len(), 1, "unexpected cleanup: {writes:?}");
+    assert_eq!(writes[0].0, Method::PATCH);
+    assert_eq!(writes[0].1, format!("dashboards/{id}/"));
+    let state = mock.state.lock().unwrap();
+    let row = &state.rows[&("dashboards".into(), id)];
+    assert_ne!(row["deleted"], true);
+    assert_eq!(row["name"], "Product activity updated");
+}
+
+#[tokio::test]
+async fn failed_cleanup_reports_manual_removal_and_keeps_mangled_row() {
+    let mock = Mock::start().await;
+    {
+        let mut state = mock.state.lock().unwrap();
+        state.mangle = Some("dashboards");
+        state.fail_cleanup = true;
+    }
+    let error = mock
+        .sync("demo", &example::declarations().unwrap())
+        .await
+        .unwrap_err();
+    let SyncError::TagNotPersisted { cleanup, .. } = &error else {
+        panic!("{error}")
+    };
+    assert!(
+        cleanup.contains("remove it by hand") && cleanup.contains("cleanup denied"),
+        "{cleanup}"
+    );
+    let writes = mock.writes();
+    assert_eq!(
+        writes.len(),
+        2,
+        "create and cleanup attempt required: {writes:?}"
+    );
+    assert_eq!(writes[0].0, Method::POST);
+    assert_eq!(writes[1].0, Method::PATCH);
+    assert_eq!(writes[1].2, json!({"deleted":true}));
+    let state = mock.state.lock().unwrap();
+    assert!(
+        state
+            .rows
+            .values()
+            .any(|row| row["tags"] == json!(["cja:mangled"]) && row["deleted"] != true)
+    );
+}
+
+#[tokio::test]
 async fn alert_names_over_the_posthog_limit_fail_before_any_request() {
     let mock = Mock::start().await;
     let mut declarations = example::declarations().unwrap();
@@ -812,13 +885,89 @@ async fn alert_names_over_the_posthog_limit_fail_before_any_request() {
     declarations.alerts[0].description = Some("d".repeat(233));
     let error = mock.sync("demo", &declarations).await.unwrap_err();
     assert!(
-        matches!(&error, SyncError::AlertNameTooLong { alert, length: 256 } if alert == "cja:demo:alert:quiet"),
+        matches!(&error, SyncError::AlertNameTooLong { alert, length: 256, .. } if alert == "cja:demo:alert:quiet"),
         "{error}"
     );
     assert!(error.to_string().contains("at most 255"), "{error}");
+    assert!(
+        error.to_string().contains("shorten the alert description"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains("shorten the alert ID"),
+        "{error}"
+    );
     // The same description fits a shorter app slug: the bound is on the name.
     assert_eq!(mock.log(), Vec::new());
     mock.sync("dem", &declarations).await.unwrap();
+
+    mock.log();
+    declarations.alerts[0].id = "a".repeat(128);
+    declarations.alerts[0].description = None;
+    let error = mock.sync("demo", &declarations).await.unwrap_err();
+    assert!(matches!(error, SyncError::AlertNameTooLong { .. }));
+    assert!(
+        error.to_string().contains("shorten the alert ID"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains("shorten the alert description"),
+        "{error}"
+    );
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn unicode_alert_length_counts_characters_and_eyes_only_alerts_skip() {
+    let mock = Mock::start().await;
+    let mut declarations = example::declarations().unwrap();
+    declarations.alerts[0].description = Some("é".repeat(232));
+    mock.sync("demo", &declarations).await.unwrap();
+    let row = mock
+        .state
+        .lock()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|((kind, _), _)| kind == "alerts")
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(row["name"].as_str().unwrap().chars().count(), 255);
+    assert!(row["name"].as_str().unwrap().len() > 255);
+    mock.log();
+    declarations.alerts[0].description = Some("é".repeat(233));
+    let error = mock.sync("demo", &declarations).await.unwrap_err();
+    assert!(matches!(
+        error,
+        SyncError::AlertNameTooLong { length: 256, .. }
+    ));
+    assert_eq!(mock.log(), Vec::new());
+
+    let ops = TelemetryMetricBuilder::new("ops", AggregateFunction::Count, None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let alert = AlertBuilder::new("ops_quiet", "ops")
+        .description("é".repeat(300))
+        .window_seconds(300)
+        .evaluation_interval_seconds(60)
+        .warning(Comparison::Below, 1.)
+        .build()
+        .unwrap();
+    let report = mock
+        .sync("demo", &Declarations::default().metric(ops).alert(alert))
+        .await
+        .unwrap();
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|entry| entry.contains("ops_quiet")),
+        "{:?}",
+        report.skipped
+    );
+    assert!(!mock.writes().iter().any(|(_, path, _)| path == "alerts/"));
 }
 
 /// Insert a copy of the live row matching `pick` under a fresh id, the way

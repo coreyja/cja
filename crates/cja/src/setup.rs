@@ -78,7 +78,7 @@ pub use eyes_subscriber::EyesShutdownHandle;
 /// Invariant: the `PostHog` bounds nest inside this one (provider flush <
 /// blocking-worker backstop <= this budget); `setup/posthog.rs` asserts it at
 /// compile time.
-const TELEMETRY_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const TELEMETRY_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Graceful-shutdown handle for the telemetry sinks installed by
 /// [`setup_tracing`] / [`TracingConfig::init`]: Eyes, `PostHog` OTLP, and
@@ -86,7 +86,11 @@ const TELEMETRY_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from
 ///
 /// Dropping the handle does not flush. Hold it for the life of the process and
 /// call [`shutdown`](Self::shutdown) on every exit path, including the error
-/// path, or the last buffered events and spans are lost.
+/// path, or the last buffered events and spans are lost. Binding it to an
+/// underscore name only suppresses the compiler warning; it does not flush.
+/// `PostHog` redacts selected OTLP attributes at export; Eyes retains raw values.
+/// In `panic = "abort"` builds, a dependency panic during exporter construction
+/// aborts the process; returned construction errors still skip `PostHog`.
 #[must_use = "call .shutdown().await to flush telemetry"]
 #[derive(Debug)]
 pub struct TelemetryShutdownHandle {

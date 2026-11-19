@@ -29,9 +29,16 @@ pub async fn mock(delay: Duration) -> (String, Captures) {
 
 pub async fn mock_with(delay: Duration, status: StatusCode) -> (String, Captures) {
     let captures = Arc::new(Mutex::new(Vec::new()));
-    let state = Arc::clone(&captures);
-    let app = Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
-        let state = Arc::clone(&state);
+    let app = mock_router(Arc::clone(&captures), delay, status);
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = format!("http://{}", socket.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    (host, captures)
+}
+
+pub fn mock_router(captures: Captures, delay: Duration, status: StatusCode) -> Router {
+    Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+        let state = Arc::clone(&captures);
         async move {
             let capture_path = uri.path() == "/i/v1/analytics/events";
             state.lock().unwrap().push(Capture { uri, headers, body });
@@ -47,11 +54,7 @@ pub async fn mock_with(delay: Duration, status: StatusCode) -> (String, Captures
                 status.into_response()
             }
         }
-    });
-    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let host = format!("http://{}", socket.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
-    (host, captures)
+    })
 }
 
 /// Every captured body, concatenated, for requests whose path passes `path`.

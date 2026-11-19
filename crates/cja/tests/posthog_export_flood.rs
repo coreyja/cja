@@ -56,7 +56,7 @@ async fn flood() {
         .unwrap();
     let start = Instant::now();
     sink.shutdown_handle().shutdown().await;
-    assert!(start.elapsed() < Duration::from_secs(15));
+    assert!(start.elapsed() < Duration::from_millis(3500));
     #[cfg(target_os = "linux")]
     assert!(
         memory_kib("VmHWM:").saturating_sub(baseline) < 256 * 1024,

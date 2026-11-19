@@ -1,6 +1,46 @@
 //! App-owned declarations shared by both observability sinks.
 use super::{AggregateFunction, MetricValueType};
+use eyes::eyes_query::{Expr, Function, Literal, NamedExpr, Stage};
 use eyes_subscriber as eyes;
+
+fn ratio_groups(metric: &eyes::NamedMetric) -> (Vec<NamedExpr>, Option<(i64, i64)>) {
+    let groups = metric
+        .query
+        .as_ref()
+        .and_then(|query| {
+            query.query.stages.iter().find_map(|stage| {
+                if let Stage::Aggregate { groups, .. } = stage {
+                    Some(groups.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default();
+    let bucket = groups.first().and_then(|group| {
+        let Expr::Call {
+            function: Function::TimeBucket,
+            args,
+        } = &group.expr
+        else {
+            return None;
+        };
+        let Some(Expr::Literal {
+            value: Literal::Duration(width),
+        }) = args.get(1)
+        else {
+            return None;
+        };
+        let origin = match args.get(2) {
+            Some(Expr::Literal {
+                value: Literal::Duration(origin),
+            }) => *origin,
+            _ => 0,
+        };
+        Some((*width, origin))
+    });
+    (groups, bucket)
+}
 /// Numeric comparison applied to the first `HogQL` result cell.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,7 +151,7 @@ pub struct Link {
 }
 
 /// Metric- and alert-id grammar: non-empty, at most 128 bytes, chars in
-/// `[a-z0-9._:_-]`.
+/// `[a-z0-9._:-]`.
 ///
 /// Every declaration id becomes part of a `PostHog` identity: a tag for
 /// metrics and dashboards, a name suffix for alerts. `PostHog` lowercases
@@ -122,18 +162,10 @@ fn valid_id(id: &str) -> bool {
         && id.len() <= 128
         && id
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._:-_".contains(&b))
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._:-".contains(&b))
 }
 
-/// Dashboard-id grammar: [`valid_id`] without `_`, which the Eyes dashboard
-/// grammar does not accept.
-fn valid_dashboard_id(id: &str) -> bool {
-    valid_id(id) && !id.contains('_')
-}
-
-const ID_RULE: &str = "must be non-empty, at most 128 bytes, lowercase chars [a-z0-9._:_-]";
-const DASHBOARD_ID_RULE: &str =
-    "must be non-empty, at most 128 bytes, lowercase chars [a-z0-9._:-]";
+const ID_RULE: &str = "must be non-empty, at most 128 bytes, lowercase chars [a-z0-9._:-]";
 
 /// Link href grammar: root-relative path (starts with `/` but not `//` —
 /// protocol-relative URLs resolve as scheme-relative external URLs) or an
@@ -159,8 +191,8 @@ impl Dashboard {
     /// declaration fails at boot in the app.
     pub fn new(id: impl Into<String>, title: impl Into<String>) -> Result<Self, String> {
         let id = id.into();
-        if !valid_dashboard_id(&id) {
-            return Err(format!("invalid dashboard id {id:?}: {DASHBOARD_ID_RULE}"));
+        if !valid_id(&id) {
+            return Err(format!("invalid dashboard id {id:?}: {ID_RULE}"));
         }
         let title = title.into();
         if title.trim().is_empty() || title.chars().count() > 256 {
@@ -1399,7 +1431,10 @@ impl Declarations {
                     }
                     ratio.eyes(m, &singular)
                 }
-                _ => Ok(singular[m.id.as_str()].clone()),
+                _ => singular
+                    .get(m.id.as_str())
+                    .cloned()
+                    .ok_or_else(|| format!("metric {} did not convert", m.id)),
             })
             .collect()
     }
@@ -1410,6 +1445,51 @@ impl Declarations {
             return Err("manifest exceeds 100 metrics or 20 dashboards".into());
         }
         let converted = self.eyes_metrics()?;
+        let singular = converted
+            .iter()
+            .filter(|m| m.ratio.is_none())
+            .map(|m| (m.id.as_str(), m))
+            .collect::<HashMap<_, _>>();
+        for metric in &self.metrics {
+            let MetricQuery::Ratio(ratio) = &metric.query else {
+                continue;
+            };
+            let numerator = singular.get(ratio.numerator.as_str()).ok_or_else(|| {
+                format!(
+                    "ratio {} has missing numerator {}",
+                    metric.id, ratio.numerator
+                )
+            })?;
+            let denominator = singular.get(ratio.denominator.as_str()).ok_or_else(|| {
+                format!(
+                    "ratio {} has missing denominator {}",
+                    metric.id, ratio.denominator
+                )
+            })?;
+            let (num_groups, num_bucket) = ratio_groups(numerator);
+            let (den_groups, den_bucket) = ratio_groups(denominator);
+            let compatible = match (numerator.result_shape, denominator.result_shape) {
+                (eyes::MetricResultShape::TimeSeries, eyes::MetricResultShape::TimeSeries) => {
+                    num_bucket.is_some()
+                        && num_bucket == den_bucket
+                        && num_groups
+                            .iter()
+                            .map(|g| &g.alias)
+                            .eq(den_groups.iter().map(|g| &g.alias))
+                        && num_groups.get(1..) == den_groups.get(1..)
+                }
+                (eyes::MetricResultShape::Table, eyes::MetricResultShape::Table) => {
+                    num_groups == den_groups
+                }
+                _ => true,
+            };
+            if !compatible {
+                return Err(format!(
+                    "ratio {} operands {} and {} have incompatible buckets or groups",
+                    metric.id, ratio.numerator, ratio.denominator
+                ));
+            }
+        }
         let shapes = converted
             .iter()
             .map(|m| (m.id.as_str(), m.result_shape))
@@ -1432,11 +1512,8 @@ impl Declarations {
         }
         ids.clear();
         for d in &self.dashboards {
-            if !valid_dashboard_id(&d.id) {
-                return Err(format!(
-                    "invalid dashboard id {:?}: {DASHBOARD_ID_RULE}",
-                    d.id
-                ));
+            if !valid_id(&d.id) {
+                return Err(format!("invalid dashboard id {:?}: {ID_RULE}", d.id));
             }
             if !ids.insert(&d.id) || d.sections.len() > 20 {
                 return Err(format!("duplicate or oversized dashboard {}", d.id));
@@ -1708,7 +1785,20 @@ mod parity_tests {
 
     #[test]
     fn ratio_metric_converts_to_exactly_the_eyes_ratio_builder_output() {
-        let declarations = arena_shaped();
+        let mut declarations = arena_shaped();
+        declarations.metrics[2] = RatioMetricBuilder::new(
+            "product.users.active.stickiness.daily",
+            "product.users.active",
+            "product.users.active.month",
+        )
+        .numerator_window_seconds(DAY)
+        .denominator_window_seconds(FOUR_WEEKS)
+        .unit("ratio")
+        .preferred_bucket_seconds(300)
+        .display_name("Users: last 1 day as fraction of last 28 days")
+        .description("Distinct users in the last day divided by the last 28 days.")
+        .build()
+        .unwrap();
         declarations.validate().unwrap();
         let manifest = declarations
             .attach_to_eyes_manifest(eyes::AppManifest::default())
@@ -1721,9 +1811,10 @@ mod parity_tests {
         )
         .numerator_window_seconds(DAY)
         .denominator_window_seconds(FOUR_WEEKS)
-        .as_percentage()
-        .display_name("Users: last 1 day as % of last 28 days")
-        .description("Distinct users in the last day as a percentage of the last 28 days.")
+        .unit("ratio")
+        .preferred_bucket_seconds(300)
+        .display_name("Users: last 1 day as fraction of last 28 days")
+        .description("Distinct users in the last day divided by the last 28 days.")
         .build(
             eyes::MetricResultShape::Scalar,
             MetricValueType::Int,
@@ -1731,6 +1822,11 @@ mod parity_tests {
             MetricValueType::Int,
         )
         .unwrap();
+        assert_eq!(expected.unit.as_deref(), Some("ratio"));
+        assert_eq!(expected.preferred_bucket_seconds, Some(300));
+        let wire = to_value(&expected).unwrap();
+        assert_eq!(wire["unit"], "ratio");
+        assert_eq!(wire["preferred_bucket_seconds"], 300);
         assert_eq!(
             to_value(&metrics).unwrap(),
             to_value([
@@ -1848,6 +1944,145 @@ mod parity_tests {
             .attach_to_eyes_manifest(eyes::AppManifest::default())
             .unwrap();
         assert_eq!(manifest.metrics.unwrap()[0].id, "game.queue_wait.p95");
+    }
+
+    #[test]
+    fn dashboard_underscore_is_valid_through_manifest_attachment() {
+        let dashboard = Dashboard::new("arena_product", "Arena product").unwrap();
+        let declarations = Declarations::default().dashboard(dashboard);
+        declarations.validate().unwrap();
+        let manifest = declarations
+            .attach_to_eyes_manifest(eyes::AppManifest::default())
+            .unwrap();
+        assert_eq!(manifest.dashboards.unwrap()[0].id, "arena_product");
+        assert!(Dashboard::new("Arena_product", "Arena product").is_err());
+    }
+
+    fn with_bucket_origin(mut metric: Metric, origin: i64) -> Metric {
+        let MetricQuery::Telemetry(TelemetryMetric(eyes)) = &mut metric.query else {
+            panic!()
+        };
+        let groups = eyes
+            .query
+            .as_mut()
+            .unwrap()
+            .query
+            .stages
+            .iter_mut()
+            .find_map(|stage| {
+                if let Stage::Aggregate { groups, .. } = stage {
+                    Some(groups)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let Expr::Call { args, .. } = &mut groups[0].expr else {
+            panic!()
+        };
+        args.push(Expr::Literal {
+            value: Literal::Duration(origin),
+        });
+        metric
+    }
+
+    fn with_first_group_alias(mut metric: Metric, alias: String) -> Metric {
+        let MetricQuery::Telemetry(TelemetryMetric(eyes)) = &mut metric.query else {
+            panic!()
+        };
+        let groups = eyes
+            .query
+            .as_mut()
+            .unwrap()
+            .query
+            .stages
+            .iter_mut()
+            .find_map(|stage| {
+                if let Stage::Aggregate { groups, .. } = stage {
+                    Some(groups)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        groups[0].alias = alias;
+        metric
+    }
+
+    #[test]
+    fn ratio_operands_must_match_bucket_and_group_expressions() {
+        let make = |id: &str, width: Option<u64>, group: &str| {
+            let mut builder = TelemetryMetricBuilder::new(id, AggregateFunction::Count, None)
+                .unwrap()
+                .group_by(group)
+                .unwrap();
+            if let Some(width) = width {
+                builder = builder.time_bucket(width);
+            }
+            builder.build().unwrap()
+        };
+        let ratio = || {
+            RatioMetricBuilder::new("share", "num", "den")
+                .build()
+                .unwrap()
+        };
+        let validate = |num: Metric, den: Metric| {
+            Declarations::default()
+                .metric(num)
+                .metric(den)
+                .metric(ratio())
+                .validate()
+        };
+        assert!(
+            validate(
+                make("num", Some(60), "fields.kind"),
+                make("den", Some(60), "fields.kind")
+            )
+            .is_ok()
+        );
+        for (num, den) in [
+            (
+                make("num", Some(60), "fields.kind"),
+                make("den", Some(120), "fields.kind"),
+            ),
+            (
+                make("num", Some(60), "fields.kind"),
+                make("den", Some(60), "fields.other"),
+            ),
+            (
+                make("num", None, "fields.kind"),
+                make("den", None, "fields.other"),
+            ),
+        ] {
+            let error = validate(num, den).unwrap_err();
+            assert!(
+                error.contains("share") && error.contains("num") && error.contains("den"),
+                "{error}"
+            );
+        }
+        assert!(
+            validate(
+                make("num", None, "fields.kind"),
+                make("den", None, "fields.kind")
+            )
+            .is_ok()
+        );
+        let num = make("num", None, "fields.kind");
+        let alias = ratio_groups(&num.eyes().unwrap()).0[0].alias.clone();
+        let den = with_first_group_alias(make("den", None, "fields.other"), alias);
+        let error = validate(num, den).unwrap_err();
+        assert!(
+            error.contains("share") && error.contains("num") && error.contains("den"),
+            "{error}"
+        );
+        let den = with_bucket_origin(make("den", Some(60), "fields.kind"), 1_000_000);
+        let error = validate(make("num", Some(60), "fields.kind"), den).unwrap_err();
+        assert!(
+            error.contains("share") && error.contains("num") && error.contains("den"),
+            "{error}"
+        );
+        let den = with_bucket_origin(make("den", Some(60), "fields.kind"), 0);
+        assert!(validate(make("num", Some(60), "fields.kind"), den).is_ok());
     }
 
     #[test]

@@ -5,6 +5,263 @@
 mod posthog_support;
 use posthog_support::{Captures, boot, mock, payload};
 use std::time::Duration;
+use tower::ServiceExt as _;
+
+#[cfg(target_os = "linux")]
+struct TlsMock {
+    host: String,
+    captures: Captures,
+    handshakes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    cert_file: std::path::PathBuf,
+    cert_dir: std::path::PathBuf,
+    server: tokio::task::JoinHandle<()>,
+    _temp: tempfile::TempDir,
+}
+
+#[cfg(target_os = "linux")]
+async fn tls_mock(wrong_ca: bool) -> TlsMock {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let make_ca = || {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let cert = params.self_signed(&key).unwrap();
+        (params, key, cert)
+    };
+    let (trusted_params, trusted_key, trusted_cert) = make_ca();
+    let (wrong_params, wrong_key, wrong_cert) = make_ca();
+    let (signer_params, signer_key, signer_cert) = if wrong_ca {
+        (&wrong_params, &wrong_key, &wrong_cert)
+    } else {
+        (&trusted_params, &trusted_key, &trusted_cert)
+    };
+    let issuer = rcgen::Issuer::from_params(signer_params, signer_key);
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])
+        .unwrap()
+        .signed_by(&leaf_key, &issuer)
+        .unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![leaf.der().clone(), signer_cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+    )
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = format!("https://{}", listener.local_addr().unwrap());
+    let captures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router =
+        posthog_support::mock_router(captures.clone(), Duration::ZERO, axum::http::StatusCode::OK);
+    let handshakes = Arc::new(AtomicUsize::new(0));
+    let attempts = handshakes.clone();
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let router = router.clone();
+            let attempts = attempts.clone();
+            connections.spawn(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let Ok(stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service = hyper_util::service::TowerToHyperService::new(router);
+                let builder = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                );
+                let _ = builder
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let cert_file = temp.path().join("ca.pem");
+    let cert_dir = temp.path().join("empty-certs");
+    std::fs::write(&cert_file, trusted_cert.pem()).unwrap();
+    std::fs::create_dir(&cert_dir).unwrap();
+    TlsMock {
+        host,
+        captures,
+        handshakes,
+        cert_file,
+        cert_dir,
+        server,
+        _temp: temp,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_tls_accepts_our_ca_and_rejects_a_different_ca() {
+    const MARKER: &str = "tls-eyes-marker";
+    if boot::is_child() {
+        return boot::child(
+            &[&|| {
+                emit_private_request();
+                tracing::info!(target: "fixture", "{MARKER}");
+            }],
+            |_| {},
+        );
+    }
+    boot::block_on(async {
+        for wrong_ca in [false, true] {
+            let tls = tls_mock(wrong_ca).await;
+            let (eyes_host, eyes) = mock(Duration::ZERO).await;
+            let mut envs = boot::EYES_ENV.to_vec();
+            envs.extend([
+                ("EYES_URL", eyes_host.as_str()),
+                ("POSTHOG_HOST", tls.host.as_str()),
+                ("POSTHOG_PROJECT_TOKEN", "phc_test"),
+                ("SSL_CERT_FILE", tls.cert_file.to_str().unwrap()),
+                ("SSL_CERT_DIR", tls.cert_dir.to_str().unwrap()),
+            ]);
+            let exit =
+                boot::spawn("local_tls_accepts_our_ca_and_rejects_a_different_ca", &envs).finish();
+            assert!(
+                exit.success && exit.stdout.contains(CONFIGURED_BANNER),
+                "{}",
+                exit.output()
+            );
+            assert!(
+                boot::eyes_payload(&eyes).contains(MARKER),
+                "Eyes missing: {}",
+                exit.output()
+            );
+            let attempts = tls.handshakes.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(attempts > 0, "TLS handshake was never attempted");
+            let captured = tls.captures.lock().unwrap();
+            if wrong_ca {
+                assert!(captured.is_empty(), "untrusted cert reached HTTP");
+            } else {
+                for path in ["/i/v1/logs", "/i/v1/traces"] {
+                    assert!(
+                        captured.iter().any(|c| c.uri.path() == path
+                            && c.headers["authorization"] == "Bearer phc_test"),
+                        "{path}: {}",
+                        exit.output()
+                    );
+                }
+            }
+            drop(captured);
+            tls.server.abort();
+        }
+    });
+}
+
+fn emit_private_request() {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+        let app = cja::server::App::new(
+            axum::Router::new().route("/callback", axum::routing::get(|| async {
+                tracing::info!(target: "fixture", uri = "/event?code=synthetic-code&page=2", http.request.header.authorization = "Bearer synthetic-authorization", "privacy-event");
+                "ok"
+            }))
+        ).into_router();
+        let request = axum::http::Request::builder()
+            .uri("/callback?code=synthetic-code&page=2")
+            .header("host", "example.test")
+            .header("user-agent", "synthetic-agent")
+            .header("x-forwarded-for", "127.0.0.1")
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-ssl", "on")
+            .header("fly-region", "ewr")
+            .header("via", "test-proxy")
+            .header("referer", "https://example.test/start?token=synthetic-referer&page=2")
+            .body(axum::body::Body::empty()).unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), axum::http::StatusCode::OK);
+    });
+    });
+}
+
+#[test]
+fn dual_sink_privacy_keeps_eyes_raw_and_redacts_posthog() {
+    if boot::is_child() {
+        return boot::child(&[&emit_private_request], |_| {});
+    }
+    boot::block_on(async {
+        let (eyes_host, eyes) = mock(Duration::ZERO).await;
+        let (posthog_host, posthog) = mock(Duration::ZERO).await;
+        let mut envs = boot::EYES_ENV.to_vec();
+        envs.extend([
+            ("EYES_URL", eyes_host.as_str()),
+            ("POSTHOG_PROJECT_TOKEN", "phc_test"),
+            ("POSTHOG_HOST", posthog_host.as_str()),
+        ]);
+        let exit = boot::spawn(
+            "dual_sink_privacy_keeps_eyes_raw_and_redacts_posthog",
+            &envs,
+        )
+        .finish();
+        assert!(exit.success, "{}", exit.output());
+        let eyes_raw = boot::eyes_payload(&eyes);
+        assert!(
+            eyes_raw.contains("synthetic-code")
+                && eyes_raw.contains("synthetic-referer")
+                && eyes_raw.contains("synthetic-agent"),
+            "Eyes raw span missing: {eyes_raw}"
+        );
+        assert!(
+            eyes_raw.contains("synthetic-authorization"),
+            "Eyes raw event missing: {eyes_raw}"
+        );
+        let captures = posthog.lock().unwrap();
+        let logs = captures
+            .iter()
+            .filter(|c| c.uri.path() == "/i/v1/logs")
+            .map(|c| String::from_utf8_lossy(&c.body).into_owned())
+            .collect::<String>();
+        let traces = captures
+            .iter()
+            .filter(|c| c.uri.path() == "/i/v1/traces")
+            .map(|c| String::from_utf8_lossy(&c.body).into_owned())
+            .collect::<String>();
+        assert!(
+            logs.contains("privacy-event"),
+            "privacy event absent from logs"
+        );
+        assert!(
+            traces.contains("privacy-event"),
+            "privacy event absent from span events"
+        );
+        for path in ["/i/v1/traces", "/i/v1/logs"] {
+            let bodies = captures
+                .iter()
+                .filter(|c| c.uri.path() == path)
+                .map(|c| String::from_utf8_lossy(&c.body).into_owned())
+                .collect::<String>();
+            assert!(
+                bodies.contains("[REDACTED]")
+                    && bodies.contains("synthetic-agent")
+                    && bodies.contains("/callback"),
+                "{path}: sanitized payload absent"
+            );
+            for secret in [
+                "synthetic-code",
+                "synthetic-referer",
+                "synthetic-authorization",
+            ] {
+                assert!(!bodies.contains(secret), "{path}: leaked {secret}");
+            }
+        }
+    });
+}
 
 const CONFIGURED_BANNER: &str = "PostHog OTLP layer configured";
 const SETUP_FAILED_BANNER: &str = "Skipping PostHog layer: exporter setup failed:";
@@ -12,6 +269,162 @@ const SETUP_FAILED_BANNER: &str = "Skipping PostHog layer: exporter setup failed
 const SDK_EXPORT_ERROR: &str = "BatchLogProcessor.ExportError";
 const SDK_MARKER: &str = "synthetic-sdk-marker";
 const AFTER_NOISE_MARKER: &str = "after-sdk-noise-marker";
+
+#[test]
+fn boot_child_scrubs_inherited_credentials() {
+    if boot::is_child() {
+        return boot::child(
+            &[&|| tracing::info!(target: "fixture", "scrub-marker")],
+            |_| {},
+        );
+    }
+    if std::env::var_os("CJA_SCRUB_INTERMEDIATE").is_some() {
+        let exit = boot::spawn("boot_child_scrubs_inherited_credentials", &[]).finish();
+        assert!(exit.success, "{}", exit.output());
+        assert!(
+            exit.stdout.contains("Skipping PostHog layer")
+                && !exit.stdout.contains(CONFIGURED_BANNER),
+            "{}",
+            exit.output()
+        );
+        return;
+    }
+    boot::block_on(async {
+        let (host, captures) = mock(Duration::ZERO).await;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "boot_child_scrubs_inherited_credentials",
+                "--nocapture",
+            ])
+            .env("CJA_SCRUB_INTERMEDIATE", "1")
+            .env("POSTHOG_PROJECT_TOKEN", "phc_synthetic_inherited")
+            .env("POSTHOG_HOST", &host)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            captures.lock().unwrap().is_empty(),
+            "inherited token exported telemetry"
+        );
+        let exit = boot::spawn(
+            "boot_child_scrubs_inherited_credentials",
+            &[
+                ("POSTHOG_PROJECT_TOKEN", "phc_test"),
+                ("POSTHOG_HOST", &host),
+            ],
+        )
+        .finish();
+        assert!(
+            exit.success && exit.stdout.contains(CONFIGURED_BANNER),
+            "{}",
+            exit.output()
+        );
+        assert!(
+            !captures.lock().unwrap().is_empty(),
+            "explicit credentials did not export"
+        );
+    });
+}
+
+#[test]
+fn hostile_otel_exporter_settings_skip_posthog_but_keep_eyes() {
+    const MARKER: &str = "hostile-env-eyes-marker";
+    if boot::is_child() {
+        return boot::child(
+            &[&|| {
+                boot::emit_markers();
+                tracing::info!(target: "fixture", "{MARKER}");
+            }],
+            |_| {},
+        );
+    }
+    boot::block_on(async {
+        for key in [
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "OTEL_EXPORTER_OTLP_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+        ] {
+            let (eyes_host, eyes) = mock(Duration::ZERO).await;
+            let (posthog_host, posthog) = mock(Duration::ZERO).await;
+            let mut envs = boot::EYES_ENV.to_vec();
+            envs.extend([
+                ("EYES_URL", eyes_host.as_str()),
+                ("POSTHOG_PROJECT_TOKEN", "phc_test"),
+                ("POSTHOG_HOST", posthog_host.as_str()),
+                (
+                    key,
+                    if key.ends_with("HEADERS") {
+                        "Authorization=Bearer foreign"
+                    } else {
+                        "gzip"
+                    },
+                ),
+            ]);
+            let child = boot::spawn(
+                "hostile_otel_exporter_settings_skip_posthog_but_keep_eyes",
+                &envs,
+            );
+            let delivered = boot::eventually(|| boot::eyes_payload(&eyes).contains(MARKER)).await;
+            let exit = child.finish();
+            assert!(exit.success && delivered, "{key}: {}", exit.output());
+            assert!(
+                exit.stdout.contains(SETUP_FAILED_BANNER) && exit.stdout.contains(key),
+                "{key}: {}",
+                exit.output()
+            );
+            assert!(
+                !exit.stdout.contains(CONFIGURED_BANNER),
+                "{key}: {}",
+                exit.output()
+            );
+            assert!(
+                posthog.lock().unwrap().is_empty(),
+                "{key}: hostile setting exported"
+            );
+        }
+        for setting in [
+            None,
+            Some(("OTEL_EXPORTER_OTLP_HEADERS", "   ")),
+            Some(("OTEL_EXPORTER_OTLP_COMPRESSION", "   ")),
+        ] {
+            let (posthog_host, posthog) = mock(Duration::ZERO).await;
+            let mut envs = vec![
+                ("POSTHOG_PROJECT_TOKEN", "phc_test"),
+                ("POSTHOG_HOST", posthog_host.as_str()),
+            ];
+            if let Some(setting) = setting {
+                envs.push(setting);
+            }
+            let exit = boot::spawn(
+                "hostile_otel_exporter_settings_skip_posthog_but_keep_eyes",
+                &envs,
+            )
+            .finish();
+            assert!(
+                exit.success && exit.stdout.contains(CONFIGURED_BANNER),
+                "{}",
+                exit.output()
+            );
+            let captures = posthog.lock().unwrap();
+            for path in ["/i/v1/logs", "/i/v1/traces"] {
+                assert!(
+                    captures.iter().any(|capture| capture.uri.path() == path
+                        && capture.headers["authorization"] == "Bearer phc_test"),
+                    "{path}: {}",
+                    exit.output()
+                );
+            }
+        }
+    });
+}
 
 // An event on an SDK target, as the OTel SDK's `internal-logs` emit them.
 fn emit_sdk_event() {
@@ -38,6 +451,7 @@ fn eyes_targets(eyes: &Captures) -> Vec<String> {
 // `src/verification/others.rs`). `rustls-native-certs` honors
 // `SSL_CERT_FILE` / `SSL_CERT_DIR`, so pointing them at an empty file and an
 // empty directory yields zero roots and a deterministic construction error.
+#[cfg(target_os = "linux")]
 #[test]
 fn exporter_setup_failure_skips_posthog_and_keeps_eyes() {
     const MARKER: &str = "setup-failure-eyes-marker";
@@ -146,6 +560,7 @@ fn production_stack_filters_posthog_logs() {
     if boot::is_child() {
         return boot::child(
             &[&|| {
+                let _span = tracing::info_span!(target: "fixture", "filter-span").entered();
                 tracing::trace!(target: "rig::completions", "{RIG}");
                 tracing::debug!(target: "fixture", "{DEBUG}");
                 tracing::info!(target: "fixture", "{CONTROL}");
@@ -184,6 +599,11 @@ fn production_stack_filters_posthog_logs() {
             "an event below RUST_LOG reached PostHog"
         );
         let everything = payload(&captures, |_| true);
+        let traces = payload(&captures, |path| path == "/i/v1/traces");
+        assert!(
+            traces.contains("filter-span") || traces.contains(CONTROL),
+            "filter trace never exported"
+        );
         assert!(!everything.contains(RIG) && !everything.contains(DEBUG));
     });
 }

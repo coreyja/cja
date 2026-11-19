@@ -344,7 +344,7 @@ pub struct JobWorkerConfig {
     /// reclaim and charge the attempt (120 seconds by default).
     pub reclaim_window: Duration,
     /// Time allowed for the running job body after cancellation. Defaults to
-    /// `ShutdownBudget::from_env().job_drain` (2 seconds when unset). This should
+    /// `ShutdownBudget::from_env().job_drain` (1 second when unset). This should
     /// match the `job_drain` of the `ShutdownBudget` given to the `Supervisor`;
     /// apps constructing a custom budget must set this field to the same value.
     pub shutdown_drain_timeout: Duration,
@@ -813,7 +813,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 if !self.dead_letter_owned(&job, count, &error_message).await? {
                     return Ok(RunJobOutcome::LeaseLost(job.job_id));
                 }
-                tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
+                tracing::error!(job_id = %job.job_id, job.name = %job.name, error_count = count,
+                    error = %error, error.detail = %error_message,
                     "Job permanently failed - payload is not deserializable, moved to dead letter queue without retries");
                 return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
                     job, error,
@@ -1210,7 +1211,7 @@ async fn cleanup_worker_locks<AppState: AS, R: JobRegistry<AppState>>(
 ///
 /// If a worker crashes or becomes unresponsive while processing a job, the job will remain
 /// locked in the database. `JobWorkerConfig` defaults to a 30-second heartbeat,
-/// a 120-second reclaim window, and the shutdown budget's job drain (2 seconds
+/// a 120-second reclaim window, and the shutdown budget's job drain (1 second
 /// when unset). An expired lock is charged as a failed attempt.
 ///
 /// # Example
@@ -1431,6 +1432,34 @@ mod tests {
     use crate::impl_job_registry;
     use crate::jobs::Job;
     use crate::server::cookies::CookieKey;
+    use prost::Message as _;
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    #[derive(Clone)]
+    struct RawFields(Arc<Mutex<Vec<String>>>);
+
+    struct FieldVisitor<'a>(&'a mut Vec<String>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for RawFields {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: Context<'_, S>,
+        ) {
+            attrs.record(&mut FieldVisitor(&mut self.0.lock().unwrap()));
+        }
+
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            event.record(&mut FieldVisitor(&mut self.0.lock().unwrap()));
+        }
+    }
 
     #[derive(Clone)]
     struct TestAppState {
@@ -3992,6 +4021,191 @@ mod tests {
         assert_eq!(remaining, 0, "job row must be deleted after dead-lettering");
         token.cancel();
         handle.await.unwrap().unwrap();
+    }
+
+    #[sqlx::test]
+    async fn invalid_payload_detail_stays_in_raw_telemetry_and_dead_letter_only(db: sqlx::PgPool) {
+        use opentelemetry_proto::tonic::collector::{
+            logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
+        };
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+
+        const EMAIL: &str = "synthetic-worker@example.test";
+        let captures = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let requests = captures.clone();
+        let app =
+            axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let requests = requests.clone();
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((uri.path().into(), body.to_vec()));
+                    axum::http::StatusCode::OK
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sink = crate::setup::posthog_test_support::PostHogSink::build(
+            &crate::setup::posthog_test_support::PostHogConfig::new_for_tests(
+                host,
+                "phc_test",
+                tracing_subscriber::filter::LevelFilter::TRACE,
+                1.0,
+            ),
+            "worker-privacy-test",
+            None,
+            None,
+            8192,
+        )
+        .unwrap();
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(sink.tracer())
+                    .with_filter(sink.filter()),
+            )
+            .with(sink.log_bridge().with_filter(sink.filter()))
+            .with(RawFields(raw.clone()));
+
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context)
+             VALUES ($1, 'TestJob', $2, 0, NOW(), NOW(), 'privacy-test')",
+        )
+        .bind(job_id)
+        .bind(serde_json::json!(EMAIL))
+        .execute(&db)
+        .await
+        .unwrap();
+        let worker = Worker::new(
+            test_state(db.clone()),
+            Jobs,
+            Duration::from_millis(20),
+            20,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+        let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.job_id, job_id);
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            run_claimed_job(&worker, claimed, &CancellationToken::new())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        sink.shutdown_handle().shutdown().await;
+
+        let dead_letter: String = sqlx::query_scalar(
+            "SELECT last_error_message FROM dead_letter_jobs WHERE original_job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(dead_letter.contains(EMAIL), "dead letter lost serde detail");
+        let raw = raw.lock().unwrap().join(" ");
+        assert!(raw.contains(EMAIL), "raw sibling lost serde detail");
+
+        let captures = captures.lock().unwrap();
+        assert!(captures.iter().any(|(path, _)| path == "/i/v1/traces"));
+        assert!(captures.iter().any(|(path, _)| path == "/i/v1/logs"));
+        for (path, body) in captures.iter() {
+            if path == "/i/v1/traces" {
+                ExportTraceServiceRequest::decode(body.as_slice()).unwrap();
+            } else if path == "/i/v1/logs" {
+                ExportLogsServiceRequest::decode(body.as_slice()).unwrap();
+            }
+            assert!(
+                !body
+                    .windows(EMAIL.len())
+                    .any(|window| window == EMAIL.as_bytes()),
+                "PostHog {path} received payload detail"
+            );
+        }
+        let logs = captures
+            .iter()
+            .filter(|(path, _)| path == "/i/v1/logs")
+            .flat_map(|(_, body)| {
+                ExportLogsServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_logs
+            })
+            .flat_map(|resource| resource.scope_logs)
+            .flat_map(|scope| scope.log_records)
+            .collect::<Vec<_>>();
+        let failure = logs
+            .iter()
+            .find(|record| {
+                record.body.as_ref().is_some_and(|body| {
+                    format!("{body:?}")
+                        .contains("payload is not deserializable, moved to dead letter")
+                })
+            })
+            .expect("worker failure log exported");
+        assert!(failure.attributes.iter().any(|attribute| {
+            attribute.key == "error"
+                && matches!(
+                    attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value == "job payload is not deserializable"
+                )
+        }));
+        assert!(
+            failure
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "job.name")
+        );
+        assert!(
+            !failure
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "error.detail")
+        );
+        let folded = logs
+            .iter()
+            .find(|record| {
+                record
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| format!("{body:?}").contains("Job Errored"))
+            })
+            .expect("worker completion log exported");
+        assert!(folded.attributes.iter().any(|attribute| {
+            attribute.key == "error_msg"
+                && matches!(
+                    attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value == "job payload is not deserializable"
+                )
+        }));
+
+        let spans = captures
+            .iter()
+            .filter(|(path, _)| path == "/i/v1/traces")
+            .flat_map(|(_, body)| {
+                ExportTraceServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_spans
+            })
+            .flat_map(|resource| resource.scope_spans)
+            .flat_map(|scope| scope.spans)
+            .collect::<Vec<_>>();
+        let run_span = spans
+            .iter()
+            .find(|span| span.name == "jobs.run_from_value")
+            .expect("run_from_value span exported");
+        assert!(run_span.events.iter().flat_map(|event| &event.attributes).any(|attribute| {
+            attribute.key == "exception.message"
+                && matches!(
+                    attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value == "job payload is not deserializable"
+                )
+        }), "instrument error event must contain only the top-level message: {:?}", run_span.events);
+        server.abort();
     }
 
     /// The `jobs_lock_pair_check` CHECK constraint pairs the lock columns: a
