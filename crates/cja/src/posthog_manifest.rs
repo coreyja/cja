@@ -625,6 +625,26 @@ mod tests {
         assert!(snapshot::<Jobs, State>(&state, &invalid, "", id, "2026-11-18T18:00:00Z").is_err());
     }
 
+    /// Pinned by PR review round 1: Blink's `resolve` joins any target that is
+    /// not an absolute URL onto `base_url` (blink main d3b03b4 src/manifest.rs),
+    /// so a same-origin relative target without a leading `/` is a valid
+    /// declaration and must not fail boot locally.
+    #[tokio::test]
+    async fn same_origin_relative_target_without_leading_slash_is_accepted() {
+        let registry = crate::cron::CronRegistry::new();
+        let zone = jiff::tz::TimeZone::UTC;
+        let input = BootManifest::new("demo", &registry, &zone, &[], &[]);
+        let id = Uuid::parse_str("a0000000-0000-0000-0000-000000000001").unwrap();
+        let relative = State {
+            target: "health",
+            ..state()
+        };
+        let bytes = snapshot::<Jobs, State>(&relative, &input, "", id, "2026-11-18T18:00:00Z")
+            .expect("same-origin relative target accepted by Blink must be accepted by cja");
+        let event: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(event["properties"]["monitors"][0]["target"], "health");
+    }
+
     #[tokio::test]
     async fn child_boot_marker() {
         if std::env::var_os("CJA_MANIFEST_CHILD").is_none() {
