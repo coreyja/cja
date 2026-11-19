@@ -3,6 +3,7 @@ use posthog_support::{boot, mock, mock_with};
 use std::time::Duration;
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn capture_payload() {
     if boot::is_child() {
         boot::child(

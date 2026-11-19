@@ -149,6 +149,7 @@ pub(crate) fn start(
     Ok(Some(CaptureShutdownHandle { task }))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn worker(
     mut rx: mpsc::Receiver<CaptureEvent>,
     client: reqwest_012::Client,
@@ -320,7 +321,7 @@ async fn capture_result(
     }
 }
 
-/// Declares a product event for tracing and optional PostHog capture.
+/// Declares a product event for tracing and optional `PostHog` capture.
 ///
 /// `properties` accepts bare `key = value` (typed tracing value, JSON serialized),
 /// `%value` (Display string), and `?value` (Debug string). `user_id` and
