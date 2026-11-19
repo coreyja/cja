@@ -38,6 +38,22 @@ fn generated_project_carries_no_cja_migration_files() {
     );
 }
 
+#[test]
+fn generated_boot_logs_errors_before_flushing_telemetry() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let project = generate(dir.path(), &[]);
+    let source = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    let run = source.find("let result = run_tasks().await;").unwrap();
+    let log = source.find("application tasks failed").unwrap();
+    let flush = source
+        .find("let flush = telemetry_handle.shutdown().await;")
+        .unwrap();
+    let returns = source[flush..].find("result\n}").unwrap() + flush;
+    assert!(run < log && log < flush && flush < returns);
+    assert!(source.contains("_handle` only hides must_use"));
+    assert!(!source[run..flush].contains("supervisor.run().await"));
+}
+
 /// Rewrite the generated `cja = ...` dependency to a path dep on this
 /// checkout, so the compile runs against the code in this PR. Fails unless
 /// exactly one `cja = ` line was replaced: if the manifest format drifts, the

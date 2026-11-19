@@ -180,9 +180,18 @@ fn main() -> cja::Result<()> {
 }
 
 async fn run() -> cja::Result<()> {
-    // Keep the Eyes handle alive for graceful shutdown
-    let _eyes_handle = setup_tracing("my-app")?;
+    // Flushes Eyes and PostHog when shutdown() is called below
+    let telemetry = setup_tracing("my-app")?;
+    let result = run_tasks().await;
+    if let Err(error) = &result {
+        tracing::error!(error = %format_args!("{error:#}"), "application tasks failed");
+    }
+    let flush = telemetry.shutdown().await;
+    if result.is_ok() { flush?; }
+    result
+}
 
+async fn run_tasks() -> cja::Result<()> {
     let app_state = MyApp { /* ... */ };
     let mut supervisor = Supervisor::new(ShutdownBudget::from_env())?;
     let shutdown = supervisor.shutdown_token();
@@ -220,7 +229,13 @@ See `crates/cja.app/` in the repository for a complete working example.
 | `JOBS_DISABLED` | No | `false` | Set to `"true"` to skip starting the job worker |
 | `CRON_DISABLED` | No | `false` | Set to `"true"` to skip starting the cron worker |
 | `RUST_LOG` | No | `info` | Tracing filter directive |
+| `CJA_SHUTDOWN_JOB_DRAIN_SECS` | No | `1` | How long an in-flight job may run after a shutdown signal before it is dropped and unlocked. Invalid values warn and use the default |
+| `CJA_SHUTDOWN_EXIT_GRACE_SECS` | No | `500ms when unset; whole seconds when set` | Extra time for tasks to exit after the job drain. Drain + grace + the telemetry flush (`TelemetryShutdownHandle::shutdown`, up to 3s when a sink is stalled) must fit the platform's kill window (Cloud Run 10s fixed, Fly 5s default). Invalid values warn and use the default |
 | `JSON_LOGS` | No | — | If set, outputs JSON logs instead of tree format |
+| `POSTHOG_PROJECT_TOKEN` | No | — | Enable OTLP logs and traces to PostHog at boot |
+| `POSTHOG_HOST` | No | `https://us.i.posthog.com` | PostHog OTLP host |
+| `POSTHOG_LOG_LEVEL` | No | `info` | Minimum level for BOTH PostHog log records and PostHog spans (one shared filter): `off` sends no traces either |
+| `POSTHOG_TRACES_SAMPLE_RATIO` | No | `1.0` | Root trace sampling probability |
 | `EYES_ORG_ID` | No | — | Eyes tracing org ID (both `ORG_ID` and `APP_ID` required) |
 | `EYES_APP_ID` | No | — | Eyes tracing app ID |
 | `EYES_URL` | No | `https://eyes.coreyja.com` | Eyes server URL |
@@ -296,7 +311,7 @@ my_job.enqueue(app_state, "urgent".into(), Some(10)).await?;
 - Handler panics are caught and recorded like returned errors. An expired lease also increments `error_count` and records its previous worker.
 - With `max_retries = N`, a job may execute N+1 times. A terminal failure moves it to `dead_letter_jobs` with the final incremented count. Success and graceful shutdown do not count as failures.
 
-The single `job_worker` accepts `JobWorkerConfig { heartbeat_interval, reclaim_window, shutdown_drain_timeout, idle_poll_gate, type_concurrency }`; pass `Default::default()` unless the application needs custom timings. `type_concurrency` carries per-process running counts behind `Job::CONCURRENCY` caps: production uses `ConcurrencyTracker::process_shared()` (also what `Default` gives you) — one shared tracker per process across all workers; `ConcurrencyTracker::isolated()` is for tests embedding independent worker fleets in one process. `idle_poll_gate` defaults to `None`, preserving independent polling. Defaults are 30 seconds between heartbeats, 120 seconds from the last successful heartbeat before reclaim, and the `ShutdownBudget::from_env().job_drain` value (2 seconds when unset). `CJA_SHUTDOWN_JOB_DRAIN_SECS` controls both the default worker drain and a default Supervisor budget. The reclaim window must be at least three heartbeat intervals. A missing heartbeat makes any owned row eligible after the window; actual pickup also depends on the idle poll cadence. A still-running body stops if its worker detects lost ownership or its watchdog expires. Job side effects must remain idempotent.
+The single `job_worker` accepts `JobWorkerConfig { heartbeat_interval, reclaim_window, shutdown_drain_timeout, idle_poll_gate, type_concurrency }`; pass `Default::default()` unless the application needs custom timings. `type_concurrency` carries per-process running counts behind `Job::CONCURRENCY` caps: production uses `ConcurrencyTracker::process_shared()` (also what `Default` gives you) — one shared tracker per process across all workers; `ConcurrencyTracker::isolated()` is for tests embedding independent worker fleets in one process. `idle_poll_gate` defaults to `None`, preserving independent polling. Defaults are 30 seconds between heartbeats, 120 seconds from the last successful heartbeat before reclaim, and the `ShutdownBudget::from_env().job_drain` value (1 second when unset). `CJA_SHUTDOWN_JOB_DRAIN_SECS` controls both the default worker drain and a default Supervisor budget. The reclaim window must be at least three heartbeat intervals. A missing heartbeat makes any owned row eligible after the window; actual pickup also depends on the idle poll cadence. A still-running body stops if its worker detects lost ownership or its watchdog expires. Job side effects must remain idempotent.
 
 To limit idle claims, create one `IdlePollGate::new(NonZeroUsize::new(2).unwrap())`, clone it into each worker's `JobWorkerConfig { idle_poll_gate: Some(gate.clone()), ..Default::default() }`, and keep a clone in application state. Override `AppState::job_enqueued` to call `gate.wake_one()`. This local wake follows successful autocommit enqueue only. Direct SQL, other processes, transactional enqueue, due retries, and expired leases still need periodic claims; permits never cover job bodies or heartbeats.
 
@@ -498,11 +513,44 @@ migrations, see the "App migrations" section of the `cja::db` module docs.
 ```rust
 use cja::setup::setup_tracing;
 
-// Keep the handle alive — dropping it shuts down Eyes
-let _eyes_handle = setup_tracing("my-app")?;
+let telemetry = setup_tracing("my-app")?;
+// After application tasks finish
+telemetry.shutdown().await?;
 ```
 
-`setup_tracing()` returns `Result<Option<EyesShutdownHandle>>`. If Eyes is configured (both `EYES_ORG_ID` and `EYES_APP_ID` set), the handle must stay alive in your `main` scope.
+For a platform-specific stdout format and a token resolved at runtime, use
+`TracingConfig` inside Tokio. Keep the handle until all tasks exit:
+
+```rust,ignore
+use tracing_subscriber::Layer as _;
+
+let eyes_token = load_eyes_token().await?;
+let stdout = tracing_subscriber::fmt::layer()
+    .json()
+    .with_writer(std::io::stdout)
+    .with_filter(tracing_subscriber::EnvFilter::new("info"));
+let telemetry = cja::setup::TracingConfig::new("my-app")
+    .stdout_layer(stdout)
+    .eyes_ids(org_id, app_id)
+    .eyes_token(eyes_token)
+    .init()?;
+let result = run_app().await;
+telemetry.shutdown().await?;
+result
+```
+
+The local stdout filter changes only stdout. It must admit operational INFO
+lines consumed by platform metrics; a WARN-only filter is useful for test
+isolation but would hide those lines in production. Explicit Eyes IDs and token
+override their corresponding env values; omitted options keep env behavior.
+`POSTHOG_PROJECT_TOKEN` is the only PostHog runtime gate. Do not put a PostHog
+personal key in an app runtime.
+
+Call `shutdown().await?` on the returned `TelemetryShutdownHandle` to flush Eyes and PostHog, on the error path too. `let _handle = setup_tracing(..)?` suppresses the `must_use` warning but loses buffered telemetry on exit. Each flush is bounded: the call returns within 3 seconds even when a sink is stalled, always returns `Ok`, and logs failures. It runs after the supervisor's drain and grace, so count it against the platform's kill window. The default total is 1s drain + 0.5s grace + up to 3s flush = 4.5s. For Cloud Run, `CJA_SHUTDOWN_JOB_DRAIN_SECS=4` and `CJA_SHUTDOWN_EXIT_GRACE_SECS=2` give 9s total. Set `POSTHOG_PROJECT_TOKEN` in the process environment before tracing setup. `POSTHOG_HOST` defaults to `https://us.i.posthog.com`, `POSTHOG_LOG_LEVEL` to `info`, and `POSTHOG_TRACES_SAMPLE_RATIO` to `1.0`. Both signals honor scoped `RUST_LOG` and the rig content cap.
+
+PostHog's OTLP copy redacts query values for `code`, `state`, `token`, `access_token`, `id_token`, `refresh_token`, `code_verifier`, `password`, `secret`, `client_secret`, `key`, `api_key`, `apikey`, `signature`, `sig`, and `otp`, plus keys containing `token`, `secret`, `password`, `passwd`, or `signature` (case insensitive). It keeps query keys and other values in `uri`, `url.query`, and `http.request.header.referer`, and drops the whole query if parsing fails. It drops recorded `authorization`, `proxy_authorization`, `cookie`, and `set_cookie` headers, the unstructured `self` Debug field on `jobs.enqueue`, and `value` on `jobs.run_from_value` and on log records inside a job. The worker's deserialize-failure detail remains in Eyes and `dead_letter_jobs`; PostHog receives only the top-level error. Other request headers, paths, and routes remain. Eyes receives raw telemetry. App-owned span fields are outside this policy: use `#[instrument(skip(self))]` on `Job::run` so its payload is not exported. Explicit product-event capture and the boot manifest use app-chosen payloads and do not use this filter. Returned PostHog construction errors skip that sink; a dependency panic aborts the process in a `panic = "abort"` profile.
+
+`POSTHOG_LOG_LEVEL` gates both PostHog log records and PostHog spans through one shared per-layer filter, so `off` sends no traces either (the sample ratio only applies to spans the level admits). The same filter always excludes the exporter's own crates, matched by target prefix (tracing-subscriber `Targets` uses `starts_with`): `opentelemetry`, `tracing_opentelemetry`, `hyper`, `hyper_util`, `h2`, `reqwest`, `rustls`, `want`, `mio` and `posthog`, so `opentelemetry` also covers `opentelemetry_sdk`, `opentelemetry_otlp` and the rest of the family. While PostHog is enabled, Eyes also drops `opentelemetry*` targets, so the OTel SDK's own diagnostics (queue drops, export errors) reach stdout only; with no token, Eyes is unfiltered as before.
 
 ## Re-exports
 
@@ -516,3 +564,21 @@ use cja::maud;
 use cja::jiff;
 use cja::jiff_sqlx;
 ```
+
+# PostHog boot manifests
+
+When `POSTHOG_PROJECT_TOKEN` is set, call `posthog_manifest::emit_boot_manifest`
+once after constructing the complete cron registry and app state, before moving
+the registry to its worker. Pass `BootManifest::new(app_slug, &registry,
+&worker_timezone, &critical_jobs, &hogql_checks)` with explicit lists, including
+empty lists. The slug must be stable across boots and is independent of
+`EYES_APP_ID`. Cron expressions use cja's parser: seconds are required, the
+year is optional, day of month and day of week both apply, and weekday 1 is
+Sunday. Interval schedules are sent as milliseconds.
+
+The emitter validates declarations synchronously, then sends a complete
+`cja_manifest` capture asynchronously. Capture uses `POSTHOG_HOST` (default
+`https://us.i.posthog.com`) and does not read OTLP filter knobs. Network
+failures never delay boot; retried snapshots retain their event ID and expire
+after 24 hours or process exit. A successful HTTP response acknowledges receipt,
+not later query visibility.
