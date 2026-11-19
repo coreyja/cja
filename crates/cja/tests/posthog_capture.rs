@@ -608,9 +608,13 @@ fn capture_verdict_case(test: &str, verdict: &str, duplicates: u64, rejected: bo
     }
     boot::block_on(async {
         let verdict = verdict.to_owned();
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorder = received.clone();
         let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
             let verdict = verdict.clone();
+            let recorder = recorder.clone();
             async move {
+                recorder.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 let uuid = request["batch"][0]["uuid"].as_str().unwrap();
                 let mut results = serde_json::Map::new();
@@ -636,6 +640,9 @@ fn capture_verdict_case(test: &str, verdict: &str, duplicates: u64, rejected: bo
         let exit = child.finish();
         server.abort();
         assert!(exit.success, "{}", exit.output());
+        assert_eq!(received.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!exit.stdout.contains("capture request failed"), "{}", exit.output());
+        assert!(!exit.stdout.contains("capture response unreadable"), "{}", exit.output());
         assert_eq!(
             exit.stdout.contains("capture rejected events"),
             rejected,
