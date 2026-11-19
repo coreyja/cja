@@ -518,6 +518,34 @@ let telemetry = setup_tracing("my-app")?;
 telemetry.shutdown().await?;
 ```
 
+For a platform-specific stdout format and a token resolved at runtime, use
+`TracingConfig` inside Tokio. Keep the handle until all tasks exit:
+
+```rust,ignore
+use tracing_subscriber::Layer as _;
+
+let eyes_token = load_eyes_token().await?;
+let stdout = tracing_subscriber::fmt::layer()
+    .json()
+    .with_writer(std::io::stdout)
+    .with_filter(tracing_subscriber::EnvFilter::new("info"));
+let telemetry = cja::setup::TracingConfig::new("my-app")
+    .stdout_layer(stdout)
+    .eyes_ids(org_id, app_id)
+    .eyes_token(eyes_token)
+    .init()?;
+let result = run_app().await;
+telemetry.shutdown().await?;
+result
+```
+
+The local stdout filter changes only stdout. It must admit operational INFO
+lines consumed by platform metrics; a WARN-only filter is useful for test
+isolation but would hide those lines in production. Explicit Eyes IDs and token
+override their corresponding env values; omitted options keep env behavior.
+`POSTHOG_PROJECT_TOKEN` is the only PostHog runtime gate. Do not put a PostHog
+personal key in an app runtime.
+
 Call `shutdown().await?` on the returned `TelemetryShutdownHandle` to flush Eyes and PostHog, on the error path too. `let _handle = setup_tracing(..)?` suppresses the `must_use` warning but loses buffered telemetry on exit. Each flush is bounded: the call returns within 3 seconds even when a sink is stalled, always returns `Ok`, and logs failures. It runs after the supervisor's drain and grace, so count it against the platform's kill window. The default total is 1s drain + 0.5s grace + up to 3s flush = 4.5s. For Cloud Run, `CJA_SHUTDOWN_JOB_DRAIN_SECS=4` and `CJA_SHUTDOWN_EXIT_GRACE_SECS=2` give 9s total. Set `POSTHOG_PROJECT_TOKEN` in the process environment before tracing setup. `POSTHOG_HOST` defaults to `https://us.i.posthog.com`, `POSTHOG_LOG_LEVEL` to `info`, and `POSTHOG_TRACES_SAMPLE_RATIO` to `1.0`. Both signals honor scoped `RUST_LOG` and the rig content cap.
 
 PostHog's OTLP copy redacts query values for `code`, `state`, `token`, `access_token`, `id_token`, `refresh_token`, `code_verifier`, `password`, `secret`, `client_secret`, `key`, `api_key`, `apikey`, `signature`, `sig`, and `otp`, plus keys containing `token`, `secret`, `password`, `passwd`, or `signature` (case insensitive). It keeps query keys and other values in `uri`, `url.query`, and `http.request.header.referer`, and drops the whole query if parsing fails. It drops recorded `authorization`, `proxy_authorization`, `cookie`, and `set_cookie` headers, the unstructured `self` Debug field on `jobs.enqueue`, and `value` on `jobs.run_from_value` and on log records inside a job. The worker's deserialize-failure detail remains in Eyes and `dead_letter_jobs`; PostHog receives only the top-level error. Other request headers, paths, and routes remain. Eyes receives raw telemetry. App-owned span fields are outside this policy: use `#[instrument(skip(self))]` on `Job::run` so its payload is not exported. Explicit product-event capture and the boot manifest use app-chosen payloads and do not use this filter. Returned PostHog construction errors skip that sink; a dependency panic aborts the process in a `panic = "abort"` profile.

@@ -51,8 +51,25 @@ fn wait_for_release() {
 /// under one second, and the final flush must fit [`SHUTDOWN_BOUND`]; the
 /// flush duration is handed to `after_shutdown` for scenario-specific checks.
 pub fn child(phases: &[&dyn Fn()], after_shutdown: impl FnOnce(Duration)) {
+    child_with_setup(
+        || cja::setup::setup_tracing("fixture").unwrap(),
+        phases,
+        |handle| async move { handle.shutdown().await.unwrap() },
+        after_shutdown,
+    );
+}
+
+/// Runs the shared boot and flush protocol with an app-owned setup path.
+pub fn child_with_setup<H, F>(
+    setup: impl FnOnce() -> H,
+    phases: &[&dyn Fn()],
+    shutdown: impl FnOnce(H) -> F,
+    after_shutdown: impl FnOnce(Duration),
+) where
+    F: Future<Output = ()>,
+{
     runtime().block_on(async {
-        let handle = cja::setup::setup_tracing("fixture").unwrap();
+        let handle = setup();
         println!("{BOOTED}");
         for phase in phases {
             let start = Instant::now();
@@ -64,7 +81,7 @@ pub fn child(phases: &[&dyn Fn()], after_shutdown: impl FnOnce(Duration)) {
             wait_for_release();
         }
         let start = Instant::now();
-        handle.shutdown().await.unwrap();
+        shutdown(handle).await;
         let elapsed = start.elapsed();
         assert!(
             elapsed < SHUTDOWN_BOUND,
@@ -115,6 +132,21 @@ pub fn spawn(test: &str, envs: &[(&str, &str)]) -> Running {
         .env(CHILD, "1")
         .env("RUST_LOG", "info")
         .env_remove("JSON_LOGS")
+        .env_remove("EYES_ORG_ID")
+        .env_remove("EYES_APP_ID")
+        .env_remove("EYES_TOKEN")
+        .env_remove("EYES_URL")
+        .env_remove("EYES_TRANSPORT")
+        .env_remove("EYES_EMIT_ENTER_EXIT")
+        .env_remove("EYES_QUEUE_CAPACITY")
+        .env_remove("POSTHOG_PROJECT_TOKEN")
+        .env_remove("POSTHOG_HOST")
+        .env_remove("POSTHOG_LOG_LEVEL")
+        .env_remove("POSTHOG_TRACES_SAMPLE_RATIO")
+        .env_remove("OTEL_EXPORTER_OTLP_HEADERS")
+        .env_remove("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+        .env_remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+        .env_remove("OTEL_EXPORTER_OTLP_COMPRESSION")
         .envs(envs.iter().copied())
         .spawn()
         .unwrap();

@@ -8,6 +8,33 @@
 //! telemetry.shutdown().await?;
 //! ```
 //!
+//! Apps with platform-specific stdout can supply that layer and runtime Eyes
+//! credentials through the same setup path. Resolve the secret before `init`:
+//!
+//! ```rust,ignore
+//! use cja::setup::TracingConfig;
+//! use tracing_subscriber::Layer as _;
+//!
+//! let eyes_token = load_eyes_token().await?;
+//! let stdout = tracing_subscriber::fmt::layer()
+//!     .json()
+//!     .with_writer(std::io::stdout)
+//!     .with_filter(tracing_subscriber::EnvFilter::new("info"));
+//! let telemetry = TracingConfig::new("my-app")
+//!     .stdout_layer(stdout)
+//!     .eyes_ids(org_id, app_id)
+//!     .eyes_token(eyes_token)
+//!     .init()?;
+//! let result = run_app().await;
+//! telemetry.shutdown().await?;
+//! result
+//! ```
+//!
+//! The stdout filter affects only stdout; keep operational lines needed by
+//! platform metrics. Explicit Eyes IDs and token override their env values
+//! independently. `POSTHOG_PROJECT_TOKEN` is the sole `PostHog` runtime gate;
+//! an app needs no `PostHog` personal key.
+//!
 //! # Supported Backends
 //!
 //! - **Console**: Tree-formatted logs (default) or JSON with `JSON_LOGS` env var
@@ -177,12 +204,19 @@ pub fn setup_tracing(crate_name: &str) -> color_eyre::Result<TelemetryShutdownHa
     TracingConfig::new(crate_name).init()
 }
 
-/// Tracing setup with an optional boot-stable Eyes process identity.
-/// Use the same identity in the boot manifest and heartbeat configuration.
+/// Configures the complete stdout, Eyes, `PostHog` OTLP, and product-capture stack.
+/// A caller-supplied stdout layer replaces only the default stdout formatter;
+/// its local filter does not affect the other sinks. Explicit Eyes IDs and token
+/// override their respective environment variables. Resolve runtime secrets
+/// before calling [`init`](Self::init).
+/// Use the same process identity in the boot manifest and heartbeat configuration.
 pub struct TracingConfig<'a> {
     crate_name: &'a str,
     service_version: Option<String>,
     process: Option<eyes_subscriber::ProcessIdentity>,
+    stdout_layer: Option<Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync + 'static>>,
+    eyes_ids: Option<(Uuid, Uuid)>,
+    eyes_token: Option<String>,
 }
 
 impl<'a> TracingConfig<'a> {
@@ -192,6 +226,9 @@ impl<'a> TracingConfig<'a> {
             crate_name,
             process: None,
             service_version: None,
+            stdout_layer: None,
+            eyes_ids: None,
+            eyes_token: None,
         }
     }
 
@@ -207,11 +244,49 @@ impl<'a> TracingConfig<'a> {
         self
     }
 
+    /// Replaces the default JSON or hierarchical stdout layer. Attach any
+    /// stdout-only filter to this layer before passing it here; keep platform
+    /// operational log lines enabled. `JSON_LOGS` is ignored for this layer.
+    #[must_use]
+    pub fn stdout_layer(
+        mut self,
+        layer: impl tracing_subscriber::Layer<Registry> + Send + Sync + 'static,
+    ) -> Self {
+        self.stdout_layer = Some(Box::new(layer));
+        self
+    }
+
+    /// Overrides both Eyes ID environment variables as one pair.
+    #[must_use]
+    pub fn eyes_ids(mut self, org_id: Uuid, app_id: Uuid) -> Self {
+        self.eyes_ids = Some((org_id, app_id));
+        self
+    }
+
+    /// Overrides `EYES_TOKEN`. Pass the token before [`init`](Self::init);
+    /// neither the token nor an invalid value is included in setup errors.
+    #[must_use]
+    pub fn eyes_token(mut self, token: impl Into<String>) -> Self {
+        self.eyes_token = Some(token.into());
+        self
+    }
+
     pub fn init(self) -> color_eyre::Result<TelemetryShutdownHandle> {
+        let Self {
+            crate_name,
+            service_version,
+            process,
+            stdout_layer,
+            eyes_ids,
+            eyes_token,
+        } = self;
         initialize_tracing(
-            self.crate_name,
-            self.process.as_ref(),
-            self.service_version.as_deref(),
+            crate_name,
+            process.as_ref(),
+            service_version.as_deref(),
+            stdout_layer,
+            eyes_ids,
+            eyes_token.as_deref(),
         )
     }
 }
@@ -220,6 +295,9 @@ fn initialize_tracing(
     crate_name: &str,
     process: Option<&eyes_subscriber::ProcessIdentity>,
     version: Option<&str>,
+    stdout_layer: Option<Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync + 'static>>,
+    eyes_ids: Option<(Uuid, Uuid)>,
+    eyes_token: Option<&str>,
 ) -> color_eyre::Result<TelemetryShutdownHandle> {
     let rust_log = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| format!("info,{crate_name}=trace,tower_http=debug,serenity=error"));
@@ -227,29 +305,13 @@ fn initialize_tracing(
     let (env_filter, rig_cap) = filter_stack(&rust_log)?;
 
     // Setup Eyes layer if configured
-    let (eyes_layer, eyes_shutdown_handle) = setup_eyes_layer(process)?;
+    let (eyes_layer, eyes_shutdown_handle) = setup_eyes_layer(process, eyes_ids, eyes_token)?;
 
-    let stdout_layer = if std::env::var("JSON_LOGS").is_ok() {
-        println!("Logging to STDOUT as JSON");
-
-        tracing_subscriber::fmt::layer()
-            .json()
-            .with_current_span(true)
-            .boxed()
+    let stdout_layer = if let Some(layer) = stdout_layer {
+        println!("Logging to STDOUT with app-supplied layer");
+        layer
     } else {
-        let hierarchical = HierarchicalLayer::default()
-            .with_writer(std::io::stdout)
-            .with_indent_lines(true)
-            .with_indent_amount(2)
-            .with_thread_names(true)
-            .with_thread_ids(true)
-            .with_verbose_exit(true)
-            .with_verbose_entry(true)
-            .with_targets(true);
-
-        println!("Logging to STDOUT as hierarchical");
-
-        hierarchical.boxed()
+        default_stdout_layer()
     };
 
     let (sink, posthog, capture_config) = setup_posthog(crate_name, process, version)?;
@@ -297,6 +359,31 @@ fn initialize_tracing(
         posthog,
         capture,
     })
+}
+
+fn default_stdout_layer() -> Box<dyn tracing_subscriber::Layer<Registry> + Send + Sync + 'static> {
+    if std::env::var("JSON_LOGS").is_ok() {
+        println!("Logging to STDOUT as JSON");
+
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .boxed()
+    } else {
+        let hierarchical = HierarchicalLayer::default()
+            .with_writer(std::io::stdout)
+            .with_indent_lines(true)
+            .with_indent_amount(2)
+            .with_thread_names(true)
+            .with_thread_ids(true)
+            .with_verbose_exit(true)
+            .with_verbose_entry(true)
+            .with_targets(true);
+
+        println!("Logging to STDOUT as hierarchical");
+
+        hierarchical.boxed()
+    }
 }
 
 fn setup_posthog(
@@ -407,9 +494,23 @@ fn rig_content_cap() -> Targets {
 /// Sets up the Eyes tracing layer if `EYES_ORG_ID` and `EYES_APP_ID` are configured.
 fn setup_eyes_layer(
     process: Option<&eyes_subscriber::ProcessIdentity>,
+    eyes_ids: Option<(Uuid, Uuid)>,
+    eyes_token: Option<&str>,
 ) -> color_eyre::Result<(Option<EyesLayer>, Option<EyesShutdownHandle>)> {
-    let org_id = std::env::var("EYES_ORG_ID").ok();
-    let app_id = std::env::var("EYES_APP_ID").ok();
+    if eyes_token.is_some_and(|token| {
+        token.trim().is_empty() || http::HeaderValue::from_str(&format!("Bearer {token}")).is_err()
+    }) {
+        return Err(color_eyre::eyre::eyre!("invalid Eyes token"));
+    }
+
+    let (org_id, app_id) = if let Some((org_id, app_id)) = eyes_ids {
+        (Some(org_id.to_string()), Some(app_id.to_string()))
+    } else {
+        (
+            std::env::var("EYES_ORG_ID").ok(),
+            std::env::var("EYES_APP_ID").ok(),
+        )
+    };
 
     match (org_id, app_id) {
         (Some(org_id_str), Some(app_id_str)) => {
@@ -423,6 +524,9 @@ fn setup_eyes_layer(
                     .wrap_err("Failed to build Eyes subscriber")?;
             if let Some(process) = process {
                 builder = builder.with_process_instance_id(process.instance_id());
+            }
+            if let Some(token) = eyes_token {
+                builder = builder.with_auth_token(token);
             }
             let (layer, shutdown_handle) = builder.build_with_transport(transport);
 
