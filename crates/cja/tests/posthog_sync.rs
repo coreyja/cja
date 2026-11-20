@@ -114,7 +114,11 @@ fn trend(event: &str, display: Option<&str>, seconds: u64) -> Value {
         } else {
             format!("-{seconds}s")
         };
-        source["dateRange"] = json!({"date_from":range,"explicitDate":true});
+        source["dateRange"] = if display == "ActionsLineGraph" {
+            json!({"date_from":range})
+        } else {
+            json!({"date_from":range,"explicitDate":true})
+        };
         source["trendsFilter"] = json!({"display":display});
     }
     json!({"kind":"InsightVizNode","source":source})
@@ -139,7 +143,11 @@ fn assert_presentation(row: &Value, display: &str, date_from: &str) {
     assert_eq!(row["query"]["source"]["trendsFilter"]["display"], display);
     assert_eq!(
         row["query"]["source"]["dateRange"],
-        json!({"date_from":date_from,"explicitDate":true})
+        if display == "ActionsLineGraph" {
+            json!({"date_from":date_from})
+        } else {
+            json!({"date_from":date_from,"explicitDate":true})
+        }
     );
 }
 /// Create one row the way `PostHog` does, including its server defaults.
@@ -810,6 +818,15 @@ async fn invalid_windows_fail_before_any_api_request() {
     for seconds in [0, 59, 31_622_401] {
         let mock = Mock::start().await;
         let d = one_metric(Some(Item::stat("views")), Some(seconds));
+        assert!(matches!(
+            mock.sync("demo", &d).await,
+            Err(SyncError::Invalid(_))
+        ));
+        assert_eq!(mock.log(), Vec::new());
+    }
+    for seconds in [0, 31_622_401] {
+        let mock = Mock::start().await;
+        let d = one_metric(None, Some(seconds));
         assert!(matches!(
             mock.sync("demo", &d).await,
             Err(SyncError::Invalid(_))

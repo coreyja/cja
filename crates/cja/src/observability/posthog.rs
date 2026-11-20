@@ -324,28 +324,16 @@ fn resolve_presentation<'a>(
     item: &'a Item,
     dash: &Dashboard,
 ) -> Option<(&'a str, &'static str, u64)> {
-    let (metric, display, window) = match item {
-        Item::Stat {
-            metric_id,
-            window_seconds,
-            ..
-        } => (metric_id, "BoldNumber", window_seconds),
-        Item::Table {
-            metric_id,
-            window_seconds,
-            ..
-        } => (metric_id, "ActionsTable", window_seconds),
-        Item::TimeSeries {
-            metric_id,
-            window_seconds,
-            ..
-        } => (metric_id, "ActionsLineGraph", window_seconds),
+    let (metric, display) = match item {
+        Item::Stat { metric_id, .. } => (metric_id, "BoldNumber"),
+        Item::Table { metric_id, .. } => (metric_id, "ActionsTable"),
+        Item::TimeSeries { metric_id, .. } => (metric_id, "ActionsLineGraph"),
         Item::HealthSummary { .. } | Item::Links { .. } => return None,
     };
     Some((
         metric,
         display,
-        window
+        item.declared_window_seconds()
             .or(dash.default_range_seconds)
             .unwrap_or(DEFAULT_RANGE_SECONDS),
     ))
@@ -400,7 +388,11 @@ fn query(p: &ProductEventMetric, app: &str, presentation: Option<(&str, u64)>) -
         source["breakdownFilter"] = json!({"breakdowns":[{"property":prop,"type":"event"}]});
     }
     if let Some((display, seconds)) = presentation {
-        source["dateRange"] = json!({"date_from":date_from(seconds),"explicitDate":true});
+        source["dateRange"] = if display == "ActionsLineGraph" {
+            json!({"date_from":date_from(seconds)})
+        } else {
+            json!({"date_from":date_from(seconds),"explicitDate":true})
+        };
         source["trendsFilter"] = json!({"display":display});
     }
     json!({"kind":"InsightVizNode","source":source})
@@ -782,13 +774,7 @@ fn preflight<'a>(
             let Some((metric_id, display, seconds)) = resolve_presentation(item, dash) else {
                 continue;
             };
-            let item_window = match item {
-                Item::Stat { window_seconds, .. }
-                | Item::Table { window_seconds, .. }
-                | Item::TimeSeries { window_seconds, .. } => *window_seconds,
-                Item::HealthSummary { .. } | Item::Links { .. } => None,
-            };
-            if let Some(window) = item_window
+            if let Some(window) = item.declared_window_seconds()
                 && !(1..=MAX_RANGE_SECONDS).contains(&window)
             {
                 return Err(SyncError::Invalid(format!(
@@ -1112,10 +1098,15 @@ mod mapping_tests {
         actual["query"]["source"]["dateRange"]["explicitDate"] = json!(false);
         assert!(insight_absences_match(&wanted, &actual));
         actual["query"]["source"]["trendsFilter"] = json!({"display":"BoldNumber"});
+        assert!(!insight_absences_match(&wanted, &actual));
         actual["query"]["source"]["dateRange"]["explicitDate"] = json!(true);
         assert!(!insight_absences_match(&wanted, &actual));
         actual["query"]["source"]["trendsFilter"] = json!({});
         assert!(!insight_absences_match(&wanted, &actual));
+        let line = json!({"query":{"source":{"dateRange":{"date_from":"-30d"},"trendsFilter":{"display":"ActionsLineGraph"}}}});
+        let mut stored_line = line.clone();
+        stored_line["query"]["source"]["dateRange"]["explicitDate"] = json!(true);
+        assert!(!insight_absences_match(&line, &stored_line));
     }
     #[test]
     fn product_trend_wire_contract() {
@@ -1158,6 +1149,12 @@ mod mapping_tests {
             query(&spec, "demo", None)["source"]["breakdownFilter"]
         );
         assert_eq!(presented["source"]["interval"], "hour");
+        let line = query(&spec, "demo", Some(("ActionsLineGraph", 604_800)));
+        assert_eq!(line["source"]["dateRange"], json!({"date_from":"-7d"}));
+        assert_eq!(
+            line["source"]["trendsFilter"],
+            json!({"display":"ActionsLineGraph"})
+        );
         let count = ProductMetricBuilder::count("sessions", "opened")
             .build()
             .unwrap();
