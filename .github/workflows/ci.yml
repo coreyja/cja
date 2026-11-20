@@ -16,6 +16,57 @@ jobs:
     with:
       rust-version: stable
 
+  check-cja-no-postgres:
+    name: Check cja without Postgres
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      SQLX_OFFLINE: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Rust toolchain
+        run: |
+          ver="$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          echo "Resolved toolchain: $ver"
+          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+
+      - name: Verify dependency graphs
+        run: |
+          set -euo pipefail
+          no_postgres_tree="$(cargo tree --locked -p cja --no-default-features -e normal)"
+          if grep -qi sqlx <<< "$no_postgres_tree"; then
+            echo "SQLx found in no-default cja graph"
+            exit 1
+          fi
+          echo "No SQLx in no-default cja graph"
+          postgres_tree="$(cargo tree --locked -p cja --no-default-features --features postgres -e normal)"
+          if ! grep -qi sqlx <<< "$postgres_tree"; then
+            echo "SQLx missing from postgres cja graph"
+            exit 1
+          fi
+          echo "SQLx present in postgres cja graph"
+
+      - name: Lint no-Postgres cja
+        run: cargo clippy --locked -p cja --no-default-features --lib --test no_postgres -- -D warnings
+
+      - name: Test stateless route
+        run: |
+          set -euo pipefail
+          cargo test --locked -p cja --no-default-features --test no_postgres -- --exact stateless_app_serves_health_route 2>&1 | tee /tmp/no-postgres-test.log
+          grep -F 'test result: ok. 1 passed; 0 failed;' /tmp/no-postgres-test.log
+
+      - name: Check independent consumers
+        run: |
+          cargo check --locked -p cja-passport --lib
+          cargo check --locked -p cja-secret --lib
+
   # cja-llm's self dev-dependency turns on `testing`, so every `--all-targets`
   # build compiles the library WITH that feature. This lane checks the
   # library the way a real app consumes it — lib only, `durable` without

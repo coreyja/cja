@@ -110,14 +110,14 @@ Cargo build. No asset is read from disk at runtime.
 
 ## Overview
 
-CJA provides three integrated subsystems:
+CJA provides an HTTP server and, by default, two PostgreSQL-backed subsystems:
 
 - **Jobs** — PostgreSQL-backed background job queue with automatic retries,
   exponential backoff, dead letter queue, and graceful shutdown
 - **Cron** — Scheduled task execution with both interval-based and cron expression
   scheduling, timezone support
-- **Server** — HTTP server on Axum with encrypted cookie management, database-backed
-  sessions, and zero-downtime reload via systemfd
+- **Server** — HTTP server on Axum with encrypted cookie management and
+  zero-downtime reload via systemfd; database-backed sessions require `postgres`
 
 All three share a single `AppState` and coordinate shutdown via `CancellationToken`.
 
@@ -150,9 +150,24 @@ impl AppState for MyApp {
 
 `AppState` is cloned per request — wrap expensive resources in `Arc`.
 
+For a server without PostgreSQL, use `cja = { version = "...", default-features = false }`.
+The `AppState` implementation needs no pool:
+
+```rust
+use cja::{app_state::AppState, server::cookies::CookieKey};
+
+#[derive(Clone)]
+struct StatelessState { cookie_key: CookieKey }
+
+impl AppState for StatelessState {
+    fn version(&self) -> &str { "1.0.0" }
+    fn cookie_key(&self) -> &CookieKey { &self.cookie_key }
+}
+```
+
 ### 2. Set Up the Database
 
-CJA requires PostgreSQL. Set `DATABASE_URL` and run migrations on startup:
+With the default `postgres` feature, set `DATABASE_URL` and run migrations on startup:
 
 ```rust
 let pool = sqlx::postgres::PgPoolOptions::new()
@@ -222,7 +237,7 @@ See `crates/cja.app/` in the repository for a complete working example.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DATABASE_URL` | Yes | — | PostgreSQL connection string |
+| `DATABASE_URL` | With `postgres` | — | PostgreSQL connection string |
 | `PORT` | No | `3000` | HTTP server port |
 | `COOKIE_KEY` | No | Ephemeral, generated at boot | Base64-encoded cookie encryption key, at least 32 bytes decoded. Unset or blank generates a new key on each boot, in release builds too, and logs a warning. Set it if sessions need to survive restarts and deploys. |
 | `SERVER_DISABLED` | No | `false` | Set to `"true"` to skip starting the HTTP server |
@@ -244,15 +259,16 @@ See `crates/cja.app/` in the repository for a complete working example.
 
 ```toml
 [features]
-default = ["cron", "jobs"]
+default = ["postgres", "cron", "jobs"]
+postgres = ["dep:sqlx", "dep:jiff-sqlx"]
 cron = ["jobs"]           # cron depends on jobs
-jobs = []
+jobs = ["postgres"]       # jobs depends on postgres
 testing = []              # enables testing::mock_oauth
 ```
 
-Disabling `jobs` at compile time also disables `cron`.
-The destructive `testing::test_db` helper is always exported so integration
-test harnesses also compile without default features.
+`cron` implies `jobs`, which implies `postgres`. The `postgres` feature exposes
+`db`, `server::session`, and `testing::test_db`; `testing` independently enables
+`testing::mock_oauth`.
 
 ## Job System
 
@@ -557,13 +573,13 @@ PostHog's OTLP copy redacts query values for `code`, `state`, `token`, `access_t
 CJA re-exports key dependencies:
 
 ```rust
-use cja::sqlx;
 use cja::uuid;
 use cja::color_eyre;
 use cja::maud;
 use cja::jiff;
-use cja::jiff_sqlx;
 ```
+
+With `postgres`, `cja::sqlx` and `cja::jiff_sqlx` are also re-exported.
 
 # PostHog boot manifests
 

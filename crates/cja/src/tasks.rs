@@ -87,7 +87,8 @@ pub async fn wait_for_first_error(tasks: Vec<NamedTask>) -> crate::Result<()> {
 pub struct ShutdownBudget {
     /// How long an in-flight job may keep running after shutdown starts
     /// before it is dropped and its lock released. Hand this to
-    /// [`crate::jobs::worker::job_worker`] via [`crate::jobs::JobWorkerConfig::shutdown_drain_timeout`].
+    /// `jobs::worker::job_worker` via `jobs::JobWorkerConfig::shutdown_drain_timeout`
+    /// when the `jobs` feature is enabled.
     pub job_drain: Duration,
     /// Extra time for every task to exit once the job drain is over: workers
     /// release their locks, the HTTP server closes connections.
