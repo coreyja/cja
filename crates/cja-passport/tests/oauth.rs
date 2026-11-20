@@ -327,6 +327,16 @@ async fn access_lifetime_response_respects_shorter_grant_lifetime() {
     f.close().await;
 }
 
+#[tokio::test]
+async fn subsecond_access_lifetime_does_not_advertise_a_full_second() {
+    let mut options = cja_passport::OAuthOptions::default();
+    options.timings.access_ttl = std::time::Duration::from_millis(500);
+    let f = Fixture::new_with_oauth_options(options).await;
+    let (_, tokens) = authorized_tokens(&f).await;
+    assert_eq!(tokens["expires_in"], 0);
+    f.close().await;
+}
+
 async fn refresh_form(f: &Fixture, client: &str, raw: &str) -> axum::response::Response {
     f.form(
         "/oauth/token",

@@ -650,7 +650,17 @@ async fn issue_tokens(
         .execute(&mut **tx)
         .await?;
     }
-    let seconds = access_ttl.as_secs().max(1);
+    let grant_remaining: i64 = sqlx::query_scalar(
+        "SELECT GREATEST(0, FLOOR(EXTRACT(EPOCH FROM expires_at - clock_timestamp())))::bigint FROM passport_oauth_grants WHERE id=$1",
+    )
+    .bind(grant_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    // Report only whole seconds that both the access TTL and grant can cover.
+    // A subsecond token must not claim a full second of validity.
+    let seconds = access_ttl
+        .as_secs()
+        .min(u64::try_from(grant_remaining).unwrap_or_default());
     Ok(
         serde_json::json!({"access_token":access,"token_type":"Bearer","expires_in":seconds,
         "refresh_token":refresh,"scope":scopes.join(" ")}),
