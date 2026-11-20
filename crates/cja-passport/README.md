@@ -133,6 +133,12 @@ slide to 180 days. A connector refresh checks the upstream device/user status;
 transient passport outages are tolerated for at most eight hours since the
 last successful check.
 
+The authorization request must include the exact configured `/mcp` resource.
+To preserve mull-site's current token behavior for Claude connectors, the token
+endpoint accepts an omitted `resource` parameter on code exchange and refresh;
+when supplied, it must match that resource exactly. The stored grant is always
+checked against the configured resource.
+
 The MCP security specification's confused-deputy guidance requires consent
 because the app uses one upstream client but accepts dynamically registered
 clients. Corey sees one **Allow** click per new connector and user after the

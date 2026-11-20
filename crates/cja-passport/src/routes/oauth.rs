@@ -667,16 +667,20 @@ async fn issue_tokens(
     )
 }
 async fn exchange<S: AppState + HasMcpOAuthConfig>(state: &S, form: &TokenForm) -> Response {
-    let (Some(code), Some(client_id), Some(uri), Some(verifier), Some(resource)) = (
+    let (Some(code), Some(client_id), Some(uri), Some(verifier)) = (
         &form.code,
         &form.client_id,
         &form.redirect_uri,
         &form.code_verifier,
-        &form.resource,
     ) else {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    if !valid_verifier(verifier) || resource != state.mcp_oauth_config().mcp_resource_url().as_str()
+    let expected_resource = state.mcp_oauth_config().mcp_resource_url().as_str();
+    if !valid_verifier(verifier)
+        || form
+            .resource
+            .as_deref()
+            .is_some_and(|resource| resource != expected_resource)
     {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
@@ -706,7 +710,7 @@ async fn exchange<S: AppState + HasMcpOAuthConfig>(state: &S, form: &TokenForm) 
                 .options()
                 .allowed_redirect_uris
                 .contains(uri)
-            && stored_resource == *resource
+            && stored_resource == expected_resource
             && stored_client == *client_id
             && row.try_get::<bool, _>("grant_live")?;
         Ok((
@@ -798,12 +802,15 @@ async fn refresh<S: AppState + HasPassportConfig + HasMcpOAuthConfig>(
     state: &S,
     form: &TokenForm,
 ) -> Response {
-    let (Some(raw), Some(client_id), Some(resource)) =
-        (&form.refresh_token, &form.client_id, &form.resource)
-    else {
+    let (Some(raw), Some(client_id)) = (&form.refresh_token, &form.client_id) else {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    if resource != state.mcp_oauth_config().mcp_resource_url().as_str() {
+    let expected_resource = state.mcp_oauth_config().mcp_resource_url().as_str();
+    if form
+        .resource
+        .as_deref()
+        .is_some_and(|resource| resource != expected_resource)
+    {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
     let request_started: jiff_sqlx::Timestamp = match sqlx::query_scalar("SELECT clock_timestamp()")
@@ -859,7 +866,7 @@ async fn refresh<S: AppState + HasPassportConfig + HasMcpOAuthConfig>(
         Ok(v) => v,
         Err(e) => return db_error(e),
     };
-    if !data.live || data.client_id != *client_id || data.resource != *resource {
+    if !data.live || data.client_id != *client_id || data.resource != expected_resource {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
     let allowed = AllowedSubject::new(&data.subject).is_ok_and(|subject| {

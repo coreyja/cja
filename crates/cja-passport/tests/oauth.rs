@@ -229,6 +229,80 @@ async fn authorize_consent_and_exchange() {
 }
 
 #[tokio::test]
+async fn token_grants_allow_omitted_resource_but_reject_mismatch() {
+    let f = Fixture::new().await;
+    let client = register(&f, "Claude").await;
+    let (cookie, pending, csrf, _) = first_consent(&f, &client).await;
+    let code = approve(&f, &cookie, &pending, &csrf).await;
+
+    let exchange = f
+        .form(
+            "/oauth/token",
+            None,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client),
+                ("redirect_uri", CALLBACK),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await;
+    assert_eq!(exchange.status(), StatusCode::OK);
+    let first: Value = serde_json::from_str(&body(exchange).await).unwrap();
+
+    let upstream = f
+        .server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/token")
+                .form_urlencoded_tuple("grant_type", "refresh_token");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "access_token":"0123456789abcdef0123456789abcdef",
+                    "token_type":"Bearer",
+                    "expires_in":300,
+                    "refresh_token":"upstream-2"
+                }));
+        })
+        .await;
+    let old_refresh = first["refresh_token"].as_str().unwrap();
+    let mismatch = f
+        .form(
+            "/oauth/token",
+            None,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", old_refresh),
+                ("client_id", &client),
+                ("resource", "https://app.example.test/other"),
+            ],
+        )
+        .await;
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    assert!(body(mismatch).await.contains("invalid_grant"));
+    assert_eq!(upstream.calls_async().await, 0);
+
+    let refresh = f
+        .form(
+            "/oauth/token",
+            None,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", old_refresh),
+                ("client_id", &client),
+            ],
+        )
+        .await;
+    assert_eq!(refresh.status(), StatusCode::OK);
+    let second: Value = serde_json::from_str(&body(refresh).await).unwrap();
+    assert_ne!(first["refresh_token"], second["refresh_token"]);
+    assert_eq!(upstream.calls_async().await, 1);
+    f.close().await;
+}
+
+#[tokio::test]
 async fn dcr_allowlist_and_deny_are_enforced() {
     let f = Fixture::new().await;
     for metadata in [
