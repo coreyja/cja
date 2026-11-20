@@ -161,7 +161,7 @@ mod sql_tests {
     }
 
     #[test]
-    fn covered_empty_sum_is_zero_but_missing_coverage_is_null() {
+    fn covered_empty_sum_is_null() {
         let metric = TelemetryMetricBuilder::new(
             "suppressed",
             EyesAggregate::Sum,
@@ -177,9 +177,25 @@ mod sql_tests {
             sql.contains("if((SELECT count() FROM (SELECT 1 FROM logs"),
             "{sql}"
         );
-        assert!(sql.contains("sum(_metric_value), NULL) AS value"), "{sql}");
         assert!(
-            !sql.contains("if(count(_metric_value) = 0, NULL, sum"),
+            sql.contains("if(count(_metric_value) = 0, NULL, sum(_metric_value))"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn covered_empty_product_sum_is_null() {
+        let metric = ProductMetricBuilder::sum("sales", "purchased", "amount")
+            .build()
+            .unwrap();
+        let MetricQuery::ProductEvent(product) = &metric.query else {
+            panic!("expected product metric")
+        };
+        let sql = product_plan(product, "arena", SqlWindow::trailing(3600))
+            .unwrap()
+            .sql;
+        assert!(
+            sql.contains("if(count(_metric_value) = 0, NULL, sum(_metric_value))"),
             "{sql}"
         );
     }
@@ -198,12 +214,13 @@ mod sql_tests {
         let sql = telemetry_sql(telemetry(&metric), "arena", SqlWindow::trailing(604_800)).unwrap();
         assert!(sql.contains("attributes['o''key'] = 'it''s ok'"), "{sql}");
         assert!(
-            sql.contains("toDateTime64('1970-01-05 00:00:00', 6)"),
+            sql.contains("toDateTime64('1970-01-05 00:00:00', 6, 'UTC')"),
             "{sql}"
         );
         assert!(sql.contains("AS bucket"));
         assert!(sql.contains("AS _dim_0"));
-        assert!(sql.contains("GROUP BY bucket, _dim_0 ORDER BY bucket, _dim_0 LIMIT 50000"));
+        assert!(sql.contains("ORDER BY bucket DESC LIMIT 50000"));
+        assert!(sql.ends_with("ORDER BY bucket, _dim_0 LIMIT 50000"));
         assert_eq!(
             sql.matches("timestamp <= now() - INTERVAL 604800 SECOND")
                 .count(),
@@ -223,7 +240,10 @@ mod sql_tests {
             .unwrap()
             .build()
             .unwrap();
-        let denominator = ProductMetricBuilder::count("monthly", "game_played")
+        let denominator = TelemetryMetricBuilder::new("monthly", EyesAggregate::Count, None)
+            .unwrap()
+            .filter_eq("fields.event_type", "game_started")
+            .unwrap()
             .build()
             .unwrap();
         let ratio = RatioMetricBuilder::new("share", "daily", "monthly")
@@ -246,16 +266,116 @@ mod sql_tests {
                 "SELECT if(isNull(_num_value) OR isNull(_den_value) OR _den_value = 0, NULL, _num_value / _den_value * 100) AS value ",
                 "FROM (SELECT value AS _num_value FROM (SELECT if((SELECT count() FROM (SELECT 1 FROM logs WHERE service_name = 'arena' AND timestamp <= now() - INTERVAL 86400 SECOND LIMIT 1)) > 0, ",
                 "count(), NULL) AS value FROM (SELECT NULL AS _metric_value FROM logs WHERE service_name = 'arena' AND timestamp >= now() - INTERVAL 86400 SECOND AND attributes['event_type'] = 'game_completed') AS _source LIMIT 1) LIMIT 1) AS _num ",
-                "CROSS JOIN (SELECT value AS _den_value FROM (SELECT if((SELECT count() FROM (SELECT 1 FROM events WHERE properties['service.name'] = 'arena' AND timestamp <= now() - INTERVAL 2419200 SECOND LIMIT 1)) > 0, ",
-                "count(), NULL) AS value FROM (SELECT NULL AS _metric_value FROM events WHERE properties['service.name'] = 'arena' AND timestamp >= now() - INTERVAL 2419200 SECOND AND event = 'game_played') AS _source LIMIT 1) LIMIT 1) AS _den LIMIT 1"
+                "CROSS JOIN (SELECT value AS _den_value FROM (SELECT if((SELECT count() FROM (SELECT 1 FROM logs WHERE service_name = 'arena' AND timestamp <= now() - INTERVAL 2419200 SECOND LIMIT 1)) > 0, ",
+                "count(), NULL) AS value FROM (SELECT NULL AS _metric_value FROM logs WHERE service_name = 'arena' AND timestamp >= now() - INTERVAL 2419200 SECOND AND attributes['event_type'] = 'game_started') AS _source LIMIT 1) LIMIT 1) AS _den LIMIT 1"
             )
         );
         assert!(sql.contains("FROM logs"));
-        assert!(sql.contains("FROM events"));
+        assert!(!sql.contains("FROM events"));
         assert!(sql.contains("timestamp <= now() - INTERVAL 86400 SECOND"));
         assert!(sql.contains("timestamp <= now() - INTERVAL 2419200 SECOND"));
         assert!(sql.contains("isNull(_num_value) OR isNull(_den_value) OR _den_value = 0"));
         assert!(sql.contains("_num_value / _den_value * 100"));
+    }
+
+    #[test]
+    fn mixed_cluster_ratio_is_rejected_before_sql_generation() {
+        let numerator = TelemetryMetricBuilder::new("completed", EyesAggregate::Count, None)
+            .unwrap()
+            .filter_eq("fields.event_type", "game_completed")
+            .unwrap()
+            .build()
+            .unwrap();
+        let denominator = ProductMetricBuilder::count("played", "game_played")
+            .build()
+            .unwrap();
+        let ratio = RatioMetricBuilder::new("share", "completed", "played")
+            .build()
+            .unwrap();
+        let MetricQuery::Ratio(spec) = &ratio.query else {
+            panic!("expected ratio")
+        };
+        let declarations = Declarations::new()
+            .metric(numerator)
+            .metric(denominator)
+            .metric(ratio.clone());
+        assert!(
+            matches!(ratio_sql(spec, &declarations, "arena", SqlWindow::trailing(3600)), Err(SyncError::Invalid(message)) if message.contains("PostHog cannot query both clusters"))
+        );
+    }
+
+    #[test]
+    fn product_product_ratio_uses_each_operand_window() {
+        let numerator = ProductMetricBuilder::count("played", "game_played")
+            .build()
+            .unwrap();
+        let denominator = ProductMetricBuilder::count("started", "game_started")
+            .build()
+            .unwrap();
+        let ratio = RatioMetricBuilder::new("share", "played", "started")
+            .numerator_window_seconds(86_400)
+            .denominator_window_seconds(2_419_200)
+            .build()
+            .unwrap();
+        let MetricQuery::Ratio(spec) = &ratio.query else {
+            panic!("expected ratio")
+        };
+        let declarations = Declarations::new()
+            .metric(numerator)
+            .metric(denominator)
+            .metric(ratio.clone());
+        let sql = ratio_sql(spec, &declarations, "arena", SqlWindow::trailing(3600)).unwrap();
+        assert_eq!(
+            sql,
+            include_str!("../../tests/fixtures/posthog_product_ratio.sql").trim_end()
+        );
+        assert!(sql.contains("event = 'game_played'"));
+        assert!(sql.contains("event = 'game_started'"));
+    }
+
+    #[test]
+    fn table_numerator_scalar_denominator_uses_cross_join() {
+        let numerator = TelemetryMetricBuilder::new("routes", EyesAggregate::Count, None)
+            .unwrap()
+            .filter_eq("semantic_kind", "http.request")
+            .unwrap()
+            .group_by("fields.route")
+            .unwrap()
+            .build()
+            .unwrap();
+        let denominator = TelemetryMetricBuilder::new("requests", EyesAggregate::Count, None)
+            .unwrap()
+            .filter_eq("semantic_kind", "http.request")
+            .unwrap()
+            .build()
+            .unwrap();
+        let ratio = RatioMetricBuilder::new("route-share", "routes", "requests")
+            .build()
+            .unwrap();
+        let MetricQuery::Ratio(spec) = &ratio.query else {
+            panic!("expected ratio")
+        };
+        let declarations = Declarations::new()
+            .metric(numerator)
+            .metric(denominator)
+            .metric(ratio.clone());
+        let sql = ratio_sql(spec, &declarations, "arena", SqlWindow::trailing(3600)).unwrap();
+        assert_eq!(
+            sql,
+            include_str!("../../tests/fixtures/posthog_table_scalar_ratio.sql").trim_end()
+        );
+        assert!(sql.contains("SELECT value AS _num_value, _dim_0"), "{sql}");
+        assert!(
+            sql.contains("CROSS JOIN (SELECT value AS _den_value"),
+            "{sql}"
+        );
+        assert!(sql.contains("GROUP BY _dim_0"), "{sql}");
+        assert!(sql.ends_with("ORDER BY _dim_0 LIMIT 50000"), "{sql}");
+        assert_eq!(
+            sql.matches("timestamp <= now() - INTERVAL 3600 SECOND")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -289,13 +409,19 @@ mod sql_tests {
             .metric(denominator)
             .metric(ratio.clone());
         let sql = ratio_sql(spec, &declarations, "arena", SqlWindow::trailing(3600)).unwrap();
-        assert!(
-            sql.contains("toNullable(value) AS numerator, NULL AS denominator, bucket, _dim_0")
+        assert_eq!(
+            sql,
+            include_str!("../../tests/fixtures/posthog_grouped_ratio.sql").trim_end()
         );
+        assert!(sql.contains(
+            "toNullable(value) AS numerator, NULL AS denominator, 1 AS num_present, bucket, _dim_0"
+        ));
         assert!(
-            sql.contains("NULL AS numerator, toNullable(value) AS denominator, bucket, _dim_0")
+            sql.contains("NULL AS numerator, toNullable(value) AS denominator, NULL AS num_present, bucket, _dim_0")
         );
-        assert!(sql.contains("GROUP BY bucket, _dim_0 LIMIT 50000"));
+        assert!(sql.contains("if(isNull(max(num_present)), 0, max(numerator))"));
+        assert!(sql.contains("isNull(_den_value) OR _den_value = 0"));
+        assert!(sql.contains("GROUP BY bucket, _dim_0 ORDER BY bucket DESC LIMIT 50000"));
         assert!(sql.ends_with("ORDER BY bucket, _dim_0 LIMIT 50000"));
     }
 
@@ -714,6 +840,8 @@ const MAX_RANGE_SECONDS: u64 = 31_622_400;
 const TAG_LIMIT: usize = 255;
 // PostHog's HogQL QUERY/SQL_ALERT contexts cap SELECT results at 50,000 rows.
 const MAX_SQL_ROWS: u64 = 50_000;
+const SQL_COVERAGE_DESCRIPTION: &str =
+    "Shows no value until PostHog holds data back to the start of this window.";
 fn date_from(seconds: u64) -> String {
     for (unit, suffix) in [(86_400, "d"), (3_600, "h"), (60, "M")] {
         if seconds.is_multiple_of(unit) {
@@ -1018,6 +1146,7 @@ fn aggregate_sql(function: EyesAggregate) -> &'static str {
 struct SqlPlan {
     sql: String,
     groups: Vec<String>,
+    coverage: String,
 }
 fn group_sql(expr: &Expr, source: SqlSource) -> Result<String, SyncError> {
     if let Expr::Path { path } = expr {
@@ -1055,7 +1184,7 @@ fn group_sql(expr: &Expr, source: SqlSource) -> Result<String, SyncError> {
             Expr::Literal {
                 value: Literal::Duration(MONDAY_ORIGIN_US),
             },
-        ] => ", toDateTime64('1970-01-05 00:00:00', 6)".into(),
+        ] => ", toDateTime64('1970-01-05 00:00:00', 6, 'UTC')".into(),
         _ => {
             return Err(SyncError::Invalid(format!(
                 "unsupported time bucket origin {expr:?}"
@@ -1178,18 +1307,26 @@ fn render_plan(
         format!("if({coverage}, {aggregate}, NULL) AS value")
     };
     let group_by = if grouped {
-        format!(
-            " WHERE {coverage} GROUP BY {} ORDER BY {}",
-            groups.join(", "),
-            groups.join(", ")
-        )
+        format!(" WHERE {coverage} GROUP BY {}", groups.join(", "))
     } else {
         String::new()
     };
     let limit = if grouped { MAX_SQL_ROWS } else { 1 };
+    let sql = format!("SELECT {projection} FROM ({rows}) AS _source{group_by}");
+    let sql = if grouped && groups.first().is_some_and(|g| g == "bucket") {
+        format!(
+            "SELECT * FROM (SELECT * FROM ({sql}) AS _grouped ORDER BY bucket DESC LIMIT {limit}) AS _recent ORDER BY {} LIMIT {limit}",
+            groups.join(", ")
+        )
+    } else if grouped {
+        format!("{sql} ORDER BY {} LIMIT {limit}", groups.join(", "))
+    } else {
+        format!("{sql} LIMIT {limit}")
+    };
     Ok(SqlPlan {
-        sql: format!("SELECT {projection} FROM ({rows}) AS _source{group_by} LIMIT {limit}"),
+        sql,
         groups: groups.to_vec(),
+        coverage,
     })
 }
 fn telemetry_plan(
@@ -1292,7 +1429,7 @@ fn telemetry_plan(
         aggregate_sql(aggregate.function),
         !matches!(
             aggregate.function,
-            EyesAggregate::Count | EyesAggregate::CountDistinct | EyesAggregate::Sum
+            EyesAggregate::Count | EyesAggregate::CountDistinct
         ),
         app,
         window,
@@ -1341,7 +1478,7 @@ fn product_plan(
                 let width = u64::from(weeks) * 604_800;
                 ensure_bucket_rows(width, window, &metric.event)?;
                 format!(
-                    "toStartOfInterval(timestamp, INTERVAL {width} SECOND, toDateTime64('1970-01-05 00:00:00', 6))"
+                    "toStartOfInterval(timestamp, INTERVAL {width} SECOND, toDateTime64('1970-01-05 00:00:00', 6, 'UTC'))"
                 )
             }
             _ => return Err(SyncError::Invalid("invalid product bucket".into())),
@@ -1392,9 +1529,7 @@ fn product_plan(
         aggregate,
         !matches!(
             metric.aggregate,
-            ProductAggregate::Count
-                | ProductAggregate::DistinctUsers
-                | ProductAggregate::Sum { .. }
+            ProductAggregate::Count | ProductAggregate::DistinctUsers
         ),
         app,
         window,
@@ -1420,6 +1555,12 @@ fn ratio_plan(
     app: &str,
     window: SqlWindow,
 ) -> Result<SqlPlan, SyncError> {
+    if ratio_mixes_clusters(ratio, declarations) {
+        return Err(SyncError::Invalid(format!(
+            "ratio {} mixes product events with logs/spans: PostHog cannot query both clusters together",
+            ratio.numerator
+        )));
+    }
     let numerator = declarations
         .metrics
         .iter()
@@ -1444,7 +1585,7 @@ fn ratio_plan(
     };
     let num = operand_plan(numerator, app, num_window)?;
     let den = operand_plan(denominator, app, den_window)?;
-    if num.groups != den.groups {
+    if !den.groups.is_empty() && num.groups != den.groups {
         return Err(SyncError::Invalid("ratio operand groups differ".into()));
     }
     let factor = if ratio.as_percentage { " * 100" } else { "" };
@@ -1456,19 +1597,36 @@ fn ratio_plan(
             "SELECT {formula} AS value FROM (SELECT value AS _num_value FROM ({}) LIMIT 1) AS _num CROSS JOIN (SELECT value AS _den_value FROM ({}) LIMIT 1) AS _den LIMIT 1",
             num.sql, den.sql
         )
+    } else if den.groups.is_empty() {
+        let keys = num.groups.join(", ");
+        format!(
+            "SELECT {formula} AS value, {keys} FROM (SELECT value AS _num_value, {keys} FROM ({}) AS _num_rows) AS _num CROSS JOIN (SELECT value AS _den_value FROM ({}) LIMIT 1) AS _den ORDER BY {keys} LIMIT {MAX_SQL_ROWS}",
+            num.sql, den.sql
+        )
     } else {
         let keys = num.groups.join(", ");
+        let recent = if num.groups.first().is_some_and(|group| group == "bucket") {
+            " ORDER BY bucket DESC"
+        } else {
+            ""
+        };
         let grouped = format!(
-            "SELECT max(numerator) AS _num_value, max(denominator) AS _den_value, {keys} FROM (SELECT toNullable(value) AS numerator, NULL AS denominator, {keys} FROM ({}) UNION ALL SELECT NULL AS numerator, toNullable(value) AS denominator, {keys} FROM ({})) AS _combined GROUP BY {keys} LIMIT {MAX_SQL_ROWS}",
-            num.sql, den.sql
+            "SELECT if({}, if(isNull(max(num_present)), 0, max(numerator)), NULL) AS _num_value, max(denominator) AS _den_value, {keys} FROM (SELECT toNullable(value) AS numerator, NULL AS denominator, 1 AS num_present, {keys} FROM ({}) UNION ALL SELECT NULL AS numerator, toNullable(value) AS denominator, NULL AS num_present, {keys} FROM ({})) AS _combined GROUP BY {keys}{recent} LIMIT {MAX_SQL_ROWS}",
+            num.coverage, num.sql, den.sql
         );
-        format!(
-            "SELECT {formula} AS value, {keys} FROM ({grouped}) AS _ratios ORDER BY {keys} LIMIT {MAX_SQL_ROWS}"
-        )
+        let selected = format!("SELECT {formula} AS value, {keys} FROM ({grouped}) AS _ratios");
+        if num.groups.first().is_some_and(|group| group == "bucket") {
+            format!(
+                "SELECT * FROM ({selected} ORDER BY bucket DESC LIMIT {MAX_SQL_ROWS}) AS _recent ORDER BY {keys} LIMIT {MAX_SQL_ROWS}"
+            )
+        } else {
+            format!("{selected} ORDER BY {keys} LIMIT {MAX_SQL_ROWS}")
+        }
     };
     Ok(SqlPlan {
         sql,
         groups: num.groups,
+        coverage: format!("{} AND {}", num.coverage, den.coverage),
     })
 }
 fn ratio_sql(
@@ -1478,6 +1636,16 @@ fn ratio_sql(
     window: SqlWindow,
 ) -> Result<String, SyncError> {
     Ok(ratio_plan(ratio, declarations, app, window)?.sql)
+}
+fn ratio_mixes_clusters(ratio: &RatioMetric, declarations: &Declarations) -> bool {
+    let is_product = |id: &str| {
+        declarations
+            .metrics
+            .iter()
+            .find(|metric| metric.id == id)
+            .is_some_and(|metric| matches!(metric.query, MetricQuery::ProductEvent(_)))
+    };
+    is_product(&ratio.numerator) != is_product(&ratio.denominator)
 }
 fn health_sql(app: &str) -> Result<String, SyncError> {
     let window = SqlWindow::trailing(86_400);
@@ -1775,6 +1943,7 @@ fn wanted_tiles(
     key: &str,
     presentations: &BTreeMap<(&str, u64), i64>,
     health: &BTreeMap<(String, usize), i64>,
+    skipped_metrics: &BTreeSet<&str>,
     r: &mut SyncReport,
 ) -> Result<Vec<i64>, SyncError> {
     let mut wanted = vec![];
@@ -1782,6 +1951,9 @@ fn wanted_tiles(
     for item in dash.sections.iter().flat_map(|s| &s.items) {
         match (item, resolve_presentation(item, dash)) {
             (_, Some((mid, _, seconds))) => {
+                if skipped_metrics.contains(mid) {
+                    continue;
+                }
                 wanted.push(*presentations.get(&(mid, seconds)).ok_or_else(|| {
                     SyncError::Invalid(format!("{key}: missing insight for metric {mid}"))
                 })?);
@@ -2012,7 +2184,7 @@ async fn sync_health_rows(
             if let Item::HealthSummary { label } = item {
                 let key = format!("cja:{}:insight:{}@health{ordinal}", api.config.app, dash.id);
                 let name = format!(
-                    "{}Recent error events (24h) — health substitute (unavailable until full source history)",
+                    "{}Recent error events (24h) — health substitute",
                     label.as_deref().map_or(String::new(), |v| format!("{v}: "))
                 );
                 let sql = health_sql(&api.config.app)?;
@@ -2020,7 +2192,7 @@ async fn sync_health_rows(
                     api,
                     "insights",
                     &key,
-                    json!({"name":name,"query":sql_query(&sql, SqlDisplay::Number)}),
+                    json!({"name":name,"description":SQL_COVERAGE_DESCRIPTION,"query":sql_query(&sql, SqlDisplay::Number)}),
                     insights,
                     report,
                 )
@@ -2053,9 +2225,17 @@ pub async fn sync(
     let mut keep = BTreeSet::new();
     let mut ids = BTreeMap::new();
     let mut presentation_ids = BTreeMap::new();
+    let mut skipped_metrics = BTreeSet::new();
     sync_dashboard_rows(&api, declarations, &mut dashboards, &mut keep, &mut report).await?;
     for metric in &declarations.metrics {
         let key = tag("insight", &metric.id);
+        if let MetricQuery::Ratio(ratio) = &metric.query
+            && ratio_mixes_clusters(ratio, declarations)
+        {
+            skipped_metrics.insert(metric.id.as_str());
+            report.skipped.push(format!("{key}: ratio mixes product events with logs/spans (PostHog-unsupported: HogQL cannot join events and logs/spans in one query)"));
+            continue;
+        }
         let declared = declared_presentations.get(metric.id.as_str());
         let alerted = alerted_ids.contains(metric.id.as_str());
         let canonical_presentation = declared
@@ -2063,23 +2243,14 @@ pub async fn sync(
             .unwrap_or(("ActionsLineGraph", DEFAULT_RANGE_SECONDS));
         let legacy =
             (alerted || declared.is_none()) && matches!(metric.query, MetricQuery::ProductEvent(_));
-        let name = if matches!(metric.query, MetricQuery::ProductEvent(_)) {
-            metric.display_name.as_ref().unwrap_or(&metric.id).clone()
-        } else {
-            format!(
-                "{} (unavailable until full source history)",
-                metric.display_name.as_ref().unwrap_or(&metric.id)
-            )
-        };
-        let insight_id = upsert(
-            &api,
-            "insights",
-            &key,
-            json!({"name":name,"query":metric_query(metric, declarations, &config.app, canonical_presentation.0, canonical_presentation.1, legacy)?}),
-            &mut insights,
-            &mut report,
-        )
-        .await?;
+        let name = metric.display_name.as_ref().unwrap_or(&metric.id).clone();
+        let description = (!matches!(metric.query, MetricQuery::ProductEvent(_)))
+            .then_some(SQL_COVERAGE_DESCRIPTION);
+        let mut body = json!({"name":name,"query":metric_query(metric, declarations, &config.app, canonical_presentation.0, canonical_presentation.1, legacy)?});
+        if let Some(description) = description {
+            body["description"] = json!(description);
+        }
+        let insight_id = upsert(&api, "insights", &key, body, &mut insights, &mut report).await?;
         if matches!(metric.query, MetricQuery::ProductEvent(_)) {
             ids.insert(metric.id.as_str(), insight_id);
         }
@@ -2090,15 +2261,12 @@ pub async fn sync(
                     insight_id
                 } else {
                     let variant = tag("insight", &format!("{}@{seconds}s", metric.id));
-                    let n = upsert(
-                        &api,
-                        "insights",
-                        &variant,
-                        json!({"name":name,"query":metric_query(metric, declarations, &config.app, display, *seconds, false)?}),
-                        &mut insights,
-                        &mut report,
-                    )
-                    .await?;
+                    let mut body = json!({"name":name,"query":metric_query(metric, declarations, &config.app, display, *seconds, false)?});
+                    if let Some(description) = description {
+                        body["description"] = json!(description);
+                    }
+                    let n = upsert(&api, "insights", &variant, body, &mut insights, &mut report)
+                        .await?;
                     keep.insert(variant);
                     n
                 };
@@ -2114,7 +2282,14 @@ pub async fn sync(
         .collect::<Result<_, _>>()?;
     for dash in &declarations.dashboards {
         let key = tag("dashboard", &dash.id);
-        let wanted = wanted_tiles(dash, &key, &presentation_ids, &health_ids, &mut report)?;
+        let wanted = wanted_tiles(
+            dash,
+            &key,
+            &presentation_ids,
+            &health_ids,
+            &skipped_metrics,
+            &mut report,
+        )?;
         tiles(
             &api,
             &key,

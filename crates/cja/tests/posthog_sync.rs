@@ -184,6 +184,16 @@ fn create(s: &mut Store, kind: &str, mut body: Value) -> Result<Value, &'static 
             body["query"]["source"]["trendsFilter"] = json!({});
         }
     }
+    if kind == "insights" && body["query"]["source"]["kind"] == "HogQLQuery" {
+        // Captured from a saved DataVisualizationNode GET in project 747577.
+        // The server adds these fields while preserving the query verbatim.
+        let mut stored: Value =
+            serde_json::from_str(include_str!("fixtures/posthog_sql_insight_get.json")).unwrap();
+        for key in ["id", "name", "description", "tags", "query"] {
+            stored[key] = body.get(key).cloned().unwrap_or(Value::Null);
+        }
+        body = stored;
+    }
     s.rows.insert((kind.into(), key), body.clone());
     Ok(body)
 }
@@ -664,13 +674,10 @@ async fn product_operand_ratio_with_distinct_windows_reconciles_without_rewrites
     let played = ProductMetricBuilder::count("played", "game_played")
         .build()
         .unwrap();
-    let completed = TelemetryMetricBuilder::new("completed", AggregateFunction::Count, None)
-        .unwrap()
-        .filter_eq("fields.event_type", "game_completed")
-        .unwrap()
+    let started = ProductMetricBuilder::count("started", "game_started")
         .build()
         .unwrap();
-    let share = RatioMetricBuilder::new("share", "played", "completed")
+    let share = RatioMetricBuilder::new("share", "played", "started")
         .numerator_window_seconds(86_400)
         .denominator_window_seconds(28 * 86_400)
         .as_percentage()
@@ -678,7 +685,7 @@ async fn product_operand_ratio_with_distinct_windows_reconciles_without_rewrites
         .unwrap();
     let declarations = Declarations::new()
         .metric(played)
-        .metric(completed)
+        .metric(started)
         .metric(share)
         .dashboard(
             Dashboard::new("ops", "Operations")
@@ -697,22 +704,195 @@ async fn product_operand_ratio_with_distinct_windows_reconciles_without_rewrites
             .as_str()
             .unwrap()
             .to_owned();
+        assert!(!sql.contains("FROM logs"), "{sql}");
         assert!(sql.contains("FROM events"), "{sql}");
-        assert!(sql.contains("properties['service.name'] = 'demo'"), "{sql}");
-        assert!(sql.contains("FROM logs"), "{sql}");
-        assert!(
-            sql.contains("timestamp <= now() - INTERVAL 86400 SECOND"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("timestamp <= now() - INTERVAL 2419200 SECOND"),
-            "{sql}"
-        );
+        let (numerator_sql, denominator_sql) = sql.split_once(" CROSS JOIN ").unwrap();
+        for (operand, event, seconds, other) in [
+            (numerator_sql, "game_played", 86_400, 2_419_200),
+            (denominator_sql, "game_started", 2_419_200, 86_400),
+        ] {
+            assert!(
+                operand.contains(&format!(
+                    "timestamp >= now() - INTERVAL {seconds} SECOND AND event = '{event}'"
+                )),
+                "{sql}"
+            );
+            assert!(
+                operand.contains(&format!(
+                    "timestamp <= now() - INTERVAL {seconds} SECOND LIMIT 1"
+                )),
+                "{sql}"
+            );
+            assert!(
+                !operand.contains(&format!("INTERVAL {other} SECOND")),
+                "{sql}"
+            );
+        }
         assert!(
             sql.contains("isNull(_den_value) OR _den_value = 0"),
             "{sql}"
         );
     }
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn mixed_cluster_ratio_is_named_skip_and_other_objects_reconcile() {
+    let mock = Mock::start().await;
+    let product = ProductMetricBuilder::count("played", "game_played")
+        .build()
+        .unwrap();
+    let telemetry = TelemetryMetricBuilder::new("completed", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("fields.event_type", "game_completed")
+        .unwrap()
+        .build()
+        .unwrap();
+    let ratio = RatioMetricBuilder::new("share", "played", "completed")
+        .build()
+        .unwrap();
+    let mut declarations = Declarations::new()
+        .metric(product)
+        .metric(telemetry)
+        .metric(ratio)
+        .dashboard(
+            Dashboard::new("ops", "Operations").unwrap().section(
+                Section::new()
+                    .item(Item::stat("share"))
+                    .item(Item::stat("completed")),
+            ),
+        );
+    let mut supported = declarations.clone();
+    supported.metrics[0] = TelemetryMetricBuilder::new("played", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("fields.event_type", "game_played")
+        .unwrap()
+        .build()
+        .unwrap();
+    mock.sync("demo", &supported).await.unwrap();
+    mock.log();
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|warning| warning.contains("cja:demo:insight:share: ratio mixes product events"))
+    );
+    assert!(
+        report
+            .deleted
+            .contains(&"cja:demo:insight:share".to_owned())
+    );
+    assert!(
+        report
+            .updated
+            .iter()
+            .any(|entry| entry.contains("removed tile"))
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+    declarations.metrics.retain(|metric| metric.id != "share");
+    let _ = declarations.dashboards[0].sections[0].items.remove(0);
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert_eq!(report.skipped, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn table_over_scalar_ratio_reconciles_and_tiles() {
+    let mock = Mock::start().await;
+    let routes = TelemetryMetricBuilder::new("routes", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("semantic_kind", "http.request")
+        .unwrap()
+        .group_by("fields.route")
+        .unwrap()
+        .build()
+        .unwrap();
+    let requests = TelemetryMetricBuilder::new("requests", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("semantic_kind", "http.request")
+        .unwrap()
+        .build()
+        .unwrap();
+    let ratio = RatioMetricBuilder::new("route-share", "routes", "requests")
+        .build()
+        .unwrap();
+    let declarations = Declarations::new()
+        .metric(routes)
+        .metric(requests)
+        .metric(ratio)
+        .dashboard(
+            Dashboard::new("ops", "Operations")
+                .unwrap()
+                .section(Section::new().item(Item::table("route-share"))),
+        );
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        report
+            .created
+            .contains(&"cja:demo:insight:route-share".to_owned())
+    );
+    let sql = mock.row("cja:demo:insight:route-share")["query"]["source"]["query"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        sql.contains("CROSS JOIN (SELECT value AS _den_value"),
+        "{sql}"
+    );
+    assert_eq!(
+        sql.matches("timestamp <= now() - INTERVAL 2592000 SECOND")
+            .count(),
+        2
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn grouped_ratio_zero_fills_denominator_only_keys_but_not_missing_coverage() {
+    let mock = Mock::start().await;
+    let make = |id: &str, event: &str| {
+        TelemetryMetricBuilder::new(id, AggregateFunction::Count, None)
+            .unwrap()
+            .filter_eq("fields.event_type", event)
+            .unwrap()
+            .group_by("fields.source")
+            .unwrap()
+            .time_bucket(300)
+            .build()
+            .unwrap()
+    };
+    let declarations = Declarations::new()
+        .metric(make("completed", "game_completed"))
+        .metric(make("started", "game_started"))
+        .metric(
+            RatioMetricBuilder::new("completion-rate", "completed", "started")
+                .build()
+                .unwrap(),
+        )
+        .dashboard(
+            Dashboard::new("ops", "Operations")
+                .unwrap()
+                .default_range_seconds(3600)
+                .section(Section::new().item(Item::time_series("completion-rate"))),
+        );
+    mock.sync("demo", &declarations).await.unwrap();
+    let sql = mock.row("cja:demo:insight:completion-rate")["query"]["source"]["query"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(sql.contains("1 AS num_present"), "{sql}");
+    assert!(
+        sql.contains("if(isNull(max(num_present)), 0, max(numerator))"),
+        "{sql}"
+    );
+    assert!(sql.contains("if((SELECT count() FROM (SELECT 1 FROM logs WHERE service_name = 'demo' AND timestamp <= now() - INTERVAL 3600 SECOND LIMIT 1)) > 0"), "{sql}");
+    assert!(
+        sql.contains("isNull(_den_value) OR _den_value = 0"),
+        "{sql}"
+    );
     mock.log();
     assert_repeat_clean(&mock, &declarations).await;
 }
@@ -752,6 +932,13 @@ async fn telemetry_windows_reconcile_and_removed_health_is_pruned() {
     mock.sync("demo", &declarations).await.unwrap();
     let canonical = mock.row("cja:demo:insight:errors");
     let variant = mock.row("cja:demo:insight:errors@7200s");
+    assert_eq!(canonical["name"], "errors");
+    assert_eq!(variant["name"], "errors");
+    assert_eq!(
+        canonical["description"],
+        "Shows no value until PostHog holds data back to the start of this window."
+    );
+    assert_eq!(variant["description"], canonical["description"]);
     assert!(
         canonical["query"]["source"]["query"]
             .as_str()
@@ -764,8 +951,14 @@ async fn telemetry_windows_reconcile_and_removed_health_is_pruned() {
             .unwrap()
             .contains("INTERVAL 7200 SECOND")
     );
+    let health = mock.row("cja:demo:insight:ops@health0");
+    assert_eq!(
+        health["name"],
+        "Recent error events (24h) — health substitute"
+    );
+    assert_eq!(health["description"], canonical["description"]);
     assert!(
-        mock.row("cja:demo:insight:ops@health0")["query"]["source"]["query"]
+        health["query"]["source"]["query"]
             .as_str()
             .unwrap()
             .contains("INTERVAL 86400 SECOND")
