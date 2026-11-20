@@ -36,6 +36,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: clippy
 
       - name: Verify dependency graphs
         run: |

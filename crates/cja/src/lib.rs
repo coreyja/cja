@@ -208,7 +208,7 @@
 //! postgres = ["dep:sqlx", "dep:jiff-sqlx"]
 //! cron = ["jobs"]           # cron depends on jobs
 //! jobs = ["postgres"]       # jobs depends on postgres
-//! testing = []              # enables mock OAuth for tests
+//! testing = ["serde_urlencoded"] # enables mock OAuth for tests
 //! ```
 //!
 //! `postgres` exposes `db`, `server::session`, `testing::test_db`, `sqlx`, and
