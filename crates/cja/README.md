@@ -263,7 +263,7 @@ default = ["postgres", "cron", "jobs"]
 postgres = ["dep:sqlx", "dep:jiff-sqlx"]
 cron = ["jobs"]           # cron depends on jobs
 jobs = ["postgres"]       # jobs depends on postgres
-testing = []              # enables testing::mock_oauth
+testing = ["serde_urlencoded"]  # enables testing::mock_oauth
 ```
 
 `cron` implies `jobs`, which implies `postgres`. The `postgres` feature exposes
