@@ -1,13 +1,15 @@
 [package]
 name = "cja"
+version.workspace = true
 description = "Cron, Jobs and Axum a meta-framework for building web applications"
 edition.workspace = true
 authors.workspace = true
 
 [features]
-default = ["cron", "jobs"]
+default = ["postgres", "cron", "jobs"]
+postgres = ["dep:sqlx", "dep:jiff-sqlx"]
 cron = ["jobs"]
-jobs = []
+jobs = ["postgres"]
 testing = ["serde_urlencoded"]
 
 [dependencies]
@@ -40,14 +42,14 @@ url = "2"
 # <= 0.1.88; the lockfile resolves 0.1.92 — don't let a cargo update regress it.
 async-trait.workspace = true
 axum.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 jiff.workspace = true
-jiff-sqlx.workspace = true
+jiff-sqlx = { workspace = true, optional = true }
 base64.workspace = true
 
 futures = "0.3"

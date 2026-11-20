@@ -1,4 +1,4 @@
-//! HTTP server built on Axum with cookies, sessions, and zero-downtime reload.
+//! HTTP server built on Axum with cookies and zero-downtime reload.
 //!
 //! # Routes
 //!
@@ -13,10 +13,10 @@
 //! }
 //! ```
 //!
-//! # Sessions
+//! # Sessions (`postgres` feature)
 //!
-//! Implement [`session::AppSession`] for your session type, then use
-//! [`session::Session<T>`](session::Session) as an Axum extractor:
+//! With `postgres`, implement `session::AppSession` for your session type, then use
+//! `session::Session<T>` as an Axum extractor:
 //!
 //! ```rust,ignore
 //! async fn index(Session(session): Session<MySession>) -> impl IntoResponse {
@@ -74,6 +74,7 @@ pub use app::App;
 
 pub mod page;
 
+#[cfg(feature = "postgres")]
 pub mod session;
 
 pub mod trace;

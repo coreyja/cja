@@ -110,14 +110,14 @@ Cargo build. No asset is read from disk at runtime.
 
 ## Overview
 
-CJA provides three integrated subsystems:
+CJA provides an HTTP server and, by default, two PostgreSQL-backed subsystems:
 
 - **Jobs** — PostgreSQL-backed background job queue with automatic retries,
   exponential backoff, dead letter queue, and graceful shutdown
 - **Cron** — Scheduled task execution with both interval-based and cron expression
   scheduling, timezone support
-- **Server** — HTTP server on Axum with encrypted cookie management, database-backed
-  sessions, and zero-downtime reload via systemfd
+- **Server** — HTTP server on Axum with encrypted cookie management and
+  zero-downtime reload via systemfd; database-backed sessions require `postgres`
 
 All three share a single `AppState` and coordinate shutdown via `CancellationToken`.
 
@@ -150,9 +150,24 @@ impl AppState for MyApp {
 
 `AppState` is cloned per request — wrap expensive resources in `Arc`.
 
+For a server without PostgreSQL, use `cja = { version = "...", default-features = false }`.
+The `AppState` implementation needs no pool:
+
+```rust
+use cja::{app_state::AppState, server::cookies::CookieKey};
+
+#[derive(Clone)]
+struct StatelessState { cookie_key: CookieKey }
+
+impl AppState for StatelessState {
+    fn version(&self) -> &str { "1.0.0" }
+    fn cookie_key(&self) -> &CookieKey { &self.cookie_key }
+}
+```
+
 ### 2. Set Up the Database
 
-CJA requires PostgreSQL. Set `DATABASE_URL` and run migrations on startup:
+With the default `postgres` feature, set `DATABASE_URL` and run migrations on startup:
 
 ```rust
 let pool = sqlx::postgres::PgPoolOptions::new()
@@ -222,7 +237,7 @@ See `crates/cja.app/` in the repository for a complete working example.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DATABASE_URL` | Yes | — | PostgreSQL connection string |
+| `DATABASE_URL` | With `postgres` | — | PostgreSQL connection string |
 | `PORT` | No | `3000` | HTTP server port |
 | `COOKIE_KEY` | No | Ephemeral, generated at boot | Base64-encoded cookie encryption key, at least 32 bytes decoded. Unset or blank generates a new key on each boot, in release builds too, and logs a warning. Set it if sessions need to survive restarts and deploys. |
 | `SERVER_DISABLED` | No | `false` | Set to `"true"` to skip starting the HTTP server |
@@ -244,15 +259,16 @@ See `crates/cja.app/` in the repository for a complete working example.
 
 ```toml
 [features]
-default = ["cron", "jobs"]
+default = ["postgres", "cron", "jobs"]
+postgres = ["dep:sqlx", "dep:jiff-sqlx"]
 cron = ["jobs"]           # cron depends on jobs
-jobs = []
-testing = []              # enables testing::mock_oauth
+jobs = ["postgres"]       # jobs depends on postgres
+testing = ["serde_urlencoded"]  # enables testing::mock_oauth
 ```
 
-Disabling `jobs` at compile time also disables `cron`.
-The destructive `testing::test_db` helper is always exported so integration
-test harnesses also compile without default features.
+`cron` implies `jobs`, which implies `postgres`. The `postgres` feature exposes
+`db`, `server::session`, and `testing::test_db`; `testing` independently enables
+`testing::mock_oauth`.
 
 ## Job System
 
@@ -469,7 +485,7 @@ The `Session` extractor refreshes `sessions.updated_at` at most once per
 a write per request. Schedule `cja::server::session::prune(pool, idle)` from a
 cron to delete idle sessions (the scaffold registers a daily 4am example);
 `idle` must be at least twice `ACTIVITY_REFRESH_MIN_INTERVAL` — the function
-refuses smaller values. The logout route lives in cja-passkey (`POST /auth/logout`):
+refuses smaller values. The logout route lives in cja-passport (`POST /auth/logout`):
 it deletes the session row and clears the cookie.
 
 ### Maud Templating
@@ -548,7 +564,7 @@ personal key in an app runtime.
 
 Call `shutdown().await?` on the returned `TelemetryShutdownHandle` to flush Eyes and PostHog, on the error path too. `let _handle = setup_tracing(..)?` suppresses the `must_use` warning but loses buffered telemetry on exit. Each flush is bounded: the call returns within 3 seconds even when a sink is stalled, always returns `Ok`, and logs failures. It runs after the supervisor's drain and grace, so count it against the platform's kill window. The default total is 1s drain + 0.5s grace + up to 3s flush = 4.5s. For Cloud Run, `CJA_SHUTDOWN_JOB_DRAIN_SECS=4` and `CJA_SHUTDOWN_EXIT_GRACE_SECS=2` give 9s total. Set `POSTHOG_PROJECT_TOKEN` in the process environment before tracing setup. `POSTHOG_HOST` defaults to `https://us.i.posthog.com`, `POSTHOG_LOG_LEVEL` to `info`, and `POSTHOG_TRACES_SAMPLE_RATIO` to `1.0`. Both signals honor scoped `RUST_LOG` and the rig content cap.
 
-PostHog's OTLP copy redacts query values for `code`, `state`, `token`, `access_token`, `id_token`, `refresh_token`, `code_verifier`, `password`, `secret`, `client_secret`, `key`, `api_key`, `apikey`, `signature`, `sig`, and `otp`, plus keys containing `token`, `secret`, `password`, `passwd`, or `signature` (case insensitive). It keeps query keys and other values in `uri`, `url.query`, and `http.request.header.referer`, and drops the whole query if parsing fails. It drops recorded `authorization`, `proxy_authorization`, `cookie`, and `set_cookie` headers, the unstructured `self` Debug field on `jobs.enqueue`, and `value` on `jobs.run_from_value` and on log records inside a job. The worker's deserialize-failure detail remains in Eyes and `dead_letter_jobs`; PostHog receives only the top-level error. Other request headers, paths, and routes remain. Eyes receives raw telemetry. App-owned span fields are outside this policy: use `#[instrument(skip(self))]` on `Job::run` so its payload is not exported. Explicit product-event capture and the boot manifest use app-chosen payloads and do not use this filter. Returned PostHog construction errors skip that sink; a dependency panic aborts the process in a `panic = "abort"` profile.
+PostHog's OTLP copy redacts query values for `code`, `state`, `token`, `access_token`, `id_token`, `refresh_token`, `code_verifier`, `password`, `secret`, `client_secret`, `key`, `api_key`, `apikey`, `signature`, `sig`, and `otp`, plus keys containing `token`, `secret`, `password`, `passwd`, or `signature` (case insensitive). It keeps query keys and other values in `uri`, `url.query`, and `http.request.header.referer`, and drops the whole query if parsing fails. It drops recorded `authorization`, `proxy_authorization`, `cookie`, and `set_cookie` headers. PostHog receives job `self`, `value`, and serde `error.detail` fields as Eyes does. The named header and URL query credential policy still applies to those OTLP records; unstructured job fields pass through as recorded. Other request headers, paths, and routes remain. Eyes receives raw telemetry. `#[instrument(skip(self))]` on an app-owned `Job::run` span only avoids an extra Debug-formatted copy of the payload on that span. A payload that must not leave the process must not be stored in the job. Explicit product-event capture and the boot manifest use app-chosen payloads and do not use this filter. Returned PostHog construction errors skip that sink; a dependency panic aborts the process in a `panic = "abort"` profile.
 
 `POSTHOG_LOG_LEVEL` gates both PostHog log records and PostHog spans through one shared per-layer filter, so `off` sends no traces either (the sample ratio only applies to spans the level admits). The same filter always excludes the exporter's own crates, matched by target prefix (tracing-subscriber `Targets` uses `starts_with`): `opentelemetry`, `tracing_opentelemetry`, `hyper`, `hyper_util`, `h2`, `reqwest`, `rustls`, `want`, `mio` and `posthog`, so `opentelemetry` also covers `opentelemetry_sdk`, `opentelemetry_otlp` and the rest of the family. While PostHog is enabled, Eyes also drops `opentelemetry*` targets, so the OTel SDK's own diagnostics (queue drops, export errors) reach stdout only; with no token, Eyes is unfiltered as before.
 
@@ -557,13 +573,13 @@ PostHog's OTLP copy redacts query values for `code`, `state`, `token`, `access_t
 CJA re-exports key dependencies:
 
 ```rust
-use cja::sqlx;
 use cja::uuid;
 use cja::color_eyre;
 use cja::maud;
 use cja::jiff;
-use cja::jiff_sqlx;
 ```
+
+With `postgres`, `cja::sqlx` and `cja::jiff_sqlx` are also re-exported.
 
 # PostHog boot manifests
 

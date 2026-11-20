@@ -1,0 +1,35 @@
+[package]
+name = "cja-passport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cja = { path = "../cja", default-features = false, features = ["postgres"] }
+openidconnect = { version = "=4.1.0", default-features = false, features = ["reqwest"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-manual-roots"] }
+axum.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+jiff.workspace = true
+jiff-sqlx.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+sha2 = { version = "0.10", features = ["oid"] }
+thiserror = "2"
+rand = "0.9"
+base64.workspace = true
+url = "2"
+async-trait.workspace = true
+tower-cookies = { version = "0.11", features = ["private"] }
+
+[dev-dependencies]
+httpmock = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
+tower = { version = "0.5", features = ["util"] }
+cja-secret = { path = "../cja-secret", features = ["testing"] }

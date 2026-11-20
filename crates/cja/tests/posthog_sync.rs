@@ -10,8 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use cja::observability::{
-    AggregateFunction, AlertBuilder, Comparison, Declarations, FilterOperator, Item, Link,
-    MetricQuery, PropertyFilter, RatioMetricBuilder, TelemetryMetricBuilder,
+    AggregateFunction, AlertBuilder, Comparison, Dashboard, Declarations, FilterOperator, Item,
+    Link, MetricQuery, ProductMetricBuilder, PropertyFilter, RatioMetricBuilder, Section,
+    TelemetryMetricBuilder,
     posthog::{self, SyncConfig, SyncError, SyncReport},
 };
 use serde_json::{Value, json};
@@ -83,6 +84,72 @@ impl Mock {
             .clone()
     }
 }
+fn one_metric(item: Option<Item>, default: Option<u64>) -> Declarations {
+    let mut dashboard = Dashboard::new("activity", "Activity").unwrap();
+    if let Some(seconds) = default {
+        dashboard = dashboard.default_range_seconds(seconds);
+    }
+    if let Some(item) = item {
+        dashboard = dashboard.section(Section::new().item(item));
+    }
+    Declarations::new()
+        .metric(
+            ProductMetricBuilder::count("views", "page_view")
+                .build()
+                .unwrap(),
+        )
+        .dashboard(dashboard)
+}
+fn trend(event: &str, display: Option<&str>, seconds: u64) -> Value {
+    let mut source = json!({
+        "kind":"TrendsQuery",
+        "series":[{"kind":"EventsNode","event":event,"math":"total","properties":[
+            {"type":"event","key":"service.name","operator":"exact","value":"demo"}
+        ]}],
+        "interval":"day","dateRange":{"date_from":"-30d"},"filterTestAccounts":false
+    });
+    if let Some(display) = display {
+        let range = if seconds.is_multiple_of(86_400) {
+            format!("-{}d", seconds / 86_400)
+        } else {
+            format!("-{seconds}s")
+        };
+        source["dateRange"] = if display == "ActionsLineGraph" {
+            json!({"date_from":range})
+        } else {
+            json!({"date_from":range,"explicitDate":true})
+        };
+        source["trendsFilter"] = json!({"display":display});
+    }
+    json!({"kind":"InsightVizNode","source":source})
+}
+fn page_query(display: Option<&str>) -> Value {
+    let mut query = trend("page_view", display, 86_400);
+    query["source"]["breakdownFilter"] = json!({"breakdowns":[{"property":"path","type":"event"}]});
+    query
+}
+fn mock_legacy(event: &str) -> Value {
+    let mut query = trend(event, None, 0);
+    query["source"]["trendsFilter"] = json!({});
+    query["source"]["version"] = json!(2);
+    query
+}
+async fn assert_repeat_clean(mock: &Mock, d: &Declarations) {
+    let report = mock.sync("demo", d).await.unwrap();
+    assert_eq!(mock.writes(), []);
+    assert!(report.created.is_empty() && report.updated.is_empty() && report.deleted.is_empty());
+}
+fn assert_presentation(row: &Value, display: &str, date_from: &str) {
+    assert_eq!(row["query"]["source"]["trendsFilter"]["display"], display);
+    assert_eq!(
+        row["query"]["source"]["dateRange"],
+        if display == "ActionsLineGraph" {
+            json!({"date_from":date_from})
+        } else {
+            json!({"date_from":date_from,"explicitDate":true})
+        }
+    );
+}
 /// Create one row the way `PostHog` does, including its server defaults.
 fn create(s: &mut Store, kind: &str, mut body: Value) -> Result<Value, &'static str> {
     if s.mangle == Some(kind) {
@@ -111,9 +178,21 @@ fn create(s: &mut Store, kind: &str, mut body: Value) -> Result<Value, &'static 
     if kind == "dashboards" {
         body["tiles"] = json!([]);
     }
-    if kind == "insights" {
+    if kind == "insights" && body["query"]["source"]["kind"] == "TrendsQuery" {
         body["query"]["source"]["version"] = json!(2);
-        body["query"]["source"]["trendsFilter"] = json!({});
+        if body["query"]["source"].get("trendsFilter").is_none() {
+            body["query"]["source"]["trendsFilter"] = json!({});
+        }
+    }
+    if kind == "insights" && body["query"]["source"]["kind"] == "HogQLQuery" {
+        // Captured from a saved DataVisualizationNode GET in project 747577.
+        // The server adds these fields while preserving the query verbatim.
+        let mut stored: Value =
+            serde_json::from_str(include_str!("fixtures/posthog_sql_insight_get.json")).unwrap();
+        for key in ["id", "name", "description", "tags", "query"] {
+            stored[key] = body.get(key).cloned().unwrap_or(Value::Null);
+        }
+        body = stored;
     }
     s.rows.insert((kind.into(), key), body.clone());
     Ok(body)
@@ -224,15 +303,15 @@ async fn reconcile_example_and_repeat() {
         .into_iter()
         .filter(|(v, _, _)| v != Method::GET)
         .collect::<Vec<_>>();
-    assert_eq!(writes.len(), 8);
+    assert_eq!(writes.len(), 9);
     assert_eq!(writes[0].1, "dashboards/");
     assert_eq!(writes[1].1, "insights/");
-    assert_eq!(writes[7].1, "alerts/");
+    assert_eq!(writes[8].1, "alerts/");
     assert_eq!(
-        writes[7].2["threshold"]["configuration"],
+        writes[8].2["threshold"]["configuration"],
         json!({"type":"absolute","bounds":{"lower":1.}})
     );
-    assert_eq!(writes[7].2["subscribed_users"], json!([]));
+    assert_eq!(writes[8].2["subscribed_users"], json!([]));
     assert_eq!(
         writes[1].2["query"]["source"]["breakdownFilter"]["breakdowns"][0]["property"],
         "path"
@@ -265,7 +344,8 @@ async fn changed_declarations_patch_in_place_and_keep_foreign_tags() {
             "kind":"TrendsQuery",
             "series":[{"kind":"EventsNode","event":"page_view","math":"total","properties":properties}],
             "interval":"day",
-            "dateRange":{"date_from":"-30d"},
+            "dateRange":{"date_from":"-1d","explicitDate":true},
+            "trendsFilter":{"display":"ActionsTable"},
             "filterTestAccounts":false,
             "breakdownFilter":{"breakdowns":[{"property":"path","type":"event"}]}
         }})
@@ -296,7 +376,7 @@ async fn changed_declarations_patch_in_place_and_keep_foreign_tags() {
                 format!("insights/{insight}/"),
                 json!({
                     "name":"Views",
-                    "query":query(json!([service])),
+                    "description":null,"query":query(json!([service])),
                     "tags":["team-growth","cja:demo:insight:pages"]
                 })
             ),
@@ -322,7 +402,7 @@ async fn changed_declarations_patch_in_place_and_keep_foreign_tags() {
             format!("insights/{insight}/"),
             json!({
                 "name":"Views",
-                "query":query(json!([service, plan])),
+                "description":null,"query":query(json!([service, plan])),
                 "tags":["team-growth","cja:demo:insight:pages"]
             })
         )]
@@ -501,7 +581,7 @@ async fn surfaces_rejected_write_and_missing_tag() {
     );
 }
 #[tokio::test]
-async fn eyes_only_declarations_are_skipped_with_named_warnings() {
+async fn telemetry_ratio_and_health_are_tiled_with_only_links_and_unproven_alerts_skipped() {
     let m = Mock::start().await;
     let mut d = example::declarations().unwrap();
     d.dashboards[0].sections[0].items.extend([
@@ -539,34 +619,34 @@ async fn eyes_only_declarations_are_skipped_with_named_warnings() {
     assert_eq!(
         r.skipped,
         [
-            "cja:demo:insight:jobs: telemetry metric (Eyes-only)",
-            "cja:demo:insight:all_jobs: telemetry metric (Eyes-only)",
-            "cja:demo:insight:share: ratio metric (Eyes-only)",
-            "cja:demo:dashboard:activity: health summary item (Eyes-only)",
             "cja:demo:dashboard:activity: links item (Eyes-only)",
-            "cja:demo:dashboard:activity: tile for telemetry metric jobs (Eyes-only)",
-            "cja:demo:dashboard:activity: tile for ratio metric share (Eyes-only)",
-            "cja:demo:alert:failed: telemetry metric jobs (Eyes-only)",
-            "cja:demo:alert:low-share: ratio metric share (Eyes-only)",
+            "cja:demo:alert:failed: SQL metric jobs alert (PostHog-unsupported: SQL alert payload and NULL evaluation unverified)",
+            "cja:demo:alert:low-share: SQL metric share alert (PostHog-unsupported: SQL alert payload and NULL evaluation unverified)",
         ]
     );
+    for key in ["jobs", "all_jobs", "share", "activity@health0"] {
+        assert!(r.created.contains(&format!("cja:demo:insight:{key}")));
+        assert_eq!(
+            m.row(&format!("cja:demo:insight:{key}"))["query"]["kind"],
+            "DataVisualizationNode"
+        );
+    }
+    let ratio = m.row("cja:demo:insight:share");
+    let sql = ratio["query"]["source"]["query"].as_str().unwrap();
+    assert!(sql.contains("isNull(_den_value) OR _den_value = 0"));
+    assert!(sql.contains("posthog.trace_spans"));
+    assert!(sql.contains("FROM logs"));
+    assert!(sql.contains("timestamp <= now() - INTERVAL 86400 SECOND"));
     assert_eq!(
-        r.created,
-        [
-            "cja:demo:dashboard:activity",
-            "cja:demo:insight:pages",
-            "cja:demo:insight:sessions",
-            "cja:demo:insight:daily",
-            "cja:demo:alert:quiet",
-        ]
+        m.row("cja:demo:insight:activity@health0")["query"]["display"],
+        "BoldNumber"
     );
     let writes = m
         .log()
         .into_iter()
         .filter(|(method, _, _)| method != Method::GET)
         .collect::<Vec<_>>();
-    // Only the example's own alert is created: none for the telemetry or
-    // ratio alert, and no insight or tile for an Eyes-only metric.
+    // SQL alert support is gated on the coordinator's live capability probe.
     let posts = |path: &str| {
         writes
             .iter()
@@ -577,14 +657,366 @@ async fn eyes_only_declarations_are_skipped_with_named_warnings() {
     let alerts = posts("alerts/");
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0]["name"], "quiet [cja:demo:alert:quiet]");
-    assert_eq!(posts("insights/").len(), 3);
+    assert_eq!(posts("insights/").len(), 8);
     assert_eq!(
         writes
             .iter()
             .filter(|(_, path, _)| path.ends_with("/add_insight/"))
             .count(),
-        3
+        6
     );
+    assert_repeat_clean(&m, &d).await;
+}
+
+#[tokio::test]
+async fn product_operand_ratio_with_distinct_windows_reconciles_without_rewrites() {
+    let mock = Mock::start().await;
+    let played = ProductMetricBuilder::count("played", "game_played")
+        .build()
+        .unwrap();
+    let started = ProductMetricBuilder::count("started", "game_started")
+        .build()
+        .unwrap();
+    let share = RatioMetricBuilder::new("share", "played", "started")
+        .numerator_window_seconds(86_400)
+        .denominator_window_seconds(28 * 86_400)
+        .as_percentage()
+        .build()
+        .unwrap();
+    let declarations = Declarations::new()
+        .metric(played)
+        .metric(started)
+        .metric(share)
+        .dashboard(
+            Dashboard::new("ops", "Operations")
+                .unwrap()
+                .default_range_seconds(3600)
+                .section(
+                    Section::new()
+                        .item(Item::stat("share"))
+                        .item(Item::stat("share").window_seconds(7200)),
+                ),
+        );
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    for key in ["cja:demo:insight:share", "cja:demo:insight:share@7200s"] {
+        assert!(report.created.contains(&key.to_owned()));
+        let sql = mock.row(key)["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!sql.contains("FROM logs"), "{sql}");
+        assert!(sql.contains("FROM events"), "{sql}");
+        let (numerator_sql, denominator_sql) = sql.split_once(" CROSS JOIN ").unwrap();
+        for (operand, event, seconds, other) in [
+            (numerator_sql, "game_played", 86_400, 2_419_200),
+            (denominator_sql, "game_started", 2_419_200, 86_400),
+        ] {
+            assert!(
+                operand.contains(&format!(
+                    "timestamp >= now() - INTERVAL {seconds} SECOND AND event = '{event}'"
+                )),
+                "{sql}"
+            );
+            assert!(
+                operand.contains(&format!(
+                    "timestamp <= now() - INTERVAL {seconds} SECOND LIMIT 1"
+                )),
+                "{sql}"
+            );
+            assert!(
+                !operand.contains(&format!("INTERVAL {other} SECOND")),
+                "{sql}"
+            );
+        }
+        assert!(
+            sql.contains("isNull(_den_value) OR _den_value = 0"),
+            "{sql}"
+        );
+    }
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn mixed_cluster_ratio_is_named_skip_and_other_objects_reconcile() {
+    let mock = Mock::start().await;
+    let product = ProductMetricBuilder::count("played", "game_played")
+        .build()
+        .unwrap();
+    let telemetry = TelemetryMetricBuilder::new("completed", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("fields.event_type", "game_completed")
+        .unwrap()
+        .build()
+        .unwrap();
+    let ratio = RatioMetricBuilder::new("share", "played", "completed")
+        .build()
+        .unwrap();
+    let mut declarations = Declarations::new()
+        .metric(product)
+        .metric(telemetry)
+        .metric(ratio)
+        .dashboard(
+            Dashboard::new("ops", "Operations").unwrap().section(
+                Section::new()
+                    .item(Item::stat("share"))
+                    .item(Item::stat("completed")),
+            ),
+        );
+    declarations.alerts.push(
+        AlertBuilder::new("share-high", "share")
+            .window_seconds(60)
+            .evaluation_interval_seconds(60)
+            .critical(Comparison::Above, 50.0)
+            .build()
+            .unwrap(),
+    );
+    let mut supported = declarations.clone();
+    supported.metrics[0] = TelemetryMetricBuilder::new("played", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("fields.event_type", "game_played")
+        .unwrap()
+        .build()
+        .unwrap();
+    mock.sync("demo", &supported).await.unwrap();
+    mock.log();
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|warning| warning.contains("cja:demo:insight:share: ratio mixes product events"))
+    );
+    assert!(report.skipped.iter().any(|warning| warning.contains("cja:demo:dashboard:ops: tile for share skipped (ratio mixes product events with logs/spans)")));
+    assert!(report.skipped.iter().any(|warning| warning.contains("cja:demo:alert:share-high: alert for share skipped (ratio mixes product events with logs/spans)")));
+    assert!(
+        report
+            .deleted
+            .contains(&"cja:demo:insight:share".to_owned())
+    );
+    assert!(
+        report
+            .updated
+            .iter()
+            .any(|entry| entry.contains("removed tile"))
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+    declarations.metrics.retain(|metric| metric.id != "share");
+    declarations.alerts.clear();
+    let _ = declarations.dashboards[0].sections[0].items.remove(0);
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert_eq!(report.skipped, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn table_over_scalar_ratio_reconciles_and_tiles() {
+    let mock = Mock::start().await;
+    let routes = TelemetryMetricBuilder::new("routes", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("semantic_kind", "http.request")
+        .unwrap()
+        .group_by("fields.route")
+        .unwrap()
+        .build()
+        .unwrap();
+    let requests = TelemetryMetricBuilder::new("requests", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("semantic_kind", "http.request")
+        .unwrap()
+        .build()
+        .unwrap();
+    let ratio = RatioMetricBuilder::new("route-share", "routes", "requests")
+        .build()
+        .unwrap();
+    let declarations = Declarations::new()
+        .metric(routes)
+        .metric(requests)
+        .metric(ratio)
+        .dashboard(
+            Dashboard::new("ops", "Operations")
+                .unwrap()
+                .section(Section::new().item(Item::table("route-share"))),
+        );
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        report
+            .created
+            .contains(&"cja:demo:insight:route-share".to_owned())
+    );
+    let ratio_insight = mock.row("cja:demo:insight:route-share");
+    let dashboard = mock.row("cja:demo:dashboard:ops");
+    assert!(
+        dashboard["tiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tile| tile["insight"]["id"] == ratio_insight["id"])
+    );
+    let sql = mock.row("cja:demo:insight:route-share")["query"]["source"]["query"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        sql.contains("CROSS JOIN (SELECT value AS _den_value"),
+        "{sql}"
+    );
+    assert_eq!(
+        sql.matches("timestamp <= now() - INTERVAL 2592000 SECOND")
+            .count(),
+        2
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn grouped_ratio_zero_fills_denominator_only_keys_but_not_missing_coverage() {
+    let mock = Mock::start().await;
+    let make = |id: &str, event: &str| {
+        TelemetryMetricBuilder::new(id, AggregateFunction::Count, None)
+            .unwrap()
+            .filter_eq("fields.event_type", event)
+            .unwrap()
+            .group_by("fields.source")
+            .unwrap()
+            .time_bucket(300)
+            .build()
+            .unwrap()
+    };
+    let declarations = Declarations::new()
+        .metric(make("completed", "game_completed"))
+        .metric(make("started", "game_started"))
+        .metric(
+            RatioMetricBuilder::new("completion-rate", "completed", "started")
+                .build()
+                .unwrap(),
+        )
+        .dashboard(
+            Dashboard::new("ops", "Operations")
+                .unwrap()
+                .default_range_seconds(3600)
+                .section(Section::new().item(Item::time_series("completion-rate"))),
+        );
+    mock.sync("demo", &declarations).await.unwrap();
+    let sql = mock.row("cja:demo:insight:completion-rate")["query"]["source"]["query"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(sql.contains("1 AS num_present"), "{sql}");
+    assert!(
+        sql.contains("if(isNull(max(num_present)), 0, max(numerator))"),
+        "{sql}"
+    );
+    assert!(sql.contains("if((SELECT count() FROM (SELECT 1 FROM logs WHERE service_name = 'demo' AND timestamp <= now() - INTERVAL 3600 SECOND LIMIT 1)) > 0"), "{sql}");
+    assert!(
+        sql.contains("isNull(_den_value) OR _den_value = 0"),
+        "{sql}"
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn overlong_health_tag_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let dashboard = Dashboard::new("a".repeat(128), "Health")
+        .unwrap()
+        .section(Section::new().item(Item::health_summary()));
+    let declarations = Declarations::new().dashboard(dashboard);
+    let app = "b".repeat(112);
+    let error = mock.sync(&app, &declarations).await.unwrap_err();
+    assert!(matches!(error, SyncError::Invalid(message) if message.contains("health tag")));
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn telemetry_windows_reconcile_and_removed_health_is_pruned() {
+    let mock = Mock::start().await;
+    let metric = TelemetryMetricBuilder::new("errors", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("level", "ERROR")
+        .unwrap()
+        .build()
+        .unwrap();
+    let dashboard = Dashboard::new("ops", "Operations")
+        .unwrap()
+        .default_range_seconds(3600)
+        .section(
+            Section::new()
+                .item(Item::stat("errors"))
+                .item(Item::stat("errors").window_seconds(7200))
+                .item(Item::health_summary()),
+        );
+    let mut declarations = Declarations::new().metric(metric).dashboard(dashboard);
+    mock.sync("demo", &declarations).await.unwrap();
+    let canonical = mock.row("cja:demo:insight:errors");
+    let variant = mock.row("cja:demo:insight:errors@7200s");
+    assert_eq!(canonical["name"], "errors");
+    assert_eq!(variant["name"], "errors");
+    assert_eq!(
+        canonical["description"],
+        "Shows no value until PostHog holds data back to the start of this window."
+    );
+    assert_eq!(variant["description"], canonical["description"]);
+    assert!(
+        canonical["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .contains("INTERVAL 3600 SECOND")
+    );
+    assert!(
+        variant["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .contains("INTERVAL 7200 SECOND")
+    );
+    let health = mock.row("cja:demo:insight:ops@health0");
+    assert_eq!(
+        health["name"],
+        "Recent error events (24h) — health substitute"
+    );
+    assert_eq!(health["description"], canonical["description"]);
+    assert!(
+        health["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .contains("INTERVAL 86400 SECOND")
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+
+    declarations.dashboards[0].sections[0].items.swap(0, 1);
+    let reordered = mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        reordered
+            .deleted
+            .contains(&"cja:demo:insight:errors@7200s".into())
+    );
+    assert_eq!(mock.row("cja:demo:insight:errors")["id"], canonical["id"]);
+    assert!(
+        mock.row("cja:demo:insight:errors")["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .contains("INTERVAL 7200 SECOND")
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+
+    declarations.dashboards[0].sections[0].items.truncate(1);
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        report
+            .deleted
+            .contains(&"cja:demo:insight:ops@health0".into())
+    );
+    assert!(
+        report
+            .deleted
+            .contains(&"cja:demo:insight:errors@3600s".into())
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
 }
 
 #[tokio::test]
@@ -646,11 +1078,18 @@ async fn membership_changes_do_not_replace_insights() {
         .collect::<Vec<_>>();
     assert_eq!(
         changes,
-        [(
-            Method::POST,
-            format!("dashboards/{}/delete_tile/", dashboard["id"]),
-            json!({"tile_id":tile_id})
-        )]
+        [
+            (
+                Method::PATCH,
+                format!("insights/{page_id}/"),
+                json!({"name":"pages","description":null,"query":page_query(None),"tags":["cja:demo:insight:pages"]})
+            ),
+            (
+                Method::POST,
+                format!("dashboards/{}/delete_tile/", dashboard["id"]),
+                json!({"tile_id":tile_id})
+            )
+        ]
     );
     declarations.dashboards[0].sections[0].items.push(item);
     mock.sync("demo", &declarations).await.unwrap();
@@ -661,12 +1100,462 @@ async fn membership_changes_do_not_replace_insights() {
         .collect::<Vec<_>>();
     assert_eq!(
         changes,
-        [(
-            Method::POST,
-            format!("dashboards/{}/add_insight/", dashboard["id"]),
-            json!({"insight_id":page_id})
-        )]
+        [
+            (
+                Method::PATCH,
+                format!("insights/{page_id}/"),
+                json!({"name":"pages","description":null,"query":page_query(Some("ActionsTable")),"tags":["cja:demo:insight:pages"]})
+            ),
+            (
+                Method::POST,
+                format!("dashboards/{}/add_insight/", dashboard["id"]),
+                json!({"insight_id":page_id})
+            )
+        ]
     );
+    assert_eq!(mock.row("cja:demo:insight:pages")["id"], page_id);
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn kinds_and_ranges_persist_with_dashboard_defaults_and_item_override() {
+    let mock = Mock::start().await;
+    let weekly = ProductMetricBuilder::count("weekly", "week_view")
+        .bucket_weeks(1)
+        .build()
+        .unwrap();
+    let d = example::declarations()
+        .unwrap()
+        .metric(weekly)
+        .dashboard(
+            Dashboard::new("history", "History")
+                .unwrap()
+                .default_range_seconds(364 * 86_400)
+                .section(Section::new().item(Item::time_series("weekly"))),
+        )
+        .dashboard(
+            Dashboard::new("history-copy", "History copy")
+                .unwrap()
+                .default_range_seconds(364 * 86_400)
+                .section(Section::new().item(Item::time_series("weekly"))),
+        )
+        .dashboard(
+            Dashboard::new("week", "Week")
+                .unwrap()
+                .default_range_seconds(364 * 86_400)
+                .section(Section::new().item(Item::time_series("weekly").window_seconds(604_800))),
+        );
+    mock.sync("demo", &d).await.unwrap();
+    assert_presentation(&mock.row("cja:demo:insight:pages"), "ActionsTable", "-1d");
+    assert_presentation(&mock.row("cja:demo:insight:sessions"), "BoldNumber", "-1d");
+    assert_presentation(
+        &mock.row("cja:demo:insight:weekly"),
+        "ActionsLineGraph",
+        "-364d",
+    );
+    assert_presentation(
+        &mock.row("cja:demo:insight:weekly@604800s"),
+        "ActionsLineGraph",
+        "-7d",
+    );
+    assert_eq!(
+        mock.row("cja:demo:insight:weekly")["query"]["source"]["interval"],
+        "week"
+    );
+    assert_eq!(
+        mock.row("cja:demo:dashboard:history")["tiles"][0]["insight"]["id"],
+        mock.row("cja:demo:dashboard:history-copy")["tiles"][0]["insight"]["id"]
+    );
+    assert_eq!(
+        mock.row("cja:demo:insight:daily")["query"],
+        mock_legacy("session_created")
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &d).await;
+}
+
+#[tokio::test]
+async fn invalid_windows_fail_before_any_api_request() {
+    for seconds in [0, 59, 31_622_401] {
+        let mock = Mock::start().await;
+        let d = one_metric(Some(Item::stat("views")), Some(seconds));
+        assert!(matches!(
+            mock.sync("demo", &d).await,
+            Err(SyncError::Invalid(_))
+        ));
+        assert_eq!(mock.log(), Vec::new());
+    }
+    for seconds in [0, 31_622_401] {
+        let mock = Mock::start().await;
+        let d = one_metric(None, Some(seconds));
+        assert!(matches!(
+            mock.sync("demo", &d).await,
+            Err(SyncError::Invalid(_))
+        ));
+        assert_eq!(mock.log(), Vec::new());
+    }
+    for seconds in [0, 31_622_401] {
+        let mock = Mock::start().await;
+        let d = one_metric(Some(Item::stat("views").window_seconds(seconds)), None);
+        assert!(matches!(
+            mock.sync("demo", &d).await,
+            Err(SyncError::Invalid(_))
+        ));
+        assert_eq!(mock.log(), Vec::new());
+    }
+    for seconds in [60, 31_622_400] {
+        let mock = Mock::start().await;
+        mock.sync("demo", &one_metric(None, Some(seconds)))
+            .await
+            .unwrap();
+    }
+    for seconds in [1, 31_622_400] {
+        let mock = Mock::start().await;
+        mock.sync(
+            "demo",
+            &one_metric(Some(Item::stat("views").window_seconds(seconds)), None),
+        )
+        .await
+        .unwrap();
+    }
+    let mock = Mock::start().await;
+    let d = one_metric(None, None);
+    mock.sync("demo", &d).await.unwrap();
+    assert_eq!(
+        mock.row("cja:demo:insight:views")["query"],
+        mock_legacy("page_view")
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &d).await;
+
+    let mock = Mock::start().await;
+    let mut d = example::declarations().unwrap();
+    d.metrics.push(
+        TelemetryMetricBuilder::new("jobs", AggregateFunction::Count, None)
+            .unwrap()
+            .build()
+            .unwrap(),
+    );
+    d.dashboards[0].sections[0]
+        .items
+        .push(Item::stat("jobs").window_seconds(0));
+    assert!(matches!(
+        mock.sync("demo", &d).await,
+        Err(SyncError::Invalid(_))
+    ));
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn overlong_variant_tag_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let d = one_metric(Some(Item::stat("views").window_seconds(604_800)), None).dashboard(
+        Dashboard::new("other", "Other")
+            .unwrap()
+            .section(Section::new().item(Item::stat("views").window_seconds(2_592_000))),
+    );
+    let error = mock.sync(&"a".repeat(240), &d).await.unwrap_err();
+    assert!(matches!(error, SyncError::Invalid(message) if message.contains("variant tag")));
+    assert_eq!(mock.log(), Vec::new());
+}
+
+fn views_alert() -> cja::observability::Alert {
+    AlertBuilder::new("high", "views")
+        .window_seconds(60)
+        .evaluation_interval_seconds(60)
+        .critical(Comparison::Above, 1.)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn adding_alert_rewrites_unalerted_30_day_stat_before_alert_creation() {
+    let mock = Mock::start().await;
+    let mut d = one_metric(Some(Item::stat("views")), None);
+    mock.sync("demo", &d).await.unwrap();
+    let canonical = mock.row("cja:demo:insight:views")["id"].clone();
+    assert_presentation(&mock.row("cja:demo:insight:views"), "BoldNumber", "-30d");
+    mock.log();
+    d.alerts.push(views_alert());
+    mock.sync("demo", &d).await.unwrap();
+    let writes = mock.writes();
+    assert_eq!(
+        writes[0],
+        (
+            Method::PATCH,
+            format!("insights/{canonical}/"),
+            json!({"name":"views","description":null,"query":trend("page_view", None, 0),"tags":["cja:demo:insight:views"]})
+        )
+    );
+    assert_eq!(writes[1].0, Method::POST);
+    assert_eq!(writes[1].1, "insights/");
+    assert_eq!(
+        writes[1].2["tags"],
+        json!(["cja:demo:insight:views@2592000s"])
+    );
+    assert_eq!(
+        writes
+            .iter()
+            .map(|(_, path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            format!("insights/{canonical}/"),
+            "insights/".into(),
+            format!(
+                "dashboards/{}/delete_tile/",
+                mock.row("cja:demo:dashboard:activity")["id"]
+            ),
+            format!(
+                "dashboards/{}/add_insight/",
+                mock.row("cja:demo:dashboard:activity")["id"]
+            ),
+            "alerts/".into()
+        ]
+    );
+    assert_eq!(mock.row("cja:demo:insight:views")["id"], canonical);
+    assert_eq!(
+        mock.row("cja:demo:insight:views")["query"],
+        trend("page_view", None, 0)
+    );
+    assert_presentation(
+        &mock.row("cja:demo:insight:views@2592000s"),
+        "BoldNumber",
+        "-30d",
+    );
+    assert_eq!(
+        mock.state
+            .lock()
+            .unwrap()
+            .rows
+            .values()
+            .find(|v| v["name"] == "high [cja:demo:alert:high]")
+            .unwrap()["insight"],
+        canonical
+    );
+    assert_repeat_clean(&mock, &d).await;
+}
+
+#[tokio::test]
+async fn removing_only_item_rewrites_unalerted_30_day_stat() {
+    let mock = Mock::start().await;
+    let mut d = one_metric(Some(Item::stat("views")), None);
+    mock.sync("demo", &d).await.unwrap();
+    let canonical = mock.row("cja:demo:insight:views")["id"].clone();
+    let dashboard = mock.row("cja:demo:dashboard:activity");
+    mock.log();
+    d.dashboards[0].sections[0].items.clear();
+    mock.sync("demo", &d).await.unwrap();
+    assert_eq!(
+        mock.writes(),
+        [
+            (
+                Method::PATCH,
+                format!("insights/{canonical}/"),
+                json!({"name":"views","description":null,"query":trend("page_view", None, 0),"tags":["cja:demo:insight:views"]})
+            ),
+            (
+                Method::POST,
+                format!("dashboards/{}/delete_tile/", dashboard["id"]),
+                json!({"tile_id":dashboard["tiles"][0]["id"]})
+            )
+        ]
+    );
+    assert_eq!(mock.row("cja:demo:insight:views")["id"], canonical);
+    assert_repeat_clean(&mock, &d).await;
+}
+
+#[tokio::test]
+async fn alerted_metric_keeps_canonical_query_and_alert_while_variants_change() {
+    let mock = Mock::start().await;
+    let mut d = one_metric(None, None).alert(views_alert());
+    mock.sync("demo", &d).await.unwrap();
+    let canonical = mock.row("cja:demo:insight:views")["id"].clone();
+    mock.log();
+    d.dashboards[0]
+        .sections
+        .push(Section::new().item(Item::stat("views").window_seconds(604_800)));
+    mock.sync("demo", &d).await.unwrap();
+    let variant = mock.row("cja:demo:insight:views@604800s")["id"].clone();
+    assert_presentation(
+        &mock.row("cja:demo:insight:views@604800s"),
+        "BoldNumber",
+        "-7d",
+    );
+    assert_eq!(
+        mock.row("cja:demo:dashboard:activity")["tiles"][0]["insight"]["id"],
+        variant
+    );
+    assert_eq!(
+        mock.row("cja:demo:insight:views")["query"],
+        mock_legacy("page_view")
+    );
+    assert!(
+        !mock
+            .writes()
+            .iter()
+            .any(|(_, path, _)| path == &format!("insights/{canonical}/") || path == "alerts/")
+    );
+    d.dashboards[0].sections[0].items[0] = Item::stat("views").window_seconds(2_592_000);
+    mock.sync("demo", &d).await.unwrap();
+    let writes = mock.writes();
+    assert_eq!(writes.first().unwrap().1, "insights/");
+    assert_eq!(
+        writes.last().unwrap(),
+        &(
+            Method::PATCH,
+            format!("insights/{variant}/"),
+            json!({"deleted":true})
+        )
+    );
+    assert_presentation(
+        &mock.row("cja:demo:insight:views@2592000s"),
+        "BoldNumber",
+        "-30d",
+    );
+    assert_eq!(mock.row("cja:demo:insight:views")["id"], canonical);
+    assert_repeat_clean(&mock, &d).await;
+    let current_variant = mock.row("cja:demo:insight:views@2592000s")["id"].clone();
+    d.dashboards[0].sections[0].items.clear();
+    mock.sync("demo", &d).await.unwrap();
+    let writes = mock.writes();
+    assert_eq!(
+        writes[0].1,
+        format!(
+            "dashboards/{}/delete_tile/",
+            mock.row("cja:demo:dashboard:activity")["id"]
+        )
+    );
+    assert_eq!(
+        writes.last().unwrap(),
+        &(
+            Method::PATCH,
+            format!("insights/{current_variant}/"),
+            json!({"deleted":true})
+        )
+    );
+    assert_eq!(mock.row("cja:demo:insight:views")["id"], canonical);
+    assert_repeat_clean(&mock, &d).await;
+}
+
+async fn seed_two_windows(mock: &Mock, d: &Declarations) -> (Value, Value) {
+    mock.sync("demo", d).await.unwrap();
+    let canonical = mock.row("cja:demo:insight:views")["id"].clone();
+    let old_variant = mock.row("cja:demo:insight:views@2592000s")["id"].clone();
+    assert_presentation(&mock.row("cja:demo:insight:views"), "BoldNumber", "-7d");
+    assert_presentation(
+        &mock.row("cja:demo:insight:views@2592000s"),
+        "BoldNumber",
+        "-30d",
+    );
+    {
+        let dashboard = mock.row("cja:demo:dashboard:activity");
+        let mut state = mock.state.lock().unwrap();
+        state
+            .rows
+            .get_mut(&(String::from("dashboards"), dashboard["id"].to_string()))
+            .unwrap()["tiles"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":9999,"text":"handmade"}));
+    }
+    mock.log();
+    (canonical, old_variant)
+}
+
+#[tokio::test]
+async fn two_windows_reorder_canonical_and_prune_obsolete_variant() {
+    let mock = Mock::start().await;
+    let mut d = one_metric(Some(Item::stat("views")), Some(604_800)).dashboard(
+        Dashboard::new("month", "Month")
+            .unwrap()
+            .default_range_seconds(2_592_000)
+            .section(Section::new().item(Item::stat("views"))),
+    );
+    let (canonical, old_variant) = seed_two_windows(&mock, &d).await;
+    d.dashboards.swap(0, 1);
+    mock.sync("demo", &d).await.unwrap();
+    let new_variant = mock.row("cja:demo:insight:views@604800s")["id"].clone();
+    let writes = mock.writes();
+    assert_eq!(
+        writes[0],
+        (
+            Method::PATCH,
+            format!("insights/{canonical}/"),
+            json!({"name":"views","description":null,"query":trend("page_view", Some("BoldNumber"), 2_592_000),"tags":["cja:demo:insight:views"]})
+        )
+    );
+    assert_eq!(writes[1].1, "insights/");
+    assert_eq!(
+        writes[1].2["tags"],
+        json!(["cja:demo:insight:views@604800s"])
+    );
+    assert_eq!(
+        writes.last().unwrap(),
+        &(
+            Method::PATCH,
+            format!("insights/{old_variant}/"),
+            json!({"deleted":true})
+        )
+    );
+    assert_eq!(writes.len(), 7);
+    let month = mock.row("cja:demo:dashboard:month");
+    let activity = mock.row("cja:demo:dashboard:activity");
+    assert_eq!(
+        writes[2].1,
+        format!("dashboards/{}/delete_tile/", month["id"])
+    );
+    assert_eq!(
+        writes[3],
+        (
+            Method::POST,
+            format!("dashboards/{}/add_insight/", month["id"]),
+            json!({"insight_id":canonical})
+        )
+    );
+    assert_eq!(
+        writes[4].1,
+        format!("dashboards/{}/delete_tile/", activity["id"])
+    );
+    assert_eq!(
+        writes[5],
+        (
+            Method::POST,
+            format!("dashboards/{}/add_insight/", activity["id"]),
+            json!({"insight_id":new_variant})
+        )
+    );
+    assert_eq!(month["tiles"][0]["insight"]["id"], canonical);
+    assert!(
+        activity["tiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tile| tile["insight"]["id"] == new_variant)
+    );
+    assert!(
+        activity["tiles"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"id":9999,"text":"handmade"}))
+    );
+    assert_repeat_clean(&mock, &d).await;
+    d.dashboards[1].sections[0].items.clear();
+    mock.sync("demo", &d).await.unwrap();
+    let writes = mock.writes();
+    assert_eq!(
+        writes[0].1,
+        format!("dashboards/{}/delete_tile/", activity["id"])
+    );
+    assert_eq!(
+        writes.last().unwrap(),
+        &(
+            Method::PATCH,
+            format!("insights/{new_variant}/"),
+            json!({"deleted":true})
+        )
+    );
+    assert_eq!(mock.row("cja:demo:insight:views")["id"], canonical);
+    assert_repeat_clean(&mock, &d).await;
 }
 
 fn list_page(results: &[Value], uri: &axum::http::Uri, headers: &HeaderMap, kind: &str) -> Value {
@@ -711,6 +1600,148 @@ async fn invalid_declarations_fail_before_any_api_request() {
         .push(Item::stat("missing"));
     assert!(mock.sync("demo", &declarations).await.is_err());
     assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn unsupported_sql_path_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let valid = TelemetryMetricBuilder::new("valid", AggregateFunction::Count, None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let invalid =
+        TelemetryMetricBuilder::new("cpu", AggregateFunction::Max, Some("measurement.value"))
+            .unwrap()
+            .build()
+            .unwrap();
+    let declarations = Declarations::new().metric(valid).metric(invalid).dashboard(
+        Dashboard::new("ops", "Operations").unwrap().section(
+            Section::new()
+                .item(Item::stat("valid"))
+                .item(Item::stat("cpu")),
+        ),
+    );
+    assert!(
+        matches!(mock.sync("demo", &declarations).await, Err(SyncError::Invalid(message)) if message.contains("unsupported field path"))
+    );
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn oversized_bucket_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let metric = TelemetryMetricBuilder::new("fast", AggregateFunction::Count, None)
+        .unwrap()
+        .time_bucket(30)
+        .build()
+        .unwrap();
+    let declarations = Declarations::new().metric(metric).dashboard(
+        Dashboard::new("ops", "Operations")
+            .unwrap()
+            .section(Section::new().item(Item::time_series("fast"))),
+    );
+    assert!(
+        matches!(mock.sync("demo", &declarations).await, Err(SyncError::Invalid(message)) if message.contains("50000-row"))
+    );
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn absent_source_group_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let metric = TelemetryMetricBuilder::new("kinds", AggregateFunction::Count, None)
+        .unwrap()
+        .group_by("semantic_kind")
+        .unwrap()
+        .build()
+        .unwrap();
+    let declarations = Declarations::new().metric(metric).dashboard(
+        Dashboard::new("ops", "Operations")
+            .unwrap()
+            .section(Section::new().item(Item::table("kinds"))),
+    );
+    assert!(
+        matches!(mock.sync("demo", &declarations).await, Err(SyncError::Invalid(message)) if message.contains("cannot group by") && message.contains("semantic_kind"))
+    );
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn switching_sql_metric_to_product_clears_description() {
+    let mock = Mock::start().await;
+    let telemetry = TelemetryMetricBuilder::new("views", AggregateFunction::Count, None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let product = ProductMetricBuilder::count("views", "page_view")
+        .build()
+        .unwrap();
+    let dashboard = Dashboard::new("ops", "Operations")
+        .unwrap()
+        .section(Section::new().item(Item::stat("views")));
+    mock.sync(
+        "demo",
+        &Declarations::new()
+            .metric(telemetry)
+            .dashboard(dashboard.clone()),
+    )
+    .await
+    .unwrap();
+    mock.log();
+    let declarations = Declarations::new().metric(product).dashboard(dashboard);
+    mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        mock.writes()
+            .iter()
+            .any(|(method, path, body)| *method == Method::PATCH
+                && path.starts_with("insights/")
+                && body["description"].is_null())
+    );
+    assert!(mock.row("cja:demo:insight:views")["description"].is_null());
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn sql_line_breakdown_sets_chart_setting_and_skips_two_dimensions() {
+    let mock = Mock::start().await;
+    let single = TelemetryMetricBuilder::new("single", AggregateFunction::Count, None)
+        .unwrap()
+        .group_by("fields.route")
+        .unwrap()
+        .time_bucket(300)
+        .build()
+        .unwrap();
+    let double = TelemetryMetricBuilder::new("double", AggregateFunction::Count, None)
+        .unwrap()
+        .group_by("fields.route")
+        .unwrap()
+        .group_by("fields.method")
+        .unwrap()
+        .time_bucket(300)
+        .build()
+        .unwrap();
+    let declarations = Declarations::new().metric(single).metric(double).dashboard(
+        Dashboard::new("ops", "Operations")
+            .unwrap()
+            .default_range_seconds(3600)
+            .section(
+                Section::new()
+                    .item(Item::time_series("single"))
+                    .item(Item::time_series("double")),
+            ),
+    );
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert_eq!(
+        mock.row("cja:demo:insight:single")["query"]["chartSettings"]["seriesBreakdownColumn"],
+        "_dim_0"
+    );
+    assert!(report.skipped.iter().any(|warning| warning.contains(
+        "tile for double skipped (PostHog-unsupported: SQL line charts break down by one column)"
+    )));
+    let dashboard = mock.row("cja:demo:dashboard:ops");
+    assert_eq!(dashboard["tiles"].as_array().unwrap().len(), 1);
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
 }
 
 #[test]
@@ -918,7 +1949,7 @@ async fn alert_names_over_the_posthog_limit_fail_before_any_request() {
 }
 
 #[tokio::test]
-async fn unicode_alert_length_counts_characters_and_eyes_only_alerts_skip() {
+async fn unicode_alert_length_counts_characters_for_every_metric_kind() {
     let mock = Mock::start().await;
     let mut declarations = example::declarations().unwrap();
     declarations.alerts[0].description = Some("é".repeat(232));
@@ -955,19 +1986,12 @@ async fn unicode_alert_length_counts_characters_and_eyes_only_alerts_skip() {
         .warning(Comparison::Below, 1.)
         .build()
         .unwrap();
-    let report = mock
+    let error = mock
         .sync("demo", &Declarations::default().metric(ops).alert(alert))
         .await
-        .unwrap();
-    assert!(
-        report
-            .skipped
-            .iter()
-            .any(|entry| entry.contains("ops_quiet")),
-        "{:?}",
-        report.skipped
-    );
-    assert!(!mock.writes().iter().any(|(_, path, _)| path == "alerts/"));
+        .unwrap_err();
+    assert!(matches!(error, SyncError::AlertNameTooLong { .. }));
+    assert_eq!(mock.log(), Vec::new());
 }
 
 /// Insert a copy of the live row matching `pick` under a fresh id, the way

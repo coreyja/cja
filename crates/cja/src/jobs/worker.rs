@@ -4024,7 +4024,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn invalid_payload_detail_stays_in_raw_telemetry_and_dead_letter_only(db: sqlx::PgPool) {
+    async fn invalid_payload_detail_reaches_eyes_posthog_and_dead_letter(db: sqlx::PgPool) {
         use opentelemetry_proto::tonic::collector::{
             logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
         };
@@ -4120,11 +4120,16 @@ mod tests {
             } else if path == "/i/v1/logs" {
                 ExportLogsServiceRequest::decode(body.as_slice()).unwrap();
             }
+        }
+        for path in ["/i/v1/traces", "/i/v1/logs"] {
             assert!(
-                !body
-                    .windows(EMAIL.len())
-                    .any(|window| window == EMAIL.as_bytes()),
-                "PostHog {path} received payload detail"
+                captures.iter().any(|(captured_path, body)| {
+                    captured_path == path
+                        && body
+                            .windows(EMAIL.len())
+                            .any(|window| window == EMAIL.as_bytes())
+                }),
+                "PostHog {path} lost payload detail"
             );
         }
         let logs = captures
@@ -4160,12 +4165,13 @@ mod tests {
                 .iter()
                 .any(|attribute| attribute.key == "job.name")
         );
-        assert!(
-            !failure
-                .attributes
-                .iter()
-                .any(|attribute| attribute.key == "error.detail")
-        );
+        assert!(failure.attributes.iter().any(|attribute| {
+            attribute.key == "error.detail"
+                && matches!(
+                    attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value.contains(EMAIL) && value.contains("invalid type")
+                )
+        }));
         let folded = logs
             .iter()
             .find(|record| {
@@ -4198,6 +4204,13 @@ mod tests {
             .iter()
             .find(|span| span.name == "jobs.run_from_value")
             .expect("run_from_value span exported");
+        assert!(run_span.attributes.iter().any(|attribute| {
+            attribute.key == "value"
+                && matches!(
+                    attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value.contains(EMAIL)
+                )
+        }));
         assert!(run_span.events.iter().flat_map(|event| &event.attributes).any(|attribute| {
             attribute.key == "exception.message"
                 && matches!(

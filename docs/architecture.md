@@ -33,7 +33,7 @@ A newly created ancestor
 ignore file is noticed on the next rerun, not immediately. Docker builds omit
 `.git/info/exclude` because `.dockerignore` removes `.git`.
 
-CJA is organized as three subsystems — Cron, Jobs, and Axum (HTTP server) — plus supporting modules for sessions, tracing, and database management. Everything coordinates through a shared `AppState` trait and `CancellationToken` for graceful shutdown.
+CJA has an Axum HTTP server and, by default, Postgres-backed Jobs and Cron subsystems. Defaults enable `postgres`, `jobs`, and `cron`; the chain is `cron → jobs → postgres`. Without defaults, `cja = { version = "...", default-features = false }` serves routes and uses tracing and cookies without SQLx. Everything coordinates through a shared `AppState` trait and `CancellationToken` for graceful shutdown.
 
 ## Crate Structure
 
@@ -50,10 +50,10 @@ migrations/         — Partial, best-effort copy of crates/cja/migrations/ (see
 ### Module Tree (`crates/cja/src/`)
 
 ```
-lib.rs             — Re-exports (sqlx, uuid, color_eyre, maud, chrono, chrono_tz)
+lib.rs             — Re-exports (uuid, color_eyre, maud, jiff; sqlx and jiff_sqlx with postgres)
 app_state.rs       — AppState trait
 setup.rs           — tracing initialization (stdout + Eyes + optional PostHog OTLP)
-db.rs              — run_migrations() via sqlx::migrate!("./migrations")
+db.rs              — With postgres: run_migrations() via sqlx::migrate!("./migrations")
 tasks.rs           — Supervisor, ShutdownBudget, NamedTask, wait_for_first_error
 jobs/
   mod.rs           — Job trait, enqueue logic, constants (DEFAULT_MAX_RETRIES, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_RECLAIM_WINDOW)
@@ -69,13 +69,13 @@ server/
   cookies/
     cookie_key.rs  — CookieKey (from COOKIE_KEY env or auto-generated)
     cookie_jar.rs  — CookieJar Axum extractor
-  session.rs       — CJASession, AppSession trait, Session<A> extractor
+  session.rs       — With postgres: CJASession, AppSession trait, Session<A> extractor
   page.rs          — Page wrapper for HTML responses
   page/factory.rs  — Factory Axum extractor
   trace.rs         — Tracer (MakeSpan + OnResponse), record_request_user, RequestUserLayer
 testing/
   mod.rs           — Test-support exports
-  test_db.rs       — Isolated PostgreSQL database lifecycle and stale reaping
+  test_db.rs       — With postgres: isolated PostgreSQL database lifecycle and stale reaping
   mock_oauth/      — Feature-gated mock OAuth server for integration tests
 ```
 
@@ -83,15 +83,21 @@ testing/
 
 ### `AppState` (`app_state.rs`)
 
-Central trait all applications must implement. Provides access to the database pool, cookie key, and version string. Cloned per-request — wrap expensive resources in `Arc`.
+Central trait all applications must implement. Provides a cookie key and version string; `db()` exists with `postgres`. Cloned per-request — wrap expensive resources in `Arc`.
 
 ```rust
 pub trait AppState: Clone + Send + Sync + 'static {
     fn version(&self) -> &str;
+    #[cfg(feature = "postgres")]
     fn db(&self) -> &sqlx::PgPool;
     fn cookie_key(&self) -> &CookieKey;
 }
 ```
+
+Without `postgres`, a cloneable state with a `CookieKey` can implement only
+`version()` and `cookie_key()`. The `db`, `server::session`, and
+`testing::test_db` modules and the `sqlx`/`jiff_sqlx` re-exports are conditional.
+`DATABASE_URL` and migrations apply to the default/Postgres path.
 
 ### `Job<AS>` (`jobs/mod.rs`)
 
@@ -137,7 +143,7 @@ Trait for custom session types backed by the `sessions` table:
 - `from_inner(CJASession) -> Self`
 - `inner(&self) -> &CJASession`
 
-The `Session<A>` extractor automatically loads or creates sessions from the `__Host-session_id` cookie (private, `HttpOnly`, `Secure`, `SameSite=Lax`) and refreshes `updated_at` at most once per `ACTIVITY_REFRESH_MIN_INTERVAL`. Lifecycle exits: `cja::server::session::prune(pool, idle)` (cron-schedulable idle deletion), `clear_session_cookie(jar)`, and cja-passkey's `POST /auth/logout` (row delete + cookie clear). cja-passkey replaces the session row (new id) on every successful registration/login, so a pre-authentication cookie never authenticates.
+The `Session<A>` extractor automatically loads or creates sessions from the `__Host-session_id` cookie (private, `HttpOnly`, `Secure`, `SameSite=Lax`) and refreshes `updated_at` at most once per `ACTIVITY_REFRESH_MIN_INTERVAL`. Lifecycle exits: `cja::server::session::prune(pool, idle)` (cron-schedulable idle deletion), `clear_session_cookie(jar)`, and cja-passport's `POST /auth/logout` (row delete + cookie clear). cja-passport replaces the session row (new id) on every successful login, so a pre-authentication cookie never authenticates.
 
 ## Data Flow
 

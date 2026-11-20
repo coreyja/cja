@@ -269,6 +269,16 @@ impl Default for Section {
 }
 
 impl Item {
+    /// The declared trailing window, when this item has one.
+    pub(crate) fn declared_window_seconds(&self) -> Option<u64> {
+        match self {
+            Self::Stat { window_seconds, .. }
+            | Self::TimeSeries { window_seconds, .. }
+            | Self::Table { window_seconds, .. } => *window_seconds,
+            Self::HealthSummary { .. } | Self::Links { .. } => None,
+        }
+    }
+
     /// A single-value item rendering a `scalar` named metric.
     /// **Infallible**: a `metric_id` is an opaque reference to a
     /// same-manifest metric; the server rejects unknown ones at ingest.
@@ -672,8 +682,6 @@ pub enum MetricQuery {
 }
 /// One declared metric divided by another, both in the same [`Declarations`].
 ///
-/// Eyes-only: the `PostHog` sync skips ratio metrics, their dashboard tiles
-/// and alerts on them with a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RatioMetric {
     pub numerator: String,
@@ -767,6 +775,16 @@ impl RatioMetricBuilder {
 /// An Eyes telemetry query validated by the telemetry builder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TelemetryMetric(eyes::NamedMetric);
+impl TelemetryMetric {
+    pub(crate) fn named_metric(&self) -> &eyes::NamedMetric {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn named_metric_mut(&mut self) -> &mut eyes::NamedMetric {
+        &mut self.0
+    }
+}
 /// Build a span or log metric for the Eyes manifest.
 #[derive(Debug)]
 #[must_use]

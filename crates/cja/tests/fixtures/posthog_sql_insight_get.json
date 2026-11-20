@@ -1,0 +1,41 @@
+{
+  "id": 0,
+  "short_id": "fixture",
+  "name": "fixture",
+  "derived_name": null,
+  "description": null,
+  "tags": [],
+  "query": {
+    "kind": "DataVisualizationNode",
+    "source": {
+      "kind": "HogQLQuery",
+      "query": "SELECT if((SELECT count() FROM (SELECT 1 FROM logs WHERE service_name = 'arena' AND timestamp <= now() - INTERVAL 3600 SECOND LIMIT 1)) > 0, count(), NULL) AS value FROM (SELECT NULL AS _metric_value FROM logs WHERE service_name = 'arena' AND timestamp >= now() - INTERVAL 3600 SECOND AND attributes['event_type'] = 'game_completed') AS _source LIMIT 1"
+    },
+    "display": "BoldNumber"
+  },
+  "filters": null,
+  "deleted": false,
+  "saved": true,
+  "result": [
+    [
+      1
+    ]
+  ],
+  "dashboards": [],
+  "dashboard_tiles": [],
+  "last_refresh": null,
+  "is_cached": true,
+  "query_status": null,
+  "hogql": "SELECT 1 AS value",
+  "types": [
+    [
+      "value",
+      "Nullable(UInt64)"
+    ]
+  ],
+  "columns": [
+    "value"
+  ],
+  "timezone": "UTC",
+  "resolved_date_range": null
+}
