@@ -292,6 +292,52 @@ fn subset(wanted: &Value, actual: &Value) -> bool {
         _ => wanted == actual,
     }
 }
+fn insight_absences_match(wanted: &Value, actual: &Value) -> bool {
+    (wanted.pointer("/query/source/breakdownFilter").is_some()
+        || actual
+            .pointer("/query/source/breakdownFilter/breakdowns")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty))
+        && (wanted
+            .pointer("/query/source/trendsFilter/display")
+            .is_some()
+            || actual
+                .pointer("/query/source/trendsFilter/display")
+                .is_none_or(|display| display == "ActionsLineGraph"))
+        && (wanted
+            .pointer("/query/source/dateRange/explicitDate")
+            .is_some()
+            || actual.pointer("/query/source/dateRange/explicitDate") != Some(&json!(true)))
+}
+const DEFAULT_RANGE_SECONDS: u64 = 30 * 86_400;
+const MAX_RANGE_SECONDS: u64 = 31_622_400;
+const TAG_LIMIT: usize = 255;
+fn date_from(seconds: u64) -> String {
+    for (unit, suffix) in [(86_400, "d"), (3_600, "h"), (60, "M")] {
+        if seconds.is_multiple_of(unit) {
+            return format!("-{}{suffix}", seconds / unit);
+        }
+    }
+    format!("-{seconds}s")
+}
+fn resolve_presentation<'a>(
+    item: &'a Item,
+    dash: &Dashboard,
+) -> Option<(&'a str, &'static str, u64)> {
+    let (metric, display) = match item {
+        Item::Stat { metric_id, .. } => (metric_id, "BoldNumber"),
+        Item::Table { metric_id, .. } => (metric_id, "ActionsTable"),
+        Item::TimeSeries { metric_id, .. } => (metric_id, "ActionsLineGraph"),
+        Item::HealthSummary { .. } | Item::Links { .. } => return None,
+    };
+    Some((
+        metric,
+        display,
+        item.declared_window_seconds()
+            .or(dash.default_range_seconds)
+            .unwrap_or(DEFAULT_RANGE_SECONDS),
+    ))
+}
 fn interval(n: u64) -> usize {
     match n {
         0..=3600 => 0,
@@ -300,7 +346,7 @@ fn interval(n: u64) -> usize {
         _ => 3,
     }
 }
-fn query(p: &ProductEventMetric, app: &str) -> Value {
+fn query(p: &ProductEventMetric, app: &str, presentation: Option<(&str, u64)>) -> Value {
     let (_, math, property) = p.aggregate.parts();
     let mut properties =
         vec![json!({"type":"event","key":"service.name","operator":"exact","value":app})];
@@ -340,6 +386,14 @@ fn query(p: &ProductEventMetric, app: &str) -> Value {
     });
     if let Some(prop) = &p.breakdown_property {
         source["breakdownFilter"] = json!({"breakdowns":[{"property":prop,"type":"event"}]});
+    }
+    if let Some((display, seconds)) = presentation {
+        source["dateRange"] = if display == "ActionsLineGraph" {
+            json!({"date_from":date_from(seconds)})
+        } else {
+            json!({"date_from":date_from(seconds),"explicitDate":true})
+        };
+        source["trendsFilter"] = json!({"display":display});
     }
     json!({"kind":"InsightVizNode","source":source})
 }
@@ -431,12 +485,7 @@ async fn upsert(
     let old = idx.get(key);
     if let Some(row) = old
         && subset(&body, row)
-        && (kind != "insights"
-            || body.pointer("/query/source/breakdownFilter").is_some()
-            || row
-                .pointer("/query/source/breakdownFilter/breakdowns")
-                .and_then(Value::as_array)
-                .is_none_or(Vec::is_empty))
+        && (kind != "insights" || insight_absences_match(&body, row))
     {
         return id(row, key);
     }
@@ -642,13 +691,13 @@ fn wanted_tiles(
     decl: &Declarations,
     dash: &Dashboard,
     key: &str,
-    ids: &BTreeMap<&str, i64>,
+    presentations: &BTreeMap<(&str, u64), i64>,
     r: &mut SyncReport,
 ) -> Vec<i64> {
     let mut wanted = vec![];
     for item in dash.sections.iter().flat_map(|s| &s.items) {
-        match (item, item.reference()) {
-            (_, Some((mid, _))) => match ids.get(mid) {
+        match (item, resolve_presentation(item, dash)) {
+            (_, Some((mid, _, seconds))) => match presentations.get(&(mid, seconds)) {
                 Some(insight_id) => wanted.push(*insight_id),
                 None => r.skipped.push(format!(
                     "{key}: tile for {} metric {mid} (Eyes-only)",
@@ -672,12 +721,11 @@ fn alert_path(row: &Value) -> Result<String, SyncError> {
         .ok_or_else(|| SyncError::Invalid("invalid alert UUID".into()))?;
     Ok(format!("alerts/{id}/"))
 }
-/// Apply a complete declaration set, including removal of stale owned objects.
-pub async fn sync(
+type Presentations<'a> = BTreeMap<&'a str, Vec<(&'static str, u64)>>;
+fn preflight<'a>(
     config: &SyncConfig,
-    declarations: &Declarations,
-    http: &SyncClient,
-) -> Result<SyncReport, SyncError> {
+    declarations: &'a Declarations,
+) -> Result<(BTreeSet<&'a str>, Presentations<'a>), SyncError> {
     slug(&config.app)
         .and_then(|()| declarations.validate())
         .map_err(SyncError::Invalid)?;
@@ -700,6 +748,94 @@ pub async fn sync(
             });
         }
     }
+    let product_ids = declarations
+        .metrics
+        .iter()
+        .filter(|metric| matches!(metric.query, MetricQuery::ProductEvent(_)))
+        .map(|metric| metric.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let alerted_ids = declarations
+        .alerts
+        .iter()
+        .filter(|alert| product_ids.contains(alert.metric_id.as_str()))
+        .map(|alert| alert.metric_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut declared_presentations: Presentations<'a> = BTreeMap::new();
+    for dash in &declarations.dashboards {
+        if let Some(seconds) = dash.default_range_seconds
+            && !(60..=MAX_RANGE_SECONDS).contains(&seconds)
+        {
+            return Err(SyncError::Invalid(format!(
+                "dashboard {}: default_range_seconds {seconds} must be 60..={MAX_RANGE_SECONDS}",
+                dash.id
+            )));
+        }
+        for item in dash.sections.iter().flat_map(|section| &section.items) {
+            let Some((metric_id, display, seconds)) = resolve_presentation(item, dash) else {
+                continue;
+            };
+            if let Some(window) = item.declared_window_seconds()
+                && !(1..=MAX_RANGE_SECONDS).contains(&window)
+            {
+                return Err(SyncError::Invalid(format!(
+                    "dashboard {} metric {metric_id}: window_seconds {window} must be 1..={MAX_RANGE_SECONDS}",
+                    dash.id
+                )));
+            }
+            if product_ids.contains(metric_id) {
+                let entries = declared_presentations.entry(metric_id).or_default();
+                if !entries.iter().any(|(_, old)| *old == seconds) {
+                    entries.push((display, seconds));
+                }
+            }
+        }
+    }
+    for (metric_id, entries) in &declared_presentations {
+        for (_, seconds) in entries
+            .iter()
+            .skip(usize::from(!alerted_ids.contains(metric_id)))
+        {
+            let key = format!("cja:{}:insight:{metric_id}@{seconds}s", config.app);
+            if key.len() > TAG_LIMIT {
+                return Err(SyncError::Invalid(format!(
+                    "insight variant tag {key} is {} characters; PostHog allows at most {TAG_LIMIT}",
+                    key.len()
+                )));
+            }
+        }
+    }
+    Ok((alerted_ids, declared_presentations))
+}
+async fn prune(
+    api: &Api<'_>,
+    dashboards: Index,
+    insights: Index,
+    keep: &BTreeSet<String>,
+    report: &mut SyncReport,
+) -> Result<(), SyncError> {
+    for (kind, rows) in [("dashboards", dashboards), ("insights", insights)] {
+        for (key, row) in rows {
+            if !keep.contains(&key) {
+                api.write(
+                    Method::PATCH,
+                    &format!("{kind}/{}/", id(&row, &key)?),
+                    &json!({"deleted":true}),
+                    &key,
+                )
+                .await?;
+                report.deleted.push(key);
+            }
+        }
+    }
+    Ok(())
+}
+/// Apply a complete declaration set, including removal of stale owned objects.
+pub async fn sync(
+    config: &SyncConfig,
+    declarations: &Declarations,
+    http: &SyncClient,
+) -> Result<SyncReport, SyncError> {
+    let (alerted_ids, declared_presentations) = preflight(config, declarations)?;
     let api = Api {
         config,
         http,
@@ -712,6 +848,7 @@ pub async fn sync(
     let mut report = SyncReport::default();
     let mut keep = BTreeSet::new();
     let mut ids = BTreeMap::new();
+    let mut presentation_ids = BTreeMap::new();
     for dash in &declarations.dashboards {
         let key = tag("dashboard", &dash.id);
         let body = json!({"name": dash.title, "description": dash.description.as_deref().unwrap_or_default()});
@@ -727,17 +864,45 @@ pub async fn sync(
             ));
             continue;
         };
+        let declared = declared_presentations.get(metric.id.as_str());
+        let alerted = alerted_ids.contains(metric.id.as_str());
+        let canonical_presentation = if alerted {
+            None
+        } else {
+            declared.and_then(|entries| entries.first().copied())
+        };
         let insight_id = upsert(
             &api,
             "insights",
             &key,
-            json!({"name":metric.display_name.as_ref().unwrap_or(&metric.id),"query":query(product,&config.app)}),
+            json!({"name":metric.display_name.as_ref().unwrap_or(&metric.id),"query":query(product,&config.app,canonical_presentation)}),
             &mut insights,
             &mut report,
         )
         .await?;
         ids.insert(metric.id.as_str(), insight_id);
         keep.insert(key);
+        if let Some(entries) = declared {
+            for (position, (display, seconds)) in entries.iter().enumerate() {
+                let n = if position == 0 && !alerted {
+                    insight_id
+                } else {
+                    let variant = tag("insight", &format!("{}@{seconds}s", metric.id));
+                    let n = upsert(
+                        &api,
+                        "insights",
+                        &variant,
+                        json!({"name":metric.display_name.as_ref().unwrap_or(&metric.id),"query":query(product,&config.app,Some((display,*seconds)))}),
+                        &mut insights,
+                        &mut report,
+                    )
+                    .await?;
+                    keep.insert(variant);
+                    n
+                };
+                presentation_ids.insert((metric.id.as_str(), *seconds), n);
+            }
+        }
     }
     let owned = insights
         .iter()
@@ -745,7 +910,7 @@ pub async fn sync(
         .collect::<Result<_, _>>()?;
     for dash in &declarations.dashboards {
         let key = tag("dashboard", &dash.id);
-        let wanted = wanted_tiles(declarations, dash, &key, &ids, &mut report);
+        let wanted = wanted_tiles(declarations, dash, &key, &presentation_ids, &mut report);
         tiles(
             &api,
             &key,
@@ -757,20 +922,7 @@ pub async fn sync(
         .await?;
     }
     alerts(&api, declarations, alert_rows, &ids, &mut report).await?;
-    for (kind, rows) in [("dashboards", dashboards), ("insights", insights)] {
-        for (key, row) in rows {
-            if !keep.contains(&key) {
-                api.write(
-                    Method::PATCH,
-                    &format!("{kind}/{}/", id(&row, &key)?),
-                    &json!({"deleted":true}),
-                    &key,
-                )
-                .await?;
-                report.deleted.push(key);
-            }
-        }
-    }
+    prune(&api, dashboards, insights, &keep, &mut report).await?;
     Ok(report)
 }
 fn message(error: &dyn Error) -> String {
@@ -904,6 +1056,59 @@ mod mapping_tests {
     use super::*;
     use crate::observability::{AlertBuilder, ProductMetricBuilder};
     #[test]
+    fn presentation_kinds_and_ranges() {
+        let dash = Dashboard::new("d", "D")
+            .unwrap()
+            .default_range_seconds(364 * 86_400);
+        for (item, display, seconds) in [
+            (Item::stat("m"), "BoldNumber", 364 * 86_400),
+            (
+                Item::table("m").window_seconds(604_800),
+                "ActionsTable",
+                604_800,
+            ),
+            (Item::time_series("m"), "ActionsLineGraph", 364 * 86_400),
+        ] {
+            assert_eq!(
+                resolve_presentation(&item, &dash),
+                Some(("m", display, seconds))
+            );
+        }
+        assert_eq!(resolve_presentation(&Item::health_summary(), &dash), None);
+        assert_eq!(resolve_presentation(&Item::links(vec![]), &dash), None);
+        for (seconds, expected) in [
+            (61, "-61s"),
+            (300, "-5M"),
+            (3_600, "-1h"),
+            (604_800, "-7d"),
+            (2_592_000, "-30d"),
+            (31_449_600, "-364d"),
+        ] {
+            assert_eq!(date_from(seconds), expected);
+        }
+    }
+    #[test]
+    fn legacy_absences_require_a_legacy_query() {
+        let wanted = json!({"query":{"source":{"dateRange":{"date_from":"-30d"}}}});
+        let mut actual = wanted.clone();
+        assert!(insight_absences_match(&wanted, &actual));
+        actual["query"]["source"]["trendsFilter"] = json!({});
+        assert!(insight_absences_match(&wanted, &actual));
+        actual["query"]["source"]["trendsFilter"] = json!({"display":"ActionsLineGraph"});
+        actual["query"]["source"]["dateRange"]["explicitDate"] = json!(false);
+        assert!(insight_absences_match(&wanted, &actual));
+        actual["query"]["source"]["trendsFilter"] = json!({"display":"BoldNumber"});
+        assert!(!insight_absences_match(&wanted, &actual));
+        actual["query"]["source"]["dateRange"]["explicitDate"] = json!(true);
+        assert!(!insight_absences_match(&wanted, &actual));
+        actual["query"]["source"]["trendsFilter"] = json!({});
+        assert!(!insight_absences_match(&wanted, &actual));
+        let line = json!({"query":{"source":{"dateRange":{"date_from":"-30d"},"trendsFilter":{"display":"ActionsLineGraph"}}}});
+        let mut stored_line = line.clone();
+        stored_line["query"]["source"]["dateRange"]["explicitDate"] = json!(true);
+        assert!(!insight_absences_match(&line, &stored_line));
+    }
+    #[test]
     fn product_trend_wire_contract() {
         let metric = ProductMetricBuilder::p95("time", "opened", "seconds")
             .filter("paid", FilterOperator::Eq, true)
@@ -916,7 +1121,7 @@ mod mapping_tests {
             panic!("expected product metric")
         };
         assert_eq!(
-            query(&spec, "demo"),
+            query(&spec, "demo", None),
             json!({
  "kind":"InsightVizNode","source":{"kind":"TrendsQuery",
  "series":[{"kind":"EventsNode","event":"opened","math":"p95","math_property":"seconds","properties":[
@@ -926,13 +1131,37 @@ mod mapping_tests {
  "interval":"hour","dateRange":{"date_from":"-30d"},"filterTestAccounts":false,
  "breakdownFilter":{"breakdowns":[{"property":"tier","type":"event"}]}}})
         );
+        let presented = query(&spec, "demo", Some(("ActionsTable", 300)));
+        assert_eq!(
+            presented["source"]["dateRange"],
+            json!({"date_from":"-5M","explicitDate":true})
+        );
+        assert_eq!(
+            presented["source"]["trendsFilter"],
+            json!({"display":"ActionsTable"})
+        );
+        assert_eq!(
+            presented["source"]["series"],
+            query(&spec, "demo", None)["source"]["series"]
+        );
+        assert_eq!(
+            presented["source"]["breakdownFilter"],
+            query(&spec, "demo", None)["source"]["breakdownFilter"]
+        );
+        assert_eq!(presented["source"]["interval"], "hour");
+        let line = query(&spec, "demo", Some(("ActionsLineGraph", 604_800)));
+        assert_eq!(line["source"]["dateRange"], json!({"date_from":"-7d"}));
+        assert_eq!(
+            line["source"]["trendsFilter"],
+            json!({"display":"ActionsLineGraph"})
+        );
         let count = ProductMetricBuilder::count("sessions", "opened")
             .build()
             .unwrap();
         let MetricQuery::ProductEvent(spec) = count.query else {
             panic!("expected product metric")
         };
-        let q = query(&spec, "demo");
+        let q = query(&spec, "demo", None);
         assert_eq!(q["source"]["interval"], "day");
         for weeks in [1, 2] {
             let weekly = ProductMetricBuilder::count("weekly", "opened")
@@ -942,7 +1171,7 @@ mod mapping_tests {
             let MetricQuery::ProductEvent(spec) = weekly.query else {
                 panic!("expected product metric")
             };
-            assert_eq!(query(&spec, "demo")["source"]["interval"], "week");
+            assert_eq!(query(&spec, "demo", None)["source"]["interval"], "week");
         }
         assert_eq!(q["source"]["series"][0]["math"], "total");
         assert!(q["source"].get("breakdownFilter").is_none());

@@ -269,6 +269,16 @@ impl Default for Section {
 }
 
 impl Item {
+    /// The declared trailing window, when this item has one.
+    pub(crate) fn declared_window_seconds(&self) -> Option<u64> {
+        match self {
+            Self::Stat { window_seconds, .. }
+            | Self::TimeSeries { window_seconds, .. }
+            | Self::Table { window_seconds, .. } => *window_seconds,
+            Self::HealthSummary { .. } | Self::Links { .. } => None,
+        }
+    }
+
     /// A single-value item rendering a `scalar` named metric.
     /// **Infallible**: a `metric_id` is an opaque reference to a
     /// same-manifest metric; the server rejects unknown ones at ingest.
