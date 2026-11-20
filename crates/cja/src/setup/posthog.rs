@@ -341,22 +341,8 @@ fn valid_percent_encoding(part: &str) -> bool {
     true
 }
 
-fn sanitize_attributes(
-    attributes: &mut Vec<ProtoKeyValue>,
-    span_name: Option<&str>,
-    log_record: bool,
-) {
-    let job_log = log_record
-        && attributes
-            .iter()
-            .any(|attribute| attribute.key == "job.name");
+fn sanitize_attributes(attributes: &mut Vec<ProtoKeyValue>) {
     attributes.retain_mut(|attribute| {
-        if (attribute.key == "self" && (log_record || span_name == Some("jobs.enqueue")))
-            || (attribute.key == "value" && (span_name == Some("jobs.run_from_value") || job_log))
-            || (attribute.key == "error.detail" && job_log)
-        {
-            return false;
-        }
         let header = attribute
             .key
             .rsplit('.')
@@ -387,7 +373,7 @@ fn sanitize_body(path: &str, body: &[u8]) -> Result<Vec<u8>> {
         for resource in &mut request.resource_logs {
             for scope in &mut resource.scope_logs {
                 for record in &mut scope.log_records {
-                    sanitize_attributes(&mut record.attributes, None, true);
+                    sanitize_attributes(&mut record.attributes);
                 }
             }
         }
@@ -398,12 +384,12 @@ fn sanitize_body(path: &str, body: &[u8]) -> Result<Vec<u8>> {
         for resource in &mut request.resource_spans {
             for scope in &mut resource.scope_spans {
                 for span in &mut scope.spans {
-                    sanitize_attributes(&mut span.attributes, Some(&span.name), false);
+                    sanitize_attributes(&mut span.attributes);
                     for event in &mut span.events {
-                        sanitize_attributes(&mut event.attributes, Some(&span.name), false);
+                        sanitize_attributes(&mut event.attributes);
                     }
                     for link in &mut span.links {
-                        sanitize_attributes(&mut link.attributes, Some(&span.name), false);
+                        sanitize_attributes(&mut link.attributes);
                     }
                 }
             }
@@ -718,6 +704,29 @@ mod tests {
         ]
     }
 
+    fn assert_request_credentials_redacted(attributes: &[ProtoKeyValue]) {
+        assert_eq!(
+            value(attributes, "uri"),
+            Some("/callback?code=[REDACTED]&page=2")
+        );
+        assert_eq!(
+            value(attributes, "url.query"),
+            Some("state=[REDACTED]&page=2")
+        );
+        assert_eq!(
+            value(attributes, "http.request.header.referer"),
+            Some("https://local/?token=[REDACTED]&page=2")
+        );
+        for key in [
+            "http.request.header.Authorization",
+            "http.request.header.proxy-authorization",
+            "http.request.header.cookie",
+            "http.request.header.set-cookie",
+        ] {
+            assert!(value(attributes, key).is_none(), "{key}");
+        }
+    }
+
     #[test]
     fn otlp_policy_covers_spans_events_links_and_copied_logs() {
         use opentelemetry_proto::tonic::{
@@ -758,26 +767,10 @@ mod tests {
             &span.links[0].attributes,
         ] {
             assert_eq!(
-                value(attributes, "uri"),
-                Some("/callback?code=[REDACTED]&page=2")
+                value(attributes, "self"),
+                Some("Job { recipient_override: synthetic@example.test }")
             );
-            assert_eq!(
-                value(attributes, "url.query"),
-                Some("state=[REDACTED]&page=2")
-            );
-            assert_eq!(
-                value(attributes, "http.request.header.referer"),
-                Some("https://local/?token=[REDACTED]&page=2")
-            );
-            for key in [
-                "self",
-                "http.request.header.Authorization",
-                "http.request.header.proxy-authorization",
-                "http.request.header.cookie",
-                "http.request.header.set-cookie",
-            ] {
-                assert!(value(attributes, key).is_none(), "{key}");
-            }
+            assert_request_credentials_redacted(attributes);
             for key in [
                 "user_agent.original",
                 "http.request.header.x-forwarded-for",
@@ -811,19 +804,18 @@ mod tests {
         let encoded = sanitize_body("/base/i/v1/logs", &logs.encode_to_vec()).unwrap();
         let decoded = ExportLogsServiceRequest::decode(encoded.as_slice()).unwrap();
         let attributes = &decoded.resource_logs[0].scope_logs[0].log_records[0].attributes;
+        assert_request_credentials_redacted(attributes);
         assert_eq!(
-            value(attributes, "uri"),
-            Some("/callback?code=[REDACTED]&page=2")
+            value(attributes, "self"),
+            Some("Job { recipient_override: synthetic@example.test }")
         );
-        assert!(value(attributes, "self").is_none());
-        assert!(value(attributes, "http.request.header.Authorization").is_none());
         assert_eq!(value(attributes, "job.id"), Some("job-1"));
         assert!(sanitize_body("/other", &logs.encode_to_vec()).is_err());
         assert!(sanitize_body("/i/v1/traces", b"not protobuf").is_err());
     }
 
     #[test]
-    fn job_run_value_is_removed_only_in_job_context() {
+    fn job_run_value_is_kept_in_job_context() {
         use opentelemetry_proto::tonic::{
             logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
             trace::v1::{
@@ -871,7 +863,7 @@ mod tests {
             &span.events[0].attributes,
             &span.links[0].attributes,
         ] {
-            assert!(value(attrs, "value").is_none());
+            assert_eq!(value(attrs, "value"), Some("synthetic-run@example.test"));
             assert_eq!(value(attrs, "job.name"), Some("Mail"));
         }
         let unrelated = &decoded.resource_spans[0].scope_spans[0].spans[1];
@@ -881,7 +873,12 @@ mod tests {
                 scope_logs: vec![ScopeLogs {
                     log_records: vec![
                         LogRecord {
-                            attributes: fields,
+                            attributes: {
+                                let mut attributes = fields;
+                                attributes
+                                    .push(attribute("error.detail", "synthetic detail marker"));
+                                attributes
+                            },
                             ..Default::default()
                         },
                         LogRecord {
@@ -897,7 +894,14 @@ mod tests {
         let body = sanitize_body("/i/v1/logs", &logs.encode_to_vec()).unwrap();
         let decoded = ExportLogsServiceRequest::decode(body.as_slice()).unwrap();
         let records = &decoded.resource_logs[0].scope_logs[0].log_records;
-        assert!(value(&records[0].attributes, "value").is_none());
+        assert_eq!(
+            value(&records[0].attributes, "value"),
+            Some("synthetic-run@example.test")
+        );
+        assert_eq!(
+            value(&records[0].attributes, "error.detail"),
+            Some("synthetic detail marker")
+        );
         assert_eq!(value(&records[0].attributes, "job.name"), Some("Mail"));
         assert_eq!(value(&records[1].attributes, "value"), Some("keep-me"));
     }
