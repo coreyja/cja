@@ -682,8 +682,6 @@ pub enum MetricQuery {
 }
 /// One declared metric divided by another, both in the same [`Declarations`].
 ///
-/// Eyes-only: the `PostHog` sync skips ratio metrics, their dashboard tiles
-/// and alerts on them with a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RatioMetric {
     pub numerator: String,
@@ -777,6 +775,16 @@ impl RatioMetricBuilder {
 /// An Eyes telemetry query validated by the telemetry builder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TelemetryMetric(eyes::NamedMetric);
+impl TelemetryMetric {
+    pub(crate) fn named_metric(&self) -> &eyes::NamedMetric {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn named_metric_mut(&mut self) -> &mut eyes::NamedMetric {
+        &mut self.0
+    }
+}
 /// Build a span or log metric for the Eyes manifest.
 #[derive(Debug)]
 #[must_use]
