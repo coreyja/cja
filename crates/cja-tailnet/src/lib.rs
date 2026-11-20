@@ -2,7 +2,7 @@
 //! stored secret.
 //!
 //! At boot the process proves its platform identity (a Google-signed ID token
-//! from the GCP metadata server or a Fly Machine OIDC token), exchanges it
+//! from the GCP metadata server, a Fly Machine, or a mounted lanyard socket), exchanges it
 //! with Tailscale's workload identity federation for a short-lived API token,
 //! mints a single-use, ephemeral, pre-authorized auth key for its tag, and joins with fresh
 //! in-memory node keys ([tailscale-rs](https://github.com/tailscale/tailscale-rs)).
@@ -12,7 +12,12 @@
 //! [`Tailnet`] implements [`setec::Dialer`], so a setec client can reach the
 //! secrets server over it.
 
-use std::{io, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use setec::{Connection, DialFuture, Dialer};
 use tokio::sync::RwLock;
@@ -20,6 +25,9 @@ use url::Url;
 use zeroize::Zeroizing;
 
 const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+const LANYARD_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
+const LANYARD_SOCKET: &str = "/run/lanyard/lanyard.sock";
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const AUTH_KEY_TTL_SECS: u64 = 300;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,6 +50,14 @@ pub enum Error {
         step: &'static str,
         status: u16,
         body: String,
+    },
+    #[error("{step} failed after {attempts} attempts over a {budget:?} retry budget")]
+    WifRetryExhausted {
+        step: &'static str,
+        budget: Duration,
+        attempts: u32,
+        #[source]
+        last: Box<Error>,
     },
     #[error("joining the tailnet did not finish within {0:?}")]
     JoinTimeout(Duration),
@@ -72,6 +88,12 @@ pub enum Identity {
         /// The federated identity's audience; the ID token is requested for it.
         audience: String,
     },
+    /// A host-mounted per-app lanyard Unix socket supplies a fresh OIDC token.
+    Lanyard {
+        socket_path: PathBuf,
+        client_id: String,
+        audience: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -87,11 +109,16 @@ pub struct TailnetConfig {
 
 impl TailnetConfig {
     pub fn new(hostname: impl Into<String>, tag: impl Into<String>, identity: Identity) -> Self {
+        let join_timeout = if matches!(identity, Identity::Lanyard { .. }) {
+            LANYARD_JOIN_TIMEOUT
+        } else {
+            DEFAULT_JOIN_TIMEOUT
+        };
         Self {
             hostname: hostname.into(),
             tag: tag.into(),
             identity,
-            join_timeout: DEFAULT_JOIN_TIMEOUT,
+            join_timeout,
         }
     }
 
@@ -102,9 +129,10 @@ impl TailnetConfig {
     /// | `TS_TAG` | required |
     /// | `TS_WIF_CLIENT_ID` | required |
     /// | `TS_WIF_AUDIENCE` | `api.tailscale.com/<client ID>`, the audience Tailscale generates |
-    /// | `TS_WIF_PROVIDER` | `gcp` on Cloud Run (`K_SERVICE` set), then `fly` on Fly (`FLY_APP_NAME` or `FLY_MACHINE_ID` set); otherwise required. Explicit value wins. |
-    /// | `TS_HOSTNAME` | selected provider's service/app name (`K_SERVICE` or `FLY_APP_NAME`), then Fly machine ID; otherwise required. Explicit value wins. |
-    /// | `TS_JOIN_TIMEOUT_SECS` | 30 |
+    /// | `TS_WIF_PROVIDER` | `gcp` on Cloud Run (`K_SERVICE` set), then `fly` on Fly (`FLY_APP_NAME` or `FLY_MACHINE_ID` set); otherwise required. Explicit `gcp`, `fly`, or `lanyard` wins. |
+    /// | `LANYARD_SOCKET` | `/run/lanyard/lanyard.sock` for lanyard |
+    /// | `TS_HOSTNAME` | required for lanyard; otherwise selected provider's service/app name (`K_SERVICE` or `FLY_APP_NAME`), then Fly machine ID. Explicit value wins. |
+    /// | `TS_JOIN_TIMEOUT_SECS` | 120 for lanyard; 30 for GCP and Fly |
     pub fn from_env() -> Result<Self, Error> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -122,14 +150,14 @@ impl TailnetConfig {
             None if fly_app.is_some() || fly_machine.is_some() => "fly".to_owned(),
             None => {
                 return Err(Error::Config(
-                    "TS_WIF_PROVIDER must be set outside Cloud Run and Fly (supported: gcp, fly)"
+                    "TS_WIF_PROVIDER must be set outside Cloud Run and Fly (supported: gcp, fly, lanyard)"
                         .into(),
                 ));
             }
         };
-        if provider != "gcp" && provider != "fly" {
+        if provider != "gcp" && provider != "fly" && provider != "lanyard" {
             return Err(Error::Config(format!(
-                "TS_WIF_PROVIDER={provider:?} is not supported (expected \"gcp\" or \"fly\")"
+                "TS_WIF_PROVIDER={provider:?} is not supported (expected \"gcp\", \"fly\", or \"lanyard\")"
             )));
         }
         let client_id = required("TS_WIF_CLIENT_ID")?;
@@ -144,16 +172,28 @@ impl TailnetConfig {
                 client_id,
                 audience,
             },
+            "lanyard" => Identity::Lanyard {
+                socket_path: PathBuf::from(
+                    get("LANYARD_SOCKET").unwrap_or_else(|| LANYARD_SOCKET.to_owned()),
+                ),
+                client_id,
+                audience,
+            },
             _ => unreachable!("provider validated above"),
         };
         let hostname = get("TS_HOSTNAME")
             .or_else(|| match provider.as_str() {
                 "gcp" => cloud_run_service,
                 "fly" => fly_app.or(fly_machine),
+                "lanyard" => None,
                 _ => unreachable!("provider validated above"),
             })
             .ok_or_else(|| {
-                Error::Config("TS_HOSTNAME must be set outside Cloud Run and Fly".into())
+                if provider == "lanyard" {
+                    Error::Config("TS_HOSTNAME must be set for lanyard".into())
+                } else {
+                    Error::Config("TS_HOSTNAME must be set outside Cloud Run and Fly".into())
+                }
             })?;
 
         let mut config = Self::new(hostname, required("TS_TAG")?, identity);
@@ -293,21 +333,151 @@ async fn mint_auth_key(
         .build()
         .map_err(|e| identity_error("building HTTP client", e))?;
 
-    let (client_id, jwt) = match &config.identity {
+    let api_token = match &config.identity {
         Identity::Gcp {
             client_id,
             audience,
-        } => (client_id, gcp_id_token(&http, endpoints, audience).await?),
+        } => {
+            let jwt = gcp_id_token(&http, endpoints, audience).await?;
+            exchange(&http, endpoints, client_id, &jwt).await?
+        }
         Identity::Fly {
             client_id,
             audience,
-        } => (
+        } => {
+            let jwt = fly_id_token(&endpoints.fly_socket, audience).await?;
+            exchange(&http, endpoints, client_id, &jwt).await?
+        }
+        Identity::Lanyard {
+            socket_path,
             client_id,
-            fly_id_token(&endpoints.fly_socket, audience).await?,
-        ),
+            audience,
+        } => {
+            lanyard_api_token(
+                &http,
+                endpoints,
+                socket_path,
+                client_id,
+                audience,
+                LanyardWifRetryPolicy::default(),
+            )
+            .await?
+        }
     };
-    let api_token = exchange(&http, endpoints, client_id, &jwt).await?;
     create_key(&http, endpoints, &api_token, &config.tag).await
+}
+
+#[derive(Clone, Copy)]
+struct LanyardWifRetryPolicy {
+    budget: Duration,
+    first_delay: Duration,
+    max_delay: Duration,
+}
+
+impl Default for LanyardWifRetryPolicy {
+    fn default() -> Self {
+        Self {
+            budget: Duration::from_secs(90),
+            first_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(8),
+        }
+    }
+}
+
+async fn lanyard_api_token(
+    http: &reqwest::Client,
+    endpoints: &Endpoints,
+    socket: &Path,
+    client_id: &str,
+    audience: &str,
+    policy: LanyardWifRetryPolicy,
+) -> Result<Zeroizing<String>, Error> {
+    const STEP: &str = "Tailscale token exchange";
+    let deadline = tokio::time::Instant::now() + policy.budget;
+    let mut delay = policy.first_delay;
+    let mut attempts = 0;
+    let mut last = None;
+    loop {
+        if attempts > 0 && tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        attempts += 1;
+        let attempt = async {
+            let jwt = lanyard_id_token(socket, audience).await?;
+            exchange(http, endpoints, client_id, &jwt).await
+        };
+        let result = if attempts == 1 {
+            attempt.await
+        } else {
+            match tokio::time::timeout_at(deadline, attempt).await {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        };
+        match result {
+            Ok(token) => return Ok(token),
+            Err(
+                error @ Error::IdentityStatus {
+                    step: STEP,
+                    status: 403,
+                    ..
+                },
+            ) => {
+                last = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(delay.min(remaining)).await;
+        delay = delay.saturating_mul(2).min(policy.max_delay);
+    }
+    Err(Error::WifRetryExhausted {
+        step: STEP,
+        budget: policy.budget,
+        attempts,
+        last: Box::new(last.expect("a timed-out retry follows a WIF 403")),
+    })
+}
+
+#[cfg(unix)]
+async fn lanyard_id_token(socket: &Path, audience: &str) -> Result<Zeroizing<String>, Error> {
+    const STEP: &str = "lanyard ID token";
+    #[derive(serde::Deserialize)]
+    struct TokenResponse {
+        token: Zeroizing<String>,
+    }
+    let http = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .unix_socket(socket)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| identity_error(STEP, e))?;
+    let response = http
+        .post("http://localhost/token")
+        .json(&serde_json::json!({"audience": audience}))
+        .send()
+        .await
+        .map_err(|e| identity_error(STEP, e))?;
+    let body = checked_text(STEP, response).await?;
+    let parsed: TokenResponse = serde_json::from_str(&body).map_err(|e| identity_error(STEP, e))?;
+    if parsed.token.trim().is_empty() {
+        return Err(identity_error(
+            STEP,
+            io::Error::new(io::ErrorKind::InvalidData, "empty lanyard token"),
+        ));
+    }
+    Ok(parsed.token)
+}
+
+#[cfg(not(unix))]
+async fn lanyard_id_token(_socket: &Path, _audience: &str) -> Result<Zeroizing<String>, Error> {
+    Err(identity_error(
+        "lanyard ID token",
+        io::Error::new(io::ErrorKind::Unsupported, "lanyard requires Unix sockets"),
+    ))
 }
 
 async fn gcp_id_token(
@@ -443,10 +613,24 @@ async fn create_key(
 /// upstream services may include sensitive details in them.
 async fn checked_text(
     step: &'static str,
-    response: reqwest::Response,
+    mut response: reqwest::Response,
 ) -> Result<Zeroizing<String>, Error> {
     let status = response.status();
-    let body = Zeroizing::new(response.text().await.map_err(|e| identity_error(step, e))?);
+    let mut bytes = Zeroizing::new(Vec::new());
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| identity_error(step, e))?
+    {
+        if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
+            return Err(identity_error(
+                step,
+                io::Error::new(io::ErrorKind::InvalidData, "response exceeded 64 KiB"),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned());
     if !status.is_success() {
         return Err(Error::IdentityStatus {
             step,
@@ -560,6 +744,74 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn lanyard_config(socket: &Path) -> TailnetConfig {
+        TailnetConfig::new(
+            "attic-app",
+            "tag:home",
+            Identity::Lanyard {
+                socket_path: socket.to_owned(),
+                client_id: "client-123".into(),
+                audience: "api.tailscale.com/client-123".into(),
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    fn lanyard_socket_server(
+        socket: &Path,
+        audience: &str,
+        replies: Vec<(u16, String)>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let audience = audience.to_owned();
+        tokio::spawn(async move {
+            for (status, body) in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0; 1024];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "request ended before headers");
+                    request.extend_from_slice(&chunk[..n]);
+                    assert!(request.len() < 8192, "request too large");
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let mut lines = headers.split("\r\n");
+                assert_eq!(lines.next().unwrap(), "POST /token HTTP/1.1");
+                let mut content_length = None;
+                for line in lines.filter(|line| !line.is_empty()) {
+                    let (name, value) = line.split_once(':').unwrap();
+                    assert!(!name.eq_ignore_ascii_case("authorization"));
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let content_length = content_length.unwrap();
+                while request.len() - header_end < content_length {
+                    let mut chunk = [0; 1024];
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "request ended before body");
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                assert_eq!(request.len() - header_end, content_length);
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&request[header_end..]).unwrap(),
+                    json!({"audience": audience})
+                );
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nLocation: /other\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        })
+    }
+
+    #[cfg(unix)]
     async fn expect_no_tailscale_calls(server: &MockServer) {
         for endpoint in ["/api/v2/oauth/token-exchange", "/api/v2/tailnet/-/keys"] {
             Mock::given(method("POST"))
@@ -631,7 +883,7 @@ mod tests {
                 assert_eq!(client_id, "kAbc123CNTRL");
                 assert_eq!(audience, "api.tailscale.com/kAbc123CNTRL");
             }
-            other @ Identity::Fly { .. } => panic!("unexpected identity {other:?}"),
+            other => panic!("unexpected identity {other:?}"),
         }
     }
 
@@ -658,7 +910,7 @@ mod tests {
                 assert_eq!(client_id, "kAbc123CNTRL");
                 assert_eq!(audience, "custom-audience");
             }
-            other @ Identity::Fly { .. } => panic!("unexpected identity {other:?}"),
+            other => panic!("unexpected identity {other:?}"),
         }
     }
 
@@ -694,7 +946,7 @@ mod tests {
                 assert_eq!(client_id, "client-123");
                 assert_eq!(audience, "api.tailscale.com/client-123");
             }
-            other @ Identity::Gcp { .. } => panic!("unexpected identity {other:?}"),
+            other => panic!("unexpected identity {other:?}"),
         }
     }
 
@@ -794,6 +1046,378 @@ mod tests {
             TailnetConfig::from_lookup(lookup(&[("K_SERVICE", "s"), ("TS_WIF_CLIENT_ID", "k")]))
                 .unwrap_err();
         assert!(err.to_string().contains("TS_TAG"), "{err}");
+    }
+
+    #[test]
+    fn lanyard_config_requires_hostname_and_credentials() {
+        let base = [
+            ("TS_WIF_PROVIDER", "lanyard"),
+            ("TS_WIF_CLIENT_ID", "client-123"),
+            ("TS_TAG", "tag:home"),
+        ];
+        for markers in [
+            vec![],
+            vec![("K_SERVICE", "cloud")],
+            vec![("FLY_APP_NAME", "fly")],
+        ] {
+            let mut values = base.to_vec();
+            values.extend(markers);
+            let err = TailnetConfig::from_lookup(lookup(&values)).unwrap_err();
+            assert!(err.to_string().contains("TS_HOSTNAME"), "{err}");
+            assert!(err.to_string().contains("lanyard"), "{err}");
+        }
+        let values = [
+            ("TS_WIF_PROVIDER", "lanyard"),
+            ("TS_HOSTNAME", "app"),
+            ("TS_TAG", "tag:home"),
+        ];
+        assert!(
+            TailnetConfig::from_lookup(lookup(&values))
+                .unwrap_err()
+                .to_string()
+                .contains("TS_WIF_CLIENT_ID")
+        );
+        let values = [
+            ("TS_WIF_PROVIDER", "lanyard"),
+            ("TS_HOSTNAME", "app"),
+            ("TS_WIF_CLIENT_ID", "id"),
+        ];
+        assert!(
+            TailnetConfig::from_lookup(lookup(&values))
+                .unwrap_err()
+                .to_string()
+                .contains("TS_TAG")
+        );
+        let unsupported = TailnetConfig::from_lookup(lookup(&[("TS_WIF_PROVIDER", "bad")]))
+            .unwrap_err()
+            .to_string();
+        for expected in ["TS_WIF_PROVIDER", "bad", "gcp", "fly", "lanyard"] {
+            assert!(unsupported.contains(expected), "{unsupported}");
+        }
+    }
+
+    #[test]
+    fn lanyard_config_defaults_and_overrides() {
+        let base = [
+            ("TS_WIF_PROVIDER", "lanyard"),
+            ("TS_WIF_CLIENT_ID", "client-123"),
+            ("TS_TAG", "tag:home"),
+            ("TS_HOSTNAME", "app"),
+        ];
+        let config = TailnetConfig::from_lookup(lookup(&base)).unwrap();
+        assert_eq!(config.hostname, "app");
+        assert_eq!(config.join_timeout, Duration::from_secs(120));
+        assert!(
+            matches!(config.identity, Identity::Lanyard { socket_path, client_id, audience }
+            if socket_path == Path::new("/run/lanyard/lanyard.sock") && client_id == "client-123" && audience == "api.tailscale.com/client-123")
+        );
+        let mut overrides = base.to_vec();
+        overrides.extend([
+            ("LANYARD_SOCKET", "/tmp/app.sock"),
+            ("TS_WIF_AUDIENCE", "custom"),
+            ("TS_JOIN_TIMEOUT_SECS", "7"),
+            ("K_SERVICE", "cloud"),
+            ("FLY_APP_NAME", "fly"),
+        ]);
+        let config = TailnetConfig::from_lookup(lookup(&overrides)).unwrap();
+        assert_eq!(config.hostname, "app");
+        assert_eq!(config.join_timeout, Duration::from_secs(7));
+        assert!(
+            matches!(config.identity, Identity::Lanyard { socket_path, audience, .. }
+            if socket_path == Path::new("/tmp/app.sock") && audience == "custom")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lanyard_mints_key_through_shared_flow() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("lanyard.sock");
+        let handle = lanyard_socket_server(
+            &socket,
+            "api.tailscale.com/client-123",
+            vec![(200, json!({"token":"lanyard.jwt.1"}).to_string())],
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/oauth/token-exchange"))
+            .and(body_string("client_id=client-123&jwt=lanyard.jwt.1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"access_token":"ts-api-token"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(path("/api/v2/tailnet/-/keys"))
+            .and(header("authorization", "Bearer ts-api-token"))
+            .and(body_partial_json(json!({"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":true,"preauthorized":true,"tags":["tag:home"]}}},"expirySeconds":300})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"key":"tskey-auth-lanyard"})))
+            .expect(1).mount(&server).await;
+        let key = mint_auth_key(&lanyard_config(&socket), &endpoints(&server))
+            .await
+            .unwrap();
+        assert_eq!(key.as_str(), "tskey-auth-lanyard");
+        handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lanyard_socket_failures_do_not_call_tailscale() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        expect_no_tailscale_calls(&server).await;
+        let missing = temp.path().join("missing.sock");
+        let refused = temp.path().join("refused.sock");
+        drop(tokio::net::UnixListener::bind(&refused).unwrap());
+        for socket in [&missing, &refused] {
+            let err = mint_auth_key(&lanyard_config(socket), &endpoints(&server))
+                .await
+                .unwrap_err();
+            match err {
+                Error::Identity { step, source } => {
+                    assert_eq!(step, "lanyard ID token");
+                    let reqwest = source.downcast_ref::<reqwest::Error>().unwrap();
+                    assert!(reqwest.is_connect(), "{reqwest}");
+                }
+                other => panic!("unexpected error {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lanyard_status_and_malformed_responses_stop_before_exchange() {
+        let cases = [
+            (500, json!({"error":"signing failed"}).to_string(), true),
+            (302, "redirect".to_owned(), true),
+            (200, "not json".to_owned(), false),
+            (200, "{}".to_owned(), false),
+            (200, json!({"token":12}).to_string(), false),
+            (200, json!({"token":""}).to_string(), false),
+            (200, json!({"token":"  \t"}).to_string(), false),
+            (200, "x".repeat(MAX_RESPONSE_BYTES + 1), false),
+        ];
+        for (status, body, is_status) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("lanyard.sock");
+            let handle = lanyard_socket_server(
+                &socket,
+                "api.tailscale.com/client-123",
+                vec![(status, body.clone())],
+            );
+            let server = MockServer::start().await;
+            expect_no_tailscale_calls(&server).await;
+            let err = mint_auth_key(&lanyard_config(&socket), &endpoints(&server))
+                .await
+                .unwrap_err();
+            if is_status {
+                match err {
+                    Error::IdentityStatus {
+                        step,
+                        status: actual,
+                        body: actual_body,
+                    } => {
+                        assert_eq!(step, "lanyard ID token");
+                        assert_eq!(actual, status);
+                        assert_eq!(actual_body, body);
+                    }
+                    other => panic!("unexpected error {other:?}"),
+                }
+            } else {
+                match err {
+                    Error::Identity { step, source } => {
+                        assert_eq!(step, "lanyard ID token");
+                        if body.len() > MAX_RESPONSE_BYTES {
+                            let io = source.downcast_ref::<io::Error>().unwrap();
+                            assert_eq!(io.kind(), io::ErrorKind::InvalidData);
+                            assert_eq!(io.to_string(), "response exceeded 64 KiB");
+                        }
+                    }
+                    other => panic!("unexpected error {other:?}"),
+                }
+            }
+            handle.await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lanyard_accepts_response_at_exact_size_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("lanyard.sock");
+        let empty = json!({"token":"jwt","padding":""}).to_string();
+        let body = json!({"token":"jwt","padding":"x".repeat(MAX_RESPONSE_BYTES - empty.len())})
+            .to_string();
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+        let handle = lanyard_socket_server(&socket, "aud", vec![(200, body)]);
+        let token = lanyard_id_token(&socket, "aud").await.unwrap();
+        assert_eq!(token.as_str(), "jwt");
+        handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lanyard_remints_after_wif_403_then_creates_one_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("lanyard.sock");
+        let handle = lanyard_socket_server(
+            &socket,
+            "api.tailscale.com/client-123",
+            vec![
+                (200, json!({"token":"lanyard.jwt.1"}).to_string()),
+                (200, json!({"token":"lanyard.jwt.2"}).to_string()),
+            ],
+        );
+        let server = MockServer::start().await;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/v2/oauth/token-exchange"))
+            .respond_with(move |_: &wiremock::Request| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(403).set_body_string("unknown kid")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"access_token":"ts-api-token"}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/tailnet/-/keys"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"key":"tskey-auth-lanyard"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let key = mint_auth_key(&lanyard_config(&socket), &endpoints(&server))
+            .await
+            .unwrap();
+        assert_eq!(key.as_str(), "tskey-auth-lanyard");
+        handle.await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let exchanges: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/api/v2/oauth/token-exchange")
+            .collect();
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0].body, b"client_id=client-123&jwt=lanyard.jwt.1");
+        assert_eq!(exchanges[1].body, b"client_id=client-123&jwt=lanyard.jwt.2");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == "/api/v2/tailnet/-/keys")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lanyard_persistent_403_exposes_budget_and_final_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("lanyard.sock");
+        let handle = lanyard_socket_server(
+            &socket,
+            "api.tailscale.com/client-123",
+            vec![
+                (200, json!({"token":"lanyard.jwt.1"}).to_string()),
+                (200, json!({"token":"lanyard.jwt.2"}).to_string()),
+            ],
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/oauth/token-exchange"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("still unknown kid"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/tailnet/-/keys"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let policy = LanyardWifRetryPolicy {
+            budget: Duration::from_secs(3),
+            first_delay: Duration::from_millis(1500),
+            max_delay: Duration::from_millis(1500),
+        };
+        let err = lanyard_api_token(
+            &http,
+            &endpoints(&server),
+            &socket,
+            "client-123",
+            "api.tailscale.com/client-123",
+            policy,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("3s"), "{err}");
+        assert!(err.to_string().contains("2 attempts"), "{err}");
+        match err {
+            Error::WifRetryExhausted {
+                step,
+                budget,
+                attempts,
+                last,
+            } => {
+                assert_eq!(step, "Tailscale token exchange");
+                assert_eq!(budget, Duration::from_secs(3));
+                assert_eq!(attempts, 2);
+                assert!(
+                    matches!(*last, Error::IdentityStatus { step: "Tailscale token exchange", status: 403, ref body } if body == "still unknown kid")
+                );
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+        handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lanyard_wif_non_403_is_not_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("lanyard.sock");
+        let handle = lanyard_socket_server(
+            &socket,
+            "api.tailscale.com/client-123",
+            vec![(200, json!({"token":"lanyard.jwt.1"}).to_string())],
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/oauth/token-exchange"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad subject"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/tailnet/-/keys"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let err = lanyard_api_token(
+            &reqwest::Client::new(),
+            &endpoints(&server),
+            &socket,
+            "client-123",
+            "api.tailscale.com/client-123",
+            LanyardWifRetryPolicy {
+                budget: Duration::from_millis(50),
+                first_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::IdentityStatus { step: "Tailscale token exchange", status: 401, ref body } if body == "bad subject")
+        );
+        handle.await.unwrap();
     }
 
     #[tokio::test]
