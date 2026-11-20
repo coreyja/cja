@@ -365,6 +365,31 @@ mod sql_tests {
             ensure_bucket_rows(600, SqlWindow::trailing(MAX_SQL_ROWS * 600), "series").is_err()
         );
     }
+
+    /// cja's `Tracer::make_span` sets `otel.name = "<METHOD> <route>"`, so the
+    /// exported `PostHog` span is never named `server.request`. The plan maps
+    /// `semantic_kind = http.request` by target and kind only, not by name.
+    #[test]
+    fn http_semantic_kind_matches_renamed_server_spans_by_target_and_kind_only() {
+        let metric = TelemetryMetricBuilder::new("http.requests", EyesAggregate::Count, None)
+            .unwrap()
+            .filter_eq("semantic_kind", "http.request")
+            .unwrap()
+            .build()
+            .unwrap();
+        let sql = telemetry_sql(telemetry(&metric), "arena", SqlWindow::trailing(3600)).unwrap();
+        assert!(sql.contains("FROM posthog.trace_spans"), "{sql}");
+        assert!(
+            sql.contains(
+                "attributes['target'] = 'cja::server::trace' AND attributes['kind'] = 'server'"
+            ),
+            "{sql}"
+        );
+        assert!(
+            !sql.contains("name = 'server.request'"),
+            "renamed HTTP spans never match a server.request name filter: {sql}"
+        );
+    }
 }
 pub(crate) fn slug(app: &str) -> Result<(), String> {
     if app.is_empty()
