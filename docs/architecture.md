@@ -137,7 +137,7 @@ Trait for custom session types backed by the `sessions` table:
 - `from_inner(CJASession) -> Self`
 - `inner(&self) -> &CJASession`
 
-The `Session<A>` extractor automatically loads or creates sessions from the `__Host-session_id` cookie (private, `HttpOnly`, `Secure`, `SameSite=Lax`) and refreshes `updated_at` at most once per `ACTIVITY_REFRESH_MIN_INTERVAL`. Lifecycle exits: `cja::server::session::prune(pool, idle)` (cron-schedulable idle deletion), `clear_session_cookie(jar)`, and cja-passkey's `POST /auth/logout` (row delete + cookie clear). cja-passkey replaces the session row (new id) on every successful registration/login, so a pre-authentication cookie never authenticates.
+The `Session<A>` extractor automatically loads or creates sessions from the `__Host-session_id` cookie (private, `HttpOnly`, `Secure`, `SameSite=Lax`) and refreshes `updated_at` at most once per `ACTIVITY_REFRESH_MIN_INTERVAL`. Lifecycle exits: `cja::server::session::prune(pool, idle)` (cron-schedulable idle deletion), `clear_session_cookie(jar)`, and cja-passport's `POST /auth/logout` (row delete + cookie clear). cja-passport replaces the session row (new id) on every successful login, so a pre-authentication cookie never authenticates.
 
 ## Data Flow
 

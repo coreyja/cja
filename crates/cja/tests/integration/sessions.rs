@@ -5,7 +5,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 /// Mint a private `__Host-session_id` cookie exactly as the server writes
-/// it, mirroring cja-passkey tests' `make_session_cookie`.
+/// it, mirroring cja-passport tests' `make_session_cookie`.
 fn mint_session_cookie(session_id: Uuid, key: &cja::server::cookies::CookieKey) -> String {
     let key = key.0.clone();
     let mut jar = tower_cookies::cookie::CookieJar::new();
