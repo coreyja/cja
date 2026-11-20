@@ -24,6 +24,10 @@ pub async fn prune_auth_artifacts(pool: &PgPool) -> cja::Result<u64> {
         .execute(pool)
         .await?
         .rows_affected();
+    count += sqlx::query("DELETE FROM passport_oauth_grants g WHERE NOT EXISTS (SELECT 1 FROM passport_oauth_refresh_tokens r WHERE r.grant_id=g.id) AND NOT EXISTS (SELECT 1 FROM passport_oauth_authorization_codes c WHERE c.grant_id=g.id AND c.expires_at>now())")
+        .execute(pool)
+        .await?
+        .rows_affected();
     count += sqlx::query("DELETE FROM passport_oauth_clients c WHERE GREATEST(c.created_at,COALESCE(c.last_used_at,c.created_at)) < now()-interval '6 hours' AND NOT EXISTS (SELECT 1 FROM passport_oauth_grants g WHERE g.oauth_client_id=c.id) AND NOT EXISTS (SELECT 1 FROM passport_oauth_login_transactions t WHERE t.oauth_client_id=c.id) AND NOT EXISTS (SELECT 1 FROM passport_oauth_consents s WHERE s.oauth_client_id=c.id) AND NOT EXISTS (SELECT 1 FROM passport_oauth_pending_consents p WHERE p.oauth_client_id=c.id)")
         .execute(pool).await?.rows_affected();
     let attempts = sqlx::query("DELETE FROM passport_login_attempts WHERE expires_at <= now()")

@@ -129,18 +129,26 @@ async fn mcp(McpUser(user): McpUser) -> String {
 
 impl Fixture {
     pub async fn new() -> Self {
-        Self::new_with_settings(None, OAuthOptions::default()).await
+        Self::new_with_settings(None, OAuthOptions::default(), &["userid:123"]).await
     }
 
     pub async fn new_with_token_endpoint(token_endpoint: Option<String>) -> Self {
-        Self::new_with_settings(token_endpoint, OAuthOptions::default()).await
+        Self::new_with_settings(token_endpoint, OAuthOptions::default(), &["userid:123"]).await
     }
 
     pub async fn new_with_oauth_options(options: OAuthOptions) -> Self {
-        Self::new_with_settings(None, options).await
+        Self::new_with_settings(None, options, &["userid:123"]).await
     }
 
-    async fn new_with_settings(token_endpoint: Option<String>, options: OAuthOptions) -> Self {
+    pub async fn new_with_allowed_subjects(subjects: &[&str]) -> Self {
+        Self::new_with_settings(None, OAuthOptions::default(), subjects).await
+    }
+
+    async fn new_with_settings(
+        token_endpoint: Option<String>,
+        options: OAuthOptions,
+        subjects: &[&str],
+    ) -> Self {
         let (pool, guard) = cja::testing::test_db::create_test_database("cja_passport_test_")
             .await
             .unwrap();
@@ -176,7 +184,10 @@ impl Fixture {
             RedirectUrl::new("https://app.example.test/auth/callback".into()).unwrap(),
             ClientId::new("test-client".into()),
             secrets.client.watch(),
-            HashSet::from([AllowedSubject::new("userid:123").unwrap()]),
+            subjects
+                .iter()
+                .map(|subject| AllowedSubject::new(*subject).unwrap())
+                .collect(),
             HashSet::from(["testapp".to_owned()]),
             SessionTimings::default(),
         )

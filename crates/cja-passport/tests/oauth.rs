@@ -49,14 +49,18 @@ fn field<'a>(html: &'a str, name: &str) -> &'a str {
         .unwrap()
 }
 async fn first_consent(f: &Fixture, client: &str) -> (String, String, String, String) {
+    first_consent_for_subject(f, client, "userid:123").await
+}
+async fn first_consent_for_subject(
+    f: &Fixture,
+    client: &str,
+    subject: &str,
+) -> (String, String, String, String) {
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
     let (_, cookie, state) = f.start(&authorize_uri(client, &challenge)).await;
     let nonce = f.nonce().await;
     let _mock = f
-        .token_mock(
-            jwt(&f.server.base_url(), &nonce, "userid:123"),
-            "upstream-1",
-        )
+        .token_mock(jwt(&f.server.base_url(), &nonce, subject), "upstream-1")
         .await;
     let response = f.callback(&cookie, &state).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -202,6 +206,10 @@ async fn authorize_consent_and_exchange() {
         .request("GET", "/mcp", None, Some(&format!("Bearer {access}")), None)
         .await;
     assert_eq!(ok.status(), StatusCode::OK);
+    let lowercase_scheme = f
+        .request("GET", "/mcp", None, Some(&format!("bearer {access}")), None)
+        .await;
+    assert_eq!(lowercase_scheme.status(), StatusCode::OK);
     let replay = f
         .form(
             "/oauth/token",
@@ -312,10 +320,44 @@ async fn refresh_form(f: &Fixture, client: &str, raw: &str) -> axum::response::R
     .await
 }
 
+async fn backdate_grant_expiry(f: &Fixture) {
+    sqlx::query("UPDATE passport_oauth_grants SET expires_at=now()+interval '1 day'")
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+}
+
+async fn assert_grant_expiry_slid(f: &Fixture, refresh_token: &str) {
+    let slid: bool = sqlx::query_scalar(
+        "SELECT expires_at > now()+interval '179 days' FROM passport_oauth_grants",
+    )
+    .fetch_one(&f.state.pool)
+    .await
+    .unwrap();
+    assert!(slid, "refresh must slide the grant expiry");
+    let token_matches_grant: bool = sqlx::query_scalar(
+        "SELECT r.expires_at=g.expires_at FROM passport_oauth_refresh_tokens r JOIN passport_oauth_grants g ON g.id=r.grant_id WHERE r.token_hash=$1",
+    )
+    .bind(Sha256::digest(refresh_token.as_bytes()).to_vec())
+    .fetch_one(&f.state.pool)
+    .await
+    .unwrap();
+    assert!(
+        token_matches_grant,
+        "new refresh expiry must equal grant expiry"
+    );
+}
+
 #[tokio::test]
 async fn refresh_rotates_and_later_reuse_revokes_the_grant() {
     let f = Fixture::new().await;
     let (client, first) = authorized_tokens(&f).await;
+    let display_before: (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT email,preferred_username,picture FROM passport_users")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+    backdate_grant_expiry(&f).await;
     let old = first["refresh_token"].as_str().unwrap();
     let upstream = f
         .server
@@ -345,7 +387,17 @@ async fn refresh_rotates_and_later_reuse_revokes_the_grant() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     let second: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_grant_expiry_slid(&f, second["refresh_token"].as_str().unwrap()).await;
     assert_ne!(second["refresh_token"], first["refresh_token"]);
+    let display_after: (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT email,preferred_username,picture FROM passport_users")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        display_after, display_before,
+        "no identity claims must preserve display fields"
+    );
     assert_ne!(second["access_token"], first["access_token"]);
     assert_eq!(upstream.calls_async().await, 1);
     let new_access = second["access_token"].as_str().unwrap();
@@ -393,6 +445,44 @@ async fn refresh_rotates_and_later_reuse_revokes_the_grant() {
         .await;
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
     assert!(revoked.headers().contains_key("www-authenticate"));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn refresh_with_partial_identity_preserves_missing_display_claims() {
+    let f = Fixture::new().await;
+    let (client, first) = authorized_tokens(&f).await;
+    let now = jiff::Timestamp::now().as_second();
+    let claims = json!({
+        "iss": f.server.base_url(), "sub": "userid:123", "aud": "test-client",
+        "exp": now + 300, "iat": now, "nbf": now - 1, "jti": "refresh-jti",
+        "preferred_username": "updated-user",
+    });
+    let _upstream = f
+        .server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/token")
+                .form_urlencoded_tuple("grant_type", "refresh_token");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "access_token":"0123456789abcdef0123456789abcdef",
+                    "token_type":"Bearer", "expires_in":300,
+                    "refresh_token":"upstream-2", "id_token":common::jwt_claims(&claims)
+                }));
+        })
+        .await;
+    let response = refresh_form(&f, &client, first["refresh_token"].as_str().unwrap()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let display: (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT email,preferred_username,picture FROM passport_users")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(display.0.as_deref(), Some("user@example.test"));
+    assert_eq!(display.1.as_deref(), Some("updated-user"));
+    assert_eq!(display.2, None);
     f.close().await;
 }
 
@@ -578,9 +668,161 @@ async fn repeated_authorize_with_consent_stays_silent_and_replaces_grant() {
 }
 
 #[tokio::test]
+async fn pruning_removes_abandoned_unexchanged_grants() {
+    let f = Fixture::new().await;
+    let client = register(&f, "Claude").await;
+    let (cookie, pending, csrf, _) = first_consent(&f, &client).await;
+    let _code = approve(&f, &cookie, &pending, &csrf).await;
+    cja_passport::prune_auth_artifacts(&f.state.pool)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM passport_oauth_grants")
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "live unexchanged code must retain its grant");
+    sqlx::query(
+        "UPDATE passport_oauth_authorization_codes SET expires_at=now()-interval '1 second'",
+    )
+    .execute(&f.state.pool)
+    .await
+    .unwrap();
+    cja_passport::prune_auth_artifacts(&f.state.pool)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM passport_oauth_grants")
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "expired abandoned code must release its upstream grant"
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn token_errors_are_not_cacheable() {
+    let f = Fixture::new().await;
+    let malformed = f
+        .request("POST", "/oauth/token", None, None, Some("{}"))
+        .await;
+    assert!(malformed.status().is_client_error());
+    assert_eq!(malformed.headers()["cache-control"], "no-store");
+    assert_eq!(malformed.headers()["pragma"], "no-cache");
+    let unsupported = f
+        .form(
+            "/oauth/token",
+            None,
+            &[("grant_type", "client_credentials")],
+        )
+        .await;
+    assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(unsupported.headers()["cache-control"], "no-store");
+    assert_eq!(unsupported.headers()["pragma"], "no-cache");
+    assert!(body(unsupported).await.contains("unsupported_grant_type"));
+    f.close().await;
+}
+
+#[tokio::test]
+async fn callback_and_consent_database_failures_return_plain_500() {
+    let f = Fixture::new().await;
+    let client = register(&f, "Claude").await;
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+    let (_, cookie, state) = f.start(&authorize_uri(&client, &challenge)).await;
+    let nonce = f.nonce().await;
+    let _mock = f
+        .token_mock(
+            jwt(&f.server.base_url(), &nonce, "userid:123"),
+            "upstream-1",
+        )
+        .await;
+    sqlx::query("DROP TABLE passport_oauth_login_transactions CASCADE")
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let failed_callback = f.callback(&cookie, &state).await;
+    assert_eq!(failed_callback.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!failed_callback.headers().contains_key("location"));
+    f.close().await;
+
+    let f = Fixture::new().await;
+    let client = register(&f, "Claude").await;
+    let (cookie, pending, csrf, _) = first_consent(&f, &client).await;
+    sqlx::query("DROP TABLE passport_oauth_pending_consents CASCADE")
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let failed_consent = f
+        .form(
+            "/oauth/consent",
+            Some(&cookie),
+            &[
+                ("pending_id", &pending),
+                ("csrf_token", &csrf),
+                ("action", "allow"),
+            ],
+        )
+        .await;
+    assert_eq!(failed_consent.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!failed_consent.headers().contains_key("location"));
+    assert_eq!(failed_consent.headers()["cache-control"], "no-store");
+    f.close().await;
+}
+
+#[tokio::test]
+async fn consent_is_scoped_to_client_and_passport_user() {
+    let f = Fixture::new_with_allowed_subjects(&["userid:123", "userid:456"]).await;
+    let client_a = register(&f, "Claude A").await;
+    let (cookie, pending, csrf, _) = first_consent(&f, &client_a).await;
+    let _code = approve(&f, &cookie, &pending, &csrf).await;
+    let consent_count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM passport_oauth_consents")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(consent_count().await, 1);
+
+    f.server.reset_async().await;
+    let client_b = register(&f, "Claude B").await;
+    let (_, _, _, html_b) = first_consent(&f, &client_b).await;
+    assert!(html_b.contains("Claude B"));
+    assert_eq!(consent_count().await, 1);
+    let b_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM passport_oauth_grants g JOIN passport_oauth_clients c ON c.id=g.oauth_client_id WHERE c.client_id=$1",
+    )
+    .bind(&client_b)
+    .fetch_one(&f.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(b_grants, 0);
+
+    f.server.reset_async().await;
+    let (_, _, _, html_other_user) = first_consent_for_subject(&f, &client_a, "userid:456").await;
+    assert!(html_other_user.contains("Claude A"));
+    assert_eq!(consent_count().await, 1);
+    let other_user_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM passport_oauth_grants g JOIN passport_users u ON u.user_id=g.user_id WHERE u.subject=$1",
+    )
+    .bind("userid:456")
+    .fetch_one(&f.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(other_user_grants, 0);
+    f.close().await;
+}
+
+#[tokio::test]
 async fn transient_refresh_honors_last_upstream_check_cap() {
     let f = Fixture::new().await;
     let (client, first) = authorized_tokens(&f).await;
+    backdate_grant_expiry(&f).await;
+    let previous_check: String =
+        sqlx::query_scalar("SELECT last_upstream_check_at::text FROM passport_oauth_grants")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
     let transient = f
         .server
         .mock_async(|when, then| {
@@ -606,6 +848,13 @@ async fn transient_refresh_honors_last_upstream_check_cap() {
     assert_eq!(response.status(), StatusCode::OK);
     let second: Value = serde_json::from_str(&body(response).await).unwrap();
     assert_ne!(second["refresh_token"], first["refresh_token"]);
+    assert_grant_expiry_slid(&f, second["refresh_token"].as_str().unwrap()).await;
+    let current_check: String =
+        sqlx::query_scalar("SELECT last_upstream_check_at::text FROM passport_oauth_grants")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(current_check, previous_check);
     let upstream: String =
         sqlx::query_scalar("SELECT upstream_refresh_token FROM passport_oauth_grants")
             .fetch_one(&f.state.pool)
