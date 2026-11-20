@@ -306,6 +306,27 @@ async fn authorized_tokens(f: &Fixture) -> (String, Value) {
     (client, serde_json::from_str(&body(response).await).unwrap())
 }
 
+#[tokio::test]
+async fn access_lifetime_response_respects_shorter_grant_lifetime() {
+    let mut options = cja_passport::OAuthOptions::default();
+    options.timings.grant_idle_ttl = std::time::Duration::from_secs(600);
+    let f = Fixture::new_with_oauth_options(options).await;
+    let (_, tokens) = authorized_tokens(&f).await;
+    let advertised = tokens["expires_in"].as_u64().unwrap();
+    let actual: i64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM expires_at-now())::bigint FROM passport_oauth_access_tokens",
+    )
+    .fetch_one(&f.state.pool)
+    .await
+    .unwrap();
+    assert!(actual <= 600, "access token is capped by the grant");
+    assert!(
+        advertised <= 600,
+        "expires_in must not outlive the issued access token (actual {actual}s, advertised {advertised}s)"
+    );
+    f.close().await;
+}
+
 async fn refresh_form(f: &Fixture, client: &str, raw: &str) -> axum::response::Response {
     f.form(
         "/oauth/token",
