@@ -1114,6 +1114,7 @@ mod enqueue_on_tests {
         server.abort();
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_enqueue_span_keeps_debug_in_eyes_and_posthog() {
         use opentelemetry_proto::tonic::collector::{
