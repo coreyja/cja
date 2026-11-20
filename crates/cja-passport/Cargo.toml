@@ -8,7 +8,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-cja = { path = "../cja", default-features = false }
+cja = { path = "../cja", default-features = false, features = ["postgres"] }
 openidconnect = { version = "=4.1.0", default-features = false, features = ["reqwest"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-manual-roots"] }
 axum.workspace = true

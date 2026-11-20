@@ -17,12 +17,13 @@
 
 ## Feature Flags
 
-- **Compile-time:** `#[cfg(feature = "...")]` for optional modules (`cron`, `jobs`) and optional helpers such as `testing::mock_oauth`
+- **Compile-time:** `#[cfg(feature = "...")]` for optional modules (`postgres`, `jobs`, `cron`) and helpers such as `testing::mock_oauth`
 - **Runtime:** `{FEATURE}_DISABLED` env vars (e.g., `SERVER_DISABLED`, `JOBS_DISABLED`, `CRON_DISABLED`)
 
-The `cron` feature depends on `jobs` — enabling `cron` automatically enables `jobs`, and disabling `jobs` at compile time also disables `cron`.
-The destructive `testing::test_db` lifecycle helper is always available; the
-`testing` feature enables only `testing::mock_oauth`.
+Defaults enable `postgres`, `jobs`, and `cron`. The chain is `cron → jobs → postgres`.
+Without default features, `AppState` needs only `version()` and `cookie_key()`;
+`db()`, `db`, `server::session`, and `testing::test_db` require `postgres`.
+The `testing` feature independently enables only `testing::mock_oauth`.
 
 ## Unsafe Code
 
@@ -64,12 +65,11 @@ To add a new job type:
 
 CJA re-exports key dependencies so consumers don't need to add them directly:
 
-- `cja::sqlx`
+- `cja::sqlx` and `cja::jiff_sqlx` with `postgres`
 - `cja::uuid`
 - `cja::color_eyre`
 - `cja::maud`
-- `cja::chrono`
-- `cja::chrono_tz`
+- `cja::jiff`
 
 Use the re-exports for version consistency.
 

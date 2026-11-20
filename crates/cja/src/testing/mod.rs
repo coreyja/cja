@@ -1,5 +1,6 @@
 #[cfg(feature = "testing")]
 pub mod mock_oauth;
+#[cfg(feature = "postgres")]
 pub mod test_db;
 
 /// Remove inherited telemetry credentials and TLS test settings from a child.

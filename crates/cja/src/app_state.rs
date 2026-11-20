@@ -4,13 +4,16 @@ use crate::server::cookies::CookieKey;
 
 /// A trait representing the application state that must be implemented by users of the cja framework.
 ///
-/// This trait provides access to core components like the database pool and cookie encryption key.
+/// This trait provides access to core components like the cookie encryption key
+/// and, with `postgres`, the database pool.
 /// The `AppState` is cloned for each request, so it should be cheap to clone (usually by wrapping
 /// expensive resources in Arc).
 ///
 /// # Example
 ///
 /// ```rust
+/// # #[cfg(feature = "postgres")]
+/// # mod postgres_example {
 /// use cja::app_state::AppState;
 /// use cja::server::cookies::CookieKey;
 /// use sqlx::PgPool;
@@ -34,11 +37,32 @@ use crate::server::cookies::CookieKey;
 ///         &self.cookie_key
 ///     }
 /// }
+/// # }
+/// ```
+///
+/// Without `postgres`, state needs no database pool:
+///
+/// ```rust
+/// # #[cfg(not(feature = "postgres"))]
+/// # mod stateless_example {
+/// use cja::app_state::AppState;
+/// use cja::server::cookies::CookieKey;
+///
+/// #[derive(Clone)]
+/// struct StatelessState { cookie_key: CookieKey }
+///
+/// impl AppState for StatelessState {
+///     fn version(&self) -> &str { "1.0.0" }
+///     fn cookie_key(&self) -> &CookieKey { &self.cookie_key }
+/// }
+/// # }
 /// ```
 ///
 /// # Using with Axum
 ///
 /// ```rust
+/// # #[cfg(feature = "postgres")]
+/// # mod postgres_axum_example {
 /// use cja::app_state::AppState;
 /// use cja::server::cookies::CookieKey;
 /// use sqlx::postgres::PgPoolOptions;
@@ -79,14 +103,16 @@ use crate::server::cookies::CookieKey;
 /// // Run the server
 /// # Ok(())
 /// # }
+/// # }
 /// ```
 pub trait AppState: Clone + Send + Sync + 'static {
     /// Returns the version string for the application.
     /// This is useful for health checks and debugging.
     fn version(&self) -> &str;
 
-    /// Returns a reference to the database connection pool.
+    /// Returns a reference to the database connection pool (`postgres` feature).
     /// The pool is typically shared across all requests.
+    #[cfg(feature = "postgres")]
     fn db(&self) -> &sqlx::PgPool;
 
     /// Called after a successful autocommit job enqueue. An override may wake
