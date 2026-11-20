@@ -752,7 +752,7 @@ pub trait Job<AppState: AS>:
     /// A payload that fails to deserialize is wrapped in [`InvalidJobPayload`]
     /// (its `serde_json::Error` rides along as the source); the worker
     /// dead-letters such rows on the first dispatch instead of retrying. The
-    /// full error detail stays in Eyes and the dead-letter row; `PostHog` drops it.
+    /// full serde error detail reaches Eyes, `PostHog` OTLP, and the dead-letter row.
     #[instrument(name = "jobs.run_from_value", skip(app_state, cancellation_token, slot), fields(job.name = Self::NAME), err)]
     async fn run_from_value(
         value: serde_json::Value,
@@ -948,12 +948,35 @@ mod enqueue_on_tests {
         }
     }
 
+    fn assert_exported_enqueue_fields(
+        attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+    ) {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+
+        for key in ["job.id", "job.name", "job.context", "job.priority"] {
+            assert!(
+                attributes.iter().any(|attribute| attribute.key == key),
+                "{key}"
+            );
+        }
+        assert!(attributes.iter().any(|attribute| {
+            attribute.key == "self"
+                && matches!(
+                    attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value))
+                        if value.contains("synthetic@example.test")
+                            && value.contains("recipient_override")
+                )
+        }));
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_run_from_value_keeps_eyes_raw_and_drops_payload_from_posthog() {
+    async fn real_run_from_value_keeps_payload_in_eyes_and_posthog() {
         use opentelemetry_proto::tonic::collector::{
             logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
         };
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
         use prost::Message as _;
 
         let captures = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
@@ -1038,7 +1061,13 @@ mod enqueue_on_tests {
                 .iter()
                 .any(|attr| attr.key == "job.name")
         );
-        assert!(!run_span.attributes.iter().any(|attr| attr.key == "value"));
+        assert!(run_span.attributes.iter().any(|attr| {
+            attr.key == "value"
+                && matches!(
+                    attr.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value.contains("synthetic-run@example.test")
+                )
+        }));
         let logs = captures
             .iter()
             .filter(|(p, _)| p == "/i/v1/logs")
@@ -1060,7 +1089,13 @@ mod enqueue_on_tests {
             })
             .expect("job log exported");
         assert!(job_log.attributes.iter().any(|attr| attr.key == "job.name"));
-        assert!(!job_log.attributes.iter().any(|attr| attr.key == "value"));
+        assert!(job_log.attributes.iter().any(|attr| {
+            attr.key == "value"
+                && matches!(
+                    attr.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value.contains("synthetic-run@example.test")
+                )
+        }));
         let outside_log = logs
             .iter()
             .find(|record| {
@@ -1076,12 +1111,16 @@ mod enqueue_on_tests {
                 .iter()
                 .any(|attr| attr.key == "value" && format!("{:?}", attr.value).contains("keep-me"))
         );
-        assert!(!format!("{spans:?}{logs:?}").contains("synthetic-run@example.test"));
         server.abort();
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_enqueue_span_keeps_raw_sibling_but_drops_debug_from_posthog() {
+    async fn real_enqueue_span_keeps_debug_in_eyes_and_posthog() {
+        use opentelemetry_proto::tonic::collector::{
+            logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
+        };
+        use prost::Message as _;
         let captures = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
         let requests_for_server = captures.clone();
         let app =
@@ -1141,24 +1180,43 @@ mod enqueue_on_tests {
             "{raw}"
         );
         let captures = captures.lock().unwrap();
-        for path in ["/i/v1/traces", "/i/v1/logs"] {
-            let body = captures
-                .iter()
-                .filter(|(p, _)| p == path)
-                .flat_map(|(_, b)| b.iter().copied())
-                .collect::<Vec<_>>();
-            let text = String::from_utf8_lossy(&body);
-            assert!(
-                text.contains("job.id")
-                    && text.contains("job.name")
-                    && text.contains("job.context")
-                    && text.contains("job.priority"),
-                "{path}"
-            );
-            assert!(
-                !text.contains("synthetic@example.test") && !text.contains("recipient_override"),
-                "{path}: leaked job Debug"
-            );
+        let spans = captures
+            .iter()
+            .filter(|(path, _)| path == "/i/v1/traces")
+            .flat_map(|(_, body)| {
+                ExportTraceServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_spans
+            })
+            .flat_map(|resource| resource.scope_spans)
+            .flat_map(|scope| scope.spans)
+            .collect::<Vec<_>>();
+        let enqueue_span = spans
+            .iter()
+            .find(|span| span.name == "jobs.enqueue")
+            .expect("enqueue span exported");
+        let logs = captures
+            .iter()
+            .filter(|(path, _)| path == "/i/v1/logs")
+            .flat_map(|(_, body)| {
+                ExportLogsServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_logs
+            })
+            .flat_map(|resource| resource.scope_logs)
+            .flat_map(|scope| scope.log_records)
+            .collect::<Vec<_>>();
+        let job_log = logs
+            .iter()
+            .find(|record| {
+                record
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| format!("{body:?}").contains("job-event"))
+            })
+            .expect("job log exported");
+        for attributes in [&enqueue_span.attributes, &job_log.attributes] {
+            assert_exported_enqueue_fields(attributes);
         }
         server.abort();
     }
