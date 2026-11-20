@@ -469,7 +469,7 @@ The `Session` extractor refreshes `sessions.updated_at` at most once per
 a write per request. Schedule `cja::server::session::prune(pool, idle)` from a
 cron to delete idle sessions (the scaffold registers a daily 4am example);
 `idle` must be at least twice `ACTIVITY_REFRESH_MIN_INTERVAL` — the function
-refuses smaller values. The logout route lives in cja-passkey (`POST /auth/logout`):
+refuses smaller values. The logout route lives in cja-passport (`POST /auth/logout`):
 it deletes the session row and clears the cookie.
 
 ### Maud Templating

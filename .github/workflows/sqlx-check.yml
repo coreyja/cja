@@ -50,6 +50,7 @@ jobs:
         run: |
           (cd crates/cja && cargo sqlx database create && cargo sqlx migrate run)
           (cd crates/cja.app && cargo sqlx migrate run --ignore-missing)
+          (cd crates/cja-passport && cargo sqlx migrate run --ignore-missing)
 
       - name: Check sqlx prepare
         run: ./scripts/sqlx.sh --check

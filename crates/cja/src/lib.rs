@@ -232,7 +232,8 @@ pub use maud;
 
 pub mod db;
 pub mod tasks;
-mod tls;
+#[doc(hidden)]
+pub mod tls;
 
 pub use jiff;
 pub use jiff_sqlx;

@@ -33,7 +33,7 @@ pub fn save_session_cookie<A: AppState>(jar: &CookieJar<A>, session_id: uuid::Uu
 /// as [`save_session_cookie`] (a `__Host-` replacement cookie must repeat
 /// `Path=/` + `Secure`), with `Expires` at the epoch.
 ///
-/// Pairs with deleting the session row server-side (see cja-passkey's
+/// Pairs with deleting the session row server-side (see cja-passport's
 /// `POST /auth/logout`): an expired `Set-Cookie` works deterministically even
 /// when the request carried no cookie, where `CookieJar::remove` needs the
 /// matching original.
@@ -60,7 +60,7 @@ pub const ACTIVITY_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Durati
 /// older than its last request. `idle` must be at least twice the interval;
 /// this function refuses smaller values.
 /// Deleting a row cascades consumer rows that reference `sessions(session_id)`
-/// with `ON DELETE CASCADE` (see the cja-passkey README framework contract);
+/// with `ON DELETE CASCADE` (see the cja-passport README framework contract);
 /// a pruned user simply appears anonymous on their next request.
 ///
 /// To stop a scheduled prune, use the `CRON_DISABLED` env var or remove the

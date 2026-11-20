@@ -39,7 +39,7 @@
 /// using `SQLx`'s built-in advisory locking for safe concurrent startup.
 ///
 /// Tolerates foreign rows in `_sqlx_migrations` (your app's own migrations,
-/// or those of sibling crates like `cja-passkey`), so this composes with
+/// or those of sibling crates like `cja-passport`), so this composes with
 /// other migrators over the same table — see the module-level docs
 /// ("App migrations").
 ///
