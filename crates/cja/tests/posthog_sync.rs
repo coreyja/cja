@@ -178,7 +178,7 @@ fn create(s: &mut Store, kind: &str, mut body: Value) -> Result<Value, &'static 
     if kind == "dashboards" {
         body["tiles"] = json!([]);
     }
-    if kind == "insights" {
+    if kind == "insights" && body["query"]["source"]["kind"] == "TrendsQuery" {
         body["query"]["source"]["version"] = json!(2);
         if body["query"]["source"].get("trendsFilter").is_none() {
             body["query"]["source"]["trendsFilter"] = json!({});
@@ -571,7 +571,7 @@ async fn surfaces_rejected_write_and_missing_tag() {
     );
 }
 #[tokio::test]
-async fn eyes_only_declarations_are_skipped_with_named_warnings() {
+async fn telemetry_ratio_and_health_are_tiled_with_only_links_and_unproven_alerts_skipped() {
     let m = Mock::start().await;
     let mut d = example::declarations().unwrap();
     d.dashboards[0].sections[0].items.extend([
@@ -609,35 +609,34 @@ async fn eyes_only_declarations_are_skipped_with_named_warnings() {
     assert_eq!(
         r.skipped,
         [
-            "cja:demo:insight:jobs: telemetry metric (Eyes-only)",
-            "cja:demo:insight:all_jobs: telemetry metric (Eyes-only)",
-            "cja:demo:insight:share: ratio metric (Eyes-only)",
-            "cja:demo:dashboard:activity: health summary item (Eyes-only)",
             "cja:demo:dashboard:activity: links item (Eyes-only)",
-            "cja:demo:dashboard:activity: tile for telemetry metric jobs (Eyes-only)",
-            "cja:demo:dashboard:activity: tile for ratio metric share (Eyes-only)",
-            "cja:demo:alert:failed: telemetry metric jobs (Eyes-only)",
-            "cja:demo:alert:low-share: ratio metric share (Eyes-only)",
+            "cja:demo:alert:failed: SQL metric jobs alert (PostHog-unsupported: SQL alert payload and NULL evaluation unverified)",
+            "cja:demo:alert:low-share: SQL metric share alert (PostHog-unsupported: SQL alert payload and NULL evaluation unverified)",
         ]
     );
+    for key in ["jobs", "all_jobs", "share", "activity@health0"] {
+        assert!(r.created.contains(&format!("cja:demo:insight:{key}")));
+        assert_eq!(
+            m.row(&format!("cja:demo:insight:{key}"))["query"]["kind"],
+            "DataVisualizationNode"
+        );
+    }
+    let ratio = m.row("cja:demo:insight:share");
+    let sql = ratio["query"]["source"]["query"].as_str().unwrap();
+    assert!(sql.contains("isNull(_den_value) OR _den_value = 0"));
+    assert!(sql.contains("posthog.trace_spans"));
+    assert!(sql.contains("FROM logs"));
+    assert!(sql.contains("timestamp <= now() - INTERVAL 86400 SECOND"));
     assert_eq!(
-        r.created,
-        [
-            "cja:demo:dashboard:activity",
-            "cja:demo:insight:pages",
-            "cja:demo:insight:sessions",
-            "cja:demo:insight:daily",
-            "cja:demo:insight:daily@86400s",
-            "cja:demo:alert:quiet",
-        ]
+        m.row("cja:demo:insight:activity@health0")["query"]["display"],
+        "BoldNumber"
     );
     let writes = m
         .log()
         .into_iter()
         .filter(|(method, _, _)| method != Method::GET)
         .collect::<Vec<_>>();
-    // Only the example's own alert is created: none for the telemetry or
-    // ratio alert, and no insight or tile for an Eyes-only metric.
+    // SQL alert support is gated on the coordinator's live capability probe.
     let posts = |path: &str| {
         writes
             .iter()
@@ -648,14 +647,91 @@ async fn eyes_only_declarations_are_skipped_with_named_warnings() {
     let alerts = posts("alerts/");
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0]["name"], "quiet [cja:demo:alert:quiet]");
-    assert_eq!(posts("insights/").len(), 4);
+    assert_eq!(posts("insights/").len(), 8);
     assert_eq!(
         writes
             .iter()
             .filter(|(_, path, _)| path.ends_with("/add_insight/"))
             .count(),
-        3
+        6
     );
+    assert_repeat_clean(&m, &d).await;
+}
+
+#[tokio::test]
+async fn telemetry_windows_reconcile_and_removed_health_is_pruned() {
+    let mock = Mock::start().await;
+    let metric = TelemetryMetricBuilder::new("errors", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("level", "ERROR")
+        .unwrap()
+        .build()
+        .unwrap();
+    let dashboard = Dashboard::new("ops", "Operations")
+        .unwrap()
+        .default_range_seconds(3600)
+        .section(
+            Section::new()
+                .item(Item::stat("errors"))
+                .item(Item::stat("errors").window_seconds(7200))
+                .item(Item::health_summary()),
+        );
+    let mut declarations = Declarations::new().metric(metric).dashboard(dashboard);
+    mock.sync("demo", &declarations).await.unwrap();
+    let canonical = mock.row("cja:demo:insight:errors");
+    let variant = mock.row("cja:demo:insight:errors@7200s");
+    assert!(
+        canonical["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .contains("INTERVAL 3600 SECOND")
+    );
+    assert!(
+        variant["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .contains("INTERVAL 7200 SECOND")
+    );
+    assert!(
+        mock.row("cja:demo:insight:ops@health0")["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .contains("INTERVAL 86400 SECOND")
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+
+    declarations.dashboards[0].sections[0].items.swap(0, 1);
+    let reordered = mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        reordered
+            .deleted
+            .contains(&"cja:demo:insight:errors@7200s".into())
+    );
+    assert_eq!(mock.row("cja:demo:insight:errors")["id"], canonical["id"]);
+    assert!(
+        mock.row("cja:demo:insight:errors")["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .contains("INTERVAL 7200 SECOND")
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+
+    declarations.dashboards[0].sections[0].items.truncate(1);
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        report
+            .deleted
+            .contains(&"cja:demo:insight:ops@health0".into())
+    );
+    assert!(
+        report
+            .deleted
+            .contains(&"cja:demo:insight:errors@3600s".into())
+    );
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
 }
 
 #[tokio::test]
@@ -1446,7 +1522,7 @@ async fn alert_names_over_the_posthog_limit_fail_before_any_request() {
 }
 
 #[tokio::test]
-async fn unicode_alert_length_counts_characters_and_eyes_only_alerts_skip() {
+async fn unicode_alert_length_counts_characters_for_every_metric_kind() {
     let mock = Mock::start().await;
     let mut declarations = example::declarations().unwrap();
     declarations.alerts[0].description = Some("é".repeat(232));
@@ -1483,19 +1559,12 @@ async fn unicode_alert_length_counts_characters_and_eyes_only_alerts_skip() {
         .warning(Comparison::Below, 1.)
         .build()
         .unwrap();
-    let report = mock
+    let error = mock
         .sync("demo", &Declarations::default().metric(ops).alert(alert))
         .await
-        .unwrap();
-    assert!(
-        report
-            .skipped
-            .iter()
-            .any(|entry| entry.contains("ops_quiet")),
-        "{:?}",
-        report.skipped
-    );
-    assert!(!mock.writes().iter().any(|(_, path, _)| path == "alerts/"));
+        .unwrap_err();
+    assert!(matches!(error, SyncError::AlertNameTooLong { .. }));
+    assert_eq!(mock.log(), Vec::new());
 }
 
 /// Insert a copy of the live row matching `pick` under a fresh id, the way

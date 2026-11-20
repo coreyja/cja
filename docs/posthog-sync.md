@@ -36,7 +36,7 @@ Dashboard and insight tags take the form `cja:<app>:<dashboard|insight>:<key>`. 
 
 Every declaration ID must be lowercase. PostHog lowercases tags when it stores them, so an uppercase ID would never match its own tag again. Metric, alert and dashboard IDs use `[a-z0-9._:-]`, including underscore. `Declarations::validate` rejects anything else, in the app at boot and in the sync before any request.
 
-An alert's name is its description, or its ID when it has none, followed by the suffix. PostHog caps names at 255 characters. The sync rejects a longer product-metric alert name with `AlertNameTooLong` before it sends anything: shorten the description, or the ID when there is no description. Eyes-only alerts are skipped by the PostHog sync.
+An alert's name is its description, or its ID when it has none, followed by the suffix. PostHog caps names at 255 characters. The sync rejects any longer alert name with `AlertNameTooLong` before it sends anything: shorten the description, or the ID when there is no description. SQL alerts are explicitly skipped until PostHog's SQL alert payload and numeric-NULL evaluation are verified live.
 
 If PostHog accepts a create but does not return the identity, the sync removes the object it just created and fails with `TagNotPersisted`. The error says whether the removal worked. Editing the display name or query updates the object in place. Changing a key replaces it. Renaming the app orphans its old objects.
 
@@ -78,9 +78,12 @@ The text after `duplicate alert` is the alert key. This check runs after dashboa
 | Dashboard | Title and description sync. Dashboard-level date filters are read-only. An item's saved insight uses its window, then the dashboard default, then 30 days. |
 | Sections and items | Sections flatten in declaration order. Stat items use `BoldNumber`, table items `ActionsTable`, and time-series items `ActionsLineGraph`. Stats and tables use exact rolling relative ranges (`explicitDate: true`); line graphs use PostHog's interval-rounded relative range so their first bucket is complete. For example, 7 days is `-7d` and 364 days is `-364d`. Section descriptions, item labels, units and preferred bucket overrides remain in Eyes. Later additions append, preserving hand tile placement. |
 | Thresholds | Upper fires above and lower below. Opposite directions create a band. Critical wins when both point in one direction. |
-| Alert evaluation | Evaluation intervals round up to hourly, daily, weekly or monthly. Window, delay, group matching and failure/recovery counts stay in Eyes. Unbucketed metrics support alerts. PostHog validates breakdown alert configurations and a rejection prints the object and API response. |
-| Ratio metrics | Eyes only. The sync skips the metric, every tile on it and every alert on it, each with a warning that names it. |
-| Ops telemetry, health summaries and links | Eyes only. The sync skips the metric or item, tiles on a telemetry metric and alerts on one, each with a warning. The adapter has no supported span-field SQL mapping. An otherwise empty dashboard still syncs. |
+| Product-event alert evaluation | Evaluation intervals round up to hourly, daily, weekly or monthly. Window, delay, group matching and failure/recovery counts stay in Eyes. Unbucketed product metrics support insight alerts. PostHog validates breakdown alert configurations and a rejection prints the object and API response. |
+| Telemetry metrics | Typed Eyes aggregate IR compiles to `DataVisualizationNode` / `HogQLQuery` over `logs` and `posthog.trace_spans`. Ordered `Where` predicates, count, distinct count, numeric aggregates, percentiles, groups and second/Monday buckets are supported. Unsupported stages fail sync with the metric name. SQL percentiles use PostHog's approximate `quantile`, so values can differ from Eyes' interpolation. |
+| Ratio metrics | SQL operands use the declared telemetry or product-event metrics. Each operand has its own window and source-history guard. Missing numerator or zero/missing denominator yields NULL; percentage ratios multiply by 100. Product-event operands read `events`, scoped by `properties['service.name']`, and distinct users use `distinct_id`. Anonymous events get fresh distinct IDs, so only use a distinct-user ratio when its declared population is appropriate. |
+| Health summaries | Each item becomes a 24-hour recent-error count over `logs`, explicitly named a health substitute. It does not represent Eyes' durable process, job or monitor state. |
+| Links | Skipped with an `(Eyes-only)` warning. |
+| Telemetry and ratio thresholds | Skipped with `(PostHog-unsupported)` until the live SQL-alert and numeric-NULL capability probe is complete. Existing Eyes failure/recovery counts and `group_match=All` cannot be expressed by the current insight alert model. |
 
 The canonical insight tag is `cja:<app>:insight:<metric-id>` and keeps its remote ID. An unalerted metric uses its first dashboard presentation there; distinct later effective windows use `cja:<app>:insight:<metric-id>@<seconds>s`. Identical windows reuse one insight across dashboards. Reordering an unalerted metric's windows can change the canonical query and variant tags while preserving the canonical remote ID.
 
@@ -88,7 +91,11 @@ An alerted product metric keeps the legacy 30-day line query at the canonical ta
 
 Sync rejects dashboard defaults outside 60 seconds to 366 days and item windows outside 1 second to 366 days before contacting PostHog, matching Eyes ingestion. A PostHog dashboard date override can supersede saved insight ranges under any setting other than “No date range override.”
 
-PostHog's 14-day default applies to logs. Product-event retention depends on the analytics plan. [PostHog pricing](https://posthog.com/pricing)
+Every SQL insight embeds a literal trailing window and a bounded `LIMIT 1` existence probe for an app row at or before its lower bound in each required source table. If any source lacks that boundary row, a scalar returns NULL and a grouped chart returns no rows. A covered empty count is zero. This guard does not prove continuous ingestion or reconstruct missing pre-OTLP history. Retention expiry can make long windows unavailable again. The app's actual log, trace and event retention must be measured; PostHog's documented default is not evidence for project 747577. [PostHog pricing](https://posthog.com/pricing)
+
+Grouped SQL insights set an explicit 50,000-row limit, matching [PostHog's HogQL query cap](https://github.com/PostHog/posthog/blob/master/posthog/hogql/constants.py). A bucket width/window that can exceed that cap is rejected before sync. Dimension cardinality is data-dependent, so large table/breakdown results still require live row-count inspection before treating them as complete.
+
+Before treating Arena as an Eyes replacement, validate every saved insight's exact SQL against project 747577, inspect response errors and compiled ClickHouse SQL, prove the NULL and empty-chart presentation, compare covered games/HTTP/active-user counts to the same Eyes windows, and require a second sync with zero writes. Its 90/364-day product history and 28-day stickiness remain unavailable until every operand has full boundary coverage. Alert rollout needs a separate disabled live capability probe and a retention/cadence decision; hourly PostHog evaluation of a 300-second window samples roughly `5/60 = 1/12` of each hour.
 
 ## First deployment
 
