@@ -71,16 +71,22 @@ The text after `duplicate alert` is the alert key. This check runs after dashboa
 
 | Declaration | Result |
 |---|---|
-| Product count, sum, average, min, max, median and percentiles | One trends insight per metric. Property aggregates set the series math property. |
+| Product count, sum, average, min, max, median and percentiles | Trends insights use the declared event, aggregate, filters and bucket. Property aggregates set the series math property. |
 | Distinct users | PostHog counts persons. Eyes counts distinct `fields.user_id` on product events. |
 | Property filters | Equality and greater-than-or-equal map to exact and gte. Other operators require support in both sinks. |
 | Breakdown and bucket | Event-property breakdowns map directly. Unspecified buckets default to day. `bucket_seconds` durations round up to hour, day, week or month. `bucket_weeks` gives Monday-aligned weeks in Eyes and the `week` interval in PostHog, whatever the width. With a breakdown and a bucket together, PostHog renders grouped trends and Eyes draws one unlabelled polyline. |
-| Dashboard | Title and description sync. Dashboard-level date filters are read-only. The default range stays in Eyes. |
-| Sections and items | Sections flatten in declaration order. Section descriptions and item labels, units, windows and bucket overrides remain in Eyes. Stat, series and table items share the metric's insight. Later additions append, preserving hand tile placement. |
+| Dashboard | Title and description sync. Dashboard-level date filters are read-only. An item's saved insight uses its window, then the dashboard default, then 30 days. |
+| Sections and items | Sections flatten in declaration order. Stat items use `BoldNumber`, table items `ActionsTable`, and time-series items `ActionsLineGraph`. Stats and tables use exact rolling relative ranges (`explicitDate: true`); line graphs use PostHog's interval-rounded relative range so their first bucket is complete. For example, 7 days is `-7d` and 364 days is `-364d`. Section descriptions, item labels, units and preferred bucket overrides remain in Eyes. Later additions append, preserving hand tile placement. |
 | Thresholds | Upper fires above and lower below. Opposite directions create a band. Critical wins when both point in one direction. |
 | Alert evaluation | Evaluation intervals round up to hourly, daily, weekly or monthly. Window, delay, group matching and failure/recovery counts stay in Eyes. Unbucketed metrics support alerts. PostHog validates breakdown alert configurations and a rejection prints the object and API response. |
 | Ratio metrics | Eyes only. The sync skips the metric, every tile on it and every alert on it, each with a warning that names it. |
 | Ops telemetry, health summaries and links | Eyes only. The sync skips the metric or item, tiles on a telemetry metric and alerts on one, each with a warning. The adapter has no supported span-field SQL mapping. An otherwise empty dashboard still syncs. |
+
+The canonical insight tag is `cja:<app>:insight:<metric-id>` and keeps its remote ID. An unalerted metric uses its first dashboard presentation there; distinct later effective windows use `cja:<app>:insight:<metric-id>@<seconds>s`. Identical windows reuse one insight across dashboards. Reordering an unalerted metric's windows can change the canonical query and variant tags while preserving the canonical remote ID.
+
+An alerted product metric keeps the legacy 30-day line query at the canonical tag, so its alert keeps the same insight ID. Every dashboard presentation uses a variant, even a 30-day line chart. A metric with no dashboard item also keeps the legacy query. In that query, absent `trendsFilter.display` and absent `dateRange.explicitDate` mean a line graph with PostHog's rounded relative range. Adding an alert or removing the last item rewrites a 30-day presentation back to that legacy shape. Existing alert thresholds, intervals and subscribers are unaffected.
+
+Sync rejects dashboard defaults outside 60 seconds to 366 days and item windows outside 1 second to 366 days before contacting PostHog, matching Eyes ingestion. A PostHog dashboard date override can supersede saved insight ranges under any setting other than “No date range override.”
 
 PostHog's 14-day default applies to logs. Product-event retention depends on the analytics plan. [PostHog pricing](https://posthog.com/pricing)
 
