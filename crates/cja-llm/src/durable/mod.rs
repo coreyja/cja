@@ -284,8 +284,8 @@ impl Durable {
 /// `reclaim_window`.
 pub const DEFAULT_LEASE_TAKEOVER: Duration = Duration::from_secs(90);
 
-/// App state that carries the [`Durable`] engine (the cja-passkey
-/// `HasPasskeyConfig` pattern for reaching crate state from an app's
+/// App state that carries the [`Durable`] engine (the cja-passport
+/// `HasPassportConfig` pattern for reaching crate state from an app's
 /// `AppState`).
 pub trait HasDurable: cja::app_state::AppState {
     /// The durable agent-run engine.

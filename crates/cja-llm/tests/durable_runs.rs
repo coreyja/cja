@@ -4,7 +4,7 @@
 //! migrations) and drives runs against `FakeGateway` — no network. The
 //! manual two-migrator setup is deliberate: a bare `#[sqlx::test]` attribute
 //! applies only one migrations directory and would miss cja's `jobs` table
-//! (the cja-passkey precedent).
+//! (the cja-passport precedent).
 
 #![allow(clippy::too_many_lines)]
 // `#[rig_tool]` generates the async dispatch boundary itself: a tool fn

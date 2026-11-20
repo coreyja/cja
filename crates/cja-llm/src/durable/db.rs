@@ -32,7 +32,7 @@ pub(super) struct ClaimedRun {
 ///
 /// Must be called AFTER `cja::db::run_migrations`: both migrators share the
 /// single `_sqlx_migrations` table, so this one ignores rows it does not
-/// recognize (the cja-passkey pattern). No hand-rolled advisory lock —
+/// recognize (the cja-passport pattern). No hand-rolled advisory lock —
 /// `sqlx::migrate!().run()` advisory-locks internally.
 pub async fn run_migrations(pool: &sqlx::PgPool) -> cja::Result<()> {
     let mut migrator = sqlx::migrate!("./migrations");
