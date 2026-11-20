@@ -1,4 +1,5 @@
 mod native;
+pub(crate) mod oauth;
 mod web;
 
 use crate::config::HasPassportConfig;
@@ -7,6 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use cja::app_state::AppState;
+pub use oauth::oauth_router;
 
 pub fn passport_router<S>() -> Router<S>
 where

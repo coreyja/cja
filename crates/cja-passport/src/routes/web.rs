@@ -33,6 +33,7 @@ use crate::{
 pub(crate) enum Destination {
     Browser(String),
     Native(String),
+    McpGrant(uuid::Uuid),
 }
 
 #[derive(Deserialize)]
@@ -95,14 +96,15 @@ pub(crate) async fn begin<S: AppState + HasPassportConfig>(
         .add_scope(Scope::new("profile".into()))
         .set_pkce_challenge(challenge)
         .url();
-    let (return_to, native_uri) = match destination {
-        Destination::Browser(path) => (Some(path), None),
-        Destination::Native(uri) => (None, Some(uri)),
+    let (return_to, native_uri, oauth_transaction_id) = match destination {
+        Destination::Browser(path) => (Some(path), None, None),
+        Destination::Native(uri) => (None, Some(uri), None),
+        Destination::McpGrant(id) => (None, None, Some(id)),
     };
     sqlx::query(
         "INSERT INTO passport_login_attempts
-         (state_hash, session_id, nonce, pkce_verifier, return_to, native_redirect_uri, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now() + interval '5 minutes')",
+         (state_hash, session_id, nonce, pkce_verifier, return_to, native_redirect_uri, oauth_transaction_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + interval '5 minutes')",
     )
     .bind(hash(state_token.secret()))
     .bind(*session.session_id())
@@ -110,6 +112,7 @@ pub(crate) async fn begin<S: AppState + HasPassportConfig>(
     .bind(verifier.secret())
     .bind(return_to)
     .bind(native_uri)
+    .bind(oauth_transaction_id)
     .execute(state.db())
     .await
     .map_err(internal)?;
@@ -158,7 +161,7 @@ pub(crate) async fn callback<S: AppState + HasPassportConfig + Send + Sync>(
     let attempt = sqlx::query(
         "DELETE FROM passport_login_attempts
          WHERE state_hash = $1 AND session_id = $2 AND expires_at > now()
-         RETURNING nonce, pkce_verifier, return_to, native_redirect_uri",
+         RETURNING nonce, pkce_verifier, return_to, native_redirect_uri, oauth_transaction_id",
     )
     .bind(hash(state_value))
     .bind(old_id)
@@ -170,6 +173,7 @@ pub(crate) async fn callback<S: AppState + HasPassportConfig + Send + Sync>(
     let pkce: String = attempt.try_get("pkce_verifier").map_err(internal)?;
     let return_to: Option<String> = attempt.try_get("return_to").map_err(internal)?;
     let native_uri: Option<String> = attempt.try_get("native_redirect_uri").map_err(internal)?;
+    let oauth_id: Option<uuid::Uuid> = attempt.try_get("oauth_transaction_id").map_err(internal)?;
     tx.commit().await.map_err(internal)?;
 
     if let Some(error) = query.error.as_deref() {
@@ -205,9 +209,10 @@ pub(crate) async fn callback<S: AppState + HasPassportConfig + Send + Sync>(
         return Err(response(StatusCode::FORBIDDEN, "User is not allowed"));
     }
 
-    let destination = match (return_to, native_uri) {
-        (Some(path), None) => Destination::Browser(path),
-        (None, Some(uri)) => Destination::Native(uri),
+    let destination = match (return_to, native_uri, oauth_id) {
+        (Some(path), None, None) => Destination::Browser(path),
+        (None, Some(uri), None) => Destination::Native(uri),
+        (None, None, Some(id)) => Destination::McpGrant(id),
         _ => {
             return Err(response(
                 StatusCode::BAD_REQUEST,
@@ -215,7 +220,12 @@ pub(crate) async fn callback<S: AppState + HasPassportConfig + Send + Sync>(
             ));
         }
     };
-    finish_login(&state, &jar, old_id, identity, refresh_token, destination).await
+    match destination {
+        Destination::McpGrant(id) => {
+            super::oauth::complete_login(&state, identity, refresh_token, id, old_id).await
+        }
+        other => finish_login(&state, &jar, old_id, identity, refresh_token, other).await,
+    }
 }
 
 async fn finish_login<S: AppState + HasPassportConfig>(
@@ -281,6 +291,7 @@ async fn finish_login<S: AppState + HasPassportConfig>(
             uri.query_pairs_mut().append_pair("code", &handoff);
             uri.to_string()
         }
+        Destination::McpGrant(_) => unreachable!("MCP logins complete without a browser session"),
     };
     tx.commit().await.map_err(internal)?;
     save_session_cookie(jar, new_id);

@@ -707,6 +707,7 @@ async fn not_due_session_works_with_fresh_config_during_idp_outage() {
         pool: fixture.state.pool.clone(),
         key: fixture.state.key.clone(),
         config,
+        oauth: fixture.state.oauth.clone(),
     };
     async fn protected(cja_passport::CurrentUser(user): cja_passport::CurrentUser) -> String {
         user.user_id.to_string()
@@ -938,6 +939,7 @@ async fn allowlist_is_rechecked_on_authenticated_request() {
         pool: fixture.state.pool.clone(),
         key: fixture.state.key.clone(),
         config,
+        oauth: fixture.state.oauth.clone(),
     };
     async fn protected(cja_passport::CurrentUser(user): cja_passport::CurrentUser) -> String {
         user.user_id.to_string()

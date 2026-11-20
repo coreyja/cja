@@ -8,8 +8,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use cja::server::{cookies::CookieKey, session::SESSION_COOKIE_NAME};
 use cja_passport::{
-    AllowedSubject, BearerUser, CurrentUser, HasPassportConfig, OptionalUser, PassportConfig,
-    SessionTimings, passport_router,
+    AllowedSubject, BearerUser, CurrentUser, HasMcpOAuthConfig, HasPassportConfig, McpOAuthConfig,
+    McpUser, OAuthOptions, OptionalUser, PassportConfig, SessionTimings, oauth_router,
+    passport_router,
 };
 use cja_secret::{FakeSetec, Secret, Secrets};
 use httpmock::{
@@ -32,6 +33,7 @@ pub struct TestState {
     pub pool: PgPool,
     pub key: CookieKey,
     pub config: PassportConfig,
+    pub oauth: McpOAuthConfig,
 }
 impl cja::app_state::AppState for TestState {
     fn version(&self) -> &'static str {
@@ -47,6 +49,11 @@ impl cja::app_state::AppState for TestState {
 impl HasPassportConfig for TestState {
     fn passport_config(&self) -> &PassportConfig {
         &self.config
+    }
+}
+impl HasMcpOAuthConfig for TestState {
+    fn mcp_oauth_config(&self) -> &McpOAuthConfig {
+        &self.oauth
     }
 }
 
@@ -116,13 +123,24 @@ async fn api(BearerUser(user): BearerUser) -> String {
 async fn optional(OptionalUser(user): OptionalUser) -> String {
     user.map_or_else(|| "none".to_owned(), |user| user.user_id.to_string())
 }
+async fn mcp(McpUser(user): McpUser) -> String {
+    user.user_id.to_string()
+}
 
 impl Fixture {
     pub async fn new() -> Self {
-        Self::new_with_token_endpoint(None).await
+        Self::new_with_settings(None, OAuthOptions::default()).await
     }
 
     pub async fn new_with_token_endpoint(token_endpoint: Option<String>) -> Self {
+        Self::new_with_settings(token_endpoint, OAuthOptions::default()).await
+    }
+
+    pub async fn new_with_oauth_options(options: OAuthOptions) -> Self {
+        Self::new_with_settings(None, options).await
+    }
+
+    async fn new_with_settings(token_endpoint: Option<String>, options: OAuthOptions) -> Self {
         let (pool, guard) = cja::testing::test_db::create_test_database("cja_passport_test_")
             .await
             .unwrap();
@@ -167,12 +185,20 @@ impl Fixture {
             pool,
             key: CookieKey::generate(),
             config,
+            oauth: McpOAuthConfig::new(
+                url::Url::parse("https://app.example.test/").unwrap(),
+                url::Url::parse("https://app.example.test/mcp").unwrap(),
+                options,
+            )
+            .unwrap(),
         };
         let router = Router::new()
             .route("/private", get(protected))
             .route("/api", get(api))
             .route("/optional", get(optional))
+            .route("/mcp", get(mcp))
             .merge(passport_router::<TestState>())
+            .merge(oauth_router::<TestState>())
             .layer(tower_cookies::CookieManagerLayer::new())
             .with_state(state.clone());
         Self {
@@ -208,6 +234,32 @@ impl Fixture {
             .oneshot(
                 builder
                     .body(axum::body::Body::from(body.unwrap_or_default().to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    pub async fn form(
+        &self,
+        uri: &str,
+        cookie: Option<&str>,
+        fields: &[(&str, &str)],
+    ) -> Response<axum::body::Body> {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.extend_pairs(fields.iter().copied());
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded");
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        self.router
+            .clone()
+            .oneshot(
+                builder
+                    .body(axum::body::Body::from(serializer.finish()))
                     .unwrap(),
             )
             .await
