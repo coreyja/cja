@@ -376,7 +376,7 @@ async fn changed_declarations_patch_in_place_and_keep_foreign_tags() {
                 format!("insights/{insight}/"),
                 json!({
                     "name":"Views",
-                    "query":query(json!([service])),
+                    "description":null,"query":query(json!([service])),
                     "tags":["team-growth","cja:demo:insight:pages"]
                 })
             ),
@@ -402,7 +402,7 @@ async fn changed_declarations_patch_in_place_and_keep_foreign_tags() {
             format!("insights/{insight}/"),
             json!({
                 "name":"Views",
-                "query":query(json!([service, plan])),
+                "description":null,"query":query(json!([service, plan])),
                 "tags":["team-growth","cja:demo:insight:pages"]
             })
         )]
@@ -763,6 +763,14 @@ async fn mixed_cluster_ratio_is_named_skip_and_other_objects_reconcile() {
                     .item(Item::stat("completed")),
             ),
         );
+    declarations.alerts.push(
+        AlertBuilder::new("share-high", "share")
+            .window_seconds(60)
+            .evaluation_interval_seconds(60)
+            .critical(Comparison::Above, 50.0)
+            .build()
+            .unwrap(),
+    );
     let mut supported = declarations.clone();
     supported.metrics[0] = TelemetryMetricBuilder::new("played", AggregateFunction::Count, None)
         .unwrap()
@@ -779,6 +787,8 @@ async fn mixed_cluster_ratio_is_named_skip_and_other_objects_reconcile() {
             .iter()
             .any(|warning| warning.contains("cja:demo:insight:share: ratio mixes product events"))
     );
+    assert!(report.skipped.iter().any(|warning| warning.contains("cja:demo:dashboard:ops: tile for share skipped (ratio mixes product events with logs/spans)")));
+    assert!(report.skipped.iter().any(|warning| warning.contains("cja:demo:alert:share-high: alert for share skipped (ratio mixes product events with logs/spans)")));
     assert!(
         report
             .deleted
@@ -793,6 +803,7 @@ async fn mixed_cluster_ratio_is_named_skip_and_other_objects_reconcile() {
     mock.log();
     assert_repeat_clean(&mock, &declarations).await;
     declarations.metrics.retain(|metric| metric.id != "share");
+    declarations.alerts.clear();
     let _ = declarations.dashboards[0].sections[0].items.remove(0);
     let report = mock.sync("demo", &declarations).await.unwrap();
     assert_eq!(report.skipped, Vec::<String>::new());
@@ -832,6 +843,15 @@ async fn table_over_scalar_ratio_reconciles_and_tiles() {
         report
             .created
             .contains(&"cja:demo:insight:route-share".to_owned())
+    );
+    let ratio_insight = mock.row("cja:demo:insight:route-share");
+    let dashboard = mock.row("cja:demo:dashboard:ops");
+    assert!(
+        dashboard["tiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tile| tile["insight"]["id"] == ratio_insight["id"])
     );
     let sql = mock.row("cja:demo:insight:route-share")["query"]["source"]["query"]
         .as_str()
@@ -1062,7 +1082,7 @@ async fn membership_changes_do_not_replace_insights() {
             (
                 Method::PATCH,
                 format!("insights/{page_id}/"),
-                json!({"name":"pages","query":page_query(None),"tags":["cja:demo:insight:pages"]})
+                json!({"name":"pages","description":null,"query":page_query(None),"tags":["cja:demo:insight:pages"]})
             ),
             (
                 Method::POST,
@@ -1084,7 +1104,7 @@ async fn membership_changes_do_not_replace_insights() {
             (
                 Method::PATCH,
                 format!("insights/{page_id}/"),
-                json!({"name":"pages","query":page_query(Some("ActionsTable")),"tags":["cja:demo:insight:pages"]})
+                json!({"name":"pages","description":null,"query":page_query(Some("ActionsTable")),"tags":["cja:demo:insight:pages"]})
             ),
             (
                 Method::POST,
@@ -1264,7 +1284,7 @@ async fn adding_alert_rewrites_unalerted_30_day_stat_before_alert_creation() {
         (
             Method::PATCH,
             format!("insights/{canonical}/"),
-            json!({"name":"views","query":trend("page_view", None, 0),"tags":["cja:demo:insight:views"]})
+            json!({"name":"views","description":null,"query":trend("page_view", None, 0),"tags":["cja:demo:insight:views"]})
         )
     );
     assert_eq!(writes[1].0, Method::POST);
@@ -1331,7 +1351,7 @@ async fn removing_only_item_rewrites_unalerted_30_day_stat() {
             (
                 Method::PATCH,
                 format!("insights/{canonical}/"),
-                json!({"name":"views","query":trend("page_view", None, 0),"tags":["cja:demo:insight:views"]})
+                json!({"name":"views","description":null,"query":trend("page_view", None, 0),"tags":["cja:demo:insight:views"]})
             ),
             (
                 Method::POST,
@@ -1461,7 +1481,7 @@ async fn two_windows_reorder_canonical_and_prune_obsolete_variant() {
         (
             Method::PATCH,
             format!("insights/{canonical}/"),
-            json!({"name":"views","query":trend("page_view", Some("BoldNumber"), 2_592_000),"tags":["cja:demo:insight:views"]})
+            json!({"name":"views","description":null,"query":trend("page_view", Some("BoldNumber"), 2_592_000),"tags":["cja:demo:insight:views"]})
         )
     );
     assert_eq!(writes[1].1, "insights/");
@@ -1580,6 +1600,148 @@ async fn invalid_declarations_fail_before_any_api_request() {
         .push(Item::stat("missing"));
     assert!(mock.sync("demo", &declarations).await.is_err());
     assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn unsupported_sql_path_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let valid = TelemetryMetricBuilder::new("valid", AggregateFunction::Count, None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let invalid =
+        TelemetryMetricBuilder::new("cpu", AggregateFunction::Max, Some("measurement.value"))
+            .unwrap()
+            .build()
+            .unwrap();
+    let declarations = Declarations::new().metric(valid).metric(invalid).dashboard(
+        Dashboard::new("ops", "Operations").unwrap().section(
+            Section::new()
+                .item(Item::stat("valid"))
+                .item(Item::stat("cpu")),
+        ),
+    );
+    assert!(
+        matches!(mock.sync("demo", &declarations).await, Err(SyncError::Invalid(message)) if message.contains("unsupported field path"))
+    );
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn oversized_bucket_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let metric = TelemetryMetricBuilder::new("fast", AggregateFunction::Count, None)
+        .unwrap()
+        .time_bucket(30)
+        .build()
+        .unwrap();
+    let declarations = Declarations::new().metric(metric).dashboard(
+        Dashboard::new("ops", "Operations")
+            .unwrap()
+            .section(Section::new().item(Item::time_series("fast"))),
+    );
+    assert!(
+        matches!(mock.sync("demo", &declarations).await, Err(SyncError::Invalid(message)) if message.contains("50000-row"))
+    );
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn absent_source_group_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let metric = TelemetryMetricBuilder::new("kinds", AggregateFunction::Count, None)
+        .unwrap()
+        .group_by("semantic_kind")
+        .unwrap()
+        .build()
+        .unwrap();
+    let declarations = Declarations::new().metric(metric).dashboard(
+        Dashboard::new("ops", "Operations")
+            .unwrap()
+            .section(Section::new().item(Item::table("kinds"))),
+    );
+    assert!(
+        matches!(mock.sync("demo", &declarations).await, Err(SyncError::Invalid(message)) if message.contains("cannot group by") && message.contains("semantic_kind"))
+    );
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
+async fn switching_sql_metric_to_product_clears_description() {
+    let mock = Mock::start().await;
+    let telemetry = TelemetryMetricBuilder::new("views", AggregateFunction::Count, None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let product = ProductMetricBuilder::count("views", "page_view")
+        .build()
+        .unwrap();
+    let dashboard = Dashboard::new("ops", "Operations")
+        .unwrap()
+        .section(Section::new().item(Item::stat("views")));
+    mock.sync(
+        "demo",
+        &Declarations::new()
+            .metric(telemetry)
+            .dashboard(dashboard.clone()),
+    )
+    .await
+    .unwrap();
+    mock.log();
+    let declarations = Declarations::new().metric(product).dashboard(dashboard);
+    mock.sync("demo", &declarations).await.unwrap();
+    assert!(
+        mock.writes()
+            .iter()
+            .any(|(method, path, body)| *method == Method::PATCH
+                && path.starts_with("insights/")
+                && body["description"].is_null())
+    );
+    assert!(mock.row("cja:demo:insight:views")["description"].is_null());
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn sql_line_breakdown_sets_chart_setting_and_skips_two_dimensions() {
+    let mock = Mock::start().await;
+    let single = TelemetryMetricBuilder::new("single", AggregateFunction::Count, None)
+        .unwrap()
+        .group_by("fields.route")
+        .unwrap()
+        .time_bucket(300)
+        .build()
+        .unwrap();
+    let double = TelemetryMetricBuilder::new("double", AggregateFunction::Count, None)
+        .unwrap()
+        .group_by("fields.route")
+        .unwrap()
+        .group_by("fields.method")
+        .unwrap()
+        .time_bucket(300)
+        .build()
+        .unwrap();
+    let declarations = Declarations::new().metric(single).metric(double).dashboard(
+        Dashboard::new("ops", "Operations")
+            .unwrap()
+            .default_range_seconds(3600)
+            .section(
+                Section::new()
+                    .item(Item::time_series("single"))
+                    .item(Item::time_series("double")),
+            ),
+    );
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    assert_eq!(
+        mock.row("cja:demo:insight:single")["query"]["chartSettings"]["seriesBreakdownColumn"],
+        "_dim_0"
+    );
+    assert!(report.skipped.iter().any(|warning| warning.contains(
+        "tile for double skipped (PostHog-unsupported: SQL line charts break down by one column)"
+    )));
+    let dashboard = mock.row("cja:demo:dashboard:ops");
+    assert_eq!(dashboard["tiles"].as_array().unwrap().len(), 1);
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
 }
 
 #[test]

@@ -219,14 +219,14 @@ mod sql_tests {
         );
         assert!(sql.contains("AS bucket"));
         assert!(sql.contains("AS _dim_0"));
-        assert!(sql.contains("ORDER BY bucket DESC LIMIT 50000"));
+        assert!(sql.contains("ORDER BY bucket DESC, _dim_0 LIMIT 50000"));
         assert!(sql.ends_with("ORDER BY bucket, _dim_0 LIMIT 50000"));
         assert_eq!(
             sql.matches("timestamp <= now() - INTERVAL 604800 SECOND")
                 .count(),
             2
         );
-        let node = sql_query(&sql, SqlDisplay::Line);
+        let node = sql_query(&sql, SqlDisplay::Line, 1);
         assert_eq!(node["kind"], "DataVisualizationNode");
         assert_eq!(node["source"]["kind"], "HogQLQuery");
         assert_eq!(node["display"], "ActionsLineGraph");
@@ -263,7 +263,7 @@ mod sql_tests {
         assert_eq!(
             sql,
             concat!(
-                "SELECT if(isNull(_num_value) OR isNull(_den_value) OR _den_value = 0, NULL, _num_value / _den_value * 100) AS value ",
+                "SELECT if(isNull(_num_value) OR isNull(_den_value) OR _den_value = 0, NULL, _num_value * 100 / _den_value) AS value ",
                 "FROM (SELECT value AS _num_value FROM (SELECT if((SELECT count() FROM (SELECT 1 FROM logs WHERE service_name = 'arena' AND timestamp <= now() - INTERVAL 86400 SECOND LIMIT 1)) > 0, ",
                 "count(), NULL) AS value FROM (SELECT NULL AS _metric_value FROM logs WHERE service_name = 'arena' AND timestamp >= now() - INTERVAL 86400 SECOND AND attributes['event_type'] = 'game_completed') AS _source LIMIT 1) LIMIT 1) AS _num ",
                 "CROSS JOIN (SELECT value AS _den_value FROM (SELECT if((SELECT count() FROM (SELECT 1 FROM logs WHERE service_name = 'arena' AND timestamp <= now() - INTERVAL 2419200 SECOND LIMIT 1)) > 0, ",
@@ -275,7 +275,7 @@ mod sql_tests {
         assert!(sql.contains("timestamp <= now() - INTERVAL 86400 SECOND"));
         assert!(sql.contains("timestamp <= now() - INTERVAL 2419200 SECOND"));
         assert!(sql.contains("isNull(_num_value) OR isNull(_den_value) OR _den_value = 0"));
-        assert!(sql.contains("_num_value / _den_value * 100"));
+        assert!(sql.contains("_num_value * 100 / _den_value"));
     }
 
     #[test]
@@ -302,6 +302,20 @@ mod sql_tests {
         assert!(
             matches!(ratio_sql(spec, &declarations, "arena", SqlWindow::trailing(3600)), Err(SyncError::Invalid(message)) if message.contains("PostHog cannot query both clusters"))
         );
+    }
+
+    #[test]
+    fn absent_source_field_cannot_be_a_group_dimension() {
+        let metric = TelemetryMetricBuilder::new("kinds", EyesAggregate::Count, None)
+            .unwrap()
+            .group_by("semantic_kind")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(matches!(
+            telemetry_sql(telemetry(&metric), "arena", SqlWindow::trailing(3600)),
+            Err(SyncError::Invalid(message)) if message.contains("cannot group by") && message.contains("semantic_kind")
+        ));
     }
 
     #[test]
@@ -421,8 +435,39 @@ mod sql_tests {
         );
         assert!(sql.contains("if(isNull(max(num_present)), 0, max(numerator))"));
         assert!(sql.contains("isNull(_den_value) OR _den_value = 0"));
-        assert!(sql.contains("GROUP BY bucket, _dim_0 ORDER BY bucket DESC LIMIT 50000"));
+        assert!(sql.contains("GROUP BY bucket, _dim_0 ORDER BY bucket DESC, _dim_0 LIMIT 50000"));
         assert!(sql.ends_with("ORDER BY bucket, _dim_0 LIMIT 50000"));
+    }
+
+    #[test]
+    fn unbucketed_grouped_ratio_orders_before_truncation() {
+        let numerator = TelemetryMetricBuilder::new("num", EyesAggregate::Count, None)
+            .unwrap()
+            .group_by("fields.source")
+            .unwrap()
+            .build()
+            .unwrap();
+        let denominator = TelemetryMetricBuilder::new("den", EyesAggregate::Count, None)
+            .unwrap()
+            .group_by("fields.source")
+            .unwrap()
+            .build()
+            .unwrap();
+        let ratio = RatioMetricBuilder::new("ratio", "num", "den")
+            .build()
+            .unwrap();
+        let MetricQuery::Ratio(spec) = &ratio.query else {
+            panic!("expected ratio")
+        };
+        let declarations = Declarations::new()
+            .metric(numerator)
+            .metric(denominator)
+            .metric(ratio.clone());
+        let sql = ratio_sql(spec, &declarations, "arena", SqlWindow::trailing(3600)).unwrap();
+        assert!(
+            sql.contains("GROUP BY _dim_0 ORDER BY _dim_0 LIMIT 50000"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -956,7 +1001,7 @@ impl SqlWindow {
         })
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SqlDisplay {
     Number,
     Table,
@@ -983,8 +1028,12 @@ impl SqlDisplay {
         }
     }
 }
-fn sql_query(sql: &str, display: SqlDisplay) -> Value {
-    json!({"kind":"DataVisualizationNode", "source":{"kind":"HogQLQuery","query":sql}, "display":display.name()})
+fn sql_query(sql: &str, display: SqlDisplay, dimensions: usize) -> Value {
+    let mut node = json!({"kind":"DataVisualizationNode", "source":{"kind":"HogQLQuery","query":sql}, "display":display.name()});
+    if display == SqlDisplay::Line && dimensions == 1 {
+        node["chartSettings"] = json!({"seriesBreakdownColumn":"_dim_0"});
+    }
+    node
 }
 fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
@@ -1150,7 +1199,14 @@ struct SqlPlan {
 }
 fn group_sql(expr: &Expr, source: SqlSource) -> Result<String, SyncError> {
     if let Expr::Path { path } = expr {
-        return path_sql(path, source, false);
+        let field = path_sql(path, source, false)?;
+        if field == "NULL" {
+            return Err(SyncError::Invalid(format!(
+                "cannot group by {path:?} on {}",
+                source.table()
+            )));
+        }
+        return Ok(field);
     }
     let Expr::Call {
         function: Function::TimeBucket,
@@ -1314,8 +1370,9 @@ fn render_plan(
     let limit = if grouped { MAX_SQL_ROWS } else { 1 };
     let sql = format!("SELECT {projection} FROM ({rows}) AS _source{group_by}");
     let sql = if grouped && groups.first().is_some_and(|g| g == "bucket") {
+        let recent_order = descending_bucket_order(groups);
         format!(
-            "SELECT * FROM (SELECT * FROM ({sql}) AS _grouped ORDER BY bucket DESC LIMIT {limit}) AS _recent ORDER BY {} LIMIT {limit}",
+            "SELECT * FROM (SELECT * FROM ({sql}) AS _grouped ORDER BY {recent_order} LIMIT {limit}) AS _recent ORDER BY {} LIMIT {limit}",
             groups.join(", ")
         )
     } else if grouped {
@@ -1328,6 +1385,14 @@ fn render_plan(
         groups: groups.to_vec(),
         coverage,
     })
+}
+fn descending_bucket_order(groups: &[String]) -> String {
+    let mut order = String::from("bucket DESC");
+    for group in groups.iter().skip(1) {
+        order.push_str(", ");
+        order.push_str(group);
+    }
+    order
 }
 fn telemetry_plan(
     metric: &TelemetryMetric,
@@ -1435,6 +1500,7 @@ fn telemetry_plan(
         window,
     )
 }
+#[allow(dead_code)] // Pure SQL interface retained for direct contract tests.
 fn telemetry_sql(
     metric: &TelemetryMetric,
     app: &str,
@@ -1588,9 +1654,13 @@ fn ratio_plan(
     if !den.groups.is_empty() && num.groups != den.groups {
         return Err(SyncError::Invalid("ratio operand groups differ".into()));
     }
-    let factor = if ratio.as_percentage { " * 100" } else { "" };
+    let expression = if ratio.as_percentage {
+        "_num_value * 100 / _den_value"
+    } else {
+        "_num_value / _den_value"
+    };
     let formula = format!(
-        "if(isNull(_num_value) OR isNull(_den_value) OR _den_value = 0, NULL, _num_value / _den_value{factor})"
+        "if(isNull(_num_value) OR isNull(_den_value) OR _den_value = 0, NULL, {expression})"
     );
     let sql = if num.groups.is_empty() {
         format!(
@@ -1606,9 +1676,9 @@ fn ratio_plan(
     } else {
         let keys = num.groups.join(", ");
         let recent = if num.groups.first().is_some_and(|group| group == "bucket") {
-            " ORDER BY bucket DESC"
+            format!(" ORDER BY {}", descending_bucket_order(&num.groups))
         } else {
-            ""
+            format!(" ORDER BY {keys}")
         };
         let grouped = format!(
             "SELECT if({}, if(isNull(max(num_present)), 0, max(numerator)), NULL) AS _num_value, max(denominator) AS _den_value, {keys} FROM (SELECT toNullable(value) AS numerator, NULL AS denominator, 1 AS num_present, {keys} FROM ({}) UNION ALL SELECT NULL AS numerator, toNullable(value) AS denominator, NULL AS num_present, {keys} FROM ({})) AS _combined GROUP BY {keys}{recent} LIMIT {MAX_SQL_ROWS}",
@@ -1616,8 +1686,9 @@ fn ratio_plan(
         );
         let selected = format!("SELECT {formula} AS value, {keys} FROM ({grouped}) AS _ratios");
         if num.groups.first().is_some_and(|group| group == "bucket") {
+            let recent_order = descending_bucket_order(&num.groups);
             format!(
-                "SELECT * FROM ({selected} ORDER BY bucket DESC LIMIT {MAX_SQL_ROWS}) AS _recent ORDER BY {keys} LIMIT {MAX_SQL_ROWS}"
+                "SELECT * FROM ({selected} ORDER BY {recent_order} LIMIT {MAX_SQL_ROWS}) AS _recent ORDER BY {keys} LIMIT {MAX_SQL_ROWS}"
             )
         } else {
             format!("{selected} ORDER BY {keys} LIMIT {MAX_SQL_ROWS}")
@@ -1629,6 +1700,7 @@ fn ratio_plan(
         coverage: format!("{} AND {}", num.coverage, den.coverage),
     })
 }
+#[allow(dead_code)] // Pure SQL interface retained for direct contract tests.
 fn ratio_sql(
     ratio: &RatioMetric,
     declarations: &Declarations,
@@ -1851,6 +1923,7 @@ async fn alerts(
     decl: &Declarations,
     rows: Vec<Value>,
     ids: &BTreeMap<&str, i64>,
+    skipped_metrics: &BTreeMap<&str, &'static str>,
     r: &mut SyncReport,
 ) -> Result<(), SyncError> {
     let app = &api.config.app;
@@ -1865,9 +1938,16 @@ async fn alerts(
     for a in &decl.alerts {
         let tag = format!("cja:{app}:alert:{}", a.id);
         let Some(n) = ids.get(a.metric_id.as_str()) else {
-            r.skipped.push(format!(
-                "{tag}: SQL metric {} alert (PostHog-unsupported: SQL alert payload and NULL evaluation unverified)", a.metric_id
-            ));
+            if let Some(reason) = skipped_metrics.get(a.metric_id.as_str()) {
+                r.skipped.push(format!(
+                    "{tag}: alert for {} skipped ({reason})",
+                    a.metric_id
+                ));
+            } else {
+                r.skipped.push(format!(
+                    "{tag}: SQL metric {} alert (PostHog-unsupported: SQL alert payload and NULL evaluation unverified)", a.metric_id
+                ));
+            }
             continue;
         };
         let cadence =
@@ -1943,7 +2023,8 @@ fn wanted_tiles(
     key: &str,
     presentations: &BTreeMap<(&str, u64), i64>,
     health: &BTreeMap<(String, usize), i64>,
-    skipped_metrics: &BTreeSet<&str>,
+    skipped_metrics: &BTreeMap<&str, &'static str>,
+    skipped_presentations: &BTreeMap<(&str, u64), &'static str>,
     r: &mut SyncReport,
 ) -> Result<Vec<i64>, SyncError> {
     let mut wanted = vec![];
@@ -1951,7 +2032,13 @@ fn wanted_tiles(
     for item in dash.sections.iter().flat_map(|s| &s.items) {
         match (item, resolve_presentation(item, dash)) {
             (_, Some((mid, _, seconds))) => {
-                if skipped_metrics.contains(mid) {
+                if let Some(reason) = skipped_metrics
+                    .get(mid)
+                    .copied()
+                    .or_else(|| skipped_presentations.get(&(mid, seconds)).copied())
+                {
+                    r.skipped
+                        .push(format!("{key}: tile for {mid} skipped ({reason})"));
                     continue;
                 }
                 wanted.push(*presentations.get(&(mid, seconds)).ok_or_else(|| {
@@ -1984,10 +2071,20 @@ fn alert_path(row: &Value) -> Result<String, SyncError> {
     Ok(format!("alerts/{id}/"))
 }
 type Presentations<'a> = BTreeMap<&'a str, Vec<(&'static str, u64)>>;
+struct Prepared<'a> {
+    alerted_ids: BTreeSet<&'a str>,
+    presentations: Presentations<'a>,
+    insights: BTreeMap<String, Value>,
+    health: BTreeMap<String, Value>,
+    skipped_metrics: BTreeMap<&'a str, &'static str>,
+    skipped_presentations: BTreeMap<(&'a str, u64), &'static str>,
+    canonical_windows: BTreeMap<&'a str, u64>,
+}
+#[allow(clippy::too_many_lines)]
 fn preflight<'a>(
     config: &SyncConfig,
     declarations: &'a Declarations,
-) -> Result<(BTreeSet<&'a str>, Presentations<'a>), SyncError> {
+) -> Result<Prepared<'a>, SyncError> {
     slug(&config.app)
         .and_then(|()| declarations.validate())
         .map_err(SyncError::Invalid)?;
@@ -2087,7 +2184,102 @@ fn preflight<'a>(
             }
         }
     }
-    Ok((alerted_ids, declared_presentations))
+    let mut prepared = Prepared {
+        alerted_ids,
+        presentations: declared_presentations,
+        insights: BTreeMap::new(),
+        health: BTreeMap::new(),
+        skipped_metrics: BTreeMap::new(),
+        skipped_presentations: BTreeMap::new(),
+        canonical_windows: BTreeMap::new(),
+    };
+    for metric in &declarations.metrics {
+        if let MetricQuery::Ratio(ratio) = &metric.query
+            && ratio_mixes_clusters(ratio, declarations)
+        {
+            prepared
+                .skipped_metrics
+                .insert(&metric.id, "ratio mixes product events with logs/spans");
+            continue;
+        }
+        let declared = prepared.presentations.get(metric.id.as_str());
+        let alerted = prepared.alerted_ids.contains(metric.id.as_str());
+        let fallback = [("ActionsLineGraph", DEFAULT_RANGE_SECONDS)];
+        let entries = declared.map_or(fallback.as_slice(), Vec::as_slice);
+        let mut rendered = Vec::new();
+        for &(display, seconds) in entries {
+            let query = metric_query(metric, declarations, &config.app, display, seconds, false)?;
+            if query.is_none() {
+                prepared.skipped_presentations.insert(
+                    (metric.id.as_str(), seconds),
+                    "PostHog-unsupported: SQL line charts break down by one column",
+                );
+            }
+            rendered.push((display, seconds, query));
+        }
+        let legacy =
+            (alerted || declared.is_none()) && matches!(metric.query, MetricQuery::ProductEvent(_));
+        let canonical = if legacy {
+            metric_query(
+                metric,
+                declarations,
+                &config.app,
+                entries[0].0,
+                entries[0].1,
+                true,
+            )?
+        } else {
+            rendered.iter().find_map(|(_, _, query)| query.clone())
+        };
+        let Some(canonical) = canonical else { continue };
+        let first_supported = rendered.iter().find(|(_, _, query)| query.is_some());
+        if !legacy && let Some((_, seconds, _)) = first_supported {
+            prepared
+                .canonical_windows
+                .insert(metric.id.as_str(), *seconds);
+        }
+        let name = metric.display_name.as_ref().unwrap_or(&metric.id);
+        let description = if matches!(metric.query, MetricQuery::ProductEvent(_)) {
+            Value::Null
+        } else {
+            json!(SQL_COVERAGE_DESCRIPTION)
+        };
+        let key = format!("cja:{}:insight:{}", config.app, metric.id);
+        prepared.insights.insert(
+            key,
+            json!({"name":name,"description":description,"query":canonical}),
+        );
+        if declared.is_some() {
+            for (_, seconds, query) in rendered {
+                let Some(query) = query else { continue };
+                if !alerted && prepared.canonical_windows.get(metric.id.as_str()) == Some(&seconds)
+                {
+                    continue;
+                }
+                let key = format!("cja:{}:insight:{}@{seconds}s", config.app, metric.id);
+                prepared.insights.insert(
+                    key,
+                    json!({"name":name,"description":description,"query":query}),
+                );
+            }
+        }
+    }
+    for dash in &declarations.dashboards {
+        let mut ordinal = 0;
+        for item in dash.sections.iter().flat_map(|section| &section.items) {
+            if let Item::HealthSummary { label } = item {
+                let key = format!("cja:{}:insight:{}@health{ordinal}", config.app, dash.id);
+                let name = format!(
+                    "{}Recent error events (24h) — health substitute",
+                    label.as_deref().map_or(String::new(), |v| format!("{v}: "))
+                );
+                let sql = health_sql(&config.app)?;
+                prepared.health.insert(key, json!({"name":name,"description":SQL_COVERAGE_DESCRIPTION,"query":sql_query(&sql, SqlDisplay::Number, 0)}));
+                ordinal += 1;
+            }
+        }
+    }
+    Ok(prepared)
 }
 fn metric_query(
     metric: &super::Metric,
@@ -2096,20 +2288,32 @@ fn metric_query(
     display: &str,
     seconds: u64,
     legacy: bool,
-) -> Result<Value, SyncError> {
+) -> Result<Option<Value>, SyncError> {
     Ok(match &metric.query {
         MetricQuery::ProductEvent(product) => {
-            query(product, app, (!legacy).then_some((display, seconds)))
+            Some(query(product, app, (!legacy).then_some((display, seconds))))
         }
-        MetricQuery::Telemetry(telemetry) => sql_query(
-            &telemetry_sql(telemetry, app, SqlWindow::trailing(seconds))?,
-            SqlDisplay::from_name(display)?,
-        ),
-        MetricQuery::Ratio(ratio) => sql_query(
-            &ratio_sql(ratio, decl, app, SqlWindow::trailing(seconds))?,
-            SqlDisplay::from_name(display)?,
-        ),
+        MetricQuery::Telemetry(telemetry) => {
+            let plan = telemetry_plan(telemetry, app, SqlWindow::trailing(seconds))?;
+            sql_node_for_plan(&plan, display)?
+        }
+        MetricQuery::Ratio(ratio) => {
+            let plan = ratio_plan(ratio, decl, app, SqlWindow::trailing(seconds))?;
+            sql_node_for_plan(&plan, display)?
+        }
     })
+}
+fn sql_node_for_plan(plan: &SqlPlan, display: &str) -> Result<Option<Value>, SyncError> {
+    let display = SqlDisplay::from_name(display)?;
+    let dimensions = plan
+        .groups
+        .iter()
+        .filter(|group| group.as_str() != "bucket")
+        .count();
+    if display == SqlDisplay::Line && dimensions > 1 {
+        return Ok(None);
+    }
+    Ok(Some(sql_query(&plan.sql, display, dimensions)))
 }
 async fn prune(
     api: &Api<'_>,
@@ -2173,6 +2377,7 @@ async fn sync_dashboard_rows(
 async fn sync_health_rows(
     api: &Api<'_>,
     declarations: &Declarations,
+    bodies: &BTreeMap<String, Value>,
     insights: &mut Index,
     keep: &mut BTreeSet<String>,
     report: &mut SyncReport,
@@ -2181,18 +2386,15 @@ async fn sync_health_rows(
     for dash in &declarations.dashboards {
         let mut ordinal = 0;
         for item in dash.sections.iter().flat_map(|section| &section.items) {
-            if let Item::HealthSummary { label } = item {
+            if let Item::HealthSummary { .. } = item {
                 let key = format!("cja:{}:insight:{}@health{ordinal}", api.config.app, dash.id);
-                let name = format!(
-                    "{}Recent error events (24h) — health substitute",
-                    label.as_deref().map_or(String::new(), |v| format!("{v}: "))
-                );
-                let sql = health_sql(&api.config.app)?;
                 let n = upsert(
                     api,
                     "insights",
                     &key,
-                    json!({"name":name,"description":SQL_COVERAGE_DESCRIPTION,"query":sql_query(&sql, SqlDisplay::Number)}),
+                    bodies.get(&key).cloned().ok_or_else(|| {
+                        SyncError::Invalid(format!("missing prepared health {key}"))
+                    })?,
                     insights,
                     report,
                 )
@@ -2206,12 +2408,13 @@ async fn sync_health_rows(
     Ok(ids)
 }
 /// Apply a complete declaration set, including removal of stale owned objects.
+#[allow(clippy::too_many_lines)]
 pub async fn sync(
     config: &SyncConfig,
     declarations: &Declarations,
     http: &SyncClient,
 ) -> Result<SyncReport, SyncError> {
-    let (alerted_ids, declared_presentations) = preflight(config, declarations)?;
+    let prepared = preflight(config, declarations)?;
     let api = Api {
         config,
         http,
@@ -2225,46 +2428,40 @@ pub async fn sync(
     let mut keep = BTreeSet::new();
     let mut ids = BTreeMap::new();
     let mut presentation_ids = BTreeMap::new();
-    let mut skipped_metrics = BTreeSet::new();
     sync_dashboard_rows(&api, declarations, &mut dashboards, &mut keep, &mut report).await?;
     for metric in &declarations.metrics {
         let key = tag("insight", &metric.id);
-        if let MetricQuery::Ratio(ratio) = &metric.query
-            && ratio_mixes_clusters(ratio, declarations)
-        {
-            skipped_metrics.insert(metric.id.as_str());
+        if prepared.skipped_metrics.contains_key(metric.id.as_str()) {
             report.skipped.push(format!("{key}: ratio mixes product events with logs/spans (PostHog-unsupported: HogQL cannot join events and logs/spans in one query)"));
             continue;
         }
-        let declared = declared_presentations.get(metric.id.as_str());
-        let alerted = alerted_ids.contains(metric.id.as_str());
-        let canonical_presentation = declared
-            .and_then(|entries| entries.first().copied())
-            .unwrap_or(("ActionsLineGraph", DEFAULT_RANGE_SECONDS));
-        let legacy =
-            (alerted || declared.is_none()) && matches!(metric.query, MetricQuery::ProductEvent(_));
-        let name = metric.display_name.as_ref().unwrap_or(&metric.id).clone();
-        let description = (!matches!(metric.query, MetricQuery::ProductEvent(_)))
-            .then_some(SQL_COVERAGE_DESCRIPTION);
-        let mut body = json!({"name":name,"query":metric_query(metric, declarations, &config.app, canonical_presentation.0, canonical_presentation.1, legacy)?});
-        if let Some(description) = description {
-            body["description"] = json!(description);
-        }
+        let Some(body) = prepared.insights.get(&key).cloned() else {
+            continue;
+        };
+        let declared = prepared.presentations.get(metric.id.as_str());
+        let alerted = prepared.alerted_ids.contains(metric.id.as_str());
         let insight_id = upsert(&api, "insights", &key, body, &mut insights, &mut report).await?;
         if matches!(metric.query, MetricQuery::ProductEvent(_)) {
             ids.insert(metric.id.as_str(), insight_id);
         }
         keep.insert(key);
         if let Some(entries) = declared {
-            for (position, (display, seconds)) in entries.iter().enumerate() {
-                let n = if position == 0 && !alerted {
+            for (_, seconds) in entries {
+                if prepared
+                    .skipped_presentations
+                    .contains_key(&(metric.id.as_str(), *seconds))
+                {
+                    continue;
+                }
+                let n = if !alerted
+                    && prepared.canonical_windows.get(metric.id.as_str()) == Some(seconds)
+                {
                     insight_id
                 } else {
                     let variant = tag("insight", &format!("{}@{seconds}s", metric.id));
-                    let mut body = json!({"name":name,"query":metric_query(metric, declarations, &config.app, display, *seconds, false)?});
-                    if let Some(description) = description {
-                        body["description"] = json!(description);
-                    }
+                    let body = prepared.insights.get(&variant).cloned().ok_or_else(|| {
+                        SyncError::Invalid(format!("missing prepared insight {variant}"))
+                    })?;
                     let n = upsert(&api, "insights", &variant, body, &mut insights, &mut report)
                         .await?;
                     keep.insert(variant);
@@ -2274,8 +2471,15 @@ pub async fn sync(
             }
         }
     }
-    let health_ids =
-        sync_health_rows(&api, declarations, &mut insights, &mut keep, &mut report).await?;
+    let health_ids = sync_health_rows(
+        &api,
+        declarations,
+        &prepared.health,
+        &mut insights,
+        &mut keep,
+        &mut report,
+    )
+    .await?;
     let owned = insights
         .iter()
         .map(|(key, v)| id(v, key))
@@ -2287,7 +2491,8 @@ pub async fn sync(
             &key,
             &presentation_ids,
             &health_ids,
-            &skipped_metrics,
+            &prepared.skipped_metrics,
+            &prepared.skipped_presentations,
             &mut report,
         )?;
         tiles(
@@ -2300,7 +2505,15 @@ pub async fn sync(
         )
         .await?;
     }
-    alerts(&api, declarations, alert_rows, &ids, &mut report).await?;
+    alerts(
+        &api,
+        declarations,
+        alert_rows,
+        &ids,
+        &prepared.skipped_metrics,
+        &mut report,
+    )
+    .await?;
     prune(&api, dashboards, insights, &keep, &mut report).await?;
     Ok(report)
 }
