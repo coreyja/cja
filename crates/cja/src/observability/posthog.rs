@@ -66,13 +66,15 @@ mod sql_tests {
                 "SELECT if((SELECT count() FROM (SELECT 1 FROM posthog.trace_spans WHERE service_name = 'arena' AND timestamp <= now() - INTERVAL 300 SECOND LIMIT 1)) > 0, ",
                 "if(count(_metric_value) = 0, NULL, quantile(0.95)(_metric_value)), NULL) AS value FROM ",
                 "(SELECT duration_nano / 1000 AS _metric_value FROM posthog.trace_spans WHERE service_name = 'arena' AND timestamp >= now() - INTERVAL 300 SECOND AND ",
-                "(name = 'server.request' AND attributes['target'] = 'cja::server::trace' AND attributes['kind'] = 'server')) AS _source LIMIT 1"
+                "(attributes['target'] = 'cja::server::trace' AND attributes['kind'] = 'server')) AS _source LIMIT 1"
             )
         );
         assert!(sql.contains("FROM posthog.trace_spans"));
         assert!(!sql.contains("FROM logs"));
         assert!(sql.contains("duration_nano / 1000 AS _metric_value"));
-        assert!(sql.contains("name = 'server.request' AND attributes['target'] = 'cja::server::trace' AND attributes['kind'] = 'server'"));
+        assert!(sql.contains(
+            "attributes['target'] = 'cja::server::trace' AND attributes['kind'] = 'server'"
+        ));
         assert!(sql.contains("quantile(0.95)(_metric_value)"));
         assert!(sql.contains("timestamp <= now() - INTERVAL 300 SECOND"));
     }
@@ -156,6 +158,30 @@ mod sql_tests {
         );
         assert!(!sql.contains("posthog.trace_spans"));
         assert!(sql.contains("if(count(_metric_value) = 0, NULL, quantile(0.95)(_metric_value))"));
+    }
+
+    #[test]
+    fn covered_empty_sum_is_zero_but_missing_coverage_is_null() {
+        let metric = TelemetryMetricBuilder::new(
+            "suppressed",
+            EyesAggregate::Sum,
+            Some("fields.suppressed"),
+        )
+        .unwrap()
+        .filter_eq("fields.event_type", "shout_screening")
+        .unwrap()
+        .build()
+        .unwrap();
+        let sql = telemetry_sql(telemetry(&metric), "arena", SqlWindow::trailing(3600)).unwrap();
+        assert!(
+            sql.contains("if((SELECT count() FROM (SELECT 1 FROM logs"),
+            "{sql}"
+        );
+        assert!(sql.contains("sum(_metric_value), NULL) AS value"), "{sql}");
+        assert!(
+            !sql.contains("if(count(_metric_value) = 0, NULL, sum"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -919,7 +945,7 @@ fn literal_sql(literal: &Literal, attribute: bool) -> Result<String, SyncError> 
 fn semantic_predicate(value: &str, source: SqlSource) -> &'static str {
     match (value, source) {
         ("http.request", SqlSource::Spans) => {
-            "name = 'server.request' AND attributes['target'] = 'cja::server::trace' AND attributes['kind'] = 'server'"
+            "attributes['target'] = 'cja::server::trace' AND attributes['kind'] = 'server'"
         }
         ("job.run", SqlSource::Spans) => "name = 'worker.run_job'",
         ("job.enqueue", SqlSource::Spans) => "name = 'jobs.enqueue'",
@@ -1266,7 +1292,7 @@ fn telemetry_plan(
         aggregate_sql(aggregate.function),
         !matches!(
             aggregate.function,
-            EyesAggregate::Count | EyesAggregate::CountDistinct
+            EyesAggregate::Count | EyesAggregate::CountDistinct | EyesAggregate::Sum
         ),
         app,
         window,
@@ -1366,7 +1392,9 @@ fn product_plan(
         aggregate,
         !matches!(
             metric.aggregate,
-            ProductAggregate::Count | ProductAggregate::DistinctUsers
+            ProductAggregate::Count
+                | ProductAggregate::DistinctUsers
+                | ProductAggregate::Sum { .. }
         ),
         app,
         window,
@@ -1748,17 +1776,16 @@ fn wanted_tiles(
     presentations: &BTreeMap<(&str, u64), i64>,
     health: &BTreeMap<(String, usize), i64>,
     r: &mut SyncReport,
-) -> Vec<i64> {
+) -> Result<Vec<i64>, SyncError> {
     let mut wanted = vec![];
     let mut health_ordinal = 0;
     for item in dash.sections.iter().flat_map(|s| &s.items) {
         match (item, resolve_presentation(item, dash)) {
-            (_, Some((mid, _, seconds))) => match presentations.get(&(mid, seconds)) {
-                Some(insight_id) => wanted.push(*insight_id),
-                None => r
-                    .skipped
-                    .push(format!("{key}: missing insight for metric {mid}")),
-            },
+            (_, Some((mid, _, seconds))) => {
+                wanted.push(*presentations.get(&(mid, seconds)).ok_or_else(|| {
+                    SyncError::Invalid(format!("{key}: missing insight for metric {mid}"))
+                })?);
+            }
             (Item::Links { .. }, None) => {
                 r.skipped.push(format!("{key}: links item (Eyes-only)"));
             }
@@ -1768,10 +1795,14 @@ fn wanted_tiles(
                 }
                 health_ordinal += 1;
             }
-            (_, None) => unreachable!("only links and health lack a presentation"),
+            (_, None) => {
+                return Err(SyncError::Invalid(format!(
+                    "{key}: item lacks a presentation"
+                )));
+            }
         }
     }
-    wanted
+    Ok(wanted)
 }
 fn alert_path(row: &Value) -> Result<String, SyncError> {
     let id = row["id"]
@@ -1953,10 +1984,11 @@ async fn sync_dashboard_rows(
                         })
                 });
         let description = if has_sql {
-            format!(
-                "{}\nSQL tiles show NULL or no rows until the full source window has boundary coverage; health shows recent error events, not durable process/job state.",
-                dash.description.as_deref().unwrap_or_default()
-            )
+            let note = "SQL tiles show NULL or no rows until the full source window has boundary coverage; health shows recent error events, not durable process/job state.";
+            match dash.description.as_deref().filter(|s| !s.is_empty()) {
+                Some(description) => format!("{description}\n{note}"),
+                None => note.to_owned(),
+            }
         } else {
             dash.description.clone().unwrap_or_default()
         };
@@ -2082,7 +2114,7 @@ pub async fn sync(
         .collect::<Result<_, _>>()?;
     for dash in &declarations.dashboards {
         let key = tag("dashboard", &dash.id);
-        let wanted = wanted_tiles(dash, &key, &presentation_ids, &health_ids, &mut report);
+        let wanted = wanted_tiles(dash, &key, &presentation_ids, &health_ids, &mut report)?;
         tiles(
             &api,
             &key,

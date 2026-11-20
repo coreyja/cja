@@ -659,6 +659,78 @@ async fn telemetry_ratio_and_health_are_tiled_with_only_links_and_unproven_alert
 }
 
 #[tokio::test]
+async fn product_operand_ratio_with_distinct_windows_reconciles_without_rewrites() {
+    let mock = Mock::start().await;
+    let played = ProductMetricBuilder::count("played", "game_played")
+        .build()
+        .unwrap();
+    let completed = TelemetryMetricBuilder::new("completed", AggregateFunction::Count, None)
+        .unwrap()
+        .filter_eq("fields.event_type", "game_completed")
+        .unwrap()
+        .build()
+        .unwrap();
+    let share = RatioMetricBuilder::new("share", "played", "completed")
+        .numerator_window_seconds(86_400)
+        .denominator_window_seconds(28 * 86_400)
+        .as_percentage()
+        .build()
+        .unwrap();
+    let declarations = Declarations::new()
+        .metric(played)
+        .metric(completed)
+        .metric(share)
+        .dashboard(
+            Dashboard::new("ops", "Operations")
+                .unwrap()
+                .default_range_seconds(3600)
+                .section(
+                    Section::new()
+                        .item(Item::stat("share"))
+                        .item(Item::stat("share").window_seconds(7200)),
+                ),
+        );
+    let report = mock.sync("demo", &declarations).await.unwrap();
+    for key in ["cja:demo:insight:share", "cja:demo:insight:share@7200s"] {
+        assert!(report.created.contains(&key.to_owned()));
+        let sql = mock.row(key)["query"]["source"]["query"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(sql.contains("FROM events"), "{sql}");
+        assert!(sql.contains("properties['service.name'] = 'demo'"), "{sql}");
+        assert!(sql.contains("FROM logs"), "{sql}");
+        assert!(
+            sql.contains("timestamp <= now() - INTERVAL 86400 SECOND"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("timestamp <= now() - INTERVAL 2419200 SECOND"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("isNull(_den_value) OR _den_value = 0"),
+            "{sql}"
+        );
+    }
+    mock.log();
+    assert_repeat_clean(&mock, &declarations).await;
+}
+
+#[tokio::test]
+async fn overlong_health_tag_fails_before_any_api_request() {
+    let mock = Mock::start().await;
+    let dashboard = Dashboard::new("a".repeat(128), "Health")
+        .unwrap()
+        .section(Section::new().item(Item::health_summary()));
+    let declarations = Declarations::new().dashboard(dashboard);
+    let app = "b".repeat(112);
+    let error = mock.sync(&app, &declarations).await.unwrap_err();
+    assert!(matches!(error, SyncError::Invalid(message) if message.contains("health tag")));
+    assert_eq!(mock.log(), Vec::new());
+}
+
+#[tokio::test]
 async fn telemetry_windows_reconcile_and_removed_health_is_pruned() {
     let mock = Mock::start().await;
     let metric = TelemetryMetricBuilder::new("errors", AggregateFunction::Count, None)
