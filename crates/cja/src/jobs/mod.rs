@@ -1179,25 +1179,33 @@ mod enqueue_on_tests {
             "{raw}"
         );
         let captures = captures.lock().unwrap();
-        let trace_body = &captures
+        let spans = captures
             .iter()
-            .find(|(path, _)| path == "/i/v1/traces")
-            .expect("trace batch exported")
-            .1;
-        let traces = ExportTraceServiceRequest::decode(trace_body.as_slice()).unwrap();
-        let enqueue_span = traces.resource_spans[0].scope_spans[0]
-            .spans
+            .filter(|(path, _)| path == "/i/v1/traces")
+            .flat_map(|(_, body)| {
+                ExportTraceServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_spans
+            })
+            .flat_map(|resource| resource.scope_spans)
+            .flat_map(|scope| scope.spans)
+            .collect::<Vec<_>>();
+        let enqueue_span = spans
             .iter()
             .find(|span| span.name == "jobs.enqueue")
             .expect("enqueue span exported");
-        let log_body = &captures
+        let logs = captures
             .iter()
-            .find(|(path, _)| path == "/i/v1/logs")
-            .expect("log batch exported")
-            .1;
-        let logs = ExportLogsServiceRequest::decode(log_body.as_slice()).unwrap();
-        let job_log = logs.resource_logs[0].scope_logs[0]
-            .log_records
+            .filter(|(path, _)| path == "/i/v1/logs")
+            .flat_map(|(_, body)| {
+                ExportLogsServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_logs
+            })
+            .flat_map(|resource| resource.scope_logs)
+            .flat_map(|scope| scope.log_records)
+            .collect::<Vec<_>>();
+        let job_log = logs
             .iter()
             .find(|record| {
                 record

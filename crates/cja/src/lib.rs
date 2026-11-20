@@ -150,9 +150,10 @@
 //! Eyes and `PostHog` data. `PostHog`'s OTLP copy redacts sensitive query values
 //! (`code`, `state`, token, password, secret, key, signature and OTP keys),
 //! drops authorization/cookie headers, and passes job `self`, `value`, and
-//! serde `error.detail` fields through as Eyes does. Eyes keeps raw fields. App-owned
-//! spans remain the app's responsibility: use
-//! `#[instrument(skip(self))]` on `Job::run` to avoid exporting its payload.
+//! serde `error.detail` fields through as Eyes does. Eyes keeps raw fields.
+//! `#[instrument(skip(self))]` on an app-owned `Job::run` span only avoids an extra
+//! Debug-formatted copy of the payload on that span. A payload that must not leave
+//! the process must not be stored in the job.
 //! Explicit product events and boot manifests are app-owned payloads.
 //! Returned `PostHog` construction errors skip that sink. A dependency panic
 //! during construction aborts in a `panic = "abort"` build.
