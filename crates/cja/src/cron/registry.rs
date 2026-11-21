@@ -191,12 +191,15 @@ impl CronDateTime for WallClock {
 }
 
 impl CronSchedule {
-    /// The first scheduled wall-clock time strictly after `after`.
-    fn next_wall_clock(&self, after: WallClock) -> DateTime {
+    /// The first scheduled wall-clock time strictly after `after`, or `None`
+    /// when the expression has none: a date that never exists (`31 6` is
+    /// June 31) or a year range that has ended. croner reports those as an
+    /// error.
+    fn next_wall_clock(&self, after: WallClock) -> Option<DateTime> {
         self.0
             .find_next_occurrence(&after, false)
-            .expect("cron expression has a next occurrence")
-            .0
+            .ok()
+            .map(|at| at.0)
     }
 
     fn should_run(
@@ -208,8 +211,11 @@ impl CronSchedule {
     ) -> bool {
         // Use last run time if available, otherwise use worker start time
         let last_run = last_run.copied().unwrap_or(worker_started_at);
-        let next_run = self.next_wall_clock(WallClock::of(last_run, timezone));
-        WallClock::of(now, timezone).0 >= next_run
+        // A schedule with no next occurrence is never due. This runs on every
+        // worker tick, so it must not panic: under the Supervisor a panic
+        // here ends the process, and the restarted worker panics again.
+        self.next_wall_clock(WallClock::of(last_run, timezone))
+            .is_some_and(|next_run| WallClock::of(now, timezone).0 >= next_run)
     }
 
     pub fn next_run(
@@ -219,7 +225,9 @@ impl CronSchedule {
         timezone: &TimeZone,
     ) -> ZonedDateTime {
         let last_run = last_run.copied().unwrap_or(now);
-        let next_run = self.next_wall_clock(WallClock::of(last_run, timezone));
+        let next_run = self
+            .next_wall_clock(WallClock::of(last_run, timezone))
+            .expect("cron expression has a next occurrence");
         let at = match timezone.to_ambiguous_timestamp(next_run).offset() {
             AmbiguousOffset::Unambiguous { offset } => offset_instant(offset, next_run),
             AmbiguousOffset::Fold { before, after } => {
@@ -1945,6 +1953,66 @@ mod test {
             })
             .count();
         assert_eq!(failing_errors, 1);
+    }
+
+    #[sqlx::test]
+    async fn never_due_cron_does_not_stop_sibling_crons_in_a_tick(db: sqlx::PgPool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = TestAppState {
+            db: db.clone(),
+            cookie_key: CookieKey::generate(),
+        };
+        let never_calls = Arc::new(AtomicUsize::new(0));
+        let healthy_calls = Arc::new(AtomicUsize::new(0));
+
+        // Gate on the never-due cron iterating first, as in
+        // `failing_callback_does_not_stop_sibling_crons_in_a_tick`.
+        let mut first_is_never = None;
+        for _ in 0..64 {
+            let mut candidate = CronRegistry::new();
+            let never_seen = never_calls.clone();
+            // June 31 never exists: croner finds no next occurrence.
+            candidate
+                .register_with_cron("june_31", None, "0 0 9 31 6 * *", move |_, _| {
+                    let never_seen = never_seen.clone();
+                    Box::pin(async move {
+                        never_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), std::io::Error>(())
+                    })
+                })
+                .unwrap();
+            let healthy_seen = healthy_calls.clone();
+            candidate.register(
+                "healthy_sibling",
+                None,
+                Duration::from_millis(1),
+                move |_, _| {
+                    let healthy_seen = healthy_seen.clone();
+                    Box::pin(async move {
+                        healthy_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), std::io::Error>(())
+                    })
+                },
+            );
+            if candidate.jobs.values().next().map(|job| job.name) == Some("june_31") {
+                first_is_never = Some(candidate);
+                break;
+            }
+        }
+        let registry =
+            first_is_never.expect("no ordering put the never-due cron first in 64 attempts");
+
+        let outcome = crate::cron::Worker::new(state, registry).tick().await;
+        assert_eq!(outcome, TickOutcome::default());
+        assert_eq!(never_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT name FROM crons")
+                .fetch_all(&db)
+                .await
+                .unwrap(),
+            vec!["healthy_sibling".to_string()]
+        );
     }
 
     #[sqlx::test]
@@ -4287,7 +4355,9 @@ mod cron_syntax_test {
     //! cja kept the `cron` crate's expression syntax when it moved to croner.
     //! A differential run of 20,000 random expressions against `cron` 0.17
     //! agreed on every parse result and the next three fire times; these pin
-    //! the settings that agreement depends on.
+    //! the settings that agreement depends on. That run kept the day of month
+    //! at 28 or below and the year at `*`, so it never generated a schedule
+    //! with no next occurrence, which `cron` and croner report differently.
 
     use jiff::Timestamp;
     use jiff::civil::{Weekday, date};
@@ -4333,6 +4403,25 @@ mod cron_syntax_test {
         let at = next("0 0 0 13 * FRI", "2026-11-17T00:00:00Z");
         assert_eq!(at.date(), date(2027, 8, 13));
         assert_eq!(at.weekday(), Weekday::Friday);
+    }
+
+    #[test]
+    fn a_schedule_with_no_next_occurrence_is_never_due() {
+        // June 31 never exists, and 2025 is over. `cron` 0.17 had no next
+        // time for these, so they were never due; croner returns an error.
+        let now: Timestamp = "2026-11-17T23:00:00Z".parse().unwrap();
+        let earlier: Timestamp = "2025-06-01T00:00:00Z".parse().unwrap();
+        for expr in ["0 0 9 31 6 * *", "0 0 9 1 1 * 2025"] {
+            let schedule = CronSchedule(Box::new(parse_cron(expr).unwrap()));
+            assert!(
+                !schedule.should_run(None, now, now, &TimeZone::UTC),
+                "{expr} with no last run"
+            );
+            assert!(
+                !schedule.should_run(Some(&earlier), now, earlier, &TimeZone::UTC),
+                "{expr} with a last run"
+            );
+        }
     }
 
     #[test]
