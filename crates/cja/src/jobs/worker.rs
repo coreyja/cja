@@ -795,7 +795,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                         tracing::warn!(job_id = %job.job_id, "Unknown-job release lost ownership");
                         return Ok(RunJobOutcome::LeaseLost(job.job_id));
                     }
-                    tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
+                    tracing::error!(job_id = %job.job_id, job.name = %job.name, job.context = %job.context, error_count = count, error = %error_message,
                         "Job permanently failed - unknown job type past its age limit, moved to dead letter queue");
                     return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
                         job, error,
@@ -813,7 +813,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 if !self.dead_letter_owned(&job, count, &error_message).await? {
                     return Ok(RunJobOutcome::LeaseLost(job.job_id));
                 }
-                tracing::error!(job_id = %job.job_id, job.name = %job.name, error_count = count,
+                tracing::error!(job_id = %job.job_id, job.name = %job.name, job.context = %job.context, error_count = count,
                     error = %error, error.detail = %error_message,
                     "Job permanently failed - payload is not deserializable, moved to dead letter queue without retries");
                 return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
@@ -828,7 +828,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 if !self.dead_letter_owned(&job, count, &error_message).await? {
                     return Ok(RunJobOutcome::LeaseLost(job.job_id));
                 }
-                tracing::error!(job_id = %job.job_id, error_count = count, error = %error_message,
+                tracing::error!(job_id = %job.job_id, job.name = %job.name, job.context = %job.context, error_count = count, error = %error_message,
                     "Job permanently failed - moved to dead letter queue");
             } else {
                 let result = sqlx::query(
@@ -847,7 +847,7 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                     tracing::warn!(job_id = %job.job_id, "Job failure finalization lost ownership");
                     return Ok(RunJobOutcome::LeaseLost(job.job_id));
                 }
-                tracing::warn!(job_id = %job.job_id, retry = job.error_count + 1, error = %error_message,
+                tracing::warn!(job_id = %job.job_id, job.name = %job.name, job.context = %job.context, retry = job.error_count + 1, error = %error_message,
                     "Job failed, retry scheduled");
             }
             return Ok(RunJobOutcome::Completed(Box::new(Err(JobError(
@@ -1007,6 +1007,8 @@ impl<AppState: AS, R: JobRegistry<AppState>> Worker<AppState, R> {
                 .await?
             {
                 tracing::error!(job_id = %claimed.job.job_id,
+                    job.name = %claimed.job.name,
+                    job.context = %claimed.job.context,
                     previous_owner = ?claimed.previous_locked_by,
                     error_count = claimed.job.error_count,
                     "Job lease expired - moved to dead letter queue");
@@ -1404,10 +1406,10 @@ async fn run_claimed_job<AppState: AS, R: JobRegistry<AppState>>(
         Ok(RunJobOutcome::Completed(result)) => {
             match *result {
                 Ok(RunJobSuccess(job)) => {
-                    tracing::info!(worker.id = %worker.id, job_id = %job.job_id, "Job Ran");
+                    tracing::info!(worker.id = %worker.id, job_id = %job.job_id, job.name = %job.name, job.context = %job.context, "Job Ran");
                 }
                 Err(job_error) => {
-                    tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
+                    tracing::error!(worker.id = %worker.id, job_id = %job_error.0.job_id, job.name = %job_error.0.name, job.context = %job_error.0.context, error_count = %job_error.0.error_count, error_msg = %job_error.1, "Job Errored");
                 }
             }
             Ok(())
@@ -1492,6 +1494,30 @@ mod tests {
 
         async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct SuccessJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for SuccessJob {
+        const NAME: &'static str = "SuccessJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+    struct FailureJob;
+
+    #[async_trait::async_trait]
+    impl Job<TestAppState> for FailureJob {
+        const NAME: &'static str = "FailureJob";
+
+        async fn run(&self, _app_state: TestAppState) -> color_eyre::Result<()> {
+            Err(color_eyre::eyre::eyre!("synthetic job failure"))
         }
     }
 
@@ -1979,6 +2005,8 @@ mod tests {
     impl_job_registry!(
         TestAppState,
         TestJob,
+        SuccessJob,
+        FailureJob,
         PanicJob,
         NormalProbeJob,
         LongJob,
@@ -4023,6 +4051,288 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
+    type CapturedLog = (String, opentelemetry_proto::tonic::logs::v1::LogRecord);
+    type ExpectedOutcome = (
+        &'static str,
+        opentelemetry_proto::tonic::logs::v1::SeverityNumber,
+        Vec<(
+            &'static str,
+            opentelemetry_proto::tonic::common::v1::any_value::Value,
+        )>,
+    );
+
+    async fn capture_job_outcome(
+        db: sqlx::PgPool,
+        name: &str,
+        context: &str,
+        max_retries: i32,
+    ) -> (uuid::Uuid, uuid::Uuid, Vec<CapturedLog>) {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+
+        let captures = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let requests = captures.clone();
+        let app =
+            axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let requests = requests.clone();
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((uri.path().into(), body.to_vec()));
+                    axum::http::StatusCode::OK
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sink = crate::setup::posthog_test_support::PostHogSink::build(
+            &crate::setup::posthog_test_support::PostHogConfig::new_for_tests(
+                host,
+                "phc_test",
+                tracing_subscriber::filter::LevelFilter::TRACE,
+                1.0,
+            ),
+            "worker-outcome-test",
+            None,
+            None,
+            8192,
+        )
+        .unwrap();
+        let subscriber =
+            tracing_subscriber::registry().with(sink.log_bridge().with_filter(sink.filter()));
+
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (job_id, name, payload, priority, run_at, created_at, context, error_count)
+             VALUES ($1, $2, $3, 0, NOW(), NOW(), $4, 0)",
+        )
+        .bind(job_id)
+        .bind(name)
+        .bind(serde_json::Value::Null)
+        .bind(context)
+        .execute(&db)
+        .await
+        .unwrap();
+        let worker = Worker::new(
+            test_state(db),
+            Jobs,
+            Duration::from_millis(20),
+            max_retries,
+            CancellationToken::new(),
+            JobWorkerConfig::default(),
+        )
+        .unwrap();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let claimed = worker.fetch_next_job().await.unwrap().unwrap();
+            assert_eq!(claimed.job.job_id, job_id);
+            assert!(matches!(
+                run_claimed_job(&worker, claimed, &CancellationToken::new()).await,
+                Some(Ok(()))
+            ));
+        }
+        sink.shutdown_handle().shutdown().await;
+        let logs = captures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/i/v1/logs")
+            .flat_map(|(_, body)| {
+                ExportLogsServiceRequest::decode(body.as_slice())
+                    .unwrap()
+                    .resource_logs
+            })
+            .flat_map(|resource| resource.scope_logs)
+            .flat_map(|scope| {
+                let name = scope.scope.expect("instrumentation scope").name;
+                scope
+                    .log_records
+                    .into_iter()
+                    .map(move |record| (name.clone(), record))
+            })
+            .collect();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        (worker.id, job_id, logs)
+    }
+
+    fn assert_job_outcome_logs(
+        logs: &[CapturedLog],
+        job_id: uuid::Uuid,
+        name: &str,
+        context: &str,
+        expected: &[ExpectedOutcome],
+    ) {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+
+        let mut missing_identity = Vec::new();
+        let mut previous_index = None;
+        for (body, severity, fields) in expected {
+            let matches = logs
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, record))| {
+                    record.body.as_ref().and_then(|body| body.value.as_ref())
+                        == Some(&Value::StringValue((*body).into()))
+                        && record.attributes.iter().any(|attribute| {
+                            attribute.key == "job_id"
+                                && attribute
+                                    .value
+                                    .as_ref()
+                                    .and_then(|value| value.value.as_ref())
+                                    == Some(&Value::StringValue(job_id.to_string()))
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "expected one {body} record for {job_id}");
+            let (index, (scope, record)) = matches[0];
+            if let Some(previous_index) = previous_index {
+                assert!(previous_index < index, "{body} was exported out of order");
+            }
+            previous_index = Some(index);
+            assert_eq!(scope, "cja::jobs::worker", "{body} scope");
+            assert_eq!(record.severity_number, *severity as i32, "{body} severity");
+            let severity_text = match severity {
+                opentelemetry_proto::tonic::logs::v1::SeverityNumber::Info => "INFO",
+                opentelemetry_proto::tonic::logs::v1::SeverityNumber::Warn => "WARN",
+                opentelemetry_proto::tonic::logs::v1::SeverityNumber::Error => "ERROR",
+                _ => panic!("unexpected test severity: {severity:?}"),
+            };
+            assert_eq!(record.severity_text, severity_text, "{body} severity text");
+            for (key, value) in [
+                ("job.name", Value::StringValue(name.into())),
+                ("job.context", Value::StringValue(context.into())),
+            ] {
+                if !record.attributes.iter().any(|attribute| {
+                    attribute.key == key
+                        && attribute
+                            .value
+                            .as_ref()
+                            .and_then(|value| value.value.as_ref())
+                            == Some(&value)
+                }) {
+                    missing_identity.push(format!("{body}: missing {key}={value:?}"));
+                }
+            }
+            for (key, value) in fields {
+                assert!(
+                    record.attributes.iter().any(|attribute| {
+                        attribute.key == *key
+                            && attribute
+                                .value
+                                .as_ref()
+                                .and_then(|value| value.value.as_ref())
+                                == Some(value)
+                    }),
+                    "{body}: missing {key}={value:?}"
+                );
+            }
+        }
+        assert!(
+            missing_identity.is_empty(),
+            "{}",
+            missing_identity.join("\n")
+        );
+    }
+
+    #[sqlx::test]
+    async fn job_outcome_success_has_identity(db: sqlx::PgPool) {
+        use opentelemetry_proto::tonic::{common::v1::any_value::Value, logs::v1::SeverityNumber};
+        let context = "manual-success";
+        let (worker_id, job_id, logs) =
+            capture_job_outcome(db, <SuccessJob as Job<TestAppState>>::NAME, context, 20).await;
+        assert_job_outcome_logs(
+            &logs,
+            job_id,
+            SuccessJob::NAME,
+            context,
+            &[(
+                "Job Ran",
+                SeverityNumber::Info,
+                vec![
+                    ("worker.id", Value::StringValue(worker_id.to_string())),
+                    ("job_id", Value::StringValue(job_id.to_string())),
+                ],
+            )],
+        );
+    }
+
+    #[sqlx::test]
+    async fn job_outcome_retry_has_identity(db: sqlx::PgPool) {
+        use opentelemetry_proto::tonic::{common::v1::any_value::Value, logs::v1::SeverityNumber};
+        let context = "Cron@outcome-retry";
+        let (worker_id, job_id, logs) =
+            capture_job_outcome(db, <FailureJob as Job<TestAppState>>::NAME, context, 20).await;
+        assert_job_outcome_logs(
+            &logs,
+            job_id,
+            FailureJob::NAME,
+            context,
+            &[
+                (
+                    "Job failed, retry scheduled",
+                    SeverityNumber::Warn,
+                    vec![
+                        ("job_id", Value::StringValue(job_id.to_string())),
+                        ("retry", Value::IntValue(1)),
+                        ("error", Value::StringValue("synthetic job failure".into())),
+                    ],
+                ),
+                (
+                    "Job Errored",
+                    SeverityNumber::Error,
+                    vec![
+                        ("worker.id", Value::StringValue(worker_id.to_string())),
+                        ("job_id", Value::StringValue(job_id.to_string())),
+                        ("error_count", Value::StringValue("0".into())),
+                        (
+                            "error_msg",
+                            Value::StringValue("synthetic job failure".into()),
+                        ),
+                    ],
+                ),
+            ],
+        );
+    }
+
+    #[sqlx::test]
+    async fn job_outcome_dead_letter_has_identity(db: sqlx::PgPool) {
+        use opentelemetry_proto::tonic::{common::v1::any_value::Value, logs::v1::SeverityNumber};
+        let context = "manual-dead-letter";
+        let (worker_id, job_id, logs) =
+            capture_job_outcome(db, <FailureJob as Job<TestAppState>>::NAME, context, 0).await;
+        assert_job_outcome_logs(
+            &logs,
+            job_id,
+            FailureJob::NAME,
+            context,
+            &[
+                (
+                    "Job permanently failed - moved to dead letter queue",
+                    SeverityNumber::Error,
+                    vec![
+                        ("job_id", Value::StringValue(job_id.to_string())),
+                        ("error_count", Value::IntValue(1)),
+                        ("error", Value::StringValue("synthetic job failure".into())),
+                    ],
+                ),
+                (
+                    "Job Errored",
+                    SeverityNumber::Error,
+                    vec![
+                        ("worker.id", Value::StringValue(worker_id.to_string())),
+                        ("job_id", Value::StringValue(job_id.to_string())),
+                        ("error_count", Value::StringValue("0".into())),
+                        (
+                            "error_msg",
+                            Value::StringValue("synthetic job failure".into()),
+                        ),
+                    ],
+                ),
+            ],
+        );
+    }
+
     #[sqlx::test]
     async fn invalid_payload_detail_reaches_eyes_posthog_and_dead_letter(db: sqlx::PgPool) {
         use opentelemetry_proto::tonic::collector::{
@@ -4159,12 +4469,18 @@ mod tests {
                     Some(Value::StringValue(value)) if value == "job payload is not deserializable"
                 )
         }));
-        assert!(
-            failure
-                .attributes
-                .iter()
-                .any(|attribute| attribute.key == "job.name")
-        );
+        for (key, expected) in [("job.name", "TestJob"), ("job.context", "privacy-test")] {
+            assert!(
+                failure.attributes.iter().any(|attribute| {
+                    attribute.key == key
+                        && matches!(
+                            attribute.value.as_ref().and_then(|value| value.value.as_ref()),
+                            Some(Value::StringValue(value)) if value == expected
+                        )
+                }),
+                "payload dead-letter record missing {key}={expected}"
+            );
+        }
         assert!(failure.attributes.iter().any(|attribute| {
             attribute.key == "error.detail"
                 && matches!(
