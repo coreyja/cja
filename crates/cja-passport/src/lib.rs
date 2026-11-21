@@ -7,6 +7,7 @@ pub mod oidc;
 pub mod rejection;
 pub mod routes;
 pub mod session;
+mod transport;
 
 pub use config::{
     AllowedSubject, HasMcpOAuthConfig, HasPassportConfig, McpOAuthConfig, OAuthOptions,

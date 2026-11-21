@@ -7,8 +7,20 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+tailnet = ["dep:cja-tailnet", "dep:setec", "dep:bytes", "dep:http", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:tokio-rustls"]
+
 [dependencies]
 cja = { path = "../cja", default-features = false, features = ["postgres"] }
+cja-tailnet = { path = "../cja-tailnet", optional = true }
+setec = { path = "../setec", optional = true }
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"], optional = true }
 openidconnect = { version = "=4.1.0", default-features = false, features = ["reqwest"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-manual-roots"] }
 axum.workspace = true

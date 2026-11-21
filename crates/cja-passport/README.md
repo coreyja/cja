@@ -46,6 +46,25 @@ let passport = cja_passport::PassportConfig::new(
 // Run refresher with the app's supervisor so rotations reach the watch receiver.
 ```
 
+For apps without host tailscaled, enable `cja-passport/tailnet` and pass the
+already joined node owned by `cja_secret::Refresher` after loading secrets:
+
+```rust,ignore
+let passport = cja_passport::PassportConfig::new(
+    issuer, callback, client_id, secrets.client_secret.watch(),
+    allowlist, native_schemes, cja_passport::SessionTimings::default(),
+)?.tailnet(refresher.tailnet().expect("tailnet transport"))?;
+```
+
+`Refresher::tailnet()` returns `Option<Arc<Tailnet>>`; handle `None` at startup.
+The issuer remains HTTPS, for example
+`https://passport.rooster-mermaid.ts.net`. Discovery, JWKS, code exchange, and
+refresh use the node with certificate verification. Without `.tailnet(...)`,
+the existing host-network client is used. `PassportConfig::dialer` accepts a
+custom `Arc<dyn setec::Dialer>` for integrations and tests. The refresher owns
+node shutdown; retaining an `Arc` does not restart a shut-down node, and later
+dials fail. cja-passport never joins a replacement node.
+
 Use `AllowedSubject::new("userid:123")` for the per-app allowlist. The number
 is the Tailscale user ID from a user-owned node or can be verified at
 `/userinfo`. It is **not** an email or display name. The identity key is
@@ -76,6 +95,8 @@ refresh policy, revocation, and eight hour cap as web cookies. The app never
 receives a tsidp access token, refresh token, or client secret. tsidp access
 tokens are opaque, so they are not JWTs for the app to validate. A custom
 scheme can be claimed by another app; keep the scheme unique.
+The handoff exchange at `/auth/native/exchange` is local; the browser callback
+and later bearer refresh contact the IdP through the selected transport.
 
 ## Migrating from cja-passkey
 

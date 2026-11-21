@@ -66,6 +66,7 @@ jobs:
       - name: Check independent consumers
         run: |
           cargo check --locked -p cja-passport --lib
+          cargo check --locked -p cja-passport --lib --features tailnet
           cargo check --locked -p cja-secret --lib
 
   # cja-llm's self dev-dependency turns on `testing`, so every `--all-targets`
@@ -146,7 +147,14 @@ jobs:
         run: |
           set -euo pipefail
           for package in cja cja-passport; do
-            for features in "" "--all-features" "--no-default-features"; do
+            # Explicit cja-passport/tailnet brings tailscale-rs/aws-lc via
+            # setec/cja-tailnet; keep the default and no-default ring guard.
+            if [ "$package" = cja-passport ]; then
+              feature_sets=("" "--no-default-features")
+            else
+              feature_sets=("" "--all-features" "--no-default-features")
+            fi
+            for features in "${feature_sets[@]}"; do
               graph=$(cargo tree --locked -p "$package" $features --target all -e normal,build --prefix none --format '{p}')
               if grep -E '^aws-lc-(rs|sys) ' <<<"$graph"; then
                 echo "::error::aws-lc-rs is in $package's dependency graph (features: '${features:-default}')"

@@ -1,3 +1,4 @@
+use crate::transport::PassportHttp;
 use openidconnect::{ClientId, IssuerUrl, RedirectUrl};
 use std::{
     collections::HashSet,
@@ -57,7 +58,7 @@ pub struct PassportConfig {
     pub allowlist: HashSet<AllowedSubject>,
     pub native_schemes: HashSet<String>,
     pub timings: SessionTimings,
-    pub(crate) http: reqwest::Client,
+    pub(crate) http: PassportHttp,
     pub(crate) discovery:
         Arc<tokio::sync::RwLock<Option<openidconnect::core::CoreProviderMetadata>>>,
 }
@@ -307,9 +308,23 @@ impl PassportConfig {
             allowlist,
             native_schemes,
             timings,
-            http,
+            http: PassportHttp::host(http),
             discovery: Arc::new(tokio::sync::RwLock::new(None)),
         })
+    }
+
+    /// Use an already joined in-process tailnet node for every OIDC request.
+    #[cfg(feature = "tailnet")]
+    pub fn tailnet(self, tailnet: Arc<cja_tailnet::Tailnet>) -> cja::Result<Self> {
+        self.dialer(tailnet)
+    }
+
+    /// Use a custom dialer for OIDC requests (also useful for tests).
+    #[cfg(feature = "tailnet")]
+    pub fn dialer(mut self, dialer: Arc<dyn setec::Dialer>) -> cja::Result<Self> {
+        self.http = PassportHttp::dialer(dialer)?;
+        self.discovery = Arc::new(tokio::sync::RwLock::new(None));
+        Ok(self)
     }
 }
 
@@ -358,9 +373,22 @@ mod tests {
             SessionTimings::default(),
         )
         .unwrap();
+        #[cfg_attr(
+            not(feature = "tailnet"),
+            expect(
+                clippy::infallible_destructuring_match,
+                reason = "the Dialer arm only exists with the tailnet feature"
+            )
+        )]
+        let client = match &config.http {
+            crate::transport::PassportHttp::Host(client) => client,
+            #[cfg(feature = "tailnet")]
+            crate::transport::PassportHttp::Dialer { .. } => {
+                panic!("PassportConfig::new must use the host HTTPS client")
+            }
+        };
         assert!(
-            config
-                .http
+            client
                 .get("https://passport.rooster-mermaid.ts.net/jwks")
                 .build()
                 .is_ok()
