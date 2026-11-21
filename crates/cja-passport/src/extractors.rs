@@ -2,7 +2,7 @@ use axum::{
     extract::FromRequestParts,
     http::{
         StatusCode,
-        header::{ACCEPT, AUTHORIZATION},
+        header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE},
         request::Parts,
     },
     response::IntoResponse,
@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use sqlx::Row;
 
 use crate::{
-    config::HasPassportConfig,
+    config::{AllowedSubject, HasMcpOAuthConfig, HasPassportConfig},
     models::user::User,
     rejection::Rejection,
     session::{PassportSession, resolve_user},
@@ -24,6 +24,65 @@ use crate::{
 pub struct CurrentUser(pub User);
 pub struct OptionalUser(pub Option<User>);
 pub struct BearerUser(pub User);
+pub struct McpUser(pub User);
+
+fn mcp_unauthorized<A: HasMcpOAuthConfig>(state: &A) -> Rejection {
+    let challenge = format!(
+        "Bearer resource_metadata=\"{}\"",
+        state
+            .mcp_oauth_config()
+            .endpoint("/.well-known/oauth-protected-resource/mcp")
+    );
+    (StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, challenge)])
+        .into_response()
+        .into()
+}
+
+impl<A: AppState + HasPassportConfig + HasMcpOAuthConfig + Send + Sync> FromRequestParts<A>
+    for McpUser
+{
+    type Rejection = Rejection;
+    async fn from_request_parts(parts: &mut Parts, state: &A) -> Result<Self, Rejection> {
+        let mut headers = parts.headers.get_all(AUTHORIZATION).iter();
+        let raw = headers
+            .next()
+            .and_then(|h| h.to_str().ok())
+            .ok_or_else(|| mcp_unauthorized(state))?;
+        if headers.next().is_some() {
+            return Err(mcp_unauthorized(state));
+        }
+        let (scheme, token) = raw.split_once(' ').ok_or_else(|| mcp_unauthorized(state))?;
+        if !scheme.eq_ignore_ascii_case("bearer")
+            || token.is_empty()
+            || token.bytes().any(|b| b.is_ascii_whitespace())
+        {
+            return Err(mcp_unauthorized(state));
+        }
+        let digest = Sha256::digest(token.as_bytes()).to_vec();
+        let id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT g.user_id FROM passport_oauth_access_tokens a JOIN passport_oauth_grants g ON g.id=a.grant_id WHERE a.token_hash=$1 AND a.expires_at>now() AND g.expires_at>now() AND g.resource=$2 AND 'mcp'=ANY(g.scopes)")
+            .bind(digest).bind(state.mcp_oauth_config().mcp_resource_url().as_str())
+            .fetch_optional(state.db()).await.map_err(db_error)?;
+        let id = id.ok_or_else(|| mcp_unauthorized(state))?;
+        let user = crate::models::user::find_by_id(state.db(), id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| mcp_unauthorized(state))?;
+        let allowed = AllowedSubject::new(&user.subject).is_ok_and(|subject| {
+            user.issuer == state.passport_config().issuer.as_str()
+                && state.passport_config().allowlist.contains(&subject)
+        });
+        if !allowed {
+            return Err(mcp_unauthorized(state));
+        }
+        if !cja::server::trace::record_request_user(
+            user.user_id,
+            cja::server::trace::AUTH_TYPE_PASSPORT,
+        ) {
+            tracing::debug!("passport request user could not be recorded outside request scope");
+        }
+        Ok(Self(user))
+    }
+}
 
 async fn bearer<A: AppState + HasPassportConfig>(
     parts: &Parts,

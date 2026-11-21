@@ -8,9 +8,12 @@ pub mod rejection;
 pub mod routes;
 pub mod session;
 
-pub use config::{AllowedSubject, HasPassportConfig, PassportConfig, SessionTimings};
+pub use config::{
+    AllowedSubject, HasMcpOAuthConfig, HasPassportConfig, McpOAuthConfig, OAuthOptions,
+    OAuthTimings, PassportConfig, SessionTimings,
+};
 pub use db::{prune_auth_artifacts, run_migrations};
-pub use extractors::{BearerUser, CurrentUser, OptionalUser};
+pub use extractors::{BearerUser, CurrentUser, McpUser, OptionalUser};
 pub use models::user::User;
-pub use routes::passport_router;
+pub use routes::{oauth_router, passport_router};
 pub use session::PassportSession;
