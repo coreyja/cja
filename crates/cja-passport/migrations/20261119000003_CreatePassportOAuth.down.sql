@@ -1,0 +1,12 @@
+DELETE FROM passport_login_attempts WHERE oauth_transaction_id IS NOT NULL;
+ALTER TABLE passport_login_attempts DROP CONSTRAINT passport_login_attempts_destination_check;
+ALTER TABLE passport_login_attempts DROP COLUMN oauth_transaction_id;
+ALTER TABLE passport_login_attempts ADD CONSTRAINT passport_login_attempts_check CHECK ((return_to IS NOT NULL) <> (native_redirect_uri IS NOT NULL));
+DROP TABLE passport_oauth_refresh_tokens;
+DROP TABLE passport_oauth_access_tokens;
+DROP TABLE passport_oauth_authorization_codes;
+DROP TABLE passport_oauth_pending_consents;
+DROP TABLE passport_oauth_consents;
+DROP TABLE passport_oauth_grants;
+DROP TABLE passport_oauth_login_transactions;
+DROP TABLE passport_oauth_clients;

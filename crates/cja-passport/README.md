@@ -92,3 +92,67 @@ scheme can be claimed by another app; keep the scheme unique.
    for web sessions. Serialize navigation across login: a stale pre-login
    response can set a new anonymous cookie after the callback rotates the old
    session, although the old row remains deleted.
+
+## MCP OAuth for Claude connectors
+
+An app with a public `/mcp` endpoint can enable the shared authorization server
+without implementing OAuth routes itself. The public base URL must be an HTTPS
+origin and the resource URL must be that origin's exact `/mcp` path. Loopback
+HTTP is accepted for local tests. `OAuthOptions::default()` permits only
+`https://claude.ai/api/mcp/auth_callback` and
+`https://claude.com/api/mcp/auth_callback`, with `mcp offline_access` scopes.
+
+```rust,ignore
+use cja_passport::{HasMcpOAuthConfig, McpOAuthConfig, McpUser, OAuthOptions};
+
+// Construct beside the app's existing PassportConfig.
+let oauth = McpOAuthConfig::new(
+    url::Url::parse("https://my-app.example/")?,
+    url::Url::parse("https://my-app.example/mcp")?,
+    OAuthOptions::default(),
+)?;
+// Store oauth in AppState; implement HasMcpOAuthConfig::mcp_oauth_config.
+let router = axum::Router::new()
+    .route("/mcp", axum::routing::post(mcp_handler))
+    .merge(cja_passport::passport_router::<AppState>())
+    .merge(cja_passport::oauth_router::<AppState>());
+
+async fn mcp_handler(cja_passport::McpUser(user): cja_passport::McpUser) {
+    // user is the allowlisted passport user for this bearer token.
+}
+```
+
+`run_migrations` creates the `passport_oauth_*` tables. Schedule
+`prune_auth_artifacts` for expired transactions, pending decisions, tokens,
+grants, and unused clients. Registration is limited to 30 requests per process
+per minute and 1,000 clients globally by default. The cap prunes unreferenced
+clients idle at least one hour when full, so fresh clients can still fill it for
+an hour. Override the redirect allowlist, scopes, lifetimes, and limits through
+`OAuthOptions`. Codes last five minutes, access tokens one hour, and grants
+slide to 180 days. A connector refresh checks the upstream device/user status;
+transient passport outages are tolerated for at most eight hours since the
+last successful check.
+
+The authorization request must include the exact configured `/mcp` resource.
+To preserve mull-site's current token behavior for Claude connectors, the token
+endpoint accepts an omitted `resource` parameter on code exchange and refresh;
+when supplied, it must match that resource exactly. The stored grant is always
+checked against the configured resource.
+
+The MCP security specification's confused-deputy guidance requires consent
+because the app uses one upstream client but accepts dynamically registered
+clients. Corey sees one **Allow** click per new connector and user after the
+silent passport sign-in. The page shows the self-reported client name, resource,
+scopes, and exact redirect URI. If Claude reuses its `client_id`, later
+reconnects are silent. Tokens and codes are stored as hashes; each grant keeps
+its own plaintext upstream refresh token in the database and backups.
+
+In tsidp v0.0.21, upstream refresh tokens are memory-only. Restarting passport
+invalidates every grant at its next refresh; reconnect in Claude once. The
+passport sign-in itself remains silent. Removing a Tailscale device or user
+revokes at the next upstream refresh; a previously issued MCP access token can
+remain valid for up to its configured lifetime.
+
+CJA's existing `server.request` telemetry records `/auth/callback?code=…` in
+`uri`/`url.query`. Callback-query redaction is separate follow-up work; do not
+add secret-bearing query parameters or application-level secret logs here.
