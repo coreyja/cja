@@ -373,6 +373,13 @@ mod tests {
             SessionTimings::default(),
         )
         .unwrap();
+        #[cfg_attr(
+            not(feature = "tailnet"),
+            expect(
+                clippy::infallible_destructuring_match,
+                reason = "the Dialer arm only exists with the tailnet feature"
+            )
+        )]
         let client = match &config.http {
             crate::transport::PassportHttp::Host(client) => client,
             #[cfg(feature = "tailnet")]
