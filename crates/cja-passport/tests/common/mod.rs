@@ -1,3 +1,5 @@
+#[cfg(feature = "tailnet")]
+use std::sync::Arc;
 use std::{collections::HashSet, sync::OnceLock};
 
 use axum::{
@@ -70,6 +72,7 @@ pub struct Fixture {
     pub guard: cja::testing::test_db::TestDatabaseGuard,
     pub fake: FakeSetec,
     pub refresher: cja_secret::Refresher,
+    pub issuer: String,
 }
 
 fn key() -> &'static RsaPrivateKey {
@@ -149,12 +152,51 @@ impl Fixture {
         options: OAuthOptions,
         subjects: &[&str],
     ) -> Self {
+        Self::new_with_transport(token_endpoint, options, subjects, None, None).await
+    }
+
+    #[cfg(feature = "tailnet")]
+    pub async fn with_dialer(issuer: String, dialer: Arc<dyn setec::Dialer>) -> Self {
+        Self::new_with_transport(
+            None,
+            OAuthOptions::default(),
+            &["userid:123"],
+            Some(issuer),
+            Some(dialer),
+        )
+        .await
+    }
+
+    #[cfg(feature = "tailnet")]
+    pub async fn with_dialer_and_token_endpoint(
+        issuer: String,
+        token_endpoint: String,
+        dialer: Arc<dyn setec::Dialer>,
+    ) -> Self {
+        Self::new_with_transport(
+            Some(token_endpoint),
+            OAuthOptions::default(),
+            &["userid:123"],
+            Some(issuer),
+            Some(dialer),
+        )
+        .await
+    }
+
+    async fn new_with_transport(
+        token_endpoint: Option<String>,
+        options: OAuthOptions,
+        subjects: &[&str],
+        issuer_override: Option<String>,
+        #[cfg(feature = "tailnet")] dialer: Option<Arc<dyn setec::Dialer>>,
+        #[cfg(not(feature = "tailnet"))] _dialer: Option<()>,
+    ) -> Self {
         let (pool, guard) = cja::testing::test_db::create_test_database("cja_passport_test_")
             .await
             .unwrap();
         cja_passport::run_migrations(&pool).await.unwrap();
         let server = MockServer::start_async().await;
-        let issuer = server.base_url();
+        let issuer = issuer_override.unwrap_or_else(|| server.base_url());
         let token_endpoint = token_endpoint.unwrap_or_else(|| format!("{issuer}/token"));
         server
             .mock_async(|when, then| {
@@ -180,7 +222,7 @@ impl Fixture {
         let fake = FakeSetec::new([("attic/passport/test-client", b"secret".as_slice())]);
         let (secrets, refresher) = fake.store().load::<TestSecrets>().await.unwrap();
         let config = PassportConfig::new(
-            IssuerUrl::new(issuer).unwrap(),
+            IssuerUrl::new(issuer.clone()).unwrap(),
             RedirectUrl::new("https://app.example.test/auth/callback".into()).unwrap(),
             ClientId::new("test-client".into()),
             secrets.client.watch(),
@@ -192,6 +234,11 @@ impl Fixture {
             SessionTimings::default(),
         )
         .unwrap();
+        #[cfg(feature = "tailnet")]
+        let config = match dialer {
+            Some(dialer) => config.dialer(dialer).unwrap(),
+            None => config,
+        };
         let state = TestState {
             pool,
             key: CookieKey::generate(),
@@ -219,6 +266,7 @@ impl Fixture {
             guard,
             fake,
             refresher,
+            issuer,
         }
     }
 

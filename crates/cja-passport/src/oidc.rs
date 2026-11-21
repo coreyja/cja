@@ -9,7 +9,10 @@ use openidconnect::{
 };
 use serde::Deserialize;
 
-use crate::config::PassportConfig;
+use crate::{
+    config::PassportConfig,
+    transport::{PassportHttp, PassportHttpError},
+};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TokenFailure {
@@ -32,15 +35,14 @@ enum TokenHttpError {
     #[error("token endpoint unavailable")]
     Server,
     #[error("token transport failed")]
-    Transport(#[from] openidconnect::HttpClientError<reqwest::Error>),
+    Transport(#[from] PassportHttpError),
 }
 
-struct TokenHttpClient(reqwest::Client);
+struct TokenHttpClient(PassportHttp);
 
 impl<'c> AsyncHttpClient<'c> for TokenHttpClient {
     type Error = TokenHttpError;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<HttpResponse, Self::Error>> + Send + Sync + 'c>>;
+    type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, Self::Error>> + Send + 'c>>;
 
     fn call(&'c self, request: HttpRequest) -> Self::Future {
         Box::pin(async move {
@@ -306,4 +308,42 @@ pub async fn refresh(
         identity,
         refresh_token: refresh,
     })
+}
+
+#[cfg(all(test, feature = "tailnet"))]
+mod live_tests {
+    use super::*;
+    use cja_tailnet::{Tailnet, TailnetConfig};
+    use openidconnect::{ClientId, IssuerUrl, RedirectUrl};
+    use std::{collections::HashSet, sync::Arc};
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    #[ignore = "requires WIF identity and passport:443 tailnet ACL"]
+    async fn live_tailnet_https_discovery() -> cja::Result<()> {
+        let node = Arc::new(Tailnet::join(TailnetConfig::from_env()?).await?);
+        let (_tx, secret) = watch::channel(Arc::new("test-secret".to_owned()));
+        let issuer = "https://passport.rooster-mermaid.ts.net";
+        let result = async {
+            let config = PassportConfig::new(
+                IssuerUrl::new(issuer.to_owned())?,
+                RedirectUrl::new("https://app.example.test/auth/callback".to_owned())?,
+                ClientId::new("test-client".to_owned()),
+                secret,
+                HashSet::from([crate::AllowedSubject::new("userid:123")?]),
+                HashSet::new(),
+                crate::SessionTimings::default(),
+            )?
+            .tailnet(node.clone())?;
+            let meta = metadata(&config, false).await.map_err(|failure| {
+                cja::color_eyre::eyre::eyre!("OIDC discovery failed: {failure:?}")
+            })?;
+            assert_eq!(meta.issuer().as_str(), issuer);
+            assert_ne!(meta.jwks().keys().len(), 0);
+            Ok(())
+        }
+        .await;
+        node.shutdown().await;
+        result
+    }
 }
